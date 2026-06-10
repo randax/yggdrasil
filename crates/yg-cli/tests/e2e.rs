@@ -34,9 +34,10 @@ async fn create_test_db() -> String {
     let admin = sqlx::PgPool::connect(&format!("{DEV_POSTGRES}/yggdrasil"))
         .await
         .expect("dev compose Postgres must be up (docker compose up -d --wait)");
-    // CREATE DATABASE cannot take bind parameters; the name is generated
-    // above from pid + nanos, not external input.
     let _serialize_creates = DB_CREATE_LOCK.lock().await;
+    drop_stale_test_dbs(&admin).await;
+    // CREATE DATABASE cannot take bind parameters; the name is generated
+    // above from pid + counter + millis, not external input.
     sqlx::query(sqlx::AssertSqlSafe(format!(
         r#"CREATE DATABASE "{db_name}""#
     )))
@@ -44,6 +45,25 @@ async fn create_test_db() -> String {
     .await
     .unwrap();
     db_name
+}
+
+/// Best-effort cleanup of databases left behind by earlier runs. Our own
+/// (live) databases are skipped by pid; a parallel run's in-use databases
+/// survive because plain DROP DATABASE refuses busy ones.
+async fn drop_stale_test_dbs(admin: &sqlx::PgPool) {
+    let mine = format!("yg_test_{}_", std::process::id());
+    let stale: Vec<(String,)> =
+        sqlx::query_as("SELECT datname FROM pg_database WHERE datname LIKE 'yg_test_%'")
+            .fetch_all(admin)
+            .await
+            .unwrap_or_default();
+    for (name,) in stale {
+        if !name.starts_with(&mine) {
+            let _ = sqlx::query(sqlx::AssertSqlSafe(format!(r#"DROP DATABASE "{name}""#)))
+                .execute(admin)
+                .await;
+        }
+    }
 }
 
 fn test_config(db_name: &str) -> ServerConfig {
@@ -67,7 +87,11 @@ async fn requests_without_a_valid_token_get_401_except_health() {
     let base = format!("http://{}", server.local_addr());
     let client = reqwest::Client::new();
 
-    let missing = client.get(format!("{base}/v1/status")).send().await.unwrap();
+    let missing = client
+        .get(format!("{base}/v1/status"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(missing.status(), 401, "missing token must be rejected");
 
     let wrong = client

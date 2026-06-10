@@ -4,7 +4,11 @@ use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "yg", version, about = "yggdrasil — Knowledge Graph Index Server")]
+#[command(
+    name = "yg",
+    version,
+    about = "yggdrasil — Knowledge Graph Index Server"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -40,7 +44,9 @@ async fn serve(role: String) -> anyhow::Result<()> {
     }
     // Logs go to stderr; stdout carries only the address announcement so
     // scripts (and the e2e tests) can parse it.
-    tracing_subscriber::fmt().with_writer(std::io::stderr).init();
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .init();
 
     let server = yg_api::serve(yg_api::ServerConfig::from_env()?).await?;
     println!("listening on http://{}", server.local_addr());

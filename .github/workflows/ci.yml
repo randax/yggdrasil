@@ -29,4 +29,6 @@ jobs:
       - run: cargo doc --workspace --no-deps --locked
         env:
           RUSTDOCFLAGS: -D warnings
+      # The e2e tests exercise the server against real Postgres + MinIO.
+      - run: docker compose up -d --wait
       - run: cargo test --workspace --locked
