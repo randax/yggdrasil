@@ -1,3 +1,5 @@
 [toolchain]
-channel = "stable"
+# Pinned so a new stable clippy can't redden unrelated change requests
+# under -D warnings; bump deliberately.
+channel = "1.96.0"
 components = ["rustfmt", "clippy"]
