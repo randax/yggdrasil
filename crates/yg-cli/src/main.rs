@@ -13,17 +13,21 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Show Index Server version, uptime, and indexed-repo count
-    Status,
+    Status {
+        /// Emit the raw JSON response instead of the human report
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     match Cli::parse().command {
-        Command::Status => status().await,
+        Command::Status { json } => status(json).await,
     }
 }
 
-async fn status() -> anyhow::Result<()> {
+async fn status(json: bool) -> anyhow::Result<()> {
     let server = std::env::var("YG_SERVER").unwrap_or_else(|_| "http://127.0.0.1:7311".into());
     let token = std::env::var("YG_TOKEN")
         .context("YG_TOKEN must be set (the bootstrap Admin token for now)")?;
@@ -43,9 +47,13 @@ async fn status() -> anyhow::Result<()> {
     }
     let body: serde_json::Value = resp.json().await.context("parsing status response")?;
 
-    println!("yggdrasil Index Server at {server}");
-    println!("version:       {}", body["version"].as_str().unwrap_or("?"));
-    println!("uptime:        {}s", body["uptime_seconds"]);
-    println!("repos indexed: {}", body["repos_indexed"]);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&body)?);
+    } else {
+        println!("yggdrasil Index Server at {server}");
+        println!("version:       {}", body["version"].as_str().unwrap_or("?"));
+        println!("uptime:        {}s", body["uptime_seconds"]);
+        println!("repos indexed: {}", body["repos_indexed"]);
+    }
     Ok(())
 }

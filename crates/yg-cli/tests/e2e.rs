@@ -152,6 +152,26 @@ async fn yg_status_prints_a_human_readable_report() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn yg_status_json_emits_machine_readable_output() {
+    let server = boot_test_server().await;
+
+    let assert = assert_cmd::Command::cargo_bin("yg")
+        .unwrap()
+        .env("YG_SERVER", format!("http://{}", server.local_addr()))
+        .env("YG_TOKEN", "ygt_test_token")
+        .args(["status", "--json"])
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let body: serde_json::Value =
+        serde_json::from_str(&stdout).expect("--json output must be valid JSON");
+    assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(body["repos_indexed"], 0);
+    assert!(body["uptime_seconds"].is_u64());
+}
+
 #[tokio::test]
 async fn server_boots_and_health_reports_server_and_storage_readiness() {
     let server = boot_test_server().await;
