@@ -38,6 +38,19 @@ services:
       timeout: 3s
       retries: 12
 
+  # One-shot: creates the Shard bucket so a clean stack is immediately usable.
+  # Reuses the minio image because it ships mc; no extra image to pin.
+  minio-init:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint:
+      - /bin/sh
+      - -c
+      - mc alias set dev http://minio:9000 yggdrasil yggdrasil && mc mb --ignore-existing dev/yggdrasil
+    restart: "no"
+
 volumes:
   postgres-data:
   minio-data:
