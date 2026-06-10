@@ -70,6 +70,27 @@ async fn requests_without_a_valid_token_get_401_except_health() {
 }
 
 #[tokio::test]
+async fn status_reports_version_uptime_and_repo_count_to_a_valid_token() {
+    let server = boot_test_server().await;
+
+    let resp = reqwest::Client::new()
+        .get(format!("http://{}/v1/status", server.local_addr()))
+        .bearer_auth("ygt_test_token")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(body["repos_indexed"], 0, "fresh deployment indexes nothing");
+    assert!(
+        body["uptime_seconds"].is_u64(),
+        "uptime must be a number, got: {body}"
+    );
+}
+
+#[tokio::test]
 async fn server_boots_and_health_reports_server_and_storage_readiness() {
     let server = boot_test_server().await;
 

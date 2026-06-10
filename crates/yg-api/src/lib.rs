@@ -48,12 +48,13 @@ struct AppState {
     control: ControlPlane,
     store: Box<dyn ObjectStore>,
     bootstrap_token: String,
+    started: std::time::Instant,
 }
 
 /// Boot the Index Server: connect to the control plane, verify object
 /// storage, and start serving.
 pub async fn serve(config: ServerConfig) -> anyhow::Result<RunningServer> {
-    let control = ControlPlane::connect(&config.database_url).await?;
+    let control = ControlPlane::connect_and_migrate(&config.database_url).await?;
 
     let store: Box<dyn ObjectStore> = Box::new(
         AmazonS3Builder::new()
@@ -74,6 +75,7 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<RunningServer> {
         control,
         store,
         bootstrap_token: config.bootstrap_token,
+        started: std::time::Instant::now(),
     });
     let v1 = Router::new()
         .route("/status", get(status))
@@ -141,8 +143,27 @@ async fn require_bearer_token(
     }
 }
 
-async fn status() -> StatusCode {
-    StatusCode::OK
+#[derive(Serialize)]
+struct StatusResponse {
+    version: &'static str,
+    uptime_seconds: u64,
+    repos_indexed: i64,
+}
+
+async fn status(State(state): State<Arc<AppState>>) -> Response {
+    match state.control.indexed_repo_count().await {
+        Ok(repos_indexed) => Json(StatusResponse {
+            version: env!("CARGO_PKG_VERSION"),
+            uptime_seconds: state.started.elapsed().as_secs(),
+            repos_indexed,
+        })
+        .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("{e:#}")})),
+        )
+            .into_response(),
+    }
 }
 
 #[derive(Serialize)]

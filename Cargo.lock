@@ -205,6 +205,9 @@ name = "bitflags"
 version = "2.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4388bee8683e3d04af747c73422af53102d2bd24d9eadb6cbc100baef4b43f8"
+dependencies = [
+ "serde_core",
+]
 
 [[package]]
 name = "block-buffer"
@@ -2138,6 +2141,7 @@ dependencies = [
  "sqlx-core",
  "sqlx-postgres",
  "syn",
+ "thiserror",
  "tokio",
  "url",
 ]
@@ -2160,6 +2164,7 @@ dependencies = [
  "generic-array",
  "log",
  "percent-encoding",
+ "serde",
  "sha1",
  "sha2 0.11.0",
  "sqlx-core",
@@ -2219,6 +2224,7 @@ dependencies = [
  "libsqlite3-sys",
  "log",
  "percent-encoding",
+ "serde",
  "sqlx-core",
  "thiserror",
  "tracing",
