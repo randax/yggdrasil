@@ -20,11 +20,11 @@ Yggdrasil is a self-hosted **Index Server** that syncs git repositories from **F
 
 *The world-tree connecting all the realms of your code.*
 
-## Users
+## Roles
 
 - **Admin** — operates the deployment: connects Forges, sets discovery rules, wires optional providers (embeddings, LLM).
 - **Member** — an engineer or their AI agent, querying the graph via CLI/MCP with a bearer token.
-- **Contributor** — appears *in* the graph (authors, owners); not necessarily a Member.
+- **Contributor** — appears *in* the graph (wrote or owns the code); not necessarily a Member.
 
 ## Goals (v1)
 
