@@ -135,6 +135,19 @@ async fn requests_without_a_valid_token_get_401_except_health() {
         .await
         .unwrap();
     assert_eq!(authed_unknown.status(), 404, "valid token sees real 404s");
+
+    // RFC 9110: the auth scheme is case-insensitive.
+    let lowercase_scheme = client
+        .get(format!("{base}/v1/status"))
+        .header("Authorization", "bearer ygt_test_token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        lowercase_scheme.status(),
+        200,
+        "lowercase scheme with a valid token must be accepted"
+    );
 }
 
 #[test]

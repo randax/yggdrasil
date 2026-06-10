@@ -166,8 +166,10 @@ async fn require_bearer_token(
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .is_some_and(|presented| {
+        // RFC 9110: the scheme is case-insensitive.
+        .and_then(|v| v.split_once(' '))
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+        .is_some_and(|(_, presented)| {
             presented
                 .as_bytes()
                 .ct_eq(state.bootstrap_token.as_bytes())
