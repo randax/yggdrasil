@@ -30,17 +30,17 @@ volumes (`yggdrasil-dev_postgres-data`, `yggdrasil-dev_minio-data`);
 
 ## Checks
 
-CI runs exactly this on every change request; run it locally before pushing:
+CI runs exactly this on every Change Request; run it locally before pushing:
 
 ```sh
 cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
-RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
-cargo test --workspace
+cargo clippy --workspace --all-targets --locked -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
+cargo test --workspace --locked
 ```
 
 The toolchain is pinned in `rust-toolchain.toml` so a new stable clippy can't
-redden unrelated change requests; bump it deliberately.
+redden unrelated Change Requests; bump it deliberately.
 
 ## Layout
 

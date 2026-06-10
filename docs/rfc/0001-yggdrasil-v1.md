@@ -5,7 +5,7 @@ Scope: full v1 design (milestones M0–M3). Requirements live in the [PRD](../PR
 
 ## 1. Summary
 
-A Rust workspace producing one binary, `yg`, that is simultaneously the server (`yg serve --role=api|worker|all`), the admin/user CLI, and a stdio MCP proxy (`yg mcp`). Stateless API/query nodes and indexing workers around Postgres (control plane) and S3-compatible object storage (immutable per-repo Shards). Public contract: twelve Verbs over REST + MCP.
+A Rust workspace producing one binary, `yg`, that is simultaneously the server (`yg serve --role=api|worker|all`), the Admin/Member CLI, and a stdio MCP proxy (`yg mcp`). Stateless API/query nodes and indexing workers around Postgres (control plane) and S3-compatible object storage (immutable per-repo Shards). Public contract: twelve Verbs over REST + MCP.
 
 ## 2. Control plane schema (Postgres, sketch)
 
@@ -93,7 +93,7 @@ Twelve Verbs, identical schemas across REST (`POST /v1/verbs/<name>`), MCP tools
 | `callers` / `callees` | symbol id, transitive? | call sites with locations |
 | `deps` / `dependents` | repo\|package\|symbol | dependency closure (xrepo-bounded) |
 | `owners` | file\|dir\|symbol | Contributors/Teams + ownership basis |
-| `history` | node, since? | commits/CRs touching it, authors |
+| `history` | node, since? | commits/CRs touching it, Contributors |
 | `impact` | symbol\|file, depth | affected Symbols→Files→Repos, grouped, provenance-annotated |
 
 Verb additions are minor-version events; removals are major. The Skill is versioned against this table.
