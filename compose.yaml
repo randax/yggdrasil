@@ -30,6 +30,9 @@ services:
     volumes:
       - minio-data:/data
     healthcheck:
+      # MinIO's documented container healthcheck. "local" is one of mc's
+      # built-in default aliases (http://localhost:9000) — no alias init is
+      # needed, and `mc ready` probes the unauthenticated health API.
       test: ["CMD", "mc", "ready", "local"]
       interval: 5s
       timeout: 3s
