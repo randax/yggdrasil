@@ -72,7 +72,8 @@ CI runs exactly this on every Change Request; run it locally before pushing
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
-docker compose up -d --wait
+docker compose up -d --wait postgres minio
+docker compose run --rm minio-init
 cargo test --workspace --locked
 ```
 

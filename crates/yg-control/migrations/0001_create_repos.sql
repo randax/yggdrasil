@@ -1,11 +1,7 @@
--- Control-plane repo registry: the slice of RFC 0001 §2's `repos` sketch
--- the server queries today. Forge linkage arrives with the forges table.
+-- Control-plane repo registry (RFC 0001 §2). This slice only needs to
+-- count indexed repos; the remaining §2 columns (forge linkage, slug,
+-- discovery state, sync cursors) arrive with the slices that use them.
 CREATE TABLE repos (
     id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    slug text NOT NULL,
-    visibility text,
-    default_branch text,
-    indexed boolean NOT NULL DEFAULT false,
-    discovery_state text NOT NULL DEFAULT 'discovered',
-    last_synced_commit text
+    indexed boolean NOT NULL DEFAULT false
 );

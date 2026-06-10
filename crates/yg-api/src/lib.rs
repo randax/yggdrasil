@@ -40,9 +40,13 @@ impl ServerConfig {
         fn var_or(key: &str, default: &str) -> String {
             std::env::var(key).unwrap_or_else(|_| default.to_string())
         }
-        let bootstrap_token = std::env::var("YG_BOOTSTRAP_TOKEN").context(
-            "YG_BOOTSTRAP_TOKEN must be set; the server refuses to boot without an Admin token",
-        )?;
+        let bootstrap_token = std::env::var("YG_BOOTSTRAP_TOKEN")
+            .ok()
+            .filter(|token| !token.trim().is_empty())
+            .context(
+                "YG_BOOTSTRAP_TOKEN must be set to a non-empty token; \
+                 the server refuses to boot without an Admin token",
+            )?;
         Ok(Self {
             listen: var_or("YG_LISTEN", "127.0.0.1:7311")
                 .parse()
@@ -113,15 +117,15 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<RunningServer> {
         bootstrap_token: config.bootstrap_token,
         started: std::time::Instant::now(),
     });
-    let v1 = Router::new()
-        .route("/status", get(status))
+    // The auth layer wraps the whole app — including fallbacks, so even
+    // nonexistent paths answer 401 to unauthenticated callers.
+    let app = Router::new()
+        .route("/healthz", get(healthz))
+        .nest("/v1", Router::new().route("/status", get(status)))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_bearer_token,
-        ));
-    let app = Router::new()
-        .route("/healthz", get(healthz))
-        .nest("/v1", v1)
+        ))
         .with_state(state);
 
     let listener = TcpListener::bind(config.listen)
@@ -145,14 +149,18 @@ async fn probe_object_store(store: &dyn ObjectStore) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Every route under /v1 requires the bootstrap Admin token; only the
-/// health endpoint is reachable without one.
+/// Every route — existing or not — requires the bootstrap Admin token;
+/// only the health endpoint is reachable without one.
 async fn require_bearer_token(
     State(state): State<Arc<AppState>>,
     req: Request,
     next: Next,
 ) -> Response {
     use subtle::ConstantTimeEq;
+
+    if req.uri().path() == "/healthz" {
+        return next.run(req).await;
+    }
 
     let authorized = req
         .headers()
