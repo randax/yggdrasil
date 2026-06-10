@@ -15,3 +15,9 @@ Yggdrasil is a self-hosted **index server** that continuously syncs git reposito
 | [CONTEXT.md](CONTEXT.md) | The project's vocabulary |
 
 Built in Rust. Postgres + S3-compatible object storage. AGPL-3.0.
+
+## Developing
+
+`docker compose up -d` brings up dev Postgres + MinIO; see
+[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) for ports, credentials, and the
+checks CI runs.
