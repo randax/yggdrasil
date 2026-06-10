@@ -4,8 +4,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::Context;
-use axum::extract::State;
-use axum::http::StatusCode;
+use axum::extract::{Request, State};
+use axum::http::{StatusCode, header};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use object_store::ObjectStore;
@@ -45,6 +47,7 @@ impl RunningServer {
 struct AppState {
     control: ControlPlane,
     store: Box<dyn ObjectStore>,
+    bootstrap_token: String,
 }
 
 /// Boot the Index Server: connect to the control plane, verify object
@@ -67,9 +70,20 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<RunningServer> {
         .await
         .context("object storage unreachable at boot")?;
 
-    let state = Arc::new(AppState { control, store });
+    let state = Arc::new(AppState {
+        control,
+        store,
+        bootstrap_token: config.bootstrap_token,
+    });
+    let v1 = Router::new()
+        .route("/status", get(status))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_bearer_token,
+        ));
     let app = Router::new()
         .route("/healthz", get(healthz))
+        .nest("/v1", v1)
         .with_state(state);
 
     let listener = TcpListener::bind(config.listen)
@@ -94,6 +108,41 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<RunningServer> {
 async fn probe_object_store(store: &dyn ObjectStore) -> anyhow::Result<()> {
     store.list_with_delimiter(None).await?;
     Ok(())
+}
+
+/// Every route under /v1 requires the bootstrap Admin token; only the
+/// health endpoint is reachable without one.
+async fn require_bearer_token(
+    State(state): State<Arc<AppState>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    use subtle::ConstantTimeEq;
+
+    let authorized = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .is_some_and(|presented| {
+            presented
+                .as_bytes()
+                .ct_eq(state.bootstrap_token.as_bytes())
+                .into()
+        });
+    if authorized {
+        next.run(req).await
+    } else {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "missing or invalid bearer token"})),
+        )
+            .into_response()
+    }
+}
+
+async fn status() -> StatusCode {
+    StatusCode::OK
 }
 
 #[derive(Serialize)]

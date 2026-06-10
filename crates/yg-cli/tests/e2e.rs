@@ -49,6 +49,27 @@ fn test_config(db_name: &str) -> ServerConfig {
 }
 
 #[tokio::test]
+async fn requests_without_a_valid_token_get_401_except_health() {
+    let server = boot_test_server().await;
+    let base = format!("http://{}", server.local_addr());
+    let client = reqwest::Client::new();
+
+    let missing = client.get(format!("{base}/v1/status")).send().await.unwrap();
+    assert_eq!(missing.status(), 401, "missing token must be rejected");
+
+    let wrong = client
+        .get(format!("{base}/v1/status"))
+        .bearer_auth("ygt_definitely_wrong")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong.status(), 401, "invalid token must be rejected");
+
+    let health = client.get(format!("{base}/healthz")).send().await.unwrap();
+    assert_eq!(health.status(), 200, "health must not require a token");
+}
+
+#[tokio::test]
 async fn server_boots_and_health_reports_server_and_storage_readiness() {
     let server = boot_test_server().await;
 
