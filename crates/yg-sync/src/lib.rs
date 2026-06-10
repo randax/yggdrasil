@@ -1,1 +1,1 @@
-//! Forge trait + GitHub/GitLab/Forgejo adapters, webhooks.
+//! Forge trait + GitHub/GitLab/Forgejo (Codeberg runs Forgejo) adapters, webhooks.

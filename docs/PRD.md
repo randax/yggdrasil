@@ -30,7 +30,7 @@ Yggdrasil is a self-hosted **Index Server** that syncs git repositories from **F
 
 ### Sync
 - G1. Connect GitHub, GitLab, and Codeberg orgs/groups; auto-discover repos; include/exclude rules. Public and internal repos auto-index; **private repos are explicit opt-in** (ADR 0001).
-- G2. Poll-based convergence (default 5 min, configurable) plus optional webhook accelerator (ADR: poll core + webhook).
+- G2. Poll-based convergence (default 5 min, configurable) plus optional webhook accelerator (RFC 0001 §3).
 - G3. Default branch fully indexed; full history by default (shallow configurable). Change Requests appear as Forge Artifacts without head indexing.
 
 ### Knowledge Graph

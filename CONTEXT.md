@@ -33,7 +33,7 @@ Data synced from a forge's API rather than from git: change requests, issues, re
 _Avoid_: Metadata
 
 **Provenance**:
-How a graph edge was derived: precise (compiler-grade indexer) or syntactic (heuristic parsing). Every edge carries it, with a confidence tag.
+How a graph edge was derived: precise (compiler-grade indexer), syntactic (heuristic parsing), extracted (deterministically derived from non-code sources: manifests, forge data, identity matches), or inferred (heuristic guess, reversible). Every edge carries it, with a confidence tag.
 _Avoid_: Source, origin (both overloaded in this domain)
 
 **Doc Section**:

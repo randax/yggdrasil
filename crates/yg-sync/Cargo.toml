@@ -1,6 +1,6 @@
 [package]
 name = "yg-sync"
-description = "Forge trait + GitHub/GitLab/Forgejo adapters, webhooks"
+description = "Forge trait + GitHub/GitLab/Forgejo (Codeberg) adapters, webhooks"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

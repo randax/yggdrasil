@@ -50,7 +50,7 @@ Pull jobs from the queue. Two-pass indexing:
 1. **Syntactic pass** (fast, always succeeds): tree-sitter parse, heuristic edges, docs/history/owners extraction → publish Shard within minutes of a change.
 2. **Precise pass** (slow, best-effort): SCIP indexer runs the repo's build inside a **sandbox** (container, controlled egress for dependency fetch, no credentials beyond read-only clone token); on success its edges overlay the syntactic ones in a new Shard revision.
 
-Every edge records Provenance (`precise` | `syntactic`) + confidence (ADR 0002). A failed build degrades a repo to syntactic — never to absent.
+Every edge records Provenance (`precise` | `syntactic` | `extracted` | `inferred`; RFC 0001 §5) + confidence (ADR 0002). A failed build degrades a repo to syntactic — never to absent.
 
 ### Shard store (object storage)
 One immutable Shard per repo per revision: graph segment (SQLite file as artifact format), full-text segment (tantivy), vector segment (ANN index, M3), plus a manifest. Content-addressed keys; re-index publishes a new Shard and atomically swaps the pointer in Postgres; old Shards garbage-collected after a grace window. No locks, no partial states, trivially cacheable (ADR 0005).
@@ -82,7 +82,7 @@ Targets as in the PRD: verb p95 < 300 ms warm, search p95 < 500 ms warm, syntact
 - **Authn:** Admin-issued bearer tokens per Member/agent; OIDC post-v1. TLS terminated at or before query nodes.
 - **Authz:** org-visible — every Member sees everything indexed; exposure is controlled by what the Admin indexes (ADR 0001).
 - **Build sandboxing:** the precise pass executes repo-controlled code. Containers with read-only source mounts, scoped egress (package registries only), no ambient credentials, resource limits. This is the most security-sensitive surface in the system.
-- **Data egress:** embeddings and LLM Concept extraction are pluggable providers, local-capable, **off by default**; no source leaves the deployment without explicit Admin opt-in.
+- **Data egress:** embeddings and LLM Concept extraction are pluggable providers, local-capable, **off by default** (when enabled, the local provider is the default; external APIs are explicit opt-in); no source leaves the deployment without explicit Admin opt-in.
 
 ## Failure modes
 

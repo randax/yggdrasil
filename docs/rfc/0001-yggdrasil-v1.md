@@ -114,7 +114,7 @@ crates/
   yg-verbs      # verb engine (pure: control-plane + shard reads)
   yg-shard      # shard read/write, cache tier, formats
   yg-control    # postgres models, job queue
-  yg-sync       # forge trait + github/gitlab/forgejo adapters, webhooks
+  yg-sync       # forge trait + github/gitlab/forgejo adapters (Codeberg runs Forgejo), webhooks
   yg-index      # tree-sitter pass, scip ingestion, extractors, sandbox driver
   yg-providers  # embedding + llm provider traits, local-onnx impl
 ```
@@ -139,4 +139,4 @@ Recorded as ADRs: org-visible vs ACL mirroring (0001); precise+fallback vs tree-
 
 ## 12. Rollout
 
-M0 ships the tracer (GitHub + syntactic + 6 Verbs + CLI/MCP/Skill v0) and is the architecture's proof; M1 adds the precise pass + `map` + GitLab; M2 completes the graph layers + Codeberg; M3 adds semantic + webhook accelerators + the 5000-repo certification run (synthetic org, published numbers). Each milestone ends with a dogfooding gate: agents must prefer the graph over grep for the navigation tasks it claims.
+M0 ships the tracer (GitHub + syntactic + the search/node/neighbors/history Verbs + CLI/MCP/Skill v0) and is the architecture's proof; M1 adds the precise pass + `map` + GitLab; M2 completes the graph layers + Codeberg; M3 adds semantic + webhook accelerators + the 5000-repo certification run (synthetic org, published numbers). Each milestone ends with a dogfooding gate: agents must prefer the graph over grep for the navigation tasks it claims.
