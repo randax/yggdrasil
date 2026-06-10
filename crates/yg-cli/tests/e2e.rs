@@ -8,6 +8,12 @@ const DEV_POSTGRES: &str = "postgres://yggdrasil:yggdrasil@localhost:5432";
 /// Each test boots against its own freshly created database so tests are
 /// independent and re-runnable.
 async fn boot_test_server() -> RunningServer {
+    serve(test_config(&create_test_db().await))
+        .await
+        .expect("server should boot against the dev stack")
+}
+
+async fn create_test_db() -> String {
     let db_name = format!(
         "yg_test_{}_{}",
         std::process::id(),
@@ -27,10 +33,7 @@ async fn boot_test_server() -> RunningServer {
     .execute(&admin)
     .await
     .unwrap();
-
-    serve(test_config(&db_name))
-        .await
-        .expect("server should boot against the dev stack")
+    db_name
 }
 
 fn test_config(db_name: &str) -> ServerConfig {
@@ -88,6 +91,26 @@ async fn status_reports_version_uptime_and_repo_count_to_a_valid_token() {
         body["uptime_seconds"].is_u64(),
         "uptime must be a number, got: {body}"
     );
+}
+
+#[tokio::test]
+async fn migrations_are_idempotent_across_server_restarts() {
+    let db_name = create_test_db().await;
+
+    let first = serve(test_config(&db_name)).await.expect("first boot");
+    drop(first);
+
+    let second = serve(test_config(&db_name))
+        .await
+        .expect("restart against an already-migrated database");
+
+    let resp = reqwest::Client::new()
+        .get(format!("http://{}/v1/status", second.local_addr()))
+        .bearer_auth("ygt_test_token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "restarted server must serve status");
 }
 
 #[tokio::test]
