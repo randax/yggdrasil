@@ -20,7 +20,9 @@ Connection string: `postgres://yggdrasil:yggdrasil@localhost:5432/yggdrasil`
 MinIO is pinned to `RELEASE.2025-04-22T22-12-26Z`, the last release with the
 full community console; the S3 API is what yggdrasil actually needs. A
 one-shot `minio-init` service creates the `yggdrasil` Shard bucket, so a
-clean stack is immediately usable.
+clean stack is immediately usable. (Compose versions older than ~v2.22 fail
+`up --wait` when that one-shot exits; use the CI sequence instead:
+`docker compose up -d --wait postgres minio && docker compose run --rm minio-init`.)
 
 If a default host port collides with something already running, override it:
 `YG_POSTGRES_PORT`, `YG_MINIO_PORT`, `YG_MINIO_CONSOLE_PORT` (e.g.
