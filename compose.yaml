@@ -1,0 +1,43 @@
+name: yggdrasil-dev
+
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: yggdrasil
+      POSTGRES_PASSWORD: yggdrasil
+      POSTGRES_DB: yggdrasil
+    ports:
+      - "${YG_POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U yggdrasil"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  minio:
+    # Last release with the full community console; the S3 API is what matters here.
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: yggdrasil
+      MINIO_ROOT_PASSWORD: yggdrasil
+    ports:
+      - "${YG_MINIO_PORT:-9000}:9000"
+      - "${YG_MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      # MinIO's documented container healthcheck. "local" is one of mc's
+      # built-in default aliases (http://localhost:9000) — no alias init is
+      # needed, and `mc ready` probes the unauthenticated health API.
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+volumes:
+  postgres-data:
+  minio-data:

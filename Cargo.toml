@@ -1,0 +1,11 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+repository = "https://github.com/randax/yggdrasil"
+# Matches the toolchain CI actually tests (rust-toolchain.toml).
+rust-version = "1.96"

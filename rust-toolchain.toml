@@ -1,0 +1,5 @@
+[toolchain]
+# Pinned so a new stable clippy can't redden unrelated Change Requests
+# under -D warnings; bump deliberately.
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]
