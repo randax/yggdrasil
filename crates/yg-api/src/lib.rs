@@ -32,15 +32,51 @@ pub struct ObjectStoreConfig {
     pub region: String,
 }
 
+impl ServerConfig {
+    /// Build from `YG_*` environment variables. Everything defaults to the
+    /// in-repo dev compose stack except the bootstrap Admin token, which
+    /// has no safe default.
+    pub fn from_env() -> anyhow::Result<Self> {
+        fn var_or(key: &str, default: &str) -> String {
+            std::env::var(key).unwrap_or_else(|_| default.to_string())
+        }
+        let bootstrap_token = std::env::var("YG_BOOTSTRAP_TOKEN").context(
+            "YG_BOOTSTRAP_TOKEN must be set; the server refuses to boot without an Admin token",
+        )?;
+        Ok(Self {
+            listen: var_or("YG_LISTEN", "127.0.0.1:7311")
+                .parse()
+                .context("parsing YG_LISTEN as host:port")?,
+            database_url: var_or(
+                "YG_DATABASE_URL",
+                "postgres://yggdrasil:yggdrasil@localhost:5432/yggdrasil",
+            ),
+            object_store: ObjectStoreConfig {
+                endpoint: var_or("YG_S3_ENDPOINT", "http://localhost:9000"),
+                bucket: var_or("YG_S3_BUCKET", "yggdrasil"),
+                access_key: var_or("YG_S3_ACCESS_KEY", "yggdrasil"),
+                secret_key: var_or("YG_S3_SECRET_KEY", "yggdrasil"),
+                region: var_or("YG_S3_REGION", "us-east-1"),
+            },
+            bootstrap_token,
+        })
+    }
+}
+
 /// A booted Index Server, listening until dropped or the process exits.
 pub struct RunningServer {
     local_addr: SocketAddr,
-    _handle: JoinHandle<()>,
+    handle: JoinHandle<()>,
 }
 
 impl RunningServer {
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    /// Run until the server task ends (it normally never does).
+    pub async fn wait(self) -> anyhow::Result<()> {
+        self.handle.await.context("server task panicked")
     }
 }
 
@@ -98,10 +134,7 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<RunningServer> {
         }
     });
 
-    Ok(RunningServer {
-        local_addr,
-        _handle: handle,
-    })
+    Ok(RunningServer { local_addr, handle })
 }
 
 /// Cheap reachability check that distinguishes "bucket missing/unreachable"

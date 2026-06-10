@@ -12,6 +12,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Boot the Index Server
+    Serve {
+        /// Which roles this process runs (only "all" in this milestone)
+        #[arg(long, default_value = "all")]
+        role: String,
+    },
     /// Show Index Server version, uptime, and indexed-repo count
     Status {
         /// Emit the raw JSON response instead of the human report
@@ -23,8 +29,22 @@ enum Command {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     match Cli::parse().command {
+        Command::Serve { role } => serve(role).await,
         Command::Status { json } => status(json).await,
     }
+}
+
+async fn serve(role: String) -> anyhow::Result<()> {
+    if role != "all" {
+        bail!("only --role=all is supported in this milestone (got {role:?})");
+    }
+    // Logs go to stderr; stdout carries only the address announcement so
+    // scripts (and the e2e tests) can parse it.
+    tracing_subscriber::fmt().with_writer(std::io::stderr).init();
+
+    let server = yg_api::serve(yg_api::ServerConfig::from_env()?).await?;
+    println!("listening on http://{}", server.local_addr());
+    server.wait().await
 }
 
 async fn status(json: bool) -> anyhow::Result<()> {

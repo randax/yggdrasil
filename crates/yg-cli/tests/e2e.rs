@@ -172,6 +172,52 @@ async fn yg_status_json_emits_machine_readable_output() {
     assert!(body["uptime_seconds"].is_u64());
 }
 
+/// Kills the spawned server even when the test panics.
+struct KillOnDrop(std::process::Child);
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn yg_serve_boots_from_env_and_answers_yg_status_end_to_end() {
+    use std::io::BufRead;
+
+    let db_name = create_test_db().await;
+    let child = std::process::Command::new(assert_cmd::cargo::cargo_bin("yg"))
+        .env("YG_LISTEN", "127.0.0.1:0")
+        .env("YG_DATABASE_URL", format!("{DEV_POSTGRES}/{db_name}"))
+        .env("YG_BOOTSTRAP_TOKEN", "ygt_test_token")
+        .args(["serve", "--role=all"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut server = KillOnDrop(child);
+
+    let stdout = server.0.stdout.take().unwrap();
+    let first_line = std::io::BufReader::new(stdout)
+        .lines()
+        .next()
+        .expect("yg serve must announce its address before exiting")
+        .unwrap();
+    let url = first_line
+        .strip_prefix("listening on ")
+        .unwrap_or_else(|| panic!("unexpected announcement: {first_line}"))
+        .to_string();
+
+    assert_cmd::Command::cargo_bin("yg")
+        .unwrap()
+        .env("YG_SERVER", &url)
+        .env("YG_TOKEN", "ygt_test_token")
+        .arg("status")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("repos indexed: 0"));
+}
+
 #[tokio::test]
 async fn server_boots_and_health_reports_server_and_storage_readiness() {
     let server = boot_test_server().await;
