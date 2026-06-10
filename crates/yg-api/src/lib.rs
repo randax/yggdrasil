@@ -40,9 +40,13 @@ impl ServerConfig {
         fn var_or(key: &str, default: &str) -> String {
             std::env::var(key).unwrap_or_else(|_| default.to_string())
         }
+        // Trimmed before storing: env files commonly leak whitespace, and
+        // HTTP strips it from header values, so a padded token could never
+        // be presented by any client.
         let bootstrap_token = std::env::var("YG_BOOTSTRAP_TOKEN")
             .ok()
-            .filter(|token| !token.trim().is_empty())
+            .map(|token| token.trim().to_string())
+            .filter(|token| !token.is_empty())
             .context(
                 "YG_BOOTSTRAP_TOKEN must be set to a non-empty token; \
                  the server refuses to boot without an Admin token",
@@ -70,7 +74,7 @@ impl ServerConfig {
 /// A booted Index Server, listening until dropped or the process exits.
 pub struct RunningServer {
     local_addr: SocketAddr,
-    handle: JoinHandle<()>,
+    handle: JoinHandle<std::io::Result<()>>,
 }
 
 impl RunningServer {
@@ -78,9 +82,13 @@ impl RunningServer {
         self.local_addr
     }
 
-    /// Run until the server task ends (it normally never does).
+    /// Run until the server task ends (it normally never does); a serve
+    /// error surfaces here instead of being silently logged.
     pub async fn wait(self) -> anyhow::Result<()> {
-        self.handle.await.context("server task panicked")
+        self.handle
+            .await
+            .context("server task panicked")?
+            .context("server exited with an error")
     }
 }
 
@@ -133,9 +141,11 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<RunningServer> {
         .with_context(|| format!("binding {}", config.listen))?;
     let local_addr = listener.local_addr()?;
     let handle = tokio::spawn(async move {
-        if let Err(e) = axum::serve(listener, app).await {
+        let result = axum::serve(listener, app).await;
+        if let Err(e) = &result {
             tracing::error!("server exited: {e}");
         }
+        result
     });
 
     Ok(RunningServer { local_addr, handle })
@@ -169,8 +179,10 @@ async fn require_bearer_token(
         // RFC 9110: the scheme is case-insensitive.
         .and_then(|v| v.split_once(' '))
         .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+        // RFC 9110 allows 1*SP between scheme and credentials.
         .is_some_and(|(_, presented)| {
             presented
+                .trim_start_matches(' ')
                 .as_bytes()
                 .ct_eq(state.bootstrap_token.as_bytes())
                 .into()
@@ -223,8 +235,10 @@ struct HealthChecks {
 }
 
 async fn healthz(State(state): State<Arc<AppState>>) -> (StatusCode, Json<HealthResponse>) {
-    let postgres = state.control.ping().await;
-    let object_store = probe_object_store(state.store.as_ref()).await;
+    let (postgres, object_store) = tokio::join!(
+        state.control.ping(),
+        probe_object_store(state.store.as_ref())
+    );
     let all_ok = postgres.is_ok() && object_store.is_ok();
 
     let check = |r: &anyhow::Result<()>| match r {

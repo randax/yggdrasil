@@ -55,6 +55,7 @@ async fn serve(role: String) -> anyhow::Result<()> {
 
 async fn status(json: bool) -> anyhow::Result<()> {
     let server = std::env::var("YG_SERVER").unwrap_or_else(|_| "http://127.0.0.1:7311".into());
+    let server = server.trim_end_matches('/');
     let token = std::env::var("YG_TOKEN")
         .context("YG_TOKEN must be set (the bootstrap Admin token for now)")?;
 

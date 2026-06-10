@@ -148,6 +148,19 @@ async fn requests_without_a_valid_token_get_401_except_health() {
         200,
         "lowercase scheme with a valid token must be accepted"
     );
+
+    // RFC 9110 allows one *or more* spaces between scheme and credentials.
+    let double_space = client
+        .get(format!("{base}/v1/status"))
+        .header("Authorization", "Bearer  ygt_test_token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        double_space.status(),
+        200,
+        "multiple spaces after the scheme are legal"
+    );
 }
 
 #[test]
@@ -242,7 +255,8 @@ async fn yg_status_json_emits_machine_readable_output() {
 
     let assert = assert_cmd::Command::cargo_bin("yg")
         .unwrap()
-        .env("YG_SERVER", format!("http://{}", server.local_addr()))
+        // Trailing slash on purpose: the CLI must not build a `//v1/…` URL.
+        .env("YG_SERVER", format!("http://{}/", server.local_addr()))
         .env("YG_TOKEN", "ygt_test_token")
         .args(["status", "--json"])
         .assert()
@@ -306,7 +320,9 @@ async fn yg_serve_boots_from_env_and_answers_yg_status_end_to_end() {
     let child = std::process::Command::new(assert_cmd::cargo::cargo_bin("yg"))
         .env("YG_LISTEN", "127.0.0.1:0")
         .env("YG_DATABASE_URL", format!("{DEV_POSTGRES}/{db_name}"))
-        .env("YG_BOOTSTRAP_TOKEN", "ygt_test_token")
+        // Padded on purpose: env files commonly leak whitespace around
+        // secrets; clients present the clean token below.
+        .env("YG_BOOTSTRAP_TOKEN", " ygt_test_token\n")
         .args(["serve", "--role=all"])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -315,11 +331,18 @@ async fn yg_serve_boots_from_env_and_answers_yg_status_end_to_end() {
     let mut server = KillOnDrop(child);
 
     let stdout = server.0.stdout.take().unwrap();
-    let first_line = std::io::BufReader::new(stdout)
-        .lines()
-        .next()
-        .expect("yg serve must announce its address before exiting")
-        .unwrap();
+    let first_line = match std::io::BufReader::new(stdout).lines().next() {
+        Some(line) => line.unwrap(),
+        None => {
+            use std::io::Read;
+            let _ = server.0.kill();
+            let mut stderr = String::new();
+            if let Some(mut err) = server.0.stderr.take() {
+                let _ = err.read_to_string(&mut stderr);
+            }
+            panic!("yg serve exited without announcing its address; stderr:\n{stderr}");
+        }
+    };
     let url = first_line
         .strip_prefix("listening on ")
         .unwrap_or_else(|| panic!("unexpected announcement: {first_line}"))
