@@ -13,20 +13,30 @@ async fn boot_test_server() -> RunningServer {
         .expect("server should boot against the dev stack")
 }
 
+/// Postgres CREATE DATABASE statements conflict on the template-database
+/// lock when run concurrently; serialize them across parallel tests.
+static DB_CREATE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 async fn create_test_db() -> String {
+    // pid distinguishes parallel `cargo test` processes; the counter
+    // distinguishes parallel tests (the system clock does not — two tests
+    // can start within one clock tick); millis distinguish re-runs.
+    static UNIQUE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let db_name = format!(
-        "yg_test_{}_{}",
+        "yg_test_{}_{}_{}",
         std::process::id(),
+        UNIQUE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_millis()
     );
     let admin = sqlx::PgPool::connect(&format!("{DEV_POSTGRES}/yggdrasil"))
         .await
         .expect("dev compose Postgres must be up (docker compose up -d --wait)");
     // CREATE DATABASE cannot take bind parameters; the name is generated
     // above from pid + nanos, not external input.
+    let _serialize_creates = DB_CREATE_LOCK.lock().await;
     sqlx::query(sqlx::AssertSqlSafe(format!(
         r#"CREATE DATABASE "{db_name}""#
     )))
@@ -111,6 +121,35 @@ async fn migrations_are_idempotent_across_server_restarts() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 200, "restarted server must serve status");
+}
+
+/// multi_thread: the yg binary blocks this thread while the in-process
+/// server it queries runs on the same test runtime.
+#[tokio::test(flavor = "multi_thread")]
+async fn yg_status_prints_a_human_readable_report() {
+    let server = boot_test_server().await;
+
+    let assert = assert_cmd::Command::cargo_bin("yg")
+        .unwrap()
+        .env("YG_SERVER", format!("http://{}", server.local_addr()))
+        .env("YG_TOKEN", "ygt_test_token")
+        .arg("status")
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(
+        stdout.contains(env!("CARGO_PKG_VERSION")),
+        "must show server version, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("repos indexed: 0"),
+        "must show indexed-repo count, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("uptime:"),
+        "must show uptime, got:\n{stdout}"
+    );
 }
 
 #[tokio::test]
