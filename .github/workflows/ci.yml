@@ -29,4 +29,9 @@ jobs:
       - run: cargo doc --workspace --no-deps --locked
         env:
           RUSTDOCFLAGS: -D warnings
+      # The e2e tests exercise the server against real Postgres + MinIO.
+      # Two steps: older compose versions fail `up --wait` when the
+      # one-shot minio-init service exits (even successfully).
+      - run: docker compose up -d --wait postgres minio
+      - run: docker compose run --rm minio-init
       - run: cargo test --workspace --locked
