@@ -1,6 +1,6 @@
 # Yggdrasil
 
-A team-deployed server that syncs git repositories from forges and serves a queryable knowledge graph of them, for AI agents (via MCP) and humans (via CLI).
+An organization-deployed server that syncs git repositories from forges and serves a queryable knowledge graph of them, for AI agents (via MCP) and humans (via CLI).
 
 ## Language
 

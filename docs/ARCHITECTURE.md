@@ -39,7 +39,7 @@ One Rust binary, three roles. Stateless compute around two stateful, self-hostab
 ## Components
 
 ### Control plane (Postgres)
-System of record: Forge connections, repo registry + discovery state, sync cursors, job queue (`SELECT … FOR UPDATE SKIP LOCKED`), Shard pointers, Members + bearer tokens, the cross-repo edge index (package → repo, repo → repo dependency edges, global symbol prefixes), and Contributor identity merges. Everything else is rebuildable; Postgres and object storage are the only backup targets.
+System of record: Forge connections, repo registry + discovery state, sync cursors, job queue (`SELECT … FOR UPDATE SKIP LOCKED`), Shard pointers, Members + bearer tokens, the cross-repo edge index (package → repo, repo → repo dependency edges; a global symbol tier is an open question, RFC 0001 Q5), and Contributor identity merges. Everything else is rebuildable; Postgres and object storage are the only backup targets.
 
 ### Sync service
 Per-Forge adapters behind one trait: discovery (orgs/groups → repos, include/exclude rules, private = opt-in), poll loop with conditional requests against rate-limit budgets, optional webhook receiver as accelerator (poll always reconciles, so missed webhooks only cost latency, never correctness). Emits jobs: `fetch`, `index_syntactic`, `index_precise`, `extract_{history,docs,owners,artifacts}`, `embed`.
@@ -67,7 +67,7 @@ Serve the Verb engine over REST + MCP (Streamable HTTP). Hot Shards are cached m
 
 | Size | Topology |
 |---|---|
-| Dev / evaluation | `yg serve --role=all` + Postgres + MinIO (docker compose, 3 containers) |
+| Dev / evaluation | `yg serve --role=all` + Postgres + MinIO (docker compose; the in-repo dev compose ships the two backing services — `yg` runs from cargo) |
 | Standard org | 1–2 API/query nodes, 4–8 workers, managed Postgres, any S3 |
 | Large org (design point) | N query nodes behind LB, 20–40+ autoscaled workers, Postgres + read replica, object storage with NVMe cache volumes on query nodes |
 

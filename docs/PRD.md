@@ -42,7 +42,7 @@ Yggdrasil is a self-hosted **Index Server** that syncs git repositories from **F
 
 ### Query
 - G9. One Verb set as the entire public contract — search, map, node, neighbors, path, callers, callees, deps, dependents, owners, history, impact — identical across CLI, MCP, HTTP. No query language (ADR 0003).
-- G10. Full-text search core (code, symbols, docs, commits, artifacts); semantic search via pluggable embedding provider (local provider default, external APIs opt-in), shipping in M3. Hybrid lexical+semantic is the target end state: Cursor's published evals ([semsearch](https://cursor.com/blog/semsearch)) show grep+semantic beats either alone, with gains concentrating in large codebases — exactly our design point. Scheduled after the core graph proves out, by explicit decision.
+- G10. Full-text search core (code, symbols, docs, commits, artifacts); semantic search via pluggable embedding provider (off by default; when enabled the local provider is the default, external APIs explicit opt-in), shipping in M3. Hybrid lexical+semantic is the target end state: Cursor's published evals ([semsearch](https://cursor.com/blog/semsearch)) show grep+semantic beats either alone, with gains concentrating in large codebases — exactly our design point. Scheduled after the core graph proves out, by explicit decision.
 
 ### Interfaces
 - G11. MCP over Streamable HTTP natively; `yg` CLI doubles as stdio→HTTP MCP proxy. Bearer-token auth v1.
@@ -87,7 +87,7 @@ Yggdrasil is a self-hosted **Index Server** that syncs git repositories from **F
 - **M0 — Tracer (GitHub, syntactic).** One vertical slice: control plane → sync → worker → Shard on object storage → query node → search/node/neighbors/history Verbs → CLI + MCP + Skill v0. Proves the architecture end-to-end.
 - **M1 — Precise core.** SCIP workers (Go, TypeScript/JS, Python, Rust), provenance overlay, callers/callees/impact, `map` Verb, GitLab support.
 - **M2 — The whole graph.** History/people layers, CODEOWNERS, Doc Sections, cross-repo dependency resolution, Codeberg, Forge Artifacts.
-- **M3 — Semantic + scale certification.** Embedding provider + vector Shards, LLM Concept extraction (opt-in), webhook accelerators, 5000-repo load certification.
+- **M3 — Semantic + scale certification.** Embedding provider + vector Shards (opt-in), LLM Concept extraction (opt-in), webhook accelerators, 5000-repo load certification.
 
 ## Post-v1 directions
 

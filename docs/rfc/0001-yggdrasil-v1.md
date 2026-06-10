@@ -74,7 +74,7 @@ shards/<repo-id>/<revision>/
   manifest.json      # commit, pass level, segment checksums, schema version
   graph.sqlite       # nodes, edges, occurrences (SQLite as *artifact format*)
   fts/               # tantivy segment directory
-  vec.usearch        # ANN segment (M3)
+  vec.*              # ANN segment (M3; library/format open — §11 Q2, usearch leading)
 ```
 
 Immutable; pointer swap in `shards` table; GC after grace window. Query nodes mmap segments from an NVMe cache keyed by checksum. SQLite survives ADR 0004's supersession as the *graph segment format* — single-file, mmap-friendly, queryable in-process — while object storage + Postgres carry the multi-node story (ADR 0005).
@@ -119,7 +119,7 @@ crates/
   yg-providers  # embedding + llm provider traits, local-onnx impl
 ```
 
-Key dependencies: axum, sqlx, rusqlite (read path), tantivy, tree-sitter grammars, gitoxide (+ git CLI escape hatch), rmcp, ort, usearch, object_store.
+Key dependencies: axum, sqlx, rusqlite (read path), tantivy, tree-sitter grammars, gitoxide (+ git CLI escape hatch), rmcp, ort, an ANN library (usearch leading candidate — §11 Q2), object_store.
 
 ## 10. Alternatives considered
 
@@ -139,4 +139,4 @@ Recorded as ADRs: org-visible vs ACL mirroring (0001); precise+fallback vs tree-
 
 ## 12. Rollout
 
-M0 ships the tracer (GitHub + syntactic + the search/node/neighbors/history Verbs + CLI/MCP/Skill v0) and is the architecture's proof; M1 adds the precise pass + `map` + GitLab; M2 completes the graph layers + Codeberg; M3 adds semantic + webhook accelerators + the 5000-repo certification run (synthetic org, published numbers). Each milestone ends with a dogfooding gate: agents must prefer the graph over grep for the navigation tasks it claims.
+M0 ships the tracer (GitHub + syntactic + the search/node/neighbors/history Verbs + CLI/MCP/Skill v0) and is the architecture's proof; M1 adds the precise pass + callers/callees/impact + `map` + GitLab; M2 completes the graph layers + Codeberg; M3 adds semantic + webhook accelerators + the 5000-repo certification run (synthetic org, published numbers). Each milestone ends with a dogfooding gate: agents must prefer the graph over grep for the navigation tasks it claims.
