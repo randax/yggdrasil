@@ -5,6 +5,10 @@ on:
   push:
     branches: [main]
 
+# fmt/clippy/test only read the checkout; nothing needs a writable token.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
