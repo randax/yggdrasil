@@ -214,3 +214,68 @@ async fn a_new_commit_publishes_a_new_revision_and_never_mutates_the_old_shard()
         "an existing Shard's graph segment must never change"
     );
 }
+
+#[tokio::test]
+async fn the_manifest_records_commit_checksums_counts_and_schema_version() {
+    use object_store::ObjectStoreExt;
+    use sha2::Digest;
+
+    let h = Harness::boot().await;
+    let head = git(&h.repo_dir, &["rev-parse", "HEAD"]);
+    h.add_repo().await;
+    h.sync_and_index().await;
+
+    let shard = h.shard_status().await;
+    let pool = sqlx::PgPool::connect(&format!("{DEV_POSTGRES}/{}", h.db_name))
+        .await
+        .unwrap();
+    let (manifest_key,): (String,) = sqlx::query_as("SELECT manifest_key FROM shards")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    let manifest_bytes = h
+        .store
+        .get(&manifest_key.as_str().into())
+        .await
+        .expect("the manifest must be in object storage")
+        .bytes()
+        .await
+        .unwrap();
+    let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes).unwrap();
+
+    assert_eq!(
+        manifest["commit"].as_str(),
+        Some(head.as_str()),
+        "the manifest must name the indexed commit, got: {manifest}"
+    );
+    assert_eq!(manifest["schema_version"], yg_shard::SCHEMA_VERSION);
+    assert_eq!(manifest["pass"], "syntactic");
+    assert_eq!(
+        manifest["counts"]["nodes"], shard["nodes"],
+        "manifest and status must agree on counts"
+    );
+    assert_eq!(manifest["counts"]["edges"], shard["edges"]);
+
+    // The recorded checksum must verify the stored segment.
+    let segment = &manifest["segments"]["graph.sqlite"];
+    let graph_bytes = h
+        .store
+        .get(
+            &manifest_key
+                .replace("manifest.json", "graph.sqlite")
+                .as_str()
+                .into(),
+        )
+        .await
+        .expect("the graph segment must be in object storage")
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(
+        segment["sha256"].as_str(),
+        Some(hex::encode(sha2::Sha256::digest(&graph_bytes)).as_str()),
+        "the manifest checksum must match the stored graph segment"
+    );
+    assert_eq!(segment["bytes"], graph_bytes.len() as u64);
+}
