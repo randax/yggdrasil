@@ -98,6 +98,10 @@ pub struct RepoSyncStatus {
     pub job_state: Option<String>,
     pub attempts: i32,
     pub last_error: Option<String>,
+    /// State of the in-flight index job (`queued` | `leased`), if any.
+    pub index_job_state: Option<String>,
+    pub index_attempts: i32,
+    pub index_last_error: Option<String>,
     /// The repo's current Shard, if it has ever been indexed.
     pub shard_revision: Option<String>,
     pub shard_node_count: Option<i64>,
@@ -189,6 +193,9 @@ impl ControlPlane {
             "SELECT r.slug, f.base_url AS forge, r.last_synced_commit,
                     j.state AS job_state, coalesce(j.attempts, 0) AS attempts,
                     j.last_error,
+                    i.state AS index_job_state,
+                    coalesce(i.attempts, 0) AS index_attempts,
+                    i.last_error AS index_last_error,
                     s.revision AS shard_revision,
                     s.node_count AS shard_node_count,
                     s.edge_count AS shard_edge_count
@@ -200,6 +207,11 @@ impl ControlPlane {
                  WHERE repo_id = r.id AND kind = 'fetch' AND state <> 'done'
                  ORDER BY id DESC LIMIT 1
              ) j ON true
+             LEFT JOIN LATERAL (
+                 SELECT state, attempts, last_error FROM jobs
+                 WHERE repo_id = r.id AND kind = 'index' AND state <> 'done'
+                 ORDER BY id DESC LIMIT 1
+             ) i ON true
              ORDER BY r.slug",
         )
         .fetch_all(&self.pool)
@@ -393,6 +405,29 @@ impl ControlPlane {
             .await?;
         tx.commit().await?;
         Ok(true)
+    }
+
+    /// Record a failed index run: back the job off and keep the error
+    /// for `yg admin status`, exactly like [`Self::fail_fetch`]. Returns
+    /// whether the failure was recorded; `false` means the lease had
+    /// lapsed and the job belongs to a newer claim.
+    pub async fn fail_index(&self, job: &LeasedIndex, error: &str) -> anyhow::Result<bool> {
+        let applied = sqlx::query(
+            "UPDATE jobs
+             SET state = 'queued', lease_until = NULL,
+                 attempts = attempts + 1, last_error = $2,
+                 run_after = now()
+                     + make_interval(secs => least(30 * 2 ^ least(attempts, 7), 3600))
+             WHERE id = $1 AND state = 'leased' AND lease_until::text = $3",
+        )
+        .bind(job.job_id)
+        .bind(error)
+        .bind(&job.lease_token)
+        .execute(&self.pool)
+        .await?
+        .rows_affected()
+            == 1;
+        Ok(applied)
     }
 
     /// How many repos are indexed into the Knowledge Graph.

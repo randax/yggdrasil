@@ -257,8 +257,16 @@ struct AdminRepoStatus {
     forge: String,
     last_synced_commit: Option<String>,
     sync: SyncStatus,
+    index: IndexStatus,
     /// The repo's current Shard; null until first indexed.
     shard: Option<ShardStatus>,
+}
+
+#[derive(Serialize)]
+struct IndexStatus {
+    state: &'static str,
+    attempts: i32,
+    last_error: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -292,6 +300,15 @@ async fn admin_status(State(state): State<Arc<AppState>>) -> Response {
                 attempts: r.attempts,
                 last_error: r.last_error,
             },
+            index: IndexStatus {
+                state: index_state(
+                    r.index_job_state.as_deref(),
+                    r.index_attempts,
+                    r.shard_revision.is_some(),
+                ),
+                attempts: r.index_attempts,
+                last_error: r.index_last_error,
+            },
             shard: r.shard_revision.map(|revision| ShardStatus {
                 revision,
                 // Set together with the revision when a Shard is recorded.
@@ -318,6 +335,19 @@ fn sync_state(job_state: Option<&str>, attempts: i32, has_synced_commit: bool) -
         (Some(_), ..) => "unknown",
         (None, _, true) => "synced",
         (None, _, false) => "registered",
+    }
+}
+
+/// The index-pipeline counterpart of [`sync_state`]. `pending` covers a
+/// repo whose first fetch hasn't completed — no index job exists yet.
+fn index_state(job_state: Option<&str>, attempts: i32, has_shard: bool) -> &'static str {
+    match (job_state, attempts, has_shard) {
+        (Some("leased"), ..) => "indexing",
+        (Some("queued"), 0, _) => "queued",
+        (Some("queued"), ..) => "retrying",
+        (Some(_), ..) => "unknown",
+        (None, _, true) => "indexed",
+        (None, _, false) => "pending",
     }
 }
 

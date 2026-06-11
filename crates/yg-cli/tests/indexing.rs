@@ -35,6 +35,7 @@ struct Harness {
     /// Held for Drop: owns the fixture repo and git cache on disk.
     _fixture: tempfile::TempDir,
     repo_dir: std::path::PathBuf,
+    cache: std::path::PathBuf,
     fixture_url: String,
     db_name: String,
     base: String,
@@ -62,6 +63,7 @@ impl Harness {
         Self {
             _fixture: fixture,
             repo_dir,
+            cache,
             fixture_url,
             db_name,
             base,
@@ -358,4 +360,71 @@ async fn every_edge_row_carries_provenance_and_confidence() {
             "confidence must be in (0, 1], got {confidence} on {src} → {dst}"
         );
     }
+}
+
+#[tokio::test]
+async fn a_failing_index_job_surfaces_its_error_backs_off_and_recovers() {
+    let h = Harness::boot().await;
+    h.add_repo().await;
+    assert!(h.sync.run_once().await.unwrap(), "fetch job must run");
+
+    // The cache mirror vanishes between fetch and index (disk eviction,
+    // stray rm): the index job cannot materialize the checkout.
+    let mirror = std::fs::read_dir(&h.cache)
+        .unwrap()
+        .next()
+        .expect("the fetch must have left a mirror")
+        .unwrap()
+        .path();
+    let vandalized = h.cache.join("vandalized");
+    std::fs::rename(&mirror, &vandalized).unwrap();
+
+    assert!(
+        h.indexer
+            .run_once()
+            .await
+            .expect("a failed index run is handled, not an error"),
+        "the job must still be claimed"
+    );
+
+    let body = admin_status_body(&h.base).await;
+    let index = &body["repos"][0]["index"];
+    assert_eq!(index["state"], "retrying", "got: {body}");
+    assert_eq!(index["attempts"], 1);
+    assert!(
+        index["last_error"].as_str().is_some_and(|e| !e.is_empty()),
+        "the error must say what failed, got: {body}"
+    );
+    assert_eq!(
+        body["repos"][0]["shard"],
+        serde_json::Value::Null,
+        "no Shard may be published for a failed index"
+    );
+
+    assert!(
+        !h.indexer.run_once().await.unwrap(),
+        "a failed job must not be due again immediately (backoff)"
+    );
+
+    // The cause clears (the mirror is back); once the backoff elapses,
+    // indexing converges on its own.
+    std::fs::rename(&vandalized, &mirror).unwrap();
+    let pool = sqlx::PgPool::connect(&format!("{DEV_POSTGRES}/{}", h.db_name))
+        .await
+        .unwrap();
+    sqlx::query("UPDATE jobs SET run_after = now() WHERE kind = 'index'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(
+        h.indexer.run_once().await.unwrap(),
+        "due again after backoff"
+    );
+
+    let body = admin_status_body(&h.base).await;
+    assert_eq!(body["repos"][0]["index"]["state"], "indexed", "got: {body}");
+    assert!(
+        body["repos"][0]["shard"]["revision"].as_str().is_some(),
+        "recovery must publish the Shard, got: {body}"
+    );
 }

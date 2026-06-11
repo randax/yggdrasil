@@ -39,29 +39,42 @@ impl IndexWorker {
     }
 
     /// Claim and run one due index job. Returns whether there was work.
+    /// A failed run is recorded (with backoff) rather than returned as an
+    /// error — `Err` means the control plane itself is unreachable.
     pub async fn run_once(&self) -> anyhow::Result<bool> {
         let Some(job) = self.control.claim_due_index(INDEX_LEASE).await? else {
             return Ok(false);
         };
-        let shard = self.index(job.repo_id, &job.commit).await?;
-        let applied = self
-            .control
-            .complete_index(
-                &job,
-                yg_control::ShardRecord {
-                    revision: &shard.revision,
-                    manifest_key: &shard.manifest_key,
-                    commit_sha: &shard.commit,
-                    provenance_level: "syntactic",
-                    node_count: shard.node_count,
-                    edge_count: shard.edge_count,
-                },
-            )
-            .await?;
-        if applied {
-            tracing::info!(slug = %job.slug, revision = %shard.revision, "indexed");
-        } else {
-            tracing::warn!(slug = %job.slug, "lease lapsed mid-index; result discarded");
+        match self.index(job.repo_id, &job.commit).await {
+            Ok(shard) => {
+                let applied = self
+                    .control
+                    .complete_index(
+                        &job,
+                        yg_control::ShardRecord {
+                            revision: &shard.revision,
+                            manifest_key: &shard.manifest_key,
+                            commit_sha: &shard.commit,
+                            provenance_level: "syntactic",
+                            node_count: shard.node_count,
+                            edge_count: shard.edge_count,
+                        },
+                    )
+                    .await?;
+                if applied {
+                    tracing::info!(slug = %job.slug, revision = %shard.revision, "indexed");
+                } else {
+                    tracing::warn!(slug = %job.slug, "lease lapsed mid-index; result discarded");
+                }
+            }
+            Err(e) => {
+                let error = format!("{e:#}");
+                if self.control.fail_index(&job, &error).await? {
+                    tracing::warn!(slug = %job.slug, attempt = job.attempts + 1, error, "index failed");
+                } else {
+                    tracing::warn!(slug = %job.slug, "lease lapsed mid-index; failure discarded");
+                }
+            }
         }
         Ok(true)
     }
