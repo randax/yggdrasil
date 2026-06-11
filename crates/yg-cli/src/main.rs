@@ -233,16 +233,27 @@ async fn workers_from_env() -> anyhow::Result<(yg_sync::SyncWorker, yg_index::In
     ))
 }
 
-/// Drain both job queues forever, sleeping briefly when idle. One pass
-/// per kind per iteration keeps a long fetch backlog from starving
-/// indexing (and the other way around).
+/// Drain both job queues forever, each on its own loop so a slow job of
+/// one kind (a cold monorepo clone, a huge syntactic pass) never stalls
+/// the other queue. An error from either side ends both.
 async fn run_workers(
     (sync, index): (yg_sync::SyncWorker, yg_index::IndexWorker),
 ) -> anyhow::Result<()> {
+    tokio::try_join!(
+        drain_queue(|| sync.run_once()),
+        drain_queue(|| index.run_once()),
+    )?;
+    Ok(())
+}
+
+/// Run one queue's claim loop forever, sleeping briefly when it's empty.
+async fn drain_queue<F, Fut>(run_once: F) -> anyhow::Result<()>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<bool>>,
+{
     loop {
-        let fetched = sync.run_once().await?;
-        let indexed = index.run_once().await?;
-        if !fetched && !indexed {
+        if !run_once().await? {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         }
     }

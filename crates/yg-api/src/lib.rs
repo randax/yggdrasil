@@ -250,21 +250,16 @@ struct AdminRepoStatus {
     slug: String,
     forge: String,
     last_synced_commit: Option<String>,
-    sync: SyncStatus,
-    index: IndexStatus,
+    sync: JobStatus,
+    index: JobStatus,
     /// The repo's current Shard; null until first indexed.
     shard: Option<ShardStatus>,
 }
 
+/// One pipeline stage's position, as admin status reports it for both
+/// sync and index.
 #[derive(Serialize)]
-struct IndexStatus {
-    state: &'static str,
-    attempts: i32,
-    last_error: Option<String>,
-}
-
-#[derive(Serialize)]
-struct SyncStatus {
+struct JobStatus {
     state: &'static str,
     attempts: i32,
     last_error: Option<String>,
@@ -285,20 +280,30 @@ async fn admin_status(State(state): State<Arc<AppState>>) -> Response {
     let repos = repos
         .into_iter()
         .map(|r| AdminRepoStatus {
-            sync: SyncStatus {
-                state: sync_state(
+            sync: JobStatus {
+                state: job_state(
                     r.job_state.as_deref(),
                     r.attempts,
                     r.last_synced_commit.is_some(),
+                    StageWords {
+                        active: "syncing",
+                        done: "synced",
+                        never_ran: "registered",
+                    },
                 ),
                 attempts: r.attempts,
                 last_error: r.last_error,
             },
-            index: IndexStatus {
-                state: index_state(
+            index: JobStatus {
+                state: job_state(
                     r.index_job_state.as_deref(),
                     r.index_attempts,
                     r.shard_revision.is_some(),
+                    StageWords {
+                        active: "indexing",
+                        done: "indexed",
+                        never_ran: "pending",
+                    },
                 ),
                 attempts: r.index_attempts,
                 last_error: r.index_last_error,
@@ -317,31 +322,31 @@ async fn admin_status(State(state): State<Arc<AppState>>) -> Response {
     Json(AdminStatusResponse { repos }).into_response()
 }
 
-/// Collapse a repo's queue position into the one word `yg admin status`
-/// shows for it. `attempts` only ever rises above zero through fetch
-/// failures (`fail_fetch` re-queues with a backoff), so a queued job
-/// with attempts is a retry, not a first run.
-fn sync_state(job_state: Option<&str>, attempts: i32, has_synced_commit: bool) -> &'static str {
-    match (job_state, attempts, has_synced_commit) {
-        (Some("leased"), ..) => "syncing",
-        (Some("queued"), 0, _) => "queued",
-        (Some("queued"), ..) => "retrying",
-        (Some(_), ..) => "unknown",
-        (None, _, true) => "synced",
-        (None, _, false) => "registered",
-    }
+/// The stage-specific words [`job_state`] fills in: what to call a
+/// leased job, a stage that finished, and one that never ran.
+struct StageWords {
+    active: &'static str,
+    done: &'static str,
+    never_ran: &'static str,
 }
 
-/// The index-pipeline counterpart of [`sync_state`]. `pending` covers a
-/// repo whose first fetch hasn't completed — no index job exists yet.
-fn index_state(job_state: Option<&str>, attempts: i32, has_shard: bool) -> &'static str {
-    match (job_state, attempts, has_shard) {
-        (Some("leased"), ..) => "indexing",
+/// Collapse a pipeline stage's queue position into the one word
+/// `yg admin status` shows for it. `attempts` only ever rises above zero
+/// through failures (`fail_*` re-queues with a backoff), so a queued job
+/// with attempts is a retry, not a first run.
+fn job_state(
+    job_state: Option<&str>,
+    attempts: i32,
+    has_output: bool,
+    words: StageWords,
+) -> &'static str {
+    match (job_state, attempts, has_output) {
+        (Some("leased"), ..) => words.active,
         (Some("queued"), 0, _) => "queued",
         (Some("queued"), ..) => "retrying",
         (Some(_), ..) => "unknown",
-        (None, _, true) => "indexed",
-        (None, _, false) => "pending",
+        (None, _, true) => words.done,
+        (None, _, false) => words.never_ran,
     }
 }
 

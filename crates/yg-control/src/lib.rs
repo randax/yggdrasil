@@ -198,6 +198,8 @@ impl ControlPlane {
     /// the in-flight fetch job, if any, and its current Shard, if any.
     pub async fn admin_status(&self) -> anyhow::Result<Vec<RepoSyncStatus>> {
         let rows = sqlx::query_as(
+            // Plain joins suffice: jobs_one_in_flight_per_repo_kind
+            // guarantees at most one non-done job per (repo, kind).
             "SELECT r.slug, f.base_url AS forge, r.last_synced_commit,
                     j.state AS job_state, coalesce(j.attempts, 0) AS attempts,
                     j.last_error,
@@ -210,16 +212,10 @@ impl ControlPlane {
              FROM repos r
              JOIN forges f ON f.id = r.forge_id
              LEFT JOIN shards s ON s.id = r.current_shard_id
-             LEFT JOIN LATERAL (
-                 SELECT state, attempts, last_error FROM jobs
-                 WHERE repo_id = r.id AND kind = 'fetch' AND state <> 'done'
-                 ORDER BY id DESC LIMIT 1
-             ) j ON true
-             LEFT JOIN LATERAL (
-                 SELECT state, attempts, last_error FROM jobs
-                 WHERE repo_id = r.id AND kind = 'index' AND state <> 'done'
-                 ORDER BY id DESC LIMIT 1
-             ) i ON true
+             LEFT JOIN jobs j
+                 ON j.repo_id = r.id AND j.kind = 'fetch' AND j.state <> 'done'
+             LEFT JOIN jobs i
+                 ON i.repo_id = r.id AND i.kind = 'index' AND i.state <> 'done'
              ORDER BY r.slug",
         )
         .fetch_all(&self.pool)
