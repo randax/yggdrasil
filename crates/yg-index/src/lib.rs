@@ -173,33 +173,89 @@ fn extract_go_symbols(
     };
     let mut cursor = tree.root_node().walk();
     for declaration in tree.root_node().children(&mut cursor) {
-        if declaration.kind() != "function_declaration" {
-            continue;
-        }
-        let Some(name) = declaration
-            .child_by_field_name("name")
-            .and_then(|n| n.utf8_text(source).ok())
-        else {
-            continue; // a declaration mid-edit can lack a name node
+        // CONTEXT.md's Symbol: function, method, type, constant. Each
+        // top-level Go declaration of those kinds names one or more.
+        let names: Vec<String> = match declaration.kind() {
+            "function_declaration" => field_text(declaration, "name", source)
+                .map(str::to_string)
+                .into_iter()
+                .collect(),
+            // Methods are receiver-qualified (Widget.Render): two types'
+            // same-named methods are different Symbols.
+            "method_declaration" => field_text(declaration, "name", source)
+                .map(|name| match receiver_type_name(declaration, source) {
+                    Some(receiver) => format!("{receiver}.{name}"),
+                    None => name.to_string(),
+                })
+                .into_iter()
+                .collect(),
+            // One declaration can hold many specs: type ( A …; B … ),
+            // const ( X = 1; Y = 2 ) — and one const spec many names.
+            "type_declaration" | "const_declaration" => {
+                let mut cursor = declaration.walk();
+                declaration
+                    .children(&mut cursor)
+                    .filter(|spec| matches!(spec.kind(), "type_spec" | "type_alias" | "const_spec"))
+                    .flat_map(|spec| {
+                        let mut cursor = spec.walk();
+                        spec.children_by_field_name("name", &mut cursor)
+                            .filter_map(|n| n.utf8_text(source).ok().map(str::to_string))
+                            .collect::<Vec<_>>()
+                    })
+                    .collect()
+            }
+            _ => continue,
         };
-        let symbol_id = format!("sym:{path}#{name}");
-        graph.nodes.push(Node {
-            id: symbol_id.clone(),
-            kind: NodeKind::Symbol,
-            name: Some(name.to_string()),
-            path: Some(path.to_string()),
-        });
-        graph.edges.push(Edge {
-            src: file_id.to_string(),
-            dst: symbol_id,
-            kind: EdgeKind::Defines,
-            provenance: Provenance::Syntactic,
-            // The declaration is right there in the parse tree; what is
-            // syntactic about it is the pass, not any guesswork.
-            confidence: 1.0,
-        });
+        for name in names {
+            let symbol_id = format!("sym:{path}#{name}");
+            graph.nodes.push(Node {
+                id: symbol_id.clone(),
+                kind: NodeKind::Symbol,
+                name: Some(name),
+                path: Some(path.to_string()),
+            });
+            graph.edges.push(Edge {
+                src: file_id.to_string(),
+                dst: symbol_id,
+                kind: EdgeKind::Defines,
+                provenance: Provenance::Syntactic,
+                // The declaration is right there in the parse tree; what
+                // is syntactic about it is the pass, not any guesswork.
+                confidence: 1.0,
+            });
+        }
     }
     Ok(())
+}
+
+/// Text of a named field on a node, when present and valid UTF-8.
+fn field_text<'a>(node: tree_sitter::Node<'_>, field: &str, source: &'a [u8]) -> Option<&'a str> {
+    node.child_by_field_name(field)
+        .and_then(|n| n.utf8_text(source).ok())
+}
+
+/// The bare type name a method's receiver refers to: the first type
+/// identifier inside `(w *Widget)`, however the receiver is spelled
+/// (pointer, generic, parenthesized).
+fn receiver_type_name<'a>(method: tree_sitter::Node<'_>, source: &'a [u8]) -> Option<&'a str> {
+    let receiver = method.child_by_field_name("receiver")?;
+    let mut cursor = receiver.walk();
+    let mut walked_to_end = false;
+    while !walked_to_end {
+        if cursor.node().kind() == "type_identifier" {
+            return cursor.node().utf8_text(source).ok();
+        }
+        // Depth-first walk without recursion.
+        if !cursor.goto_first_child() {
+            while !cursor.goto_next_sibling() {
+                if !cursor.goto_parent() {
+                    walked_to_end = true;
+                    break;
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Recursively collect repo-relative, slash-separated file paths.
