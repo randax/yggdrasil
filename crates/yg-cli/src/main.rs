@@ -162,6 +162,15 @@ async fn admin_status(json: bool) -> anyhow::Result<()> {
         if let Some(error) = repo["sync"]["last_error"].as_str() {
             print!("  [attempt {}: {error}]", repo["sync"]["attempts"]);
         }
+        if let Some(revision) = repo["shard"]["revision"].as_str() {
+            print!(
+                "  shard {revision} ({} nodes, {} edges)",
+                repo["shard"]["nodes"], repo["shard"]["edges"]
+            );
+        }
+        if let Some(error) = repo["index"]["last_error"].as_str() {
+            print!("  [index attempt {}: {error}]", repo["index"]["attempts"]);
+        }
         println!();
     }
     Ok(())

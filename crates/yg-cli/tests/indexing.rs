@@ -430,6 +430,36 @@ async fn a_failing_index_job_surfaces_its_error_backs_off_and_recovers() {
 }
 
 /// multi_thread: the yg binary blocks this thread while the in-process
+/// server it queries runs on the same test runtime.
+#[tokio::test(flavor = "multi_thread")]
+async fn yg_admin_status_shows_the_shard_revision_and_counts() {
+    let h = Harness::boot().await;
+    h.add_repo().await;
+    h.sync_and_index().await;
+    let revision = h.shard_status().await["revision"]
+        .as_str()
+        .expect("indexed repo has a revision")
+        .to_string();
+
+    let status = assert_cmd::Command::cargo_bin("yg")
+        .unwrap()
+        .env("YG_SERVER", &h.base)
+        .env("YG_TOKEN", "ygt_test_token")
+        .args(["admin", "status"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(status.get_output().stdout.clone()).unwrap();
+    assert!(
+        stdout.contains(&revision[..12]),
+        "the human report must show the Shard revision, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("4 nodes") && stdout.contains("2 edges"),
+        "the human report must show the graph counts, got:\n{stdout}"
+    );
+}
+
+/// multi_thread: the yg binary blocks this thread while the in-process
 /// HTTP client polls it from the same test runtime.
 #[tokio::test(flavor = "multi_thread")]
 async fn yg_serve_role_all_indexes_an_added_repo_end_to_end() {
