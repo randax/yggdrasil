@@ -158,9 +158,12 @@ impl IndexWorker {
 }
 
 /// Whether `commit` is present in the (possibly absent) bare mirror.
+/// `--git-dir`, not `-C`: discovery would climb out of a missing
+/// mirror into whatever repository encloses the cache dir and answer
+/// for the wrong repo.
 async fn commit_available(mirror: &Path, commit: &str) -> bool {
     let mut cmd = tokio::process::Command::new("git");
-    cmd.arg("-C")
+    cmd.arg("--git-dir")
         .arg(mirror)
         .args(["cat-file", "-e", &format!("{commit}^{{commit}}")]);
     cmd.kill_on_drop(true);
@@ -173,7 +176,9 @@ fn extract_tree(mirror: &Path, commit: &str, dest: &Path) -> anyhow::Result<()> 
     use std::io::Read;
     use std::process::{Command, Stdio};
     let mut archive = Command::new("git")
-        .arg("-C")
+        // --git-dir, not -C: never let repo discovery climb out of the
+        // mirror path into an enclosing repository.
+        .arg("--git-dir")
         .arg(mirror)
         // The ^{tree} suffix matters: archiving a commit embeds a pax
         // global header carrying the commit id, which some tar

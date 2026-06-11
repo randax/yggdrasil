@@ -127,17 +127,17 @@ impl GitFetcher {
         let local = mirror_path(&self.cache_dir, repo_id);
         let depth_arg = depth.map(|n| format!("--depth={n}"));
         sweep_stale_partials(&self.cache_dir, repo_id).await;
-        // A bare repo's skeleton: a non-empty HEAD plus objects/ and
+        // A bare repo's skeleton: a well-formed HEAD plus objects/ and
         // refs/. Anything less is wreckage to re-clone — a crash can
-        // leave a zero-byte HEAD, a torn restore can drop objects/ —
-        // and git would fail "not a git repository" on every retry
-        // forever. Deliberately stats, not a git probe: a probe
-        // conflates "git said no" with "git could not run" (missing
-        // binary, fd pressure) and would delete a healthy mirror over
-        // an environmental blip — and a HEAD that exists but dangles
-        // is healed after the fetch by the re-point below, not by
-        // re-downloading history that would dangle again.
-        let usable = std::fs::metadata(local.join("HEAD")).is_ok_and(|m| m.is_file() && m.len() > 0)
+        // leave HEAD zero-byte or NUL-filled, a torn restore can drop
+        // objects/ — and git would fail "not a git repository" on
+        // every retry forever. Deliberately file reads, not a git
+        // probe: a probe conflates "git said no" with "git could not
+        // run" (missing binary, fd pressure) and would delete a
+        // healthy mirror over an environmental blip — and a HEAD that
+        // exists but dangles is healed after the fetch by the re-point
+        // below, not by re-downloading history that would dangle again.
+        let usable = head_names_a_ref(&local.join("HEAD"))
             && local.join("objects").is_dir()
             && local.join("refs").is_dir();
         if usable {
@@ -174,10 +174,10 @@ impl GitFetcher {
                     if git_says_yes(&local, &["rev-parse", "--verify", "--quiet", &target])
                         .await
                         .unwrap_or(false)
+                        && let Err(e) =
+                            run_git(Some(&local), &["symbolic-ref", "HEAD", &target], None).await
                     {
-                        run_git(Some(&local), &["symbolic-ref", "HEAD", &target], None)
-                            .await
-                            .context("re-pointing the mirror's HEAD at the remote default branch")?;
+                        tracing::warn!(%clone_url, error = format!("{e:#}"), "could not re-point the mirror's HEAD; keeping the old one");
                     }
                 }
                 // The server hides the symref (old protocol, stripping
@@ -202,10 +202,16 @@ impl GitFetcher {
                         git_says_yes(&local, &["cat-file", "-e", &format!("{oid}^{{commit}}")])
                             .await
                             .unwrap_or(false);
-                    if !healthy_symref && have_commit {
-                        run_git(Some(&local), &["update-ref", "--no-deref", "HEAD", &oid], None)
-                            .await
-                            .context("pointing the mirror's HEAD at the remote's HEAD commit")?;
+                    if !healthy_symref
+                        && have_commit
+                        && let Err(e) = run_git(
+                            Some(&local),
+                            &["update-ref", "--no-deref", "HEAD", &oid],
+                            None,
+                        )
+                        .await
+                    {
+                        tracing::warn!(%clone_url, error = format!("{e:#}"), "could not point the mirror's HEAD at the remote's HEAD commit");
                     }
                 }
                 // An unborn or hidden remote HEAD: keep what we have.
@@ -261,6 +267,21 @@ impl GitFetcher {
     }
 }
 
+/// Whether a HEAD file plausibly names a ref ("ref: refs/…") or a
+/// commit (a hex oid) — the two shapes git itself writes. A crash can
+/// leave HEAD existing but NUL-filled or truncated (the journal
+/// replays the rename without the data); such a mirror must re-clone,
+/// not fail "not a git repository" on every retry forever.
+fn head_names_a_ref(path: &std::path::Path) -> bool {
+    let Ok(head) = std::fs::read_to_string(path) else {
+        return false; // unreadable or not UTF-8: wreckage either way
+    };
+    let head = head.trim_end();
+    head.strip_prefix("ref: ")
+        .is_some_and(|target| target.starts_with("refs/"))
+        || (head.len() >= 40 && head.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
 /// Where a remote's HEAD points, as `ls-remote --symref` advertises it.
 enum RemoteHead {
     /// The default branch, from the symref capability.
@@ -292,10 +313,11 @@ async fn remote_head(clone_url: &str, token: Option<&str>) -> anyhow::Result<Rem
 /// Run git for a yes/no question, `Ok` only when git actually ran. A
 /// git that could not run (missing binary, spawn pressure, timeout) is
 /// an `Err`, never a "no" — callers must not let an environmental blip
-/// answer a question about repository state.
+/// answer a question about repository state. `--git-dir` for the same
+/// no-discovery reason as [`run_git`].
 async fn git_says_yes(dir: &std::path::Path, args: &[&str]) -> anyhow::Result<bool> {
     let mut cmd = tokio::process::Command::new("git");
-    cmd.arg("-C").arg(dir);
+    cmd.arg("--git-dir").arg(dir);
     cmd.args(args);
     cmd.kill_on_drop(true);
     cmd.env("GIT_TERMINAL_PROMPT", "0");
@@ -343,23 +365,27 @@ pub async fn lock_mirror(
         .map_err(|_| {
             anyhow::anyhow!("timed out waiting for this process's work on the repo's mirror")
         })?;
-    let remaining = timeout.saturating_sub(started.elapsed());
+    let in_process_wait = started.elapsed();
+    let remaining = timeout.saturating_sub(in_process_wait);
     let lock_path = cache_dir.join(format!("{repo_id}.git.lock"));
     let cache_dir = cache_dir.to_path_buf();
     let lock_file = tokio::task::spawn_blocking(move || -> anyhow::Result<std::fs::File> {
         std::fs::create_dir_all(&cache_dir).context("creating the git cache directory")?;
         let file = open_lock_file(&lock_path)?;
-        let deadline = std::time::Instant::now() + remaining;
+        let file_wait_started = std::time::Instant::now();
+        let deadline = file_wait_started + remaining;
         loop {
             match file.try_lock() {
                 Ok(()) => return Ok(file),
                 Err(std::fs::TryLockError::WouldBlock) => {
                     if std::time::Instant::now() >= deadline {
                         anyhow::bail!(
-                            "another process held the mirror lock {} for this job's whole \
-                             lease — often a long cold clone that will still land the \
-                             mirror; retrying after backoff",
-                            lock_path.display()
+                            "gave up on the mirror lock {} after queueing in-process for \
+                             {}s and waiting {}s on another process — often a long cold \
+                             clone that will still land the mirror; retrying after backoff",
+                            lock_path.display(),
+                            in_process_wait.as_secs(),
+                            file_wait_started.elapsed().as_secs()
                         );
                     }
                     std::thread::sleep(Duration::from_millis(250));
@@ -471,6 +497,11 @@ const GIT_TIMEOUT: Duration = Duration::from_secs(4 * 60 * 60);
 /// Run git non-interactively, returning stdout. The Forge token travels
 /// via `GIT_CONFIG_*` environment variables — never the command line
 /// (visible in `ps`) and never the on-disk config.
+///
+/// `dir` is passed as `--git-dir`, not `-C`: `-C` *discovers* the
+/// repository, climbing parent directories when `dir` isn't one — a
+/// torn mirror inside some enclosing checkout would have its destructive
+/// fetch run against that checkout instead of failing.
 async fn run_git(
     dir: Option<&std::path::Path>,
     args: &[&str],
@@ -478,7 +509,7 @@ async fn run_git(
 ) -> anyhow::Result<String> {
     let mut cmd = tokio::process::Command::new("git");
     if let Some(dir) = dir {
-        cmd.arg("-C").arg(dir);
+        cmd.arg("--git-dir").arg(dir);
     }
     cmd.args(args);
     // If this future is dropped (shutdown, lease handling), take the git
