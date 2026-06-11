@@ -8,14 +8,15 @@ use axum::extract::{Request, State};
 use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use object_store::ObjectStore;
 use object_store::aws::AmazonS3Builder;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use yg_control::ControlPlane;
+use yg_sync::RepoLocator;
 
 pub struct ServerConfig {
     pub listen: SocketAddr,
@@ -55,10 +56,7 @@ impl ServerConfig {
             listen: var_or("YG_LISTEN", "127.0.0.1:7311")
                 .parse()
                 .context("parsing YG_LISTEN as host:port")?,
-            database_url: var_or(
-                "YG_DATABASE_URL",
-                "postgres://yggdrasil:yggdrasil@localhost:5432/yggdrasil",
-            ),
+            database_url: var_or("YG_DATABASE_URL", yg_control::DEFAULT_DATABASE_URL),
             object_store: ObjectStoreConfig {
                 endpoint: var_or("YG_S3_ENDPOINT", "http://localhost:9000"),
                 bucket: var_or("YG_S3_BUCKET", "yggdrasil"),
@@ -129,7 +127,13 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<RunningServer> {
     // nonexistent paths answer 401 to unauthenticated callers.
     let app = Router::new()
         .route("/healthz", get(healthz))
-        .nest("/v1", Router::new().route("/status", get(status)))
+        .nest(
+            "/v1",
+            Router::new()
+                .route("/status", get(status))
+                .route("/admin/repos", post(admin_repo_add))
+                .route("/admin/status", get(admin_status)),
+        )
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_bearer_token,
@@ -190,11 +194,131 @@ async fn require_bearer_token(
     if authorized {
         next.run(req).await
     } else {
-        (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error": "missing or invalid bearer token"})),
+        error_json(StatusCode::UNAUTHORIZED, "missing or invalid bearer token")
+    }
+}
+
+/// The one shape every error leaves this server in: `{"error": "…"}`.
+fn error_json(status: StatusCode, message: impl Into<String>) -> Response {
+    (status, Json(serde_json::json!({"error": message.into()}))).into_response()
+}
+
+#[derive(Deserialize)]
+struct AddRepoRequest {
+    url: String,
+    /// Shallow-clone override; omitted = full history.
+    depth: Option<i32>,
+}
+
+#[derive(Serialize)]
+struct AddRepoResponse {
+    slug: String,
+    created: bool,
+    /// False when a fetch was already pending — nothing new was queued.
+    fetch_queued: bool,
+}
+
+async fn admin_repo_add(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<AddRepoRequest>,
+) -> Response {
+    if let Some(depth) = req.depth
+        && depth < 1
+    {
+        return error_json(
+            StatusCode::BAD_REQUEST,
+            format!("depth must be a positive number of commits (got {depth})"),
+        );
+    }
+    let locator = match RepoLocator::parse(&req.url) {
+        Ok(locator) => locator,
+        Err(reason) => return error_json(StatusCode::BAD_REQUEST, reason),
+    };
+    let outcome = state
+        .control
+        .add_repo(yg_control::AddRepo {
+            forge_kind: locator.kind.as_str(),
+            base_url: &locator.base_url,
+            token_env: locator.kind.token_env(),
+            slug: &locator.slug,
+            fetch_depth: req.depth,
+        })
+        .await;
+    match outcome {
+        Ok(outcome) => (
+            if outcome.created {
+                StatusCode::CREATED
+            } else {
+                StatusCode::OK
+            },
+            Json(AddRepoResponse {
+                slug: locator.slug,
+                created: outcome.created,
+                fetch_queued: outcome.fetch_queued,
+            }),
         )
-            .into_response()
+            .into_response(),
+        Err(e) => error_json(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+    }
+}
+
+#[derive(Serialize)]
+struct AdminStatusResponse {
+    repos: Vec<AdminRepoStatus>,
+}
+
+#[derive(Serialize)]
+struct AdminRepoStatus {
+    slug: String,
+    forge: String,
+    last_synced_commit: Option<String>,
+    sync: SyncStatus,
+}
+
+#[derive(Serialize)]
+struct SyncStatus {
+    state: &'static str,
+    attempts: i32,
+    last_error: Option<String>,
+}
+
+async fn admin_status(State(state): State<Arc<AppState>>) -> Response {
+    let repos = match state.control.admin_status().await {
+        Ok(repos) => repos,
+        Err(e) => return error_json(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+    };
+    let repos = repos
+        .into_iter()
+        .map(|r| AdminRepoStatus {
+            sync: SyncStatus {
+                state: sync_state(
+                    r.job_state.as_deref(),
+                    r.attempts,
+                    r.last_synced_commit.is_some(),
+                ),
+                attempts: r.attempts,
+                last_error: r.last_error,
+            },
+            slug: r.slug,
+            forge: r.forge,
+            last_synced_commit: r.last_synced_commit,
+        })
+        .collect();
+    Json(AdminStatusResponse { repos }).into_response()
+}
+
+/// Collapse a repo's queue position into the one word `yg admin status`
+/// shows for it. `attempts` only ever rises above zero through fetch
+/// failures (`fail_fetch` re-queues with a backoff), so a queued job
+/// with attempts is a retry, not a first run.
+fn sync_state(job_state: Option<&str>, attempts: i32, has_synced_commit: bool) -> &'static str {
+    match (job_state, attempts, has_synced_commit) {
+        (Some("leased"), ..) => "syncing",
+        (Some("queued"), 0, _) => "queued",
+        (Some("queued"), ..) => "retrying",
+        (Some(_), ..) => "unknown",
+        (None, _, true) => "synced",
+        (None, _, false) => "registered",
     }
 }
 
@@ -213,11 +337,7 @@ async fn status(State(state): State<Arc<AppState>>) -> Response {
             repos_indexed,
         })
         .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("{e:#}")})),
-        )
-            .into_response(),
+        Err(e) => error_json(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
     }
 }
 
