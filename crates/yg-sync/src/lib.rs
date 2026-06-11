@@ -344,8 +344,11 @@ impl RepoLocator {
 
 /// The single derivation of a clone URL from its stored halves — used by
 /// [`RepoLocator::clone_url`] and the worker re-deriving it from a claim.
+/// Strips one trailing slash from the base so the degenerate `file:///`
+/// forge root doesn't join into a doubled slash.
 pub fn join_clone_url(base_url: &str, slug: &str) -> String {
-    format!("{base_url}/{slug}")
+    let base = base_url.strip_suffix('/').unwrap_or(base_url);
+    format!("{base}/{slug}")
 }
 
 /// A repository path split into its meaningful segments: empty segments
@@ -409,6 +412,18 @@ mod tests {
         assert_eq!(locator.base_url, "file:///tmp/fixtures");
         assert_eq!(locator.slug, "acme/widgets");
         assert_eq!(locator.clone_url(), "file:///tmp/fixtures/acme/widgets");
+    }
+
+    #[test]
+    fn a_repo_at_the_filesystem_root_round_trips_to_a_clean_clone_url() {
+        // Degenerate but legal: the forge root collapses to file:///.
+        let locator = parsed("file:///acme/widgets");
+        assert_eq!(locator.slug, "acme/widgets");
+        assert_eq!(
+            locator.clone_url(),
+            "file:///acme/widgets",
+            "joining must not double the slash after a bare file:/// root"
+        );
     }
 
     #[test]

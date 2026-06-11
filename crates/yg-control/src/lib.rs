@@ -178,6 +178,9 @@ impl ControlPlane {
         lease: std::time::Duration,
     ) -> anyhow::Result<Option<LeasedFetch>> {
         let row = sqlx::query_as(
+            // `state <> 'done'` looks implied by the OR below (done rows
+            // have lease_until NULL), but the planner needs the partial
+            // index predicate verbatim to use jobs_claim_scan.
             "WITH due AS (
                  SELECT id FROM jobs
                  WHERE kind = 'fetch' AND state <> 'done' AND run_after <= now()

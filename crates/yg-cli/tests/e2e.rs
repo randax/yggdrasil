@@ -668,11 +668,7 @@ async fn depth_override_clones_shallow_while_default_keeps_full_history() {
     );
 
     // The same fixture without an override mirrors all of history.
-    let (fixture_full, _, full_url) = {
-        let (root, dir, _) = fixture_repo(3);
-        let url = format!("file://{}", dir.display());
-        (root, dir, url)
-    };
+    let (fixture_full, _full_repo_dir, full_url) = fixture_repo(3);
     let full_cache = fixture_full.path().join("git-cache");
     let control = control_plane(&db_name).await;
     let full_worker = yg_sync::SyncWorker::new(control, &full_cache);
