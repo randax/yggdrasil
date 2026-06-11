@@ -92,24 +92,33 @@ impl Harness {
             .unwrap()
     }
 
-    /// The recorded Shard's manifest key (single-shard tests only).
-    async fn manifest_key(&self) -> String {
-        let (key,): (String,) = sqlx::query_as("SELECT manifest_key FROM shards")
-            .fetch_one(&self.pool().await)
-            .await
-            .unwrap();
-        key
-    }
-
-    /// The recorded Shard's graph-segment key, derived by the layout's
-    /// one definition rather than re-encoded here.
-    async fn graph_key(&self) -> String {
-        let (repo_id, revision): (i64, String) =
-            sqlx::query_as("SELECT repo_id, revision FROM shards")
-                .fetch_one(&self.pool().await)
+    /// The recorded Shard's (manifest, graph-segment) keys, read from
+    /// the one shards row — asserted single so the pair can never
+    /// describe two different Shards. The graph key comes from the
+    /// layout's one definition rather than being re-encoded here.
+    async fn shard_keys(&self) -> (String, String) {
+        let rows: Vec<(i64, String, String)> =
+            sqlx::query_as("SELECT repo_id, revision, manifest_key FROM shards")
+                .fetch_all(&self.pool().await)
                 .await
                 .unwrap();
-        yg_shard::graph_segment_key(repo_id, &revision)
+        let [(repo_id, revision, manifest_key)] = rows.as_slice() else {
+            panic!("these helpers serve single-shard tests; found {rows:?}");
+        };
+        (
+            manifest_key.clone(),
+            yg_shard::graph_segment_key(*repo_id, revision),
+        )
+    }
+
+    /// The recorded Shard's manifest key (single-shard tests only).
+    async fn manifest_key(&self) -> String {
+        self.shard_keys().await.0
+    }
+
+    /// The recorded Shard's graph-segment key (single-shard tests only).
+    async fn graph_key(&self) -> String {
+        self.shard_keys().await.1
     }
 
     /// Raw bytes of one Shard object.

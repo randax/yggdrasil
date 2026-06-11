@@ -39,7 +39,7 @@ impl SyncWorker {
         // not a dead worker: record it and let backoff retry.
         let synced = async {
             let _serialize_same_mirror =
-                lock_mirror(self.fetcher.cache_dir(), job.repo_id).await?;
+                lock_mirror(self.fetcher.cache_dir(), job.repo_id, FETCH_LEASE).await?;
             self.fetcher
                 .sync(job.repo_id, &clone_url, token.as_deref(), job.fetch_depth)
                 .await
@@ -146,6 +146,21 @@ impl GitFetcher {
             run_git(Some(&local), &args, token)
                 .await
                 .with_context(|| format!("fetching {clone_url}"))?;
+            // git fetch never moves a bare mirror's HEAD — it stays
+            // wherever clone set it. After a remote default-branch
+            // rename, HEAD would dangle (--prune deleted the old ref)
+            // or silently pin the old branch; re-derive it from the
+            // remote on every fetch. None (a detached remote HEAD)
+            // keeps whatever the mirror has.
+            if let Some(branch) = remote_default_branch(clone_url, token).await? {
+                run_git(
+                    Some(&local),
+                    &["symbolic-ref", "HEAD", &format!("refs/heads/{branch}")],
+                    None,
+                )
+                .await
+                .context("re-pointing the mirror's HEAD at the remote default branch")?;
+            }
         } else {
             remove_dir_if_present(&local)
                 .await
@@ -183,11 +198,30 @@ impl GitFetcher {
             }
             cloned_into_place?;
         }
-        let head = run_git(Some(&local), &["rev-parse", "HEAD"], None)
+        // --verify HEAD^{commit}: on a dangling HEAD, plain `rev-parse
+        // HEAD` exits 0 and prints the literal string "HEAD" — which
+        // would be recorded as the synced commit. Fail loudly instead.
+        let head = run_git(Some(&local), &["rev-parse", "--verify", "HEAD^{commit}"], None)
             .await
             .context("resolving the synced commit")?;
         Ok(head.trim().to_string())
     }
+}
+
+/// The branch the remote's HEAD points at, via `ls-remote --symref`.
+/// `None` when the remote HEAD is detached or the server hides the
+/// symref.
+async fn remote_default_branch(
+    clone_url: &str,
+    token: Option<&str>,
+) -> anyhow::Result<Option<String>> {
+    let out = run_git(None, &["ls-remote", "--symref", clone_url, "HEAD"], token)
+        .await
+        .with_context(|| format!("asking {clone_url} for its default branch"))?;
+    Ok(out.lines().find_map(|line| {
+        let target = line.strip_prefix("ref: ")?.strip_suffix("\tHEAD")?;
+        Some(target.strip_prefix("refs/heads/")?.to_string())
+    }))
 }
 
 /// Holds one repo's mirror lock; work on the mirror — populating it
@@ -206,32 +240,77 @@ pub struct MirrorGuard {
 /// dir; two layers close both: an in-process mutex, then an advisory
 /// file lock beside the mirror. Advisory locks are unreliable on
 /// network filesystems — give a shared cache a local disk.
+///
+/// Acquisition is bounded by `timeout` — callers pass their job's
+/// lease, past which a completion would be fenced off anyway. A hung
+/// holder (a stuck git in another process) then fails this one job
+/// into backoff instead of wedging the worker's whole queue behind an
+/// unbounded wait.
 pub async fn lock_mirror(
     cache_dir: &std::path::Path,
     repo_id: i64,
+    timeout: Duration,
 ) -> anyhow::Result<MirrorGuard> {
+    let started = std::time::Instant::now();
     // In-process contenders queue on the mutex, so at most one task per
-    // process parks a blocking thread on the file lock below.
-    let in_process = mirror_mutex(repo_id).lock_owned().await;
+    // process polls the file lock below.
+    let in_process = tokio::time::timeout(timeout, mirror_mutex(repo_id).lock_owned())
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("timed out waiting for this process's work on the repo's mirror")
+        })?;
+    let remaining = timeout.saturating_sub(started.elapsed());
     let lock_path = cache_dir.join(format!("{repo_id}.git.lock"));
     let cache_dir = cache_dir.to_path_buf();
     let lock_file = tokio::task::spawn_blocking(move || -> anyhow::Result<std::fs::File> {
         std::fs::create_dir_all(&cache_dir).context("creating the git cache directory")?;
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false) // the file carries no content, only the lock
-            .write(true)
-            .open(&lock_path)
-            .with_context(|| format!("opening the mirror lock {}", lock_path.display()))?;
-        file.lock()
-            .with_context(|| format!("locking the mirror lock {}", lock_path.display()))?;
-        Ok(file)
+        let file = open_lock_file(&lock_path)?;
+        let deadline = std::time::Instant::now() + remaining;
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(file),
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    if std::time::Instant::now() >= deadline {
+                        anyhow::bail!(
+                            "timed out waiting for another process's lock on {}",
+                            lock_path.display()
+                        );
+                    }
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+                Err(std::fs::TryLockError::Error(e)) => {
+                    return Err(e)
+                        .with_context(|| format!("locking the mirror lock {}", lock_path.display()));
+                }
+            }
+        }
     })
     .await
     .context("mirror lock task panicked")??;
     Ok(MirrorGuard {
         _lock_file: lock_file,
         _serialize_in_process: in_process,
+    })
+}
+
+/// Open (creating if needed) a mirror lock file. Wreckage squatting on
+/// the path — a stray directory, an unopenable file — is discarded and
+/// the open retried once: like the mirrors beside it, the lock file
+/// heals rather than failing the repo's every job forever. A *healthy*
+/// lock file always opens (advisory locks don't block opens), so only
+/// wreckage can be swept here.
+fn open_lock_file(path: &std::path::Path) -> anyhow::Result<std::fs::File> {
+    let open = |path: &std::path::Path| {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false) // the file carries no content, only the lock
+            .write(true)
+            .open(path)
+    };
+    open(path).or_else(|_| {
+        let _ = std::fs::remove_dir_all(path);
+        let _ = std::fs::remove_file(path);
+        open(path).with_context(|| format!("opening the mirror lock {}", path.display()))
     })
 }
 
@@ -258,9 +337,11 @@ fn partial_prefix(repo_id: i64) -> String {
 /// Best-effort removal of wreckage from clone attempts that never made
 /// it into place — crashed workers and rename-race losers leave
 /// `<repo>.git.partial.*` directories behind. Callers run under the
-/// repo's [`lock_mirror`] guard, which keeps every live clone (this
-/// process or another sharing the cache) out of the sweep — only
-/// attempts that already died can match.
+/// repo's [`lock_mirror`] guard, which keeps the live clones of every
+/// lock-taking process out of the sweep; a writer that bypasses the
+/// lock (a pre-upgrade binary mid-rolling-deploy, a cache on a
+/// filesystem whose advisory locks are no-ops, manual git) can still
+/// lose its in-flight clone here — it fails, is fenced, and retries.
 async fn sweep_stale_partials(cache_dir: &std::path::Path, repo_id: i64) {
     let prefix = partial_prefix(repo_id);
     let Ok(mut entries) = tokio::fs::read_dir(cache_dir).await else {

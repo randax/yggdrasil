@@ -192,9 +192,14 @@ pub fn manifest_key(repo_id: i64, revision: &str) -> String {
     format!("shards/{repo_id}/{revision}/manifest.json")
 }
 
+/// File name of the graph segment inside a Shard — the key under
+/// [`Manifest::segments`] and the last component of
+/// [`graph_segment_key`].
+pub const GRAPH_SEGMENT_FILE: &str = "graph.sqlite";
+
 /// Object key of a revision's graph segment, beside its manifest.
 pub fn graph_segment_key(repo_id: i64, revision: &str) -> String {
-    format!("shards/{repo_id}/{revision}/graph.sqlite")
+    format!("shards/{repo_id}/{revision}/{GRAPH_SEGMENT_FILE}")
 }
 
 /// S3-compatible object storage holding the Shards (ADR 0005).
@@ -286,6 +291,18 @@ pub async fn published_shard(
             manifest.commit,
             manifest.pass,
             manifest.schema_version
+        );
+    }
+    // Same fail-closed stance for shape: write_shard always records the
+    // graph segment, so a manifest without it describes an artifact the
+    // layout says cannot exist (a half-copied bucket, a manual repair).
+    // Trusting it would surface as a missing segment at first read,
+    // far from the cause — and the deterministic revision plus
+    // create-only puts mean nothing would ever repair it.
+    if !manifest.segments.contains_key(GRAPH_SEGMENT_FILE) {
+        anyhow::bail!(
+            "the published manifest at {manifest_key} records no {GRAPH_SEGMENT_FILE} segment; \
+             refusing to trust it"
         );
     }
     Ok(Some(PublishedShard {
@@ -381,7 +398,7 @@ pub async fn write_shard(
         commit: commit.to_string(),
         pass: SYNTACTIC_PASS.to_string(),
         counts,
-        segments: BTreeMap::from([("graph.sqlite".to_string(), segment)]),
+        segments: BTreeMap::from([(GRAPH_SEGMENT_FILE.to_string(), segment)]),
     };
     match store
         .put_opts(

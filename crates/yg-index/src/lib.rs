@@ -107,7 +107,7 @@ impl IndexWorker {
             // reads only the private checkout, and holding the repo's
             // lock through minutes of parsing would starve its fetches.
             let _serialize_same_mirror =
-                yg_sync::lock_mirror(&self.git_cache, job.repo_id).await?;
+                yg_sync::lock_mirror(&self.git_cache, job.repo_id, INDEX_LEASE).await?;
             let mirror = self.ensure_mirror_has(job).await?;
             let commit = job.commit.clone();
             let dest = checkout.path().to_path_buf();
@@ -205,8 +205,20 @@ fn extract_tree(mirror: &Path, commit: &str, dest: &Path) -> anyhow::Result<()> 
             archive.stdout.take().expect("stdout was piped above"),
         ))
         .stderr(Stdio::piped())
-        .output()
-        .context("running tar (is tar installed on this worker?)")?;
+        .output();
+    let unpack = match unpack {
+        Ok(output) => output,
+        // tar never spawned (missing binary, fork pressure): reap git
+        // before bailing — a std Child is neither killed nor reaped on
+        // drop, and this path repeats every retry, accruing one zombie
+        // per attempt for the worker's lifetime.
+        Err(e) => {
+            let _ = archive.kill();
+            let _ = archive.wait();
+            let _ = stderr_reader.join();
+            return Err(e).context("running tar (is tar installed on this worker?)");
+        }
+    };
     let archive_status = archive.wait().context("waiting for git archive")?;
     let archive_stderr = stderr_reader
         .join()
@@ -367,13 +379,19 @@ struct FileEntry {
 /// they are blobs in the git tree — but are flagged so nothing reads
 /// through them.
 fn collect_files(root: &Path, dir: &Path, out: &mut Vec<FileEntry>) -> anyhow::Result<()> {
+    // Materialize the listing before descending: recursing with the
+    // ReadDir handle open holds one directory fd per nesting level, and
+    // a deep-enough committed path chain would run the whole process —
+    // API listener included — out of file descriptors.
+    let mut entries = Vec::new();
     for entry in std::fs::read_dir(dir).with_context(|| format!("walking {}", dir.display()))? {
         let entry = entry?;
-        let file_type = entry.file_type()?;
+        entries.push((entry.path(), entry.file_type()?));
+    }
+    for (full, file_type) in entries {
         if file_type.is_dir() {
-            collect_files(root, &entry.path(), out)?;
+            collect_files(root, &full, out)?;
         } else {
-            let full = entry.path();
             let relative = full.strip_prefix(root).expect("walk stays under root");
             // A non-UTF-8 name can't round-trip through the graph's
             // string ids — converting it lossily would point the id at a

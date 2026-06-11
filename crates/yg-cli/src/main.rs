@@ -206,8 +206,12 @@ async fn serve(role: Role) -> anyhow::Result<()> {
         }
         Role::All => {
             let server = yg_api::serve(yg_api::ServerConfig::from_env()?).await?;
-            println!("listening on http://{}", server.local_addr());
             let workers = workers_from_env().await?;
+            // Announce only once the whole process is up: scripts and
+            // the e2e harness treat this line as the readiness signal,
+            // and a worker-boot failure after it would read as a crash
+            // mid-serve instead of a boot failure.
+            println!("listening on http://{}", server.local_addr());
             // Either side dying takes the process down — a half-alive
             // server that accepts repos it will never sync helps nobody.
             tokio::select! {

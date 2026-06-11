@@ -357,6 +357,13 @@ impl ControlPlane {
         // beats serving none — except when the pointer already holds the
         // synced head's Shard: exactly-current must never move backward
         // (a force-push to an older commit racing its own undo).
+        //
+        // The up_to_date arm assumes one SCHEMA_VERSION in flight: a
+        // mixed-image deploy re-indexing an unchanged commit could swap
+        // an exactly-current pointer between that commit's per-schema
+        // shards in either direction. Accepted for now under the same
+        // pre-production stance as migration 0005; ordering would need
+        // the shards row to carry its schema version.
         sqlx::query(
             "UPDATE repos SET current_shard_id = $1
              WHERE id = $2
