@@ -271,15 +271,16 @@ impl GitFetcher {
 /// commit (a hex oid) — the two shapes git itself writes. A crash can
 /// leave HEAD existing but NUL-filled or truncated (the journal
 /// replays the rename without the data); such a mirror must re-clone,
-/// not fail "not a git repository" on every retry forever.
+/// not fail "not a git repository" on every retry forever. Judged on
+/// bytes: refnames may legally hold non-UTF-8, and a healthy mirror
+/// must never be condemned over its default branch's spelling.
 fn head_names_a_ref(path: &std::path::Path) -> bool {
-    let Ok(head) = std::fs::read_to_string(path) else {
-        return false; // unreadable or not UTF-8: wreckage either way
+    let Ok(head) = std::fs::read(path) else {
+        return false; // unreadable: wreckage
     };
-    let head = head.trim_end();
-    head.strip_prefix("ref: ")
-        .is_some_and(|target| target.starts_with("refs/"))
-        || (head.len() >= 40 && head.bytes().all(|b| b.is_ascii_hexdigit()))
+    let head = head.trim_ascii_end();
+    head.starts_with(b"ref: refs/")
+        || (head.len() >= 40 && head.iter().all(|b| b.is_ascii_hexdigit()))
 }
 
 /// Where a remote's HEAD points, as `ls-remote --symref` advertises it.
