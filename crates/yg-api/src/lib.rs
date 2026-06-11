@@ -11,11 +11,13 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use object_store::ObjectStore;
-use object_store::aws::AmazonS3Builder;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use yg_control::ControlPlane;
+// Server config embeds the object-store half owned by yg-shard; clients
+// of this crate keep addressing it as `yg_api::ObjectStoreConfig`.
+pub use yg_shard::ObjectStoreConfig;
 use yg_sync::RepoLocator;
 
 pub struct ServerConfig {
@@ -23,14 +25,6 @@ pub struct ServerConfig {
     pub database_url: String,
     pub object_store: ObjectStoreConfig,
     pub bootstrap_token: String,
-}
-
-pub struct ObjectStoreConfig {
-    pub endpoint: String,
-    pub bucket: String,
-    pub access_key: String,
-    pub secret_key: String,
-    pub region: String,
 }
 
 impl ServerConfig {
@@ -92,7 +86,7 @@ impl RunningServer {
 
 struct AppState {
     control: ControlPlane,
-    store: Box<dyn ObjectStore>,
+    store: std::sync::Arc<dyn ObjectStore>,
     bootstrap_token: String,
     started: std::time::Instant,
 }
@@ -102,17 +96,7 @@ struct AppState {
 pub async fn serve(config: ServerConfig) -> anyhow::Result<RunningServer> {
     let control = ControlPlane::connect_and_migrate(&config.database_url).await?;
 
-    let store: Box<dyn ObjectStore> = Box::new(
-        AmazonS3Builder::new()
-            .with_endpoint(&config.object_store.endpoint)
-            .with_bucket_name(&config.object_store.bucket)
-            .with_access_key_id(&config.object_store.access_key)
-            .with_secret_access_key(&config.object_store.secret_key)
-            .with_region(&config.object_store.region)
-            .with_allow_http(true)
-            .build()
-            .context("configuring object store client")?,
-    );
+    let store = config.object_store.connect()?;
     probe_object_store(store.as_ref())
         .await
         .context("object storage unreachable at boot")?;
@@ -273,6 +257,8 @@ struct AdminRepoStatus {
     forge: String,
     last_synced_commit: Option<String>,
     sync: SyncStatus,
+    /// The repo's current Shard; null until first indexed.
+    shard: Option<ShardStatus>,
 }
 
 #[derive(Serialize)]
@@ -280,6 +266,13 @@ struct SyncStatus {
     state: &'static str,
     attempts: i32,
     last_error: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ShardStatus {
+    revision: String,
+    nodes: i64,
+    edges: i64,
 }
 
 async fn admin_status(State(state): State<Arc<AppState>>) -> Response {
@@ -299,6 +292,12 @@ async fn admin_status(State(state): State<Arc<AppState>>) -> Response {
                 attempts: r.attempts,
                 last_error: r.last_error,
             },
+            shard: r.shard_revision.map(|revision| ShardStatus {
+                revision,
+                // Set together with the revision when a Shard is recorded.
+                nodes: r.shard_node_count.unwrap_or(0),
+                edges: r.shard_edge_count.unwrap_or(0),
+            }),
             slug: r.slug,
             forge: r.forge,
             last_synced_commit: r.last_synced_commit,

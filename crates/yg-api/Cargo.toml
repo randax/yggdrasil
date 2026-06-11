@@ -17,4 +17,5 @@ subtle = "2.6.1"
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "signal", "net", "time"] }
 tracing = "0.1.44"
 yg-control = { version = "0.1.0", path = "../yg-control" }
+yg-shard = { version = "0.1.0", path = "../yg-shard" }
 yg-sync = { version = "0.1.0", path = "../yg-sync" }

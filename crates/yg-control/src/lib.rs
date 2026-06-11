@@ -60,6 +60,33 @@ pub struct LeasedFetch {
     lease_token: String,
 }
 
+/// An index job a worker holds the lease on: which repo to index and the
+/// commit its sync position points at.
+#[derive(sqlx::FromRow)]
+pub struct LeasedIndex {
+    pub job_id: i64,
+    pub repo_id: i64,
+    /// Failures so far (0 on the first run).
+    pub attempts: i32,
+    pub slug: String,
+    /// The commit to index — the repo's sync position at claim time.
+    pub commit: String,
+    /// Opaque fencing token; see [`LeasedFetch::lease_token`].
+    lease_token: String,
+}
+
+/// A published Shard as the control plane records it: the row inserted
+/// into `shards` when an index job completes.
+pub struct ShardRecord<'a> {
+    pub revision: &'a str,
+    pub manifest_key: &'a str,
+    pub commit_sha: &'a str,
+    /// `syntactic` | `precise` (ADR 0002).
+    pub provenance_level: &'a str,
+    pub node_count: i64,
+    pub edge_count: i64,
+}
+
 /// One repo's row in `yg admin status`.
 #[derive(sqlx::FromRow)]
 pub struct RepoSyncStatus {
@@ -71,6 +98,10 @@ pub struct RepoSyncStatus {
     pub job_state: Option<String>,
     pub attempts: i32,
     pub last_error: Option<String>,
+    /// The repo's current Shard, if it has ever been indexed.
+    pub shard_revision: Option<String>,
+    pub shard_node_count: Option<i64>,
+    pub shard_edge_count: Option<i64>,
 }
 
 impl ControlPlane {
@@ -151,15 +182,19 @@ impl ControlPlane {
         })
     }
 
-    /// Every registered repo with its sync position: last synced commit
-    /// plus the in-flight fetch job, if any.
+    /// Every registered repo with its sync position: last synced commit,
+    /// the in-flight fetch job, if any, and its current Shard, if any.
     pub async fn admin_status(&self) -> anyhow::Result<Vec<RepoSyncStatus>> {
         let rows = sqlx::query_as(
             "SELECT r.slug, f.base_url AS forge, r.last_synced_commit,
                     j.state AS job_state, coalesce(j.attempts, 0) AS attempts,
-                    j.last_error
+                    j.last_error,
+                    s.revision AS shard_revision,
+                    s.node_count AS shard_node_count,
+                    s.edge_count AS shard_edge_count
              FROM repos r
              JOIN forges f ON f.id = r.forge_id
+             LEFT JOIN shards s ON s.id = r.current_shard_id
              LEFT JOIN LATERAL (
                  SELECT state, attempts, last_error FROM jobs
                  WHERE repo_id = r.id AND kind = 'fetch' AND state <> 'done'
@@ -235,6 +270,17 @@ impl ControlPlane {
             .bind(job.repo_id)
             .execute(&mut *tx)
             .await?;
+        // Every synced commit wants indexing. The index job carries no
+        // payload: a worker reads the repo's sync position at claim time,
+        // so a job queued for one commit indexes whatever is newest by
+        // the time it runs.
+        sqlx::query(
+            "INSERT INTO jobs (kind, repo_id) VALUES ('index', $1)
+             ON CONFLICT (repo_id, kind) WHERE state <> 'done' DO NOTHING",
+        )
+        .bind(job.repo_id)
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         Ok(true)
     }
@@ -262,6 +308,84 @@ impl ControlPlane {
         .rows_affected()
             == 1;
         Ok(applied)
+    }
+
+    /// Claim the next due index job under a lease, same protocol as
+    /// [`Self::claim_due_fetch`]. Only repos with a synced commit are
+    /// claimable — there is nothing to index before the first fetch lands.
+    pub async fn claim_due_index(
+        &self,
+        lease: std::time::Duration,
+    ) -> anyhow::Result<Option<LeasedIndex>> {
+        let row = sqlx::query_as(
+            "WITH due AS (
+                 SELECT j.id FROM jobs j JOIN repos r ON r.id = j.repo_id
+                 WHERE j.kind = 'index' AND j.state <> 'done' AND j.run_after <= now()
+                   AND (j.state = 'queued' OR j.lease_until < now())
+                   AND r.last_synced_commit IS NOT NULL
+                 ORDER BY j.priority DESC, j.run_after
+                 LIMIT 1
+                 FOR UPDATE OF j SKIP LOCKED
+             )
+             UPDATE jobs j
+             SET state = 'leased', lease_until = now() + make_interval(secs => $1)
+             FROM due, repos r
+             WHERE j.id = due.id AND r.id = j.repo_id
+             RETURNING j.id AS job_id, j.repo_id, j.attempts,
+                       r.slug, r.last_synced_commit AS commit,
+                       j.lease_until::text AS lease_token",
+        )
+        .bind(lease.as_secs_f64())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    /// Record a finished index job: insert the published Shard and swap
+    /// the repo's current-Shard pointer to it, atomically. Lease-fenced
+    /// like [`Self::complete_fetch`]; returns whether the result was
+    /// applied.
+    pub async fn complete_index(
+        &self,
+        job: &LeasedIndex,
+        shard: ShardRecord<'_>,
+    ) -> anyhow::Result<bool> {
+        let mut tx = self.pool.begin().await?;
+        let claimed = sqlx::query(
+            "UPDATE jobs SET state = 'done', lease_until = NULL
+             WHERE id = $1 AND state = 'leased' AND lease_until::text = $2",
+        )
+        .bind(job.job_id)
+        .bind(&job.lease_token)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            == 1;
+        if !claimed {
+            return Ok(false);
+        }
+        let (shard_id,): (i64,) = sqlx::query_as(
+            "INSERT INTO shards (repo_id, revision, manifest_key, commit_sha,
+                                 provenance_level, node_count, edge_count)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
+             RETURNING id",
+        )
+        .bind(job.repo_id)
+        .bind(shard.revision)
+        .bind(shard.manifest_key)
+        .bind(shard.commit_sha)
+        .bind(shard.provenance_level)
+        .bind(shard.node_count)
+        .bind(shard.edge_count)
+        .fetch_one(&mut *tx)
+        .await?;
+        sqlx::query("UPDATE repos SET current_shard_id = $1, indexed = true WHERE id = $2")
+            .bind(shard_id)
+            .bind(job.repo_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(true)
     }
 
     /// How many repos are indexed into the Knowledge Graph.
