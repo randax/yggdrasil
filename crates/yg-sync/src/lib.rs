@@ -127,14 +127,19 @@ impl GitFetcher {
         let local = mirror_path(&self.cache_dir, repo_id);
         let depth_arg = depth.map(|n| format!("--depth={n}"));
         sweep_stale_partials(&self.cache_dir, repo_id).await;
-        // Every bare repo has a HEAD file; a directory without one is
-        // wreckage, not a mirror. Deliberately a stat, not a git probe:
-        // a probe conflates "git said no" with "git could not run"
-        // (missing binary, fd pressure) and would delete a healthy
-        // mirror over an environmental blip — and a HEAD that exists
-        // but dangles is healed after the fetch by the re-point below,
-        // not by re-downloading history that would dangle again.
-        let usable = local.join("HEAD").exists();
+        // A bare repo's skeleton: a non-empty HEAD plus objects/ and
+        // refs/. Anything less is wreckage to re-clone — a crash can
+        // leave a zero-byte HEAD, a torn restore can drop objects/ —
+        // and git would fail "not a git repository" on every retry
+        // forever. Deliberately stats, not a git probe: a probe
+        // conflates "git said no" with "git could not run" (missing
+        // binary, fd pressure) and would delete a healthy mirror over
+        // an environmental blip — and a HEAD that exists but dangles
+        // is healed after the fetch by the re-point below, not by
+        // re-downloading history that would dangle again.
+        let usable = std::fs::metadata(local.join("HEAD")).is_ok_and(|m| m.is_file() && m.len() > 0)
+            && local.join("objects").is_dir()
+            && local.join("refs").is_dir();
         if usable {
             let mut args: Vec<&str> = vec!["fetch", "--prune", "--quiet"];
             args.extend(depth_arg.as_deref());
@@ -176,23 +181,31 @@ impl GitFetcher {
                     }
                 }
                 // The server hides the symref (old protocol, stripping
-                // proxy) but still advertises HEAD's commit. Only when
-                // the mirror's HEAD no longer resolves — never to pin a
-                // healthy symref to today's tip — detach HEAD at that
-                // commit, if the fetch brought it.
+                // proxy) but still advertises HEAD's commit. A healthy
+                // symref HEAD is left alone — never pinned to today's
+                // tip — but a dangling one is detached at that commit,
+                // and an already-detached one (a previous heal here) is
+                // advanced to it, or the synced commit would freeze at
+                // detach time forever. Probe failures err toward not
+                // writing.
                 Ok(RemoteHead::Commit(oid)) => {
-                    let head_resolves =
-                        git_says_yes(&local, &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"])
-                            .await
-                            .unwrap_or(true);
+                    let healthy_symref = git_says_yes(&local, &["symbolic-ref", "-q", "HEAD"])
+                        .await
+                        .unwrap_or(true)
+                        && git_says_yes(
+                            &local,
+                            &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"],
+                        )
+                        .await
+                        .unwrap_or(true);
                     let have_commit =
                         git_says_yes(&local, &["cat-file", "-e", &format!("{oid}^{{commit}}")])
                             .await
                             .unwrap_or(false);
-                    if !head_resolves && have_commit {
+                    if !healthy_symref && have_commit {
                         run_git(Some(&local), &["update-ref", "--no-deref", "HEAD", &oid], None)
                             .await
-                            .context("detaching the mirror's dangling HEAD at the remote's HEAD commit")?;
+                            .context("pointing the mirror's HEAD at the remote's HEAD commit")?;
                     }
                 }
                 // An unborn or hidden remote HEAD: keep what we have.
@@ -343,7 +356,9 @@ pub async fn lock_mirror(
                 Err(std::fs::TryLockError::WouldBlock) => {
                     if std::time::Instant::now() >= deadline {
                         anyhow::bail!(
-                            "timed out waiting for another process's lock on {}",
+                            "another process held the mirror lock {} for this job's whole \
+                             lease — often a long cold clone that will still land the \
+                             mirror; retrying after backoff",
                             lock_path.display()
                         );
                     }
