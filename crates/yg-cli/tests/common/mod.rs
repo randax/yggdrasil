@@ -152,9 +152,7 @@ impl Drop for KillOnDrop {
 /// server that dies before announcing panics with its stderr instead of
 /// an opaque unwrap; a live one has its stderr drained on a thread so a
 /// chatty run can never fill the pipe and block.
-pub fn spawn_yg_serve(
-    configure: impl FnOnce(&mut std::process::Command),
-) -> (KillOnDrop, String) {
+pub fn spawn_yg_serve(configure: impl FnOnce(&mut std::process::Command)) -> (KillOnDrop, String) {
     use std::io::{BufRead, Read};
     let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin("yg"));
     cmd.env("YG_LISTEN", "127.0.0.1:0");

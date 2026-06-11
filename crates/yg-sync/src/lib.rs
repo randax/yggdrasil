@@ -260,9 +260,13 @@ impl GitFetcher {
         // --verify HEAD^{commit}: on a dangling HEAD, plain `rev-parse
         // HEAD` exits 0 and prints the literal string "HEAD" — which
         // would be recorded as the synced commit. Fail loudly instead.
-        let head = run_git(Some(&local), &["rev-parse", "--verify", "HEAD^{commit}"], None)
-            .await
-            .context("resolving the synced commit — the remote's HEAD may be unborn or dangling")?;
+        let head = run_git(
+            Some(&local),
+            &["rev-parse", "--verify", "HEAD^{commit}"],
+            None,
+        )
+        .await
+        .context("resolving the synced commit — the remote's HEAD may be unborn or dangling")?;
         Ok(head.trim().to_string())
     }
 }
@@ -392,8 +396,9 @@ pub async fn lock_mirror(
                     std::thread::sleep(Duration::from_millis(250));
                 }
                 Err(std::fs::TryLockError::Error(e)) => {
-                    return Err(e)
-                        .with_context(|| format!("locking the mirror lock {}", lock_path.display()));
+                    return Err(e).with_context(|| {
+                        format!("locking the mirror lock {}", lock_path.display())
+                    });
                 }
             }
         }
