@@ -100,10 +100,13 @@ impl ControlPlane {
         // DO UPDATE (rather than DO NOTHING) so RETURNING yields the id
         // on conflict too. Overwriting kind is safe: it's derived from
         // the URL host, so every add of this base_url carries the same
-        // value.
+        // value. token_env only backfills a missing value — an explicit
+        // per-forge override is never clobbered by a re-add.
         let (forge_id,): (i64,) = sqlx::query_as(
             "INSERT INTO forges (kind, base_url, token_env) VALUES ($1, $2, $3)
-             ON CONFLICT (base_url) DO UPDATE SET kind = excluded.kind
+             ON CONFLICT (base_url) DO UPDATE
+             SET kind = excluded.kind,
+                 token_env = coalesce(forges.token_env, excluded.token_env)
              RETURNING id",
         )
         .bind(repo.forge_kind)
@@ -210,9 +213,13 @@ impl ControlPlane {
     /// discarded.
     pub async fn complete_fetch(&self, job: &LeasedFetch, commit: &str) -> anyhow::Result<bool> {
         let mut tx = self.pool.begin().await?;
+        // The token is the lease's text rendering; comparing in the text
+        // domain avoids any text→timestamptz parse-back, so a session
+        // formatting quirk can only fail closed (result discarded, job
+        // re-runs at lease expiry), never match a stale claim.
         let claimed = sqlx::query(
             "UPDATE jobs SET state = 'done', lease_until = NULL
-             WHERE id = $1 AND state = 'leased' AND lease_until = $2::timestamptz",
+             WHERE id = $1 AND state = 'leased' AND lease_until::text = $2",
         )
         .bind(job.job_id)
         .bind(&job.lease_token)
@@ -245,7 +252,7 @@ impl ControlPlane {
                  attempts = attempts + 1, last_error = $2,
                  run_after = now()
                      + make_interval(secs => least(30 * 2 ^ least(attempts, 7), 3600))
-             WHERE id = $1 AND state = 'leased' AND lease_until = $3::timestamptz",
+             WHERE id = $1 AND state = 'leased' AND lease_until::text = $3",
         )
         .bind(job.job_id)
         .bind(error)

@@ -42,7 +42,10 @@ impl SyncWorker {
             .as_deref()
             .and_then(|var| std::env::var(var).ok())
             .map(|token| token.trim().to_string())
-            .filter(|token| !token.is_empty());
+            .filter(|token| !token.is_empty())
+            // Defense in depth: whatever the control plane says, a Forge
+            // token only ever travels over TLS.
+            .filter(|_| clone_url.starts_with("https://"));
         match self
             .fetcher
             .sync(job.repo_id, &clone_url, token.as_deref(), job.fetch_depth)
@@ -106,6 +109,7 @@ impl GitFetcher {
     ) -> anyhow::Result<String> {
         let local = self.cache_dir.join(format!("{repo_id}.git"));
         let depth_arg = depth.map(|n| format!("--depth={n}"));
+        sweep_stale_partials(&self.cache_dir, repo_id).await;
         // Every bare repo has a HEAD file; a directory without one is
         // wreckage, not a mirror.
         let usable = local.join("HEAD").exists();
@@ -134,25 +138,55 @@ impl GitFetcher {
                 .context("creating the git cache directory")?;
             // Clone beside the final path, then rename: the real path
             // only ever holds a complete mirror, however the clone dies.
-            let partial = self.cache_dir.join(format!("{repo_id}.git.partial"));
-            remove_dir_if_present(&partial)
-                .await
-                .context("clearing a leftover partial clone")?;
+            // Each attempt gets its own partial dir (pid + counter), so
+            // two workers whose leases overlapped never write into one
+            // another's tree; the loser's rename fails and cleans up.
+            static ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let partial = self.cache_dir.join(format!(
+                "{repo_id}.git.partial.{}-{}",
+                std::process::id(),
+                ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
             let mut args: Vec<&str> = vec!["clone", "--bare", "--quiet"];
             args.extend(depth_arg.as_deref());
             let partial_str = partial.to_str().context("git cache path is not UTF-8")?;
             args.extend([clone_url, partial_str]);
-            run_git(None, &args, token)
-                .await
-                .with_context(|| format!("cloning {clone_url}"))?;
-            tokio::fs::rename(&partial, &local)
-                .await
-                .context("moving the finished clone into place")?;
+            let cloned_into_place = async {
+                run_git(None, &args, token)
+                    .await
+                    .with_context(|| format!("cloning {clone_url}"))?;
+                tokio::fs::rename(&partial, &local)
+                    .await
+                    .context("moving the finished clone into place")
+            }
+            .await;
+            if cloned_into_place.is_err() {
+                let _ = remove_dir_if_present(&partial).await;
+            }
+            cloned_into_place?;
         }
         let head = run_git(Some(&local), &["rev-parse", "HEAD"], None)
             .await
             .context("resolving the synced commit")?;
         Ok(head.trim().to_string())
+    }
+}
+
+/// Best-effort removal of wreckage from clone attempts that never made
+/// it into place — crashed workers and rename-race losers leave
+/// `<repo>.git.partial.*` directories behind. Sweeping may also kill a
+/// clone another worker is running right now, but only when both hold
+/// the same repo (an expired-lease overlap): that worker fails, its
+/// result is fenced off anyway, and the queue retries.
+async fn sweep_stale_partials(cache_dir: &std::path::Path, repo_id: i64) {
+    let prefix = format!("{repo_id}.git.partial");
+    let Ok(mut entries) = tokio::fs::read_dir(cache_dir).await else {
+        return; // no cache dir yet — nothing to sweep
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if entry.file_name().to_string_lossy().starts_with(&prefix) {
+            let _ = remove_dir_if_present(&entry.path()).await;
+        }
     }
 }
 
@@ -329,6 +363,24 @@ impl RepoLocator {
         } else {
             ForgeKind::Git
         };
+        // GitHub repos live at exactly owner/repo; a longer path is a
+        // pasted browser page (tree/…, issues/…), not a different repo —
+        // rejected rather than guessed at.
+        if kind == ForgeKind::Github && segments.len() > 2 {
+            return Err(format!(
+                "GitHub repositories are owner/repo — drop the trailing path \
+                 (got {} extra segment(s)): {url}",
+                segments.len() - 2
+            ));
+        }
+        // GitHub only speaks https; normalizing here keeps a worker from
+        // ever sending the Forge token over plaintext because of a URL
+        // spelling, and keeps http/https variants on one forge row.
+        let scheme = if kind == ForgeKind::Github {
+            "https".to_string()
+        } else {
+            scheme
+        };
         Ok(Self {
             kind,
             base_url: format!("{scheme}://{host}"),
@@ -403,6 +455,33 @@ mod tests {
     #[test]
     fn nested_group_paths_keep_the_full_path_as_slug() {
         assert_eq!(parsed("https://gitlab.example/a/b/c").slug, "a/b/c");
+    }
+
+    #[test]
+    fn github_subpage_urls_are_rejected_not_guessed_at() {
+        // Pasted browser URLs: the repo is owner/repo, the rest is a page.
+        for url in [
+            "https://github.com/acme/widgets/tree/main",
+            "https://github.com/acme/widgets/issues/5",
+            "https://github.com/acme/widgets/blob/main/README.md",
+        ] {
+            let err = RepoLocator::parse(url).unwrap_err();
+            assert!(err.contains("owner/repo"), "{url} → {err}");
+        }
+    }
+
+    #[test]
+    fn github_over_plain_http_normalizes_to_https() {
+        // The GitHub forge always speaks https; a worker must never send
+        // its token over plaintext because of a URL spelling.
+        let locator = parsed("http://github.com/acme/widgets");
+        assert_eq!(locator.kind, ForgeKind::Github);
+        assert_eq!(locator.base_url, "https://github.com");
+        assert_eq!(
+            locator.base_url,
+            parsed("https://github.com/acme/widgets").base_url,
+            "http and https spellings must land on the same forge row"
+        );
     }
 
     #[test]

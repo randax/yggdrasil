@@ -396,6 +396,86 @@ async fn a_vandalized_cache_mirror_heals_on_the_next_sync() {
 }
 
 #[tokio::test]
+async fn re_adding_heals_a_forge_row_missing_its_token_env() {
+    let db_name = create_test_db().await;
+    let control = control_plane(&db_name).await;
+    let add = || {
+        control.add_repo(yg_control::AddRepo {
+            forge_kind: "github",
+            base_url: "https://github.com",
+            token_env: Some("YG_GITHUB_TOKEN"),
+            slug: "acme/widgets",
+            fetch_depth: None,
+        })
+    };
+    add().await.unwrap();
+
+    // A degraded forge row — manual insert, older deployment.
+    let pool = sqlx::PgPool::connect(&format!("{DEV_POSTGRES}/{db_name}"))
+        .await
+        .unwrap();
+    sqlx::query("UPDATE forges SET token_env = NULL")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    add().await.unwrap();
+    let job = control
+        .claim_due_fetch(std::time::Duration::from_secs(60))
+        .await
+        .unwrap()
+        .expect("fetch job claimable");
+    assert_eq!(
+        job.token_env.as_deref(),
+        Some("YG_GITHUB_TOKEN"),
+        "re-adding must backfill a missing token_env"
+    );
+}
+
+#[tokio::test]
+async fn stale_partial_clones_are_swept_on_the_next_sync() {
+    let (fixture, _repo_dir, fixture_url) = fixture_repo(1);
+
+    let db_name = create_test_db().await;
+    let server = serve(test_config(&db_name)).await.expect("boot");
+    let base = format!("http://{}", server.local_addr());
+    let control = control_plane(&db_name).await;
+    let cache = fixture.path().join("git-cache");
+    let worker = yg_sync::SyncWorker::new(control, &cache);
+
+    post_repo(&base, serde_json::json!({"url": fixture_url})).await;
+    assert!(worker.run_once().await.unwrap());
+
+    // Wreckage from a crashed clone attempt sits beside the mirror.
+    let mirror_name = std::fs::read_dir(&cache)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .file_name();
+    let stale = cache.join(format!("{}.partial.4242-7", mirror_name.to_string_lossy()));
+    std::fs::create_dir_all(stale.join("objects")).unwrap();
+
+    post_repo(&base, serde_json::json!({"url": fixture_url})).await;
+    assert!(worker.run_once().await.unwrap());
+
+    let leftovers: Vec<String> = std::fs::read_dir(&cache)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains("partial"))
+        .collect();
+    assert_eq!(
+        leftovers,
+        Vec::<String>::new(),
+        "syncing must sweep crashed clone attempts"
+    );
+    assert_eq!(
+        admin_status_body(&base).await["repos"][0]["sync"]["state"],
+        "synced"
+    );
+}
+
+#[tokio::test]
 async fn a_fetch_job_outlives_its_crashed_worker_via_lease_expiry() {
     let db_name = create_test_db().await;
     let control = control_plane(&db_name).await;
