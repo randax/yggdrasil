@@ -102,15 +102,30 @@ impl IndexWorker {
 /// Materialize `commit`'s tree from a bare mirror into `dest`, without
 /// touching the mirror: `git archive` piped through `tar`.
 fn extract_tree(mirror: &Path, commit: &str, dest: &Path) -> anyhow::Result<()> {
+    use std::io::Read;
     use std::process::{Command, Stdio};
     let mut archive = Command::new("git")
         .arg("-C")
         .arg(mirror)
-        .args(["archive", commit])
+        // The ^{tree} suffix matters: archiving a commit embeds a pax
+        // global header carrying the commit id, which some tar
+        // implementations (busybox) extract as a phantom file — the same
+        // revision would then index differently across worker images.
+        .args(["archive", &format!("{commit}^{{tree}}")])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .env("GIT_TERMINAL_PROMPT", "0")
         .spawn()
         .context("running git archive (is git installed on this worker?)")?;
+    // Drain stderr concurrently: left unread, a chatty git (GIT_TRACE,
+    // attribute warnings) fills the pipe buffer and deadlocks the
+    // archive | tar pipeline.
+    let mut archive_stderr = archive.stderr.take().expect("stderr was piped above");
+    let stderr_reader = std::thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = archive_stderr.read_to_string(&mut buf);
+        buf
+    });
     let unpack = Command::new("tar")
         .arg("-x")
         .arg("-C")
@@ -121,14 +136,12 @@ fn extract_tree(mirror: &Path, commit: &str, dest: &Path) -> anyhow::Result<()> 
         .stderr(Stdio::piped())
         .output()
         .context("running tar (is tar installed on this worker?)")?;
-    let archive = archive
-        .wait_with_output()
-        .context("waiting for git archive")?;
-    if !archive.status.success() {
-        anyhow::bail!(
-            "git archive {commit} failed: {}",
-            String::from_utf8_lossy(&archive.stderr).trim()
-        );
+    let archive_status = archive.wait().context("waiting for git archive")?;
+    let archive_stderr = stderr_reader
+        .join()
+        .unwrap_or_else(|_| "stderr reader panicked".to_string());
+    if !archive_status.success() {
+        anyhow::bail!("git archive {commit} failed: {}", archive_stderr.trim());
     }
     if !unpack.status.success() {
         anyhow::bail!(
