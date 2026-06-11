@@ -184,7 +184,7 @@ pub struct PublishedShard {
 /// Deterministic on purpose: re-indexing the same commit derives the same
 /// revision, which is what makes re-indexing idempotent.
 pub fn syntactic_revision(commit: &str) -> String {
-    format!("{commit}-syntactic-v{SCHEMA_VERSION}")
+    format!("{commit}-{SYNTACTIC_PASS}-v{SCHEMA_VERSION}")
 }
 
 /// S3-compatible object storage holding the Shards (ADR 0005).
@@ -248,6 +248,22 @@ pub async fn published_shard(
     };
     let manifest: Manifest =
         serde_json::from_slice(&bytes).context("parsing the published manifest")?;
+    // Fail closed: the revision id asserts (commit, pass, schema), and a
+    // manifest that disagrees — bucket aliasing across deployments, a
+    // manual repair gone wrong — must not have its contents recorded as
+    // this revision's.
+    if manifest.commit != commit
+        || manifest.pass != SYNTACTIC_PASS
+        || manifest.schema_version != SCHEMA_VERSION
+    {
+        anyhow::bail!(
+            "the published manifest at {manifest_key} does not describe this revision \
+             (it says commit {}, pass {}, schema v{}); refusing to trust it",
+            manifest.commit,
+            manifest.pass,
+            manifest.schema_version
+        );
+    }
     Ok(Some(PublishedShard {
         revision,
         manifest_key,
@@ -271,12 +287,10 @@ pub async fn write_shard(
     commit: &str,
     graph: Graph,
 ) -> anyhow::Result<PublishedShard> {
-    if let Some(published) = published_shard(store, repo_id, commit).await? {
-        return Ok(published);
-    }
     let revision = syntactic_revision(commit);
     let prefix = format!("shards/{repo_id}/{revision}");
     let manifest_key = format!("{prefix}/manifest.json");
+    let graph_key = object_store::path::Path::from(format!("{prefix}/graph.sqlite"));
     let counts = Counts {
         nodes: graph.nodes.len() as i64,
         edges: graph.edges.len() as i64,
@@ -285,27 +299,41 @@ pub async fn write_shard(
     let graph_bytes = tokio::task::spawn_blocking(move || build_graph_sqlite(&graph))
         .await
         .context("graph segment build task panicked")??;
-    let segment = Segment {
-        sha256: hex::encode(Sha256::digest(&graph_bytes)),
-        bytes: graph_bytes.len() as u64,
-    };
     let create_only = PutOptions {
         mode: PutMode::Create,
         ..Default::default()
     };
-    match store
+    let segment = match store
         .put_opts(
-            &format!("{prefix}/graph.sqlite").into(),
-            PutPayload::from(graph_bytes),
+            &graph_key,
+            PutPayload::from(graph_bytes.clone()),
             create_only.clone(),
         )
         .await
     {
-        // Another publisher beat us to the segment; same revision means
-        // same bytes by construction, so theirs is as good as ours.
-        Ok(_) | Err(object_store::Error::AlreadyExists { .. }) => {}
+        Ok(_) => Segment {
+            sha256: hex::encode(Sha256::digest(&graph_bytes)),
+            bytes: graph_bytes.len() as u64,
+        },
+        // Another publisher beat us to the segment. Same revision should
+        // mean same bytes, but the manifest must describe what storage
+        // actually holds — a racing worker on a different build (mixed
+        // images mid-deploy) may have written subtly different bytes.
+        Err(object_store::Error::AlreadyExists { .. }) => {
+            let stored = store
+                .get(&graph_key)
+                .await
+                .context("reading the segment another publisher just wrote")?
+                .bytes()
+                .await
+                .context("reading the segment another publisher just wrote")?;
+            Segment {
+                sha256: hex::encode(Sha256::digest(&stored)),
+                bytes: stored.len() as u64,
+            }
+        }
         Err(e) => return Err(e).context("uploading the graph segment"),
-    }
+    };
 
     let manifest = Manifest {
         schema_version: SCHEMA_VERSION,

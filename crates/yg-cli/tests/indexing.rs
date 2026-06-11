@@ -443,6 +443,63 @@ async fn an_index_worker_without_the_mirror_fetches_it_itself() {
 }
 
 #[tokio::test]
+async fn a_published_manifest_describing_a_different_commit_fails_closed() {
+    use object_store::ObjectStoreExt;
+
+    let h = Harness::boot().await;
+    h.add_repo().await;
+    assert!(h.sync.run_once().await.unwrap(), "fetch job must run");
+
+    // Something already squats at this revision's manifest key but
+    // describes a different commit — bucket aliasing across deployments,
+    // a manual repair gone wrong. Trusting it would record provenance
+    // and counts for an artifact this revision never produced.
+    let head = git(&h.repo_dir, &["rev-parse", "HEAD"]);
+    let (repo_id,): (i64,) = sqlx::query_as("SELECT id FROM repos")
+        .fetch_one(&h.pool().await)
+        .await
+        .unwrap();
+    let revision = yg_shard::syntactic_revision(&head);
+    let bogus = serde_json::json!({
+        "schema_version": yg_shard::SCHEMA_VERSION,
+        "commit": "deadbeef00000000000000000000000000000000",
+        "pass": "syntactic",
+        "counts": {"nodes": 999, "edges": 999},
+        "segments": {}
+    });
+    h.store
+        .put(
+            &format!("shards/{repo_id}/{revision}/manifest.json")
+                .as_str()
+                .into(),
+            serde_json::to_vec(&bogus).unwrap().into(),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        h.indexer
+            .run_once()
+            .await
+            .expect("a failed index run is handled, not an error"),
+        "the job must still be claimed"
+    );
+    let body = admin_status_body(&h.base).await;
+    assert_eq!(
+        body["repos"][0]["shard"],
+        serde_json::Value::Null,
+        "a manifest that doesn't describe this revision must not be \
+         recorded, got: {body}"
+    );
+    assert!(
+        body["repos"][0]["index"]["last_error"]
+            .as_str()
+            .is_some_and(|e| e.contains("manifest")),
+        "the error must point at the manifest, got: {body}"
+    );
+}
+
+#[tokio::test]
 async fn a_shallow_mirror_that_cannot_reach_the_commit_says_so() {
     let h = Harness::boot().await;
     // Shallow override: the mirror only ever holds the newest commit.
