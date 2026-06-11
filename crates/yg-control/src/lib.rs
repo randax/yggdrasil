@@ -270,9 +270,10 @@ impl ControlPlane {
             .execute(&mut *tx)
             .await?;
         // Every synced commit wants indexing. The index job carries no
-        // payload: a worker reads the repo's sync position at claim time,
-        // so a job queued for one commit indexes whatever is newest by
-        // the time it runs.
+        // payload: a worker reads the repo's sync position at claim time.
+        // If a job is already in flight this no-ops — a queued job will
+        // pick the new commit up at claim, and a leased one is re-queued
+        // by complete_index when it notices the repo moved on.
         sqlx::query(
             "INSERT INTO jobs (kind, repo_id) VALUES ('index', $1)
              ON CONFLICT (repo_id, kind) WHERE state <> 'done' DO NOTHING",
@@ -330,13 +331,40 @@ impl ControlPlane {
     /// the repo's current-Shard pointer to it, atomically. Lease-fenced
     /// like [`Self::complete_fetch`]; returns whether the result was
     /// applied.
+    ///
+    /// A fetch can land while the job is leased — `complete_fetch`'s
+    /// enqueue no-ops against a job that is merely in flight, so it's
+    /// this completion that must notice the repo moved past the commit
+    /// it indexed and re-queue the same job rather than retiring it.
     pub async fn complete_index(
         &self,
         job: &LeasedIndex,
         shard: ShardRecord<'_>,
     ) -> anyhow::Result<bool> {
         let mut tx = self.pool.begin().await?;
-        if !fence_job_done(&mut tx, job.job_id, &job.lease_token).await? {
+        // Lock the repo row before reading its sync position so a
+        // concurrent complete_fetch can't advance it between this check
+        // and commit (its own repos UPDATE serializes behind this lock).
+        let (current_commit,): (Option<String>,) =
+            sqlx::query_as("SELECT last_synced_commit FROM repos WHERE id = $1 FOR UPDATE")
+                .bind(job.repo_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        let up_to_date = current_commit.as_deref() == Some(job.commit.as_str());
+        let claimed = sqlx::query(
+            "UPDATE jobs
+             SET state = CASE WHEN $3 THEN 'done' ELSE 'queued' END,
+                 lease_until = NULL, run_after = now()
+             WHERE id = $1 AND state = 'leased' AND lease_until::text = $2",
+        )
+        .bind(job.job_id)
+        .bind(&job.lease_token)
+        .bind(up_to_date)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            == 1;
+        if !claimed {
             return Ok(false);
         }
         // Revisions are deterministic per (commit, pass, schema), so

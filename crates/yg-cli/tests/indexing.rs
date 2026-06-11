@@ -429,6 +429,63 @@ async fn a_failing_index_job_surfaces_its_error_backs_off_and_recovers() {
     );
 }
 
+#[tokio::test]
+async fn a_commit_fetched_mid_index_still_gets_indexed() {
+    let h = Harness::boot().await;
+    h.add_repo().await;
+    assert!(h.sync.run_once().await.unwrap(), "fetch job must run");
+
+    // A worker claims the index job for the first commit and is slow.
+    let control = control_plane(&h.db_name).await;
+    let job = control
+        .claim_due_index(std::time::Duration::from_secs(60))
+        .await
+        .unwrap()
+        .expect("the queued index job must be claimable");
+
+    // While it grinds, the repo moves on and a fresh fetch lands.
+    std::fs::write(
+        h.repo_dir.join("extra.go"),
+        "package main\n\nfunc Extra() {}\n",
+    )
+    .unwrap();
+    git(&h.repo_dir, &["add", "."]);
+    git(&h.repo_dir, &["commit", "-m", "extra"]);
+    let new_head = git(&h.repo_dir, &["rev-parse", "HEAD"]);
+    h.add_repo().await;
+    assert!(h.sync.run_once().await.unwrap(), "second fetch must run");
+
+    // The slow worker finishes its (now stale) run and reports it.
+    let applied = control
+        .complete_index(
+            &job,
+            yg_control::ShardRecord {
+                revision: &format!("{}-syntactic-v1", job.commit),
+                manifest_key: &format!("shards/{}/test/manifest.json", job.repo_id),
+                commit_sha: &job.commit,
+                provenance_level: "syntactic",
+                node_count: 4,
+                edge_count: 2,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(applied, "the live lease holder's completion must apply");
+
+    // The newer commit must not be lost: indexing converges on it.
+    assert!(
+        h.indexer.run_once().await.unwrap(),
+        "a fetch that landed mid-index must leave index work pending"
+    );
+    let shard = h.shard_status().await;
+    assert!(
+        shard["revision"]
+            .as_str()
+            .is_some_and(|r| r.starts_with(&new_head)),
+        "the current Shard must cover the newest synced commit, got: {shard}"
+    );
+}
+
 /// multi_thread: the yg binary blocks this thread while the in-process
 /// server it queries runs on the same test runtime.
 #[tokio::test(flavor = "multi_thread")]
