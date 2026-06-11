@@ -93,9 +93,15 @@ impl IndexWorker {
         {
             return Ok(published);
         }
-        let mirror = self.ensure_mirror_has(job).await?;
-        let checkout = tempfile::tempdir().context("creating a scratch checkout dir")?;
         let graph = {
+            // Held across both the (possibly self-healing) availability
+            // check and the archive read: a concurrent fetch reshaping
+            // the mirror between them could yank the commit out from
+            // under git archive.
+            let lock = yg_sync::mirror_lock(job.repo_id);
+            let _serialize_same_mirror = lock.lock().await;
+            let mirror = self.ensure_mirror_has(job).await?;
+            let checkout = tempfile::tempdir().context("creating a scratch checkout dir")?;
             let commit = job.commit.clone();
             let dest = checkout.path().to_path_buf();
             tokio::task::spawn_blocking(move || -> anyhow::Result<Graph> {
@@ -132,8 +138,8 @@ impl IndexWorker {
             anyhow::bail!(
                 "commit {} is still missing after fetching {clone_url} — \
                  a shallow fetch depth that no longer reaches it, or \
-                 rewritten history; a future fetch of the repo will \
-                 supersede this job",
+                 rewritten history; re-adding the repo queues a fresh \
+                 fetch whose newer commit supersedes this job",
                 job.commit
             );
         }

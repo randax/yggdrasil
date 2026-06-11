@@ -35,6 +35,8 @@ impl SyncWorker {
         };
         let clone_url = join_clone_url(&job.base_url, &job.slug);
         let token = forge_token(job.token_env.as_deref(), &clone_url);
+        let lock = mirror_lock(job.repo_id);
+        let _serialize_same_mirror = lock.lock().await;
         match self
             .fetcher
             .sync(job.repo_id, &clone_url, token.as_deref(), job.fetch_depth)
@@ -100,6 +102,10 @@ impl GitFetcher {
     /// A mirror that exists but isn't usable (interrupted clone, stray
     /// deletion) is discarded and re-cloned rather than left to fail
     /// every retry forever.
+    ///
+    /// Callers hold the repo's [`mirror_lock`] across this call (and any
+    /// reads of the mirror they do around it) — the lock is not taken
+    /// here so a caller can keep it across a fetch-then-read sequence.
     pub async fn sync(
         &self,
         repo_id: i64,
@@ -107,12 +113,6 @@ impl GitFetcher {
         token: Option<&str>,
         depth: Option<i32>,
     ) -> anyhow::Result<String> {
-        // The Sync loop and an indexing worker's self-heal fetch can hold
-        // valid leases on the same repo at once (one per job kind) and
-        // share this process's cache; unserialized, one's partial-clone
-        // sweep would tear down the other's clone in flight.
-        let lock = mirror_lock(repo_id);
-        let _serialize_same_mirror = lock.lock().await;
         let local = mirror_path(&self.cache_dir, repo_id);
         let depth_arg = depth.map(|n| format!("--depth={n}"));
         sweep_stale_partials(&self.cache_dir, repo_id).await;
@@ -149,7 +149,8 @@ impl GitFetcher {
             // another's tree; the loser's rename fails and cleans up.
             static ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let partial = self.cache_dir.join(format!(
-                "{repo_id}.git.partial.{}-{}",
+                "{}.{}-{}",
+                partial_prefix(repo_id),
                 std::process::id(),
                 ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             ));
@@ -178,11 +179,12 @@ impl GitFetcher {
     }
 }
 
-/// Serializes same-process work on one repo's mirror: the per-kind job
-/// leases don't prevent a fetch job and an index job's self-heal from
-/// running concurrently. Cross-process overlap on a shared cache dir
-/// remains possible only through expired-lease races, as before.
-fn mirror_lock(repo_id: i64) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+/// Serializes same-process work on one repo's mirror — populating it
+/// *and* reading it (`git archive` mid-fetch sees half a mirror). The
+/// per-kind job leases don't prevent a fetch job and an index job from
+/// running concurrently on one repo. Cross-process overlap on a shared
+/// cache dir remains possible only through expired-lease races.
+pub fn mirror_lock(repo_id: i64) -> std::sync::Arc<tokio::sync::Mutex<()>> {
     static LOCKS: std::sync::LazyLock<
         std::sync::Mutex<std::collections::HashMap<i64, std::sync::Arc<tokio::sync::Mutex<()>>>>,
     > = std::sync::LazyLock::new(Default::default);
@@ -194,6 +196,12 @@ fn mirror_lock(repo_id: i64) -> std::sync::Arc<tokio::sync::Mutex<()>> {
         .clone()
 }
 
+/// Name prefix of repo `repo_id`'s in-progress clone attempts — minted
+/// by the cloning path, matched by the sweep.
+fn partial_prefix(repo_id: i64) -> String {
+    format!("{repo_id}.git.partial")
+}
+
 /// Best-effort removal of wreckage from clone attempts that never made
 /// it into place — crashed workers and rename-race losers leave
 /// `<repo>.git.partial.*` directories behind. Sweeping may also kill a
@@ -202,7 +210,7 @@ fn mirror_lock(repo_id: i64) -> std::sync::Arc<tokio::sync::Mutex<()>> {
 /// result is fenced off anyway, and the queue retries. Within one
 /// process, [`mirror_lock`] keeps concurrent job kinds off each other.
 async fn sweep_stale_partials(cache_dir: &std::path::Path, repo_id: i64) {
-    let prefix = format!("{repo_id}.git.partial");
+    let prefix = partial_prefix(repo_id);
     let Ok(mut entries) = tokio::fs::read_dir(cache_dir).await else {
         return; // no cache dir yet — nothing to sweep
     };

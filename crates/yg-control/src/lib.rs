@@ -177,15 +177,7 @@ impl ControlPlane {
         .bind(repo.slug)
         .execute(&mut *tx)
         .await?;
-        let fetch_queued = sqlx::query(
-            "INSERT INTO jobs (kind, repo_id) VALUES ('fetch', $1)
-             ON CONFLICT (repo_id, kind) WHERE state <> 'done' DO NOTHING",
-        )
-        .bind(repo_id)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected()
-            == 1;
+        let fetch_queued = enqueue_job_unless_in_flight(&mut tx, "fetch", repo_id).await?;
         tx.commit().await?;
         Ok(AddRepoOutcome {
             repo_id,
@@ -280,13 +272,7 @@ impl ControlPlane {
         // If a job is already in flight this no-ops — a queued job will
         // pick the new commit up at claim, and a leased one is re-queued
         // by complete_index when it notices the repo moved on.
-        sqlx::query(
-            "INSERT INTO jobs (kind, repo_id) VALUES ('index', $1)
-             ON CONFLICT (repo_id, kind) WHERE state <> 'done' DO NOTHING",
-        )
-        .bind(job.repo_id)
-        .execute(&mut *tx)
-        .await?;
+        enqueue_job_unless_in_flight(&mut tx, "index", job.repo_id).await?;
         sqlx::query("UPDATE repos SET last_synced_commit = $1 WHERE id = $2")
             .bind(commit)
             .bind(job.repo_id)
@@ -452,6 +438,27 @@ impl ControlPlane {
         sqlx::query("SELECT 1").execute(&self.pool).await?;
         Ok(())
     }
+}
+
+/// Queue a job for the repo unless one of its kind is already in flight
+/// — jobs_one_in_flight_per_repo_kind dedups in-flight work. Returns
+/// whether a new job was queued.
+async fn enqueue_job_unless_in_flight(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    kind: &str,
+    repo_id: i64,
+) -> anyhow::Result<bool> {
+    let queued = sqlx::query(
+        "INSERT INTO jobs (kind, repo_id) VALUES ($1, $2)
+         ON CONFLICT (repo_id, kind) WHERE state <> 'done' DO NOTHING",
+    )
+    .bind(kind)
+    .bind(repo_id)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected()
+        == 1;
+    Ok(queued)
 }
 
 /// Settle a leased job, but only while the caller still holds its lease.

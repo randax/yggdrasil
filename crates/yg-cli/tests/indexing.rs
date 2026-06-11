@@ -241,7 +241,7 @@ async fn the_manifest_records_commit_checksums_counts_and_schema_version() {
         "the manifest must name the indexed commit, got: {manifest}"
     );
     assert_eq!(manifest["schema_version"], yg_shard::SCHEMA_VERSION);
-    assert_eq!(manifest["pass"], "syntactic");
+    assert_eq!(manifest["pass"], yg_shard::SYNTACTIC_PASS);
     assert_eq!(
         manifest["counts"]["nodes"], shard["nodes"],
         "manifest and status must agree on counts"
@@ -307,7 +307,8 @@ async fn every_edge_row_carries_provenance_and_confidence() {
     assert!(!edges.is_empty(), "the Go fixture must yield edges");
     for (src, dst, provenance, confidence) in edges {
         assert_eq!(
-            provenance, "syntactic",
+            provenance,
+            yg_shard::SYNTACTIC_PASS,
             "M0 edges all come from the syntactic pass ({src} → {dst})"
         );
         assert!(
@@ -463,15 +464,13 @@ async fn a_published_manifest_describing_a_different_commit_fails_closed() {
     let bogus = serde_json::json!({
         "schema_version": yg_shard::SCHEMA_VERSION,
         "commit": "deadbeef00000000000000000000000000000000",
-        "pass": "syntactic",
+        "pass": yg_shard::SYNTACTIC_PASS,
         "counts": {"nodes": 999, "edges": 999},
         "segments": {}
     });
     h.store
         .put(
-            &format!("shards/{repo_id}/{revision}/manifest.json")
-                .as_str()
-                .into(),
+            &yg_shard::manifest_key(repo_id, &revision).as_str().into(),
             serde_json::to_vec(&bogus).unwrap().into(),
         )
         .await
@@ -576,9 +575,9 @@ async fn a_commit_fetched_mid_index_still_gets_indexed() {
             &job,
             yg_control::ShardRecord {
                 revision: &revision,
-                manifest_key: &format!("shards/{}/{revision}/manifest.json", job.repo_id),
+                manifest_key: &yg_shard::manifest_key(job.repo_id, &revision),
                 commit_sha: &job.commit,
-                provenance_level: "syntactic",
+                provenance_level: yg_shard::SYNTACTIC_PASS,
                 node_count: 4,
                 edge_count: 2,
             },

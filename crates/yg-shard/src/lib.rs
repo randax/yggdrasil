@@ -187,6 +187,18 @@ pub fn syntactic_revision(commit: &str) -> String {
     format!("{commit}-{SYNTACTIC_PASS}-v{SCHEMA_VERSION}")
 }
 
+/// Object key of a revision's manifest — the one definition of the
+/// Shard layout (RFC 0001 §6), shared by the writer, the reader, and
+/// anything that needs to plant or inspect a Shard.
+pub fn manifest_key(repo_id: i64, revision: &str) -> String {
+    format!("shards/{repo_id}/{revision}/manifest.json")
+}
+
+/// Object key of a revision's graph segment, beside its manifest.
+pub fn graph_segment_key(repo_id: i64, revision: &str) -> String {
+    format!("shards/{repo_id}/{revision}/graph.sqlite")
+}
+
 /// S3-compatible object storage holding the Shards (ADR 0005).
 pub struct ObjectStoreConfig {
     pub endpoint: String,
@@ -237,7 +249,7 @@ pub async fn published_shard(
     commit: &str,
 ) -> anyhow::Result<Option<PublishedShard>> {
     let revision = syntactic_revision(commit);
-    let manifest_key = format!("shards/{repo_id}/{revision}/manifest.json");
+    let manifest_key = manifest_key(repo_id, &revision);
     let bytes = match store.get(&manifest_key.as_str().into()).await {
         Ok(get) => get
             .bytes()
@@ -288,10 +300,9 @@ pub async fn write_shard(
     graph: Graph,
 ) -> anyhow::Result<PublishedShard> {
     let revision = syntactic_revision(commit);
-    let prefix = format!("shards/{repo_id}/{revision}");
-    let manifest_key = format!("{prefix}/manifest.json");
-    let graph_key = object_store::path::Path::from(format!("{prefix}/graph.sqlite"));
-    let counts = Counts {
+    let manifest_key = manifest_key(repo_id, &revision);
+    let graph_key = object_store::path::Path::from(graph_segment_key(repo_id, &revision));
+    let local_counts = Counts {
         nodes: graph.nodes.len() as i64,
         edges: graph.edges.len() as i64,
     };
@@ -299,26 +310,28 @@ pub async fn write_shard(
     let graph_bytes = tokio::task::spawn_blocking(move || build_graph_sqlite(&graph))
         .await
         .context("graph segment build task panicked")??;
+    let local_segment = Segment {
+        sha256: hex::encode(Sha256::digest(&graph_bytes)),
+        bytes: graph_bytes.len() as u64,
+    };
     let create_only = PutOptions {
         mode: PutMode::Create,
         ..Default::default()
     };
-    let segment = match store
+    let (segment, counts) = match store
         .put_opts(
             &graph_key,
-            PutPayload::from(graph_bytes.clone()),
+            PutPayload::from(graph_bytes),
             create_only.clone(),
         )
         .await
     {
-        Ok(_) => Segment {
-            sha256: hex::encode(Sha256::digest(&graph_bytes)),
-            bytes: graph_bytes.len() as u64,
-        },
+        Ok(_) => (local_segment, local_counts),
         // Another publisher beat us to the segment. Same revision should
         // mean same bytes, but the manifest must describe what storage
         // actually holds — a racing worker on a different build (mixed
-        // images mid-deploy) may have written subtly different bytes.
+        // images mid-deploy) may have written subtly different bytes —
+        // so digest AND counts come from the stored artifact.
         Err(object_store::Error::AlreadyExists { .. }) => {
             let stored = store
                 .get(&graph_key)
@@ -327,10 +340,17 @@ pub async fn write_shard(
                 .bytes()
                 .await
                 .context("reading the segment another publisher just wrote")?;
-            Segment {
-                sha256: hex::encode(Sha256::digest(&stored)),
-                bytes: stored.len() as u64,
-            }
+            tokio::task::spawn_blocking(move || -> anyhow::Result<(Segment, Counts)> {
+                let segment = Segment {
+                    sha256: hex::encode(Sha256::digest(&stored)),
+                    bytes: stored.len() as u64,
+                };
+                let counts = read_graph_counts(&stored)
+                    .context("counting the segment another publisher just wrote")?;
+                Ok((segment, counts))
+            })
+            .await
+            .context("segment inspection task panicked")??
         }
         Err(e) => return Err(e).context("uploading the graph segment"),
     };
@@ -369,6 +389,28 @@ pub async fn write_shard(
         node_count: counts.nodes,
         edge_count: counts.edges,
     })
+}
+
+/// Node/edge counts of a serialized graph segment, read back from its
+/// bytes — used when another publisher's artifact, not ours, is the one
+/// in storage.
+fn read_graph_counts(bytes: &[u8]) -> anyhow::Result<Counts> {
+    let dir = tempfile::tempdir().context("creating a scratch dir to inspect a graph segment")?;
+    let path = dir.path().join("graph.sqlite");
+    std::fs::write(&path, bytes).context("staging the graph segment for inspection")?;
+    let conn =
+        rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let counts = conn.query_row(
+        "SELECT (SELECT count(*) FROM nodes), (SELECT count(*) FROM edges)",
+        [],
+        |row| {
+            Ok(Counts {
+                nodes: row.get(0)?,
+                edges: row.get(1)?,
+            })
+        },
+    )?;
+    Ok(counts)
 }
 
 /// Serialize a graph into a single-file SQLite database (SQLite as
