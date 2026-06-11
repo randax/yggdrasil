@@ -32,5 +32,4 @@ rusqlite = "0.39"
 sha2 = "0.11.0"
 sqlx = { version = "0.9.0", default-features = false, features = ["postgres", "runtime-tokio"] }
 tempfile = "3.24.0"
-yg-index = { path = "../yg-index" }
 yg-shard = { path = "../yg-shard" }

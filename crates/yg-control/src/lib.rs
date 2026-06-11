@@ -391,7 +391,7 @@ impl ControlPlane {
         .bind(shard.edge_count)
         .fetch_one(&mut *tx)
         .await?;
-        sqlx::query("UPDATE repos SET current_shard_id = $1, indexed = true WHERE id = $2")
+        sqlx::query("UPDATE repos SET current_shard_id = $1 WHERE id = $2")
             .bind(shard_id)
             .bind(job.repo_id)
             .execute(&mut *tx)
@@ -437,11 +437,13 @@ impl ControlPlane {
         Ok(applied)
     }
 
-    /// How many repos are indexed into the Knowledge Graph.
+    /// How many repos are indexed into the Knowledge Graph: those whose
+    /// current-Shard pointer is set.
     pub async fn indexed_repo_count(&self) -> anyhow::Result<i64> {
-        let (count,): (i64,) = sqlx::query_as("SELECT count(*) FROM repos WHERE indexed")
-            .fetch_one(&self.pool)
-            .await?;
+        let (count,): (i64,) =
+            sqlx::query_as("SELECT count(*) FROM repos WHERE current_shard_id IS NOT NULL")
+                .fetch_one(&self.pool)
+                .await?;
         Ok(count)
     }
 
