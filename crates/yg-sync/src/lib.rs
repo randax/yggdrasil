@@ -127,19 +127,14 @@ impl GitFetcher {
         let local = mirror_path(&self.cache_dir, repo_id);
         let depth_arg = depth.map(|n| format!("--depth={n}"));
         sweep_stale_partials(&self.cache_dir, repo_id).await;
-        // Usable means HEAD resolves to a commit — not merely that a
-        // HEAD file exists. A failed resolve is wreckage (interrupted
-        // clone) or a mirror whose HEAD went dangling after a remote
-        // default-branch rename (--prune deleted the old ref on a sync
-        // that couldn't re-point it); both re-clone rather than fail
-        // every retry forever.
-        let usable = run_git(
-            Some(&local),
-            &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"],
-            None,
-        )
-        .await
-        .is_ok();
+        // Every bare repo has a HEAD file; a directory without one is
+        // wreckage, not a mirror. Deliberately a stat, not a git probe:
+        // a probe conflates "git said no" with "git could not run"
+        // (missing binary, fd pressure) and would delete a healthy
+        // mirror over an environmental blip — and a HEAD that exists
+        // but dangles is healed after the fetch by the re-point below,
+        // not by re-downloading history that would dangle again.
+        let usable = local.join("HEAD").exists();
         if usable {
             let mut args: Vec<&str> = vec!["fetch", "--prune", "--quiet"];
             args.extend(depth_arg.as_deref());
@@ -162,30 +157,48 @@ impl GitFetcher {
             // or silently pin the old branch; re-derive it from the
             // remote on every fetch. Best-effort: the fetch itself
             // succeeded, and a HEAD left dangling fails the resolve
-            // below, after which the next sync re-clones (the usable
-            // check) — so a hiccup here must not fail a healthy fetch.
-            match remote_default_branch(clone_url, token).await {
+            // below loudly — a hiccup here must not fail a healthy
+            // fetch.
+            match remote_head(clone_url, token).await {
                 // Only re-point at a branch this fetch actually brought:
                 // one created-and-made-default after the fetch
                 // enumerated refs would leave HEAD dangling until the
                 // next sync fetches it.
-                Ok(Some(branch)) => {
+                Ok(RemoteHead::Branch(branch)) => {
                     let target = format!("refs/heads/{branch}");
-                    let exists_locally =
-                        run_git(Some(&local), &["rev-parse", "--verify", "--quiet", &target], None)
-                            .await
-                            .is_ok();
-                    if exists_locally {
+                    if git_says_yes(&local, &["rev-parse", "--verify", "--quiet", &target])
+                        .await
+                        .unwrap_or(false)
+                    {
                         run_git(Some(&local), &["symbolic-ref", "HEAD", &target], None)
                             .await
                             .context("re-pointing the mirror's HEAD at the remote default branch")?;
                     }
                 }
-                // A detached remote HEAD (or a server hiding the
-                // symref): keep whatever the mirror has.
-                Ok(None) => {}
+                // The server hides the symref (old protocol, stripping
+                // proxy) but still advertises HEAD's commit. Only when
+                // the mirror's HEAD no longer resolves — never to pin a
+                // healthy symref to today's tip — detach HEAD at that
+                // commit, if the fetch brought it.
+                Ok(RemoteHead::Commit(oid)) => {
+                    let head_resolves =
+                        git_says_yes(&local, &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"])
+                            .await
+                            .unwrap_or(true);
+                    let have_commit =
+                        git_says_yes(&local, &["cat-file", "-e", &format!("{oid}^{{commit}}")])
+                            .await
+                            .unwrap_or(false);
+                    if !head_resolves && have_commit {
+                        run_git(Some(&local), &["update-ref", "--no-deref", "HEAD", &oid], None)
+                            .await
+                            .context("detaching the mirror's dangling HEAD at the remote's HEAD commit")?;
+                    }
+                }
+                // An unborn or hidden remote HEAD: keep what we have.
+                Ok(RemoteHead::Unknown) => {}
                 Err(e) => {
-                    tracing::warn!(%clone_url, error = format!("{e:#}"), "could not read the remote default branch; keeping the mirror's HEAD");
+                    tracing::warn!(%clone_url, error = format!("{e:#}"), "could not read the remote HEAD; keeping the mirror's");
                 }
             }
         } else {
@@ -230,25 +243,56 @@ impl GitFetcher {
         // would be recorded as the synced commit. Fail loudly instead.
         let head = run_git(Some(&local), &["rev-parse", "--verify", "HEAD^{commit}"], None)
             .await
-            .context("resolving the synced commit")?;
+            .context("resolving the synced commit — the remote's HEAD may be unborn or dangling")?;
         Ok(head.trim().to_string())
     }
 }
 
-/// The branch the remote's HEAD points at, via `ls-remote --symref`.
-/// `None` when the remote HEAD is detached or the server hides the
-/// symref.
-async fn remote_default_branch(
-    clone_url: &str,
-    token: Option<&str>,
-) -> anyhow::Result<Option<String>> {
+/// Where a remote's HEAD points, as `ls-remote --symref` advertises it.
+enum RemoteHead {
+    /// The default branch, from the symref capability.
+    Branch(String),
+    /// The server hid the symref but still listed HEAD's commit.
+    Commit(String),
+    /// No HEAD advertised at all (unborn HEAD, empty repo).
+    Unknown,
+}
+
+async fn remote_head(clone_url: &str, token: Option<&str>) -> anyhow::Result<RemoteHead> {
     let out = run_git(None, &["ls-remote", "--symref", clone_url, "HEAD"], token)
         .await
-        .with_context(|| format!("asking {clone_url} for its default branch"))?;
-    Ok(out.lines().find_map(|line| {
+        .with_context(|| format!("asking {clone_url} where its HEAD points"))?;
+    let symref = out.lines().find_map(|line| {
         let target = line.strip_prefix("ref: ")?.strip_suffix("\tHEAD")?;
         Some(target.strip_prefix("refs/heads/")?.to_string())
-    }))
+    });
+    if let Some(branch) = symref {
+        return Ok(RemoteHead::Branch(branch));
+    }
+    let oid = out.lines().find_map(|line| {
+        let oid = line.strip_suffix("\tHEAD")?;
+        (oid.len() >= 40 && oid.bytes().all(|b| b.is_ascii_hexdigit())).then(|| oid.to_string())
+    });
+    Ok(oid.map_or(RemoteHead::Unknown, RemoteHead::Commit))
+}
+
+/// Run git for a yes/no question, `Ok` only when git actually ran. A
+/// git that could not run (missing binary, spawn pressure, timeout) is
+/// an `Err`, never a "no" — callers must not let an environmental blip
+/// answer a question about repository state.
+async fn git_says_yes(dir: &std::path::Path, args: &[&str]) -> anyhow::Result<bool> {
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.arg("-C").arg(dir);
+    cmd.args(args);
+    cmd.kill_on_drop(true);
+    cmd.env("GIT_TERMINAL_PROMPT", "0");
+    cmd.stdout(std::process::Stdio::null());
+    cmd.stderr(std::process::Stdio::null());
+    let status = tokio::time::timeout(GIT_TIMEOUT, cmd.status())
+        .await
+        .map_err(|_| anyhow::anyhow!("git {} timed out", args.first().unwrap_or(&"?")))?
+        .context("running git (is it installed on this worker?)")?;
+    Ok(status.success())
 }
 
 /// Holds one repo's mirror lock; work on the mirror — populating it
@@ -399,12 +443,15 @@ async fn remove_dir_if_present(path: &std::path::Path) -> std::io::Result<()> {
     }
 }
 
-/// Hard cap on a single git invocation, aligned with [`FETCH_LEASE`] —
-/// already "generous" for the worst case, a cold full-history clone. A
-/// git stuck past it (a blackholed connection that never RSTs) would
-/// otherwise hold its worker loop, and the repo's mirror lock, forever;
-/// the timeout drops the future and `kill_on_drop` reaps the child.
-const GIT_TIMEOUT: Duration = FETCH_LEASE;
+/// Last-resort cap on a single git invocation. Network stalls — the
+/// realistic hang, a blackholed connection that never RSTs — are
+/// killed within ~a minute by the low-speed guard in [`run_git`]; this
+/// backstop only fires on non-network hangs (a dead cache filesystem),
+/// so it is sized to never kill a legitimately slow cold clone of a
+/// huge repo. Such a clone outlives its job's lease, but it still
+/// lands the mirror — the re-claimed job then needs only a cheap
+/// fetch. The timeout drops the future and `kill_on_drop` reaps git.
+const GIT_TIMEOUT: Duration = Duration::from_secs(4 * 60 * 60);
 
 /// Run git non-interactively, returning stdout. The Forge token travels
 /// via `GIT_CONFIG_*` environment variables — never the command line
@@ -423,24 +470,32 @@ async fn run_git(
     // process down with it instead of orphaning a half-done clone.
     cmd.kill_on_drop(true);
     cmd.env("GIT_TERMINAL_PROMPT", "0");
+    // Transfers that stall — under 1 KB/s for a minute straight — are
+    // dead connections, not slow ones; have git kill them itself so a
+    // blackholed remote fails the job in ~a minute instead of holding
+    // the worker loop and the mirror lock until GIT_TIMEOUT.
+    let mut config = vec![
+        ("http.lowSpeedLimit", "1024".to_string()),
+        ("http.lowSpeedTime", "60".to_string()),
+    ];
     if let Some(token) = token {
         // GitHub accepts any username with the token as password.
         let basic =
             base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{token}"));
-        cmd.env("GIT_CONFIG_COUNT", "1");
-        cmd.env("GIT_CONFIG_KEY_0", "http.extraHeader");
-        cmd.env(
-            "GIT_CONFIG_VALUE_0",
-            format!("Authorization: Basic {basic}"),
-        );
+        config.push(("http.extraHeader", format!("Authorization: Basic {basic}")));
+    }
+    cmd.env("GIT_CONFIG_COUNT", config.len().to_string());
+    for (i, (key, value)) in config.iter().enumerate() {
+        cmd.env(format!("GIT_CONFIG_KEY_{i}"), key);
+        cmd.env(format!("GIT_CONFIG_VALUE_{i}"), value);
     }
     let out = tokio::time::timeout(GIT_TIMEOUT, cmd.output())
         .await
         .map_err(|_| {
             anyhow::anyhow!(
-                "git {} still running after {} minutes; killed (hung remote?)",
+                "git {} still running after {} hours; killed (hung filesystem?)",
                 args.first().unwrap_or(&"?"),
-                GIT_TIMEOUT.as_secs() / 60
+                GIT_TIMEOUT.as_secs() / 3600
             )
         })?
         .context("running git (is it installed on this worker?)")?;
