@@ -40,6 +40,7 @@ struct Harness {
     _server: yg_api::RunningServer,
     sync: yg_sync::SyncWorker,
     indexer: yg_index::IndexWorker,
+    store: std::sync::Arc<dyn object_store::ObjectStore>,
 }
 
 impl Harness {
@@ -55,7 +56,8 @@ impl Harness {
         let server = serve(config).await.expect("boot");
         let base = format!("http://{}", server.local_addr());
         let sync = yg_sync::SyncWorker::new(control_plane(&db_name).await, &cache);
-        let indexer = yg_index::IndexWorker::new(control_plane(&db_name).await, store, &cache);
+        let indexer =
+            yg_index::IndexWorker::new(control_plane(&db_name).await, store.clone(), &cache);
         Self {
             fixture,
             repo_dir,
@@ -65,6 +67,7 @@ impl Harness {
             _server: server,
             sync,
             indexer,
+            store,
         }
     }
 
@@ -140,4 +143,74 @@ async fn re_indexing_the_same_commit_is_idempotent() {
         .await
         .unwrap();
     assert_eq!(revisions, 1, "one commit, one Shard revision");
+}
+
+#[tokio::test]
+async fn a_new_commit_publishes_a_new_revision_and_never_mutates_the_old_shard() {
+    use object_store::ObjectStoreExt;
+
+    let h = Harness::boot().await;
+    h.add_repo().await;
+    h.sync_and_index().await;
+    let first = h.shard_status().await;
+
+    // Pin the first Shard's bytes before the repo moves on.
+    let pool = sqlx::PgPool::connect(&format!("{DEV_POSTGRES}/{}", h.db_name))
+        .await
+        .unwrap();
+    let (manifest_key,): (String,) = sqlx::query_as("SELECT manifest_key FROM shards")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let graph_key = manifest_key.replace("manifest.json", "graph.sqlite");
+    let bytes_of = |key: String| {
+        let store = h.store.clone();
+        async move {
+            store
+                .get(&key.as_str().into())
+                .await
+                .expect("shard object must exist")
+                .bytes()
+                .await
+                .unwrap()
+        }
+    };
+    let first_manifest = bytes_of(manifest_key.clone()).await;
+    let first_graph = bytes_of(graph_key.clone()).await;
+
+    // The repo grows a function; sync and index pick it up.
+    std::fs::write(
+        h.repo_dir.join("main.go"),
+        "package main\n\nfunc Hello() string {\n\treturn \"hello\"\n}\n\nfunc Bye() string {\n\treturn \"bye\"\n}\n\nfunc main() {\n\tprintln(Hello())\n}\n",
+    )
+    .unwrap();
+    git(&h.repo_dir, &["add", "."]);
+    git(&h.repo_dir, &["commit", "-m", "add Bye"]);
+    h.add_repo().await;
+    h.sync_and_index().await;
+
+    let second = h.shard_status().await;
+    assert_ne!(
+        second["revision"], first["revision"],
+        "a new commit must publish a new Shard revision"
+    );
+    assert_eq!(second["nodes"], 5, "the new Shard sees Bye, got: {second}");
+    assert_eq!(second["edges"], 3, "got: {second}");
+
+    // Both revisions are recorded; the old Shard's objects are untouched.
+    let (revisions,): (i64,) = sqlx::query_as("SELECT count(*) FROM shards")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(revisions, 2, "every published revision stays recorded");
+    assert_eq!(
+        bytes_of(manifest_key).await,
+        first_manifest,
+        "an existing Shard's manifest must never change"
+    );
+    assert_eq!(
+        bytes_of(graph_key).await,
+        first_graph,
+        "an existing Shard's graph segment must never change"
+    );
 }
