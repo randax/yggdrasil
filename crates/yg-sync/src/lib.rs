@@ -127,9 +127,19 @@ impl GitFetcher {
         let local = mirror_path(&self.cache_dir, repo_id);
         let depth_arg = depth.map(|n| format!("--depth={n}"));
         sweep_stale_partials(&self.cache_dir, repo_id).await;
-        // Every bare repo has a HEAD file; a directory without one is
-        // wreckage, not a mirror.
-        let usable = local.join("HEAD").exists();
+        // Usable means HEAD resolves to a commit — not merely that a
+        // HEAD file exists. A failed resolve is wreckage (interrupted
+        // clone) or a mirror whose HEAD went dangling after a remote
+        // default-branch rename (--prune deleted the old ref on a sync
+        // that couldn't re-point it); both re-clone rather than fail
+        // every retry forever.
+        let usable = run_git(
+            Some(&local),
+            &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"],
+            None,
+        )
+        .await
+        .is_ok();
         if usable {
             let mut args: Vec<&str> = vec!["fetch", "--prune", "--quiet"];
             args.extend(depth_arg.as_deref());
@@ -150,16 +160,33 @@ impl GitFetcher {
             // wherever clone set it. After a remote default-branch
             // rename, HEAD would dangle (--prune deleted the old ref)
             // or silently pin the old branch; re-derive it from the
-            // remote on every fetch. None (a detached remote HEAD)
-            // keeps whatever the mirror has.
-            if let Some(branch) = remote_default_branch(clone_url, token).await? {
-                run_git(
-                    Some(&local),
-                    &["symbolic-ref", "HEAD", &format!("refs/heads/{branch}")],
-                    None,
-                )
-                .await
-                .context("re-pointing the mirror's HEAD at the remote default branch")?;
+            // remote on every fetch. Best-effort: the fetch itself
+            // succeeded, and a HEAD left dangling fails the resolve
+            // below, after which the next sync re-clones (the usable
+            // check) — so a hiccup here must not fail a healthy fetch.
+            match remote_default_branch(clone_url, token).await {
+                // Only re-point at a branch this fetch actually brought:
+                // one created-and-made-default after the fetch
+                // enumerated refs would leave HEAD dangling until the
+                // next sync fetches it.
+                Ok(Some(branch)) => {
+                    let target = format!("refs/heads/{branch}");
+                    let exists_locally =
+                        run_git(Some(&local), &["rev-parse", "--verify", "--quiet", &target], None)
+                            .await
+                            .is_ok();
+                    if exists_locally {
+                        run_git(Some(&local), &["symbolic-ref", "HEAD", &target], None)
+                            .await
+                            .context("re-pointing the mirror's HEAD at the remote default branch")?;
+                    }
+                }
+                // A detached remote HEAD (or a server hiding the
+                // symref): keep whatever the mirror has.
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(%clone_url, error = format!("{e:#}"), "could not read the remote default branch; keeping the mirror's HEAD");
+                }
             }
         } else {
             remove_dir_if_present(&local)
@@ -293,12 +320,15 @@ pub async fn lock_mirror(
     })
 }
 
-/// Open (creating if needed) a mirror lock file. Wreckage squatting on
-/// the path — a stray directory, an unopenable file — is discarded and
-/// the open retried once: like the mirrors beside it, the lock file
-/// heals rather than failing the repo's every job forever. A *healthy*
-/// lock file always opens (advisory locks don't block opens), so only
-/// wreckage can be swept here.
+/// Open (creating if needed) a mirror lock file. A stray *directory*
+/// squatting on the path is discarded and the open retried once: like
+/// the mirrors beside it, the lock heals rather than failing the
+/// repo's every job forever. Plain files are never unlinked, however
+/// the open failed — unlink-and-recreate would split the lock across
+/// two inodes, with the old file's holder and the new file's holder
+/// each believing they own the mirror. (A healthy lock file always
+/// opens — advisory locks don't block opens — so this can only cost us
+/// healing exotic file wreckage, which stays a visible per-job error.)
 fn open_lock_file(path: &std::path::Path) -> anyhow::Result<std::fs::File> {
     let open = |path: &std::path::Path| {
         std::fs::OpenOptions::new()
@@ -309,7 +339,6 @@ fn open_lock_file(path: &std::path::Path) -> anyhow::Result<std::fs::File> {
     };
     open(path).or_else(|_| {
         let _ = std::fs::remove_dir_all(path);
-        let _ = std::fs::remove_file(path);
         open(path).with_context(|| format!("opening the mirror lock {}", path.display()))
     })
 }
@@ -370,6 +399,13 @@ async fn remove_dir_if_present(path: &std::path::Path) -> std::io::Result<()> {
     }
 }
 
+/// Hard cap on a single git invocation, aligned with [`FETCH_LEASE`] —
+/// already "generous" for the worst case, a cold full-history clone. A
+/// git stuck past it (a blackholed connection that never RSTs) would
+/// otherwise hold its worker loop, and the repo's mirror lock, forever;
+/// the timeout drops the future and `kill_on_drop` reaps the child.
+const GIT_TIMEOUT: Duration = FETCH_LEASE;
+
 /// Run git non-interactively, returning stdout. The Forge token travels
 /// via `GIT_CONFIG_*` environment variables — never the command line
 /// (visible in `ps`) and never the on-disk config.
@@ -398,9 +434,15 @@ async fn run_git(
             format!("Authorization: Basic {basic}"),
         );
     }
-    let out = cmd
-        .output()
+    let out = tokio::time::timeout(GIT_TIMEOUT, cmd.output())
         .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "git {} still running after {} minutes; killed (hung remote?)",
+                args.first().unwrap_or(&"?"),
+                GIT_TIMEOUT.as_secs() / 60
+            )
+        })?
         .context("running git (is it installed on this worker?)")?;
     if !out.status.success() {
         anyhow::bail!(

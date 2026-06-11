@@ -505,6 +505,60 @@ async fn a_published_manifest_describing_a_different_commit_fails_closed() {
 }
 
 #[tokio::test]
+async fn a_published_manifest_missing_its_graph_segment_fails_closed() {
+    use object_store::ObjectStoreExt;
+
+    let h = Harness::boot().await;
+    h.add_repo().await;
+    assert!(h.sync.run_once().await.unwrap(), "fetch job must run");
+
+    // Right commit, pass, and schema — but no graph segment recorded: a
+    // half-copied bucket, or a repair that re-uploaded the manifest
+    // without its segment. Trusting it would record a Shard whose only
+    // data file doesn't exist, surfacing at first read instead of here.
+    let head = git(&h.repo_dir, &["rev-parse", "HEAD"]);
+    let (repo_id,): (i64,) = sqlx::query_as("SELECT id FROM repos")
+        .fetch_one(&h.pool().await)
+        .await
+        .unwrap();
+    let revision = yg_shard::syntactic_revision(&head);
+    let bogus = serde_json::json!({
+        "schema_version": yg_shard::SCHEMA_VERSION,
+        "commit": head,
+        "pass": yg_shard::SYNTACTIC_PASS,
+        "counts": {"nodes": 0, "edges": 0},
+        "segments": {}
+    });
+    h.store
+        .put(
+            &yg_shard::manifest_key(repo_id, &revision).as_str().into(),
+            serde_json::to_vec(&bogus).unwrap().into(),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        h.indexer
+            .run_once()
+            .await
+            .expect("a failed index run is handled, not an error"),
+        "the job must still be claimed"
+    );
+    let body = admin_status_body(&h.base).await;
+    assert_eq!(
+        body["repos"][0]["shard"],
+        serde_json::Value::Null,
+        "a manifest without its graph segment must not be recorded, got: {body}"
+    );
+    assert!(
+        body["repos"][0]["index"]["last_error"]
+            .as_str()
+            .is_some_and(|e| e.contains("segment")),
+        "the error must point at the missing segment, got: {body}"
+    );
+}
+
+#[tokio::test]
 async fn a_shallow_mirror_that_cannot_reach_the_commit_says_so() {
     let h = Harness::boot().await;
     // Shallow override: the mirror only ever holds the newest commit.
