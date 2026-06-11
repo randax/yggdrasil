@@ -124,6 +124,19 @@ impl IndexWorker {
             .sync(job.repo_id, &clone_url, token.as_deref(), job.fetch_depth)
             .await
             .context("fetching the mirror for indexing")?;
+        // A fetch brings the remote's *current* state, which is not
+        // necessarily the job's commit: a shallow depth override prunes
+        // older commits, and rewritten history drops them entirely. Say
+        // so instead of letting git archive fail cryptically downstream.
+        if !commit_available(&mirror, &job.commit).await {
+            anyhow::bail!(
+                "commit {} is still missing after fetching {clone_url} — \
+                 a shallow fetch depth that no longer reaches it, or \
+                 rewritten history; a future fetch of the repo will \
+                 supersede this job",
+                job.commit
+            );
+        }
         Ok(mirror)
     }
 }
@@ -179,14 +192,23 @@ fn extract_tree(mirror: &Path, commit: &str, dest: &Path) -> anyhow::Result<()> 
     let archive_stderr = stderr_reader
         .join()
         .unwrap_or_else(|_| "stderr reader panicked".to_string());
+    // tar's verdict first: when tar dies (disk full, unwritable dest),
+    // git takes an EPIPE and "fails" with nothing on stderr — blaming
+    // git would hide the actual cause.
+    if !unpack.status.success() {
+        let tar_stderr = String::from_utf8_lossy(&unpack.stderr);
+        let git_said = if archive_status.success() || archive_stderr.trim().is_empty() {
+            String::new()
+        } else {
+            format!(" (git archive: {})", archive_stderr.trim())
+        };
+        anyhow::bail!(
+            "unpacking the checkout failed: {}{git_said}",
+            tar_stderr.trim()
+        );
+    }
     if !archive_status.success() {
         anyhow::bail!("git archive {commit} failed: {}", archive_stderr.trim());
-    }
-    if !unpack.status.success() {
-        anyhow::bail!(
-            "unpacking the checkout failed: {}",
-            String::from_utf8_lossy(&unpack.stderr).trim()
-        );
     }
     Ok(())
 }

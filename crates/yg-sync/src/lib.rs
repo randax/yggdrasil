@@ -107,6 +107,12 @@ impl GitFetcher {
         token: Option<&str>,
         depth: Option<i32>,
     ) -> anyhow::Result<String> {
+        // The Sync loop and an indexing worker's self-heal fetch can hold
+        // valid leases on the same repo at once (one per job kind) and
+        // share this process's cache; unserialized, one's partial-clone
+        // sweep would tear down the other's clone in flight.
+        let lock = mirror_lock(repo_id);
+        let _serialize_same_mirror = lock.lock().await;
         let local = mirror_path(&self.cache_dir, repo_id);
         let depth_arg = depth.map(|n| format!("--depth={n}"));
         sweep_stale_partials(&self.cache_dir, repo_id).await;
@@ -172,12 +178,29 @@ impl GitFetcher {
     }
 }
 
+/// Serializes same-process work on one repo's mirror: the per-kind job
+/// leases don't prevent a fetch job and an index job's self-heal from
+/// running concurrently. Cross-process overlap on a shared cache dir
+/// remains possible only through expired-lease races, as before.
+fn mirror_lock(repo_id: i64) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashMap<i64, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+    > = std::sync::LazyLock::new(Default::default);
+    LOCKS
+        .lock()
+        .expect("mirror lock registry poisoned")
+        .entry(repo_id)
+        .or_default()
+        .clone()
+}
+
 /// Best-effort removal of wreckage from clone attempts that never made
 /// it into place — crashed workers and rename-race losers leave
 /// `<repo>.git.partial.*` directories behind. Sweeping may also kill a
-/// clone another worker is running right now, but only when both hold
+/// clone another *process* is running right now, but only when both hold
 /// the same repo (an expired-lease overlap): that worker fails, its
-/// result is fenced off anyway, and the queue retries.
+/// result is fenced off anyway, and the queue retries. Within one
+/// process, [`mirror_lock`] keeps concurrent job kinds off each other.
 async fn sweep_stale_partials(cache_dir: &std::path::Path, repo_id: i64) {
     let prefix = format!("{repo_id}.git.partial");
     let Ok(mut entries) = tokio::fs::read_dir(cache_dir).await else {

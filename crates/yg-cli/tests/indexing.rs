@@ -443,6 +443,44 @@ async fn an_index_worker_without_the_mirror_fetches_it_itself() {
 }
 
 #[tokio::test]
+async fn a_shallow_mirror_that_cannot_reach_the_commit_says_so() {
+    let h = Harness::boot().await;
+    // Shallow override: the mirror only ever holds the newest commit.
+    post_repo(
+        &h.base,
+        serde_json::json!({"url": h.fixture_url, "depth": 1}),
+    )
+    .await;
+    assert!(h.sync.run_once().await.unwrap(), "fetch job must run");
+
+    // The remote advances — but no new fetch runs — and the cache is
+    // evicted. The self-heal fetch can only reach the NEW tip at depth 1;
+    // the job's commit is unreachable however often it retries.
+    std::fs::write(h.repo_dir.join("extra.go"), "package main\n").unwrap();
+    git(&h.repo_dir, &["add", "."]);
+    git(&h.repo_dir, &["commit", "-m", "extra"]);
+    std::fs::remove_dir_all(&h.cache).unwrap();
+
+    assert!(
+        h.indexer
+            .run_once()
+            .await
+            .expect("a failed index run is handled, not an error"),
+        "the job must still be claimed"
+    );
+
+    let body = admin_status_body(&h.base).await;
+    let error = body["repos"][0]["index"]["last_error"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        error.contains("after fetching"),
+        "the error must say the commit stayed unreachable after the \
+         self-heal fetch (not a cryptic git archive failure), got: {body}"
+    );
+}
+
+#[tokio::test]
 async fn a_commit_fetched_mid_index_still_gets_indexed() {
     let h = Harness::boot().await;
     h.add_repo().await;
