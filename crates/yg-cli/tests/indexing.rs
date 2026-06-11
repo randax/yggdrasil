@@ -32,7 +32,8 @@ fn go_fixture_repo() -> (tempfile::TempDir, std::path::PathBuf, String) {
 /// A booted server plus sync and index workers around one Go fixture
 /// repo: everything an indexing test drives.
 struct Harness {
-    fixture: tempfile::TempDir,
+    /// Held for Drop: owns the fixture repo and git cache on disk.
+    _fixture: tempfile::TempDir,
     repo_dir: std::path::PathBuf,
     fixture_url: String,
     db_name: String,
@@ -59,7 +60,7 @@ impl Harness {
         let indexer =
             yg_index::IndexWorker::new(control_plane(&db_name).await, store.clone(), &cache);
         Self {
-            fixture,
+            _fixture: fixture,
             repo_dir,
             fixture_url,
             db_name,
