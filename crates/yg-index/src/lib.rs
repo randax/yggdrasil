@@ -93,23 +93,28 @@ impl IndexWorker {
         {
             return Ok(published);
         }
-        let graph = {
+        let checkout = tempfile::tempdir().context("creating a scratch checkout dir")?;
+        {
             // Held across both the (possibly self-healing) availability
             // check and the archive read: a concurrent fetch reshaping
             // the mirror between them could yank the commit out from
-            // under git archive.
+            // under git archive. Released before the parse — the pass
+            // reads only the private checkout, and holding the repo's
+            // lock through minutes of parsing would starve its fetches.
             let lock = yg_sync::mirror_lock(job.repo_id);
             let _serialize_same_mirror = lock.lock().await;
             let mirror = self.ensure_mirror_has(job).await?;
-            let checkout = tempfile::tempdir().context("creating a scratch checkout dir")?;
             let commit = job.commit.clone();
             let dest = checkout.path().to_path_buf();
-            tokio::task::spawn_blocking(move || -> anyhow::Result<Graph> {
-                extract_tree(&mirror, &commit, &dest)?;
-                syntactic_pass(&dest)
-            })
-            .await
-            .context("syntactic pass task panicked")??
+            tokio::task::spawn_blocking(move || extract_tree(&mirror, &commit, &dest))
+                .await
+                .context("checkout extraction task panicked")??;
+        }
+        let graph = {
+            let dest = checkout.path().to_path_buf();
+            tokio::task::spawn_blocking(move || syntactic_pass(&dest))
+                .await
+                .context("syntactic pass task panicked")??
         };
         yg_shard::write_shard(self.store.as_ref(), job.repo_id, &job.commit, graph).await
     }
