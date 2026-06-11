@@ -99,6 +99,883 @@ fn test_config(db_name: &str) -> ServerConfig {
 }
 
 #[tokio::test]
+async fn admin_repo_add_registers_repo_and_admin_status_lists_it_queued() {
+    let server = boot_test_server().await;
+    let base = format!("http://{}", server.local_addr());
+
+    let add = post_repo(
+        &base,
+        serde_json::json!({"url": "https://github.com/acme/widgets"}),
+    )
+    .await;
+    assert_eq!(add.status(), 201, "first add must report creation");
+    let body: serde_json::Value = add.json().await.unwrap();
+    assert_eq!(body["slug"], "acme/widgets");
+    assert_eq!(body["created"], true);
+
+    let body = admin_status_body(&base).await;
+    let repos = body["repos"].as_array().expect("repos must be a list");
+    assert_eq!(repos.len(), 1, "the added repo must be listed, got: {body}");
+    assert_eq!(repos[0]["slug"], "acme/widgets");
+    assert_eq!(repos[0]["forge"], "https://github.com");
+    assert_eq!(
+        repos[0]["last_synced_commit"],
+        serde_json::Value::Null,
+        "nothing synced yet"
+    );
+    assert_eq!(
+        repos[0]["sync"]["state"], "queued",
+        "a fetch job must be waiting, got: {body}"
+    );
+}
+
+#[tokio::test]
+async fn admin_repo_add_is_idempotent() {
+    let server = boot_test_server().await;
+    let base = format!("http://{}", server.local_addr());
+
+    let first = post_repo(
+        &base,
+        serde_json::json!({"url": "https://github.com/acme/widgets"}),
+    )
+    .await;
+    assert_eq!(first.status(), 201);
+    let body: serde_json::Value = first.json().await.unwrap();
+    assert_eq!(body["fetch_queued"], true, "first add queues the fetch");
+
+    // Same repo, cosmetically different URL: trailing slash + .git suffix.
+    let again = post_repo(
+        &base,
+        serde_json::json!({"url": "https://github.com/acme/widgets.git/"}),
+    )
+    .await;
+    assert_eq!(again.status(), 200, "re-add must not be a second creation");
+    let body: serde_json::Value = again.json().await.unwrap();
+    assert_eq!(body["created"], false);
+    assert_eq!(body["slug"], "acme/widgets");
+    assert_eq!(
+        body["fetch_queued"], false,
+        "a fetch is already pending — the re-add must say it queued nothing"
+    );
+
+    let body = admin_status_body(&base).await;
+    assert_eq!(
+        body["repos"].as_array().unwrap().len(),
+        1,
+        "re-adding must not register a second repo, got: {body}"
+    );
+}
+
+#[tokio::test]
+async fn admin_repo_add_rejects_urls_that_are_not_repositories() {
+    let server = boot_test_server().await;
+    let base = format!("http://{}", server.local_addr());
+
+    for url in [
+        "not a url",
+        "ssh://github.com/acme/widgets", // unsupported scheme
+        "https://github.com/acme",       // no repo, just an owner
+        "https://github.com",            // no path at all
+    ] {
+        let resp = post_repo(&base, serde_json::json!({"url": url})).await;
+        assert_eq!(resp.status(), 400, "{url:?} must be rejected");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert!(
+            body["error"].as_str().is_some_and(|e| !e.is_empty()),
+            "rejection must say why, got: {body}"
+        );
+    }
+
+    let body = admin_status_body(&base).await;
+    assert_eq!(
+        body["repos"].as_array().unwrap().len(),
+        0,
+        "rejected URLs must not register anything, got: {body}"
+    );
+}
+
+/// The worker-side view of a test database.
+async fn control_plane(db_name: &str) -> yg_control::ControlPlane {
+    yg_control::ControlPlane::connect_and_migrate(&format!("{DEV_POSTGRES}/{db_name}"))
+        .await
+        .unwrap()
+}
+
+/// POST /v1/admin/repos as the test Admin.
+async fn post_repo(base: &str, body: serde_json::Value) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(format!("{base}/v1/admin/repos"))
+        .bearer_auth("ygt_test_token")
+        .json(&body)
+        .send()
+        .await
+        .unwrap()
+}
+
+/// GET /v1/admin/status as the test Admin, parsed.
+async fn admin_status_body(base: &str) -> serde_json::Value {
+    let resp = reqwest::Client::new()
+        .get(format!("{base}/v1/admin/status"))
+        .bearer_auth("ygt_test_token")
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let text = resp.text().await.unwrap();
+    assert!(
+        status.is_success(),
+        "admin status returned {status}: {text}"
+    );
+    serde_json::from_str(&text).expect("admin status must be JSON")
+}
+
+/// Run git in a directory, panicking (with stderr) on failure.
+fn git(dir: &std::path::Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .expect("git must be installed to run the sync tests");
+    assert!(
+        out.status.success(),
+        "git {args:?} failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
+}
+
+/// A local git repository standing in for a Forge-hosted one, addressable
+/// as `file://…/acme/widgets`. Returns (fixture root guard, repo dir, URL).
+fn fixture_repo(commits: usize) -> (tempfile::TempDir, std::path::PathBuf, String) {
+    let root = tempfile::tempdir().unwrap();
+    let repo = root.path().join("fixtures/acme/widgets");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-b", "main"]);
+    git(&repo, &["config", "user.email", "fixture@example.com"]);
+    git(&repo, &["config", "user.name", "Fixture"]);
+    // A developer's global commit.gpgsign=true would make fixture
+    // commits demand a signing key; fixtures must not depend on the
+    // machine's git config.
+    git(&repo, &["config", "commit.gpgsign", "false"]);
+    for n in 1..=commits {
+        std::fs::write(repo.join("README.md"), format!("revision {n}\n")).unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-m", &format!("commit {n}")]);
+    }
+    let url = format!("file://{}", repo.display());
+    (root, repo, url)
+}
+
+#[tokio::test]
+async fn worker_syncs_added_repo_and_status_shows_its_commit() {
+    let (fixture, repo_dir, fixture_url) = fixture_repo(1);
+    let head = git(&repo_dir, &["rev-parse", "HEAD"]);
+
+    let db_name = create_test_db().await;
+    let server = serve(test_config(&db_name)).await.expect("boot");
+    let base = format!("http://{}", server.local_addr());
+
+    let add = post_repo(&base, serde_json::json!({"url": fixture_url})).await;
+    assert_eq!(add.status(), 201);
+
+    let control = control_plane(&db_name).await;
+    let worker = yg_sync::SyncWorker::new(control, fixture.path().join("git-cache"));
+    let worked = worker.run_once().await.expect("sync must not error");
+    assert!(worked, "the queued fetch job must be picked up");
+
+    let body = admin_status_body(&base).await;
+    assert_eq!(
+        body["repos"][0]["last_synced_commit"].as_str(),
+        Some(head.as_str()),
+        "status must show the fixture's HEAD, got: {body}"
+    );
+    assert_eq!(body["repos"][0]["sync"]["state"], "synced");
+
+    assert!(
+        !worker.run_once().await.expect("idle poll must not error"),
+        "queue must be drained after the one job"
+    );
+}
+
+#[tokio::test]
+async fn re_adding_a_synced_repo_queues_a_fresh_fetch_that_picks_up_new_commits() {
+    let (fixture, repo_dir, fixture_url) = fixture_repo(1);
+
+    let db_name = create_test_db().await;
+    let server = serve(test_config(&db_name)).await.expect("boot");
+    let base = format!("http://{}", server.local_addr());
+    let control = control_plane(&db_name).await;
+    let worker = yg_sync::SyncWorker::new(control, fixture.path().join("git-cache"));
+
+    let add = || post_repo(&base, serde_json::json!({"url": fixture_url}));
+    let synced_commit = || async {
+        admin_status_body(&base).await["repos"][0]["last_synced_commit"]
+            .as_str()
+            .map(str::to_string)
+    };
+
+    add().await;
+    assert!(worker.run_once().await.unwrap());
+    let first_head = git(&repo_dir, &["rev-parse", "HEAD"]);
+    assert_eq!(synced_commit().await.as_deref(), Some(first_head.as_str()));
+
+    // The repo moves on the forge; re-adding it requests a fresh sync.
+    std::fs::write(repo_dir.join("README.md"), "revision 2\n").unwrap();
+    git(&repo_dir, &["add", "."]);
+    git(&repo_dir, &["commit", "-m", "commit 2"]);
+    let second_head = git(&repo_dir, &["rev-parse", "HEAD"]);
+
+    let re_add = add().await;
+    let body: serde_json::Value = re_add.json().await.unwrap();
+    assert_eq!(
+        body["fetch_queued"], true,
+        "with the previous fetch done, a re-add queues a fresh one"
+    );
+    assert!(
+        worker.run_once().await.unwrap(),
+        "re-add must queue another fetch for the synced repo"
+    );
+    assert_eq!(
+        synced_commit().await.as_deref(),
+        Some(second_head.as_str()),
+        "the fetch must advance the synced commit"
+    );
+}
+
+#[tokio::test]
+async fn a_vandalized_cache_mirror_heals_on_the_next_sync() {
+    let (fixture, repo_dir, fixture_url) = fixture_repo(2);
+    let head = git(&repo_dir, &["rev-parse", "HEAD"]);
+
+    let db_name = create_test_db().await;
+    let server = serve(test_config(&db_name)).await.expect("boot");
+    let base = format!("http://{}", server.local_addr());
+    let control = control_plane(&db_name).await;
+    let cache = fixture.path().join("git-cache");
+    let worker = yg_sync::SyncWorker::new(control, &cache);
+
+    post_repo(&base, serde_json::json!({"url": fixture_url})).await;
+    assert!(worker.run_once().await.unwrap());
+
+    // A crashed clone, a stray rm, a partial disk: the mirror is junk now.
+    let mirror = std::fs::read_dir(&cache)
+        .unwrap()
+        .next()
+        .expect("mirror must exist")
+        .unwrap()
+        .path();
+    std::fs::remove_dir_all(&mirror).unwrap();
+    std::fs::create_dir_all(mirror.join("not-a-git-repo")).unwrap();
+
+    post_repo(&base, serde_json::json!({"url": fixture_url})).await;
+    assert!(worker.run_once().await.unwrap());
+
+    let body = admin_status_body(&base).await;
+    assert_eq!(
+        body["repos"][0]["sync"]["state"], "synced",
+        "the worker must re-clone over an unusable mirror, got: {body}"
+    );
+    assert_eq!(
+        body["repos"][0]["last_synced_commit"].as_str(),
+        Some(head.as_str())
+    );
+
+    // Worse: the mirror path is now a plain file, not even a directory.
+    std::fs::remove_dir_all(&mirror).unwrap();
+    std::fs::write(&mirror, "wreckage").unwrap();
+
+    post_repo(&base, serde_json::json!({"url": fixture_url})).await;
+    assert!(worker.run_once().await.unwrap());
+
+    let body = admin_status_body(&base).await;
+    assert_eq!(
+        body["repos"][0]["sync"]["state"], "synced",
+        "the worker must re-clone over a file squatting on the mirror path, got: {body}"
+    );
+}
+
+#[tokio::test]
+async fn re_adding_heals_a_forge_row_missing_its_token_env() {
+    let db_name = create_test_db().await;
+    let control = control_plane(&db_name).await;
+    let add = || {
+        control.add_repo(yg_control::AddRepo {
+            forge_kind: "github",
+            base_url: "https://github.com",
+            token_env: Some("YG_GITHUB_TOKEN"),
+            slug: "acme/widgets",
+            fetch_depth: None,
+        })
+    };
+    add().await.unwrap();
+
+    // A degraded forge row — manual insert, older deployment.
+    let pool = sqlx::PgPool::connect(&format!("{DEV_POSTGRES}/{db_name}"))
+        .await
+        .unwrap();
+    sqlx::query("UPDATE forges SET token_env = NULL")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    add().await.unwrap();
+    let job = control
+        .claim_due_fetch(std::time::Duration::from_secs(60))
+        .await
+        .unwrap()
+        .expect("fetch job claimable");
+    assert_eq!(
+        job.token_env.as_deref(),
+        Some("YG_GITHUB_TOKEN"),
+        "re-adding must backfill a missing token_env"
+    );
+}
+
+#[tokio::test]
+async fn stale_partial_clones_are_swept_on_the_next_sync() {
+    let (fixture, _repo_dir, fixture_url) = fixture_repo(1);
+
+    let db_name = create_test_db().await;
+    let server = serve(test_config(&db_name)).await.expect("boot");
+    let base = format!("http://{}", server.local_addr());
+    let control = control_plane(&db_name).await;
+    let cache = fixture.path().join("git-cache");
+    let worker = yg_sync::SyncWorker::new(control, &cache);
+
+    post_repo(&base, serde_json::json!({"url": fixture_url})).await;
+    assert!(worker.run_once().await.unwrap());
+
+    // Wreckage from a crashed clone attempt sits beside the mirror.
+    let mirror_name = std::fs::read_dir(&cache)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .file_name();
+    let stale = cache.join(format!("{}.partial.4242-7", mirror_name.to_string_lossy()));
+    std::fs::create_dir_all(stale.join("objects")).unwrap();
+
+    post_repo(&base, serde_json::json!({"url": fixture_url})).await;
+    assert!(worker.run_once().await.unwrap());
+
+    let leftovers: Vec<String> = std::fs::read_dir(&cache)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains("partial"))
+        .collect();
+    assert_eq!(
+        leftovers,
+        Vec::<String>::new(),
+        "syncing must sweep crashed clone attempts"
+    );
+    assert_eq!(
+        admin_status_body(&base).await["repos"][0]["sync"]["state"],
+        "synced"
+    );
+}
+
+#[tokio::test]
+async fn a_fetch_job_outlives_its_crashed_worker_via_lease_expiry() {
+    let db_name = create_test_db().await;
+    let control = control_plane(&db_name).await;
+    control
+        .add_repo(yg_control::AddRepo {
+            forge_kind: "github",
+            base_url: "https://github.com",
+            token_env: Some("YG_GITHUB_TOKEN"),
+            slug: "acme/widgets",
+            fetch_depth: None,
+        })
+        .await
+        .unwrap();
+
+    // A worker claims the job and crashes: its lease expires instantly.
+    let crashed = control
+        .claim_due_fetch(std::time::Duration::ZERO)
+        .await
+        .unwrap()
+        .expect("the queued job must be claimable");
+
+    // Another worker picks the same job up once the lease is gone…
+    let recovered = control
+        .claim_due_fetch(std::time::Duration::from_secs(60))
+        .await
+        .unwrap()
+        .expect("an expired lease must make the job claimable again");
+    assert_eq!(recovered.job_id, crashed.job_id, "same job, not a copy");
+    assert_eq!(recovered.attempts, 0, "a crash is not a fetch failure");
+
+    // …and while that lease is live, nobody else can.
+    assert!(
+        control
+            .claim_due_fetch(std::time::Duration::from_secs(60))
+            .await
+            .unwrap()
+            .is_none(),
+        "a live lease must block other workers"
+    );
+}
+
+#[tokio::test]
+async fn a_worker_that_outlived_its_lease_cannot_clobber_the_new_claim() {
+    let db_name = create_test_db().await;
+    let control = control_plane(&db_name).await;
+    control
+        .add_repo(yg_control::AddRepo {
+            forge_kind: "github",
+            base_url: "https://github.com",
+            token_env: Some("YG_GITHUB_TOKEN"),
+            slug: "acme/widgets",
+            fetch_depth: None,
+        })
+        .await
+        .unwrap();
+
+    // Worker A stalls long enough for its lease to lapse; worker B takes
+    // over the job.
+    let stale = control
+        .claim_due_fetch(std::time::Duration::ZERO)
+        .await
+        .unwrap()
+        .expect("claimable");
+    let fresh = control
+        .claim_due_fetch(std::time::Duration::from_secs(60))
+        .await
+        .unwrap()
+        .expect("expired lease must be claimable");
+
+    // A finally finishes — too late. Its result must be discarded.
+    assert!(
+        !control
+            .complete_fetch(&stale, "deadbeef0000000000000000000000000000dead")
+            .await
+            .unwrap(),
+        "a stale completion must report that it was discarded"
+    );
+    let repos = control.admin_status().await.unwrap();
+    assert_eq!(
+        repos[0].last_synced_commit, None,
+        "a stale completion must not advance the synced commit"
+    );
+    assert_eq!(
+        repos[0].job_state.as_deref(),
+        Some("leased"),
+        "the job must still belong to worker B"
+    );
+
+    // A stale failure must not reset B's job either.
+    assert!(
+        !control.fail_fetch(&stale, "boom").await.unwrap(),
+        "a stale failure must report that it was discarded"
+    );
+    let repos = control.admin_status().await.unwrap();
+    assert_eq!(repos[0].attempts, 0, "stale failure must not count");
+    assert_eq!(repos[0].job_state.as_deref(), Some("leased"));
+
+    // B's own completion still lands.
+    assert!(
+        control
+            .complete_fetch(&fresh, "feedface0000000000000000000000000000feed")
+            .await
+            .unwrap(),
+        "the live lease holder's completion must apply"
+    );
+    let repos = control.admin_status().await.unwrap();
+    assert_eq!(
+        repos[0].last_synced_commit.as_deref(),
+        Some("feedface0000000000000000000000000000feed")
+    );
+}
+
+#[tokio::test]
+async fn admin_repo_add_rejects_non_positive_depth() {
+    let server = boot_test_server().await;
+    let base = format!("http://{}", server.local_addr());
+
+    for depth in [0, -3] {
+        let resp = post_repo(
+            &base,
+            serde_json::json!({"url": "https://github.com/acme/widgets", "depth": depth}),
+        )
+        .await;
+        assert_eq!(resp.status(), 400, "depth {depth} must be rejected");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert!(
+            body["error"].as_str().is_some_and(|e| e.contains("depth")),
+            "the error must name depth, got: {body}"
+        );
+    }
+
+    let body = admin_status_body(&base).await;
+    assert_eq!(
+        body["repos"].as_array().unwrap().len(),
+        0,
+        "a rejected depth must not register the repo, got: {body}"
+    );
+
+    // The CLI rejects it before the request even leaves.
+    let cli = assert_cmd::Command::cargo_bin("yg")
+        .unwrap()
+        .env("YG_SERVER", &base)
+        .env("YG_TOKEN", "ygt_test_token")
+        .args([
+            "admin",
+            "repo",
+            "add",
+            "https://github.com/acme/widgets",
+            "--depth",
+            "0",
+        ])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8(cli.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("depth") || stderr.contains("--depth"),
+        "clap must reject depth 0, got:\n{stderr}"
+    );
+}
+
+#[tokio::test]
+async fn failing_fetches_surface_their_error_and_back_off_exponentially() {
+    let fixture = tempfile::tempdir().unwrap();
+    // Valid URL shape, but nothing lives there.
+    let bad_url = format!("file://{}/gone/acme/widgets", fixture.path().display());
+
+    let db_name = create_test_db().await;
+    let server = serve(test_config(&db_name)).await.expect("boot");
+    let base = format!("http://{}", server.local_addr());
+    let db_url = format!("{DEV_POSTGRES}/{db_name}");
+    let control = control_plane(&db_name).await;
+    let worker = yg_sync::SyncWorker::new(control, fixture.path().join("git-cache"));
+
+    post_repo(&base, serde_json::json!({"url": bad_url})).await;
+    assert!(
+        worker
+            .run_once()
+            .await
+            .expect("a failed fetch is handled, not an error"),
+        "the job must still be claimed"
+    );
+
+    let body = admin_status_body(&base).await;
+    let sync = &body["repos"][0]["sync"];
+    assert_eq!(sync["state"], "retrying", "got: {body}");
+    assert_eq!(sync["attempts"], 1);
+    assert!(
+        sync["last_error"]
+            .as_str()
+            .is_some_and(|e| e.contains("clon")),
+        "the error must say what failed, got: {body}"
+    );
+
+    let control = control_plane(&db_name).await;
+    assert!(
+        control
+            .claim_due_fetch(std::time::Duration::from_secs(60))
+            .await
+            .unwrap()
+            .is_none(),
+        "a failed job must not be due again immediately"
+    );
+
+    // Backoff must grow: time-travel the job back to due, fail it again,
+    // and compare the scheduled delays.
+    let pool = sqlx::PgPool::connect(&db_url).await.unwrap();
+    let first_delay: f64 = delay_seconds(&pool).await;
+    sqlx::query("UPDATE jobs SET run_after = now()")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(
+        worker.run_once().await.unwrap(),
+        "due again after time travel"
+    );
+    let second_delay: f64 = delay_seconds(&pool).await;
+    assert!(
+        second_delay > first_delay * 1.5,
+        "backoff must grow per failure: first {first_delay}s, second {second_delay}s"
+    );
+}
+
+/// Seconds until the single queued job is due again.
+async fn delay_seconds(pool: &sqlx::PgPool) -> f64 {
+    let (delay,): (f64,) =
+        sqlx::query_as("SELECT extract(epoch FROM run_after - now())::float8 FROM jobs")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    delay
+}
+
+#[tokio::test]
+async fn depth_override_clones_shallow_while_default_keeps_full_history() {
+    let (fixture, repo_dir, fixture_url) = fixture_repo(3);
+    let head = git(&repo_dir, &["rev-parse", "HEAD"]);
+
+    let db_name = create_test_db().await;
+    let server = serve(test_config(&db_name)).await.expect("boot");
+    let base = format!("http://{}", server.local_addr());
+    let control = control_plane(&db_name).await;
+    let cache = fixture.path().join("git-cache");
+    let worker = yg_sync::SyncWorker::new(control, &cache);
+
+    let commit_count_in_cache = |cache: std::path::PathBuf| {
+        // The cache holds one bare mirror per synced repo; with a single
+        // repo added, the single entry is it.
+        let mirror = std::fs::read_dir(&cache)
+            .unwrap()
+            .next()
+            .expect("the worker must have cloned into the cache")
+            .unwrap()
+            .path();
+        git(&mirror, &["rev-list", "--count", "HEAD"])
+    };
+
+    post_repo(&base, serde_json::json!({"url": fixture_url, "depth": 1})).await;
+    assert!(worker.run_once().await.unwrap());
+
+    let body = admin_status_body(&base).await;
+    assert_eq!(
+        body["repos"][0]["last_synced_commit"].as_str(),
+        Some(head.as_str()),
+        "shallow still syncs the tip, got: {body}"
+    );
+    assert_eq!(
+        commit_count_in_cache(cache.clone()),
+        "1",
+        "depth=1 must clone only the tip commit"
+    );
+
+    // The same fixture without an override mirrors all of history.
+    let (fixture_full, _full_repo_dir, full_url) = fixture_repo(3);
+    let full_cache = fixture_full.path().join("git-cache");
+    let control = control_plane(&db_name).await;
+    let full_worker = yg_sync::SyncWorker::new(control, &full_cache);
+    post_repo(&base, serde_json::json!({"url": full_url})).await;
+    assert!(full_worker.run_once().await.unwrap());
+    assert_eq!(
+        commit_count_in_cache(full_cache),
+        "3",
+        "no override must fetch full history"
+    );
+}
+
+#[tokio::test]
+async fn removing_the_depth_override_restores_full_history() {
+    let (fixture, _repo_dir, fixture_url) = fixture_repo(3);
+
+    let db_name = create_test_db().await;
+    let server = serve(test_config(&db_name)).await.expect("boot");
+    let base = format!("http://{}", server.local_addr());
+    let control = control_plane(&db_name).await;
+    let cache = fixture.path().join("git-cache");
+    let worker = yg_sync::SyncWorker::new(control, &cache);
+
+    post_repo(&base, serde_json::json!({"url": fixture_url, "depth": 1})).await;
+    assert!(worker.run_once().await.unwrap());
+
+    let mirror = std::fs::read_dir(&cache)
+        .unwrap()
+        .next()
+        .expect("mirror must exist")
+        .unwrap()
+        .path();
+    assert_eq!(
+        git(&mirror, &["rev-list", "--count", "HEAD"]),
+        "1",
+        "the override starts the mirror shallow"
+    );
+
+    // Dropping the override goes back to the default: full history.
+    post_repo(&base, serde_json::json!({"url": fixture_url})).await;
+    assert!(worker.run_once().await.unwrap());
+    assert_eq!(
+        git(&mirror, &["rev-list", "--count", "HEAD"]),
+        "3",
+        "without the override the mirror must deepen to full history"
+    );
+}
+
+/// multi_thread: the yg binary blocks this thread while the in-process
+/// server it queries runs on the same test runtime.
+#[tokio::test(flavor = "multi_thread")]
+async fn yg_admin_repo_add_and_admin_status_drive_the_admin_surface() {
+    let server = boot_test_server().await;
+    let env = [
+        ("YG_SERVER", format!("http://{}", server.local_addr())),
+        ("YG_TOKEN", "ygt_test_token".into()),
+    ];
+
+    let add = assert_cmd::Command::cargo_bin("yg")
+        .unwrap()
+        .envs(env.iter().cloned())
+        .args(["admin", "repo", "add", "https://github.com/acme/widgets"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(add.get_output().stdout.clone()).unwrap();
+    assert!(
+        stdout.contains("registered") && stdout.contains("acme/widgets"),
+        "add must confirm what it did, got:\n{stdout}"
+    );
+
+    let re_add = assert_cmd::Command::cargo_bin("yg")
+        .unwrap()
+        .envs(env.iter().cloned())
+        .args(["admin", "repo", "add", "https://github.com/acme/widgets"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(re_add.get_output().stdout.clone()).unwrap();
+    assert!(
+        stdout.contains("already registered"),
+        "re-add must say the repo was known, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("already pending"),
+        "re-add must not claim it queued a fetch when one is pending, got:\n{stdout}"
+    );
+
+    let status = assert_cmd::Command::cargo_bin("yg")
+        .unwrap()
+        .envs(env.iter().cloned())
+        .args(["admin", "status"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(status.get_output().stdout.clone()).unwrap();
+    assert!(
+        stdout.contains("acme/widgets") && stdout.contains("queued"),
+        "status must list the repo with its sync state, got:\n{stdout}"
+    );
+
+    let json = assert_cmd::Command::cargo_bin("yg")
+        .unwrap()
+        .envs(env.iter().cloned())
+        .args(["admin", "status", "--json"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(json.get_output().stdout.clone()).unwrap();
+    let body: serde_json::Value =
+        serde_json::from_str(&stdout).expect("--json output must be valid JSON");
+    assert_eq!(body["repos"][0]["slug"], "acme/widgets");
+    assert_eq!(body["repos"][0]["sync"]["state"], "queued");
+
+    let rejected = assert_cmd::Command::cargo_bin("yg")
+        .unwrap()
+        .envs(env.iter().cloned())
+        .args(["admin", "repo", "add", "https://github.com/just-an-owner"])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8(rejected.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("owner/repo"),
+        "a rejected URL must explain itself, got:\n{stderr}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn yg_serve_role_all_syncs_an_added_repo_without_a_separate_worker() {
+    use std::io::BufRead;
+
+    let (fixture, repo_dir, fixture_url) = fixture_repo(1);
+    let head = git(&repo_dir, &["rev-parse", "HEAD"]);
+
+    let db_name = create_test_db().await;
+    let child = std::process::Command::new(assert_cmd::cargo::cargo_bin("yg"))
+        .env("YG_LISTEN", "127.0.0.1:0")
+        .env("YG_DATABASE_URL", format!("{DEV_POSTGRES}/{db_name}"))
+        .env("YG_BOOTSTRAP_TOKEN", "ygt_test_token")
+        .env("YG_GIT_CACHE", fixture.path().join("git-cache"))
+        .args(["serve", "--role=all"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut server = KillOnDrop(child);
+    let stdout = server.0.stdout.take().unwrap();
+    let first_line = std::io::BufReader::new(stdout)
+        .lines()
+        .next()
+        .expect("yg serve must announce its address")
+        .unwrap();
+    let url = first_line
+        .strip_prefix("listening on ")
+        .unwrap()
+        .to_string();
+
+    assert_cmd::Command::cargo_bin("yg")
+        .unwrap()
+        .env("YG_SERVER", &url)
+        .env("YG_TOKEN", "ygt_test_token")
+        .args(["admin", "repo", "add", &fixture_url])
+        .assert()
+        .success();
+
+    // The in-process worker picks the job up on its own; no worker
+    // process, no manual nudge.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let body = admin_status_body(&url).await;
+        if body["repos"][0]["last_synced_commit"].as_str() == Some(head.as_str()) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "repo never synced; last status: {body}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
+#[tokio::test]
+async fn yg_serve_role_worker_drains_the_queue_without_serving_http() {
+    let (fixture, repo_dir, fixture_url) = fixture_repo(1);
+    let head = git(&repo_dir, &["rev-parse", "HEAD"]);
+
+    let db_name = create_test_db().await;
+    let db_url = format!("{DEV_POSTGRES}/{db_name}");
+    let control = control_plane(&db_name).await;
+    let locator = fixture_url.strip_prefix("file://").unwrap();
+    let (base, slug) = locator.rsplit_once("/acme/").unwrap();
+    control
+        .add_repo(yg_control::AddRepo {
+            forge_kind: "git",
+            base_url: &format!("file://{base}"),
+            token_env: None,
+            slug: &format!("acme/{slug}"),
+            fetch_depth: None,
+        })
+        .await
+        .unwrap();
+
+    // Worker role: no HTTP, no bootstrap token — just the queue.
+    let child = std::process::Command::new(assert_cmd::cargo::cargo_bin("yg"))
+        .env_remove("YG_BOOTSTRAP_TOKEN")
+        .env("YG_DATABASE_URL", &db_url)
+        .env("YG_GIT_CACHE", fixture.path().join("git-cache"))
+        .args(["serve", "--role=worker"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let _worker = KillOnDrop(child);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let repos = control.admin_status().await.unwrap();
+        if repos[0].last_synced_commit.as_deref() == Some(head.as_str()) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "worker never synced the repo; last state: {:?} after {:?} attempts",
+            repos[0].job_state,
+            repos[0].attempts
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
+#[tokio::test]
 async fn requests_without_a_valid_token_get_401_except_health() {
     let server = boot_test_server().await;
     let base = format!("http://{}", server.local_addr());

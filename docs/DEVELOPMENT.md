@@ -40,13 +40,32 @@ which is required:
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `YG_BOOTSTRAP_TOKEN` | — (required) | Bootstrap Admin bearer token |
+| `YG_BOOTSTRAP_TOKEN` | — (required for api/all) | Bootstrap Admin bearer token |
 | `YG_LISTEN` | `127.0.0.1:7311` | Server bind address |
 | `YG_DATABASE_URL` | dev compose Postgres | Control-plane database |
 | `YG_S3_ENDPOINT` | `http://localhost:9000` | Object storage endpoint |
 | `YG_S3_BUCKET` | `yggdrasil` | Shard bucket |
 | `YG_S3_ACCESS_KEY` / `YG_S3_SECRET_KEY` | `yggdrasil` / `yggdrasil` | Object storage credentials |
 | `YG_S3_REGION` | `us-east-1` | Object storage region |
+| `YG_GIT_CACHE` | `./data/git` | Worker-local cache of bare clones |
+| `YG_GITHUB_TOKEN` | — (optional) | Forge token for `github.com` Sync |
+
+`yg serve --role=api|worker|all` picks what the process runs: `api` serves
+HTTP only, `worker` drains the Sync queue only (it needs the control plane
+and a git cache, but no bootstrap token and no listen address), and `all`
+runs both in one process.
+
+### Forge token scope
+
+Sync only ever reads from a Forge — give it read-only credentials. For
+GitHub, use a **fine-grained personal access token** with *Contents:
+Read-only* (and *Metadata: Read-only*, which GitHub adds automatically) on
+the repositories you sync. Classic tokens can't express read-only access to
+private repositories (`repo` grants write), so prefer fine-grained. Public
+repositories sync without any token, within GitHub's anonymous rate limits.
+The worker passes the token to git per invocation (HTTP header via
+process-local config); it is never written to disk or stored in the control
+plane.
 
 The CLI talks to a server via `YG_SERVER` (default `http://127.0.0.1:7311`)
 and `YG_TOKEN`.
@@ -57,7 +76,10 @@ End to end from a clean checkout:
 docker compose up -d --wait
 export YG_BOOTSTRAP_TOKEN=ygt_dev_$(whoami)
 cargo run -p yg-cli -- serve --role=all &
-YG_TOKEN=$YG_BOOTSTRAP_TOKEN cargo run -p yg-cli -- status
+export YG_TOKEN=$YG_BOOTSTRAP_TOKEN
+cargo run -p yg-cli -- status
+cargo run -p yg-cli -- admin repo add https://github.com/octocat/Hello-World
+cargo run -p yg-cli -- admin status   # shows the synced commit once fetched
 ```
 
 `GET /healthz` (no token) reports per-dependency readiness; every `/v1`
