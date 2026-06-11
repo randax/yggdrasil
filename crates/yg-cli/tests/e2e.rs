@@ -195,12 +195,7 @@ async fn a_vandalized_cache_mirror_heals_on_the_next_sync() {
     assert!(worker.run_once().await.unwrap());
 
     // A crashed clone, a stray rm, a partial disk: the mirror is junk now.
-    let mirror = std::fs::read_dir(&cache)
-        .unwrap()
-        .next()
-        .expect("mirror must exist")
-        .unwrap()
-        .path();
+    let mirror = only_mirror(&cache);
     std::fs::remove_dir_all(&mirror).unwrap();
     std::fs::create_dir_all(mirror.join("not-a-git-repo")).unwrap();
 
@@ -283,12 +278,7 @@ async fn stale_partial_clones_are_swept_on_the_next_sync() {
     assert!(worker.run_once().await.unwrap());
 
     // Wreckage from a crashed clone attempt sits beside the mirror.
-    let mirror_name = std::fs::read_dir(&cache)
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .file_name();
+    let mirror_name = only_mirror(&cache).file_name().unwrap().to_owned();
     let stale = cache.join(format!("{}.partial.4242-7", mirror_name.to_string_lossy()));
     std::fs::create_dir_all(stale.join("objects")).unwrap();
 
@@ -556,17 +546,8 @@ async fn depth_override_clones_shallow_while_default_keeps_full_history() {
     let cache = fixture.path().join("git-cache");
     let worker = yg_sync::SyncWorker::new(control, &cache);
 
-    let commit_count_in_cache = |cache: std::path::PathBuf| {
-        // The cache holds one bare mirror per synced repo; with a single
-        // repo added, the single entry is it.
-        let mirror = std::fs::read_dir(&cache)
-            .unwrap()
-            .next()
-            .expect("the worker must have cloned into the cache")
-            .unwrap()
-            .path();
-        git(&mirror, &["rev-list", "--count", "HEAD"])
-    };
+    let commit_count_in_cache =
+        |cache: std::path::PathBuf| git(&only_mirror(&cache), &["rev-list", "--count", "HEAD"]);
 
     post_repo(&base, serde_json::json!({"url": fixture_url, "depth": 1})).await;
     assert!(worker.run_once().await.unwrap());
@@ -611,12 +592,7 @@ async fn removing_the_depth_override_restores_full_history() {
     post_repo(&base, serde_json::json!({"url": fixture_url, "depth": 1})).await;
     assert!(worker.run_once().await.unwrap());
 
-    let mirror = std::fs::read_dir(&cache)
-        .unwrap()
-        .next()
-        .expect("mirror must exist")
-        .unwrap()
-        .path();
+    let mirror = only_mirror(&cache);
     assert_eq!(
         git(&mirror, &["rev-list", "--count", "HEAD"]),
         "1",
@@ -710,33 +686,15 @@ async fn yg_admin_repo_add_and_admin_status_drive_the_admin_surface() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn yg_serve_role_all_syncs_an_added_repo_without_a_separate_worker() {
-    use std::io::BufRead;
-
     let (fixture, repo_dir, fixture_url) = fixture_repo(1);
     let head = git(&repo_dir, &["rev-parse", "HEAD"]);
 
     let db_name = create_test_db().await;
-    let child = std::process::Command::new(assert_cmd::cargo::cargo_bin("yg"))
-        .env("YG_LISTEN", "127.0.0.1:0")
-        .env("YG_DATABASE_URL", format!("{DEV_POSTGRES}/{db_name}"))
-        .env("YG_BOOTSTRAP_TOKEN", "ygt_test_token")
-        .env("YG_GIT_CACHE", fixture.path().join("git-cache"))
-        .args(["serve", "--role=all"])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .unwrap();
-    let mut server = KillOnDrop(child);
-    let stdout = server.0.stdout.take().unwrap();
-    let first_line = std::io::BufReader::new(stdout)
-        .lines()
-        .next()
-        .expect("yg serve must announce its address")
-        .unwrap();
-    let url = first_line
-        .strip_prefix("listening on ")
-        .unwrap()
-        .to_string();
+    let (_server, url) = spawn_yg_serve(|cmd| {
+        cmd.env("YG_DATABASE_URL", format!("{DEV_POSTGRES}/{db_name}"))
+            .env("YG_BOOTSTRAP_TOKEN", "ygt_test_token")
+            .env("YG_GIT_CACHE", fixture.path().join("git-cache"));
+    });
 
     assert_cmd::Command::cargo_bin("yg")
         .unwrap()
@@ -1018,39 +976,13 @@ async fn health_degrades_to_503_when_a_dependency_dies() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn yg_serve_boots_from_env_and_answers_yg_status_end_to_end() {
-    use std::io::BufRead;
-
     let db_name = create_test_db().await;
-    let child = std::process::Command::new(assert_cmd::cargo::cargo_bin("yg"))
-        .env("YG_LISTEN", "127.0.0.1:0")
-        .env("YG_DATABASE_URL", format!("{DEV_POSTGRES}/{db_name}"))
-        // Padded on purpose: env files commonly leak whitespace around
-        // secrets; clients present the clean token below.
-        .env("YG_BOOTSTRAP_TOKEN", " ygt_test_token\n")
-        .args(["serve", "--role=all"])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut server = KillOnDrop(child);
-
-    let stdout = server.0.stdout.take().unwrap();
-    let first_line = match std::io::BufReader::new(stdout).lines().next() {
-        Some(line) => line.unwrap(),
-        None => {
-            use std::io::Read;
-            let _ = server.0.kill();
-            let mut stderr = String::new();
-            if let Some(mut err) = server.0.stderr.take() {
-                let _ = err.read_to_string(&mut stderr);
-            }
-            panic!("yg serve exited without announcing its address; stderr:\n{stderr}");
-        }
-    };
-    let url = first_line
-        .strip_prefix("listening on ")
-        .unwrap_or_else(|| panic!("unexpected announcement: {first_line}"))
-        .to_string();
+    let (_server, url) = spawn_yg_serve(|cmd| {
+        cmd.env("YG_DATABASE_URL", format!("{DEV_POSTGRES}/{db_name}"))
+            // Padded on purpose: env files commonly leak whitespace
+            // around secrets; clients present the clean token below.
+            .env("YG_BOOTSTRAP_TOKEN", " ygt_test_token\n");
+    });
 
     assert_cmd::Command::cargo_bin("yg")
         .unwrap()

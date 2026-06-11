@@ -227,6 +227,12 @@ async fn workers_from_env() -> anyhow::Result<(yg_sync::SyncWorker, yg_index::In
     let git_cache = std::env::var("YG_GIT_CACHE").unwrap_or_else(|_| "./data/git".to_string());
     let control = yg_control::ControlPlane::connect_and_migrate(&database_url).await?;
     let store = yg_api::ObjectStoreConfig::from_env().connect()?;
+    // Fail at boot, not on every index job: connect() never touches the
+    // network, so this probe is the first thing that would notice a
+    // missing or wrong YG_S3_* configuration.
+    yg_api::probe_object_store(store.as_ref())
+        .await
+        .context("object storage unreachable at worker boot")?;
     Ok((
         yg_sync::SyncWorker::new(control.clone(), &git_cache),
         yg_index::IndexWorker::new(control, store, &git_cache),

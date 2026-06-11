@@ -167,15 +167,13 @@ pub struct Segment {
 }
 
 /// A Shard that made it to object storage, ready to be recorded in the
-/// control plane.
+/// control plane. Commit and pass aren't carried: both entry points
+/// fail closed unless the manifest matches the commit the caller asked
+/// about and [`SYNTACTIC_PASS`], so the caller already holds them.
 #[derive(Debug, Clone)]
 pub struct PublishedShard {
     pub revision: String,
     pub manifest_key: String,
-    pub commit: String,
-    /// The pass that produced it (`provenance_level` in the control
-    /// plane) — carried from the manifest so callers never re-assert it.
-    pub pass: String,
     pub node_count: i64,
     pub edge_count: i64,
 }
@@ -239,10 +237,24 @@ impl ObjectStoreConfig {
     }
 }
 
+/// Cheap reachability check that distinguishes "bucket missing or
+/// unreachable" from "bucket empty": a delimited list succeeds on an
+/// empty bucket but errors when the bucket doesn't exist. Every process
+/// that touches Shards probes at boot — [`ObjectStoreConfig::connect`]
+/// never goes near the network, so a misconfigured endpoint otherwise
+/// boots cleanly and fails every job instead.
+pub async fn probe_object_store(store: &dyn ObjectStore) -> anyhow::Result<()> {
+    store.list_with_delimiter(None).await?;
+    Ok(())
+}
+
 /// The Shard already published for `commit` at the current schema
 /// version, if any — read back from its manifest, so the returned counts
 /// describe the artifact actually in storage, not whatever a fresh run
 /// of the pass would produce.
+///
+/// Syntactic-pass only, like [`write_shard`]: M1's precise pass brings
+/// its own entry points rather than a pass parameter guessed at now.
 pub async fn published_shard(
     store: &dyn ObjectStore,
     repo_id: i64,
@@ -279,20 +291,18 @@ pub async fn published_shard(
     Ok(Some(PublishedShard {
         revision,
         manifest_key,
-        commit: manifest.commit,
-        pass: manifest.pass,
         node_count: manifest.counts.nodes,
         edge_count: manifest.counts.edges,
     }))
 }
 
-/// Write a Shard for `commit` of repo `repo_id`: the graph segment, then
-/// the manifest. The manifest goes last — its presence marks a complete
-/// Shard, so a write that dies half-way leaves garbage, never a torn
-/// artifact. Published Shards are immutable: every put is create-only
-/// (If-None-Match), so even a stale lease holder racing a fresh one can
-/// never overwrite published objects, and an already-published revision
-/// is returned as-is.
+/// Write a syntactic-pass Shard for `commit` of repo `repo_id`: the
+/// graph segment, then the manifest. The manifest goes last — its
+/// presence marks a complete Shard, so a write that dies half-way leaves
+/// garbage, never a torn artifact. Published Shards are immutable: every
+/// put is create-only (If-None-Match), so even a stale lease holder
+/// racing a fresh one can never overwrite published objects, and an
+/// already-published revision is returned as-is.
 pub async fn write_shard(
     store: &dyn ObjectStore,
     repo_id: i64,
@@ -307,13 +317,19 @@ pub async fn write_shard(
         edges: graph.edges.len() as i64,
     };
 
-    let graph_bytes = tokio::task::spawn_blocking(move || build_graph_sqlite(&graph))
+    // Build and digest together off the runtime threads: hashing a large
+    // artifact is as blocking as building it.
+    let (graph_bytes, local_segment) =
+        tokio::task::spawn_blocking(move || -> anyhow::Result<(Vec<u8>, Segment)> {
+            let bytes = build_graph_sqlite(&graph)?;
+            let segment = Segment {
+                sha256: hex::encode(Sha256::digest(&bytes)),
+                bytes: bytes.len() as u64,
+            };
+            Ok((bytes, segment))
+        })
         .await
         .context("graph segment build task panicked")??;
-    let local_segment = Segment {
-        sha256: hex::encode(Sha256::digest(&graph_bytes)),
-        bytes: graph_bytes.len() as u64,
-    };
     let create_only = PutOptions {
         mode: PutMode::Create,
         ..Default::default()
@@ -327,12 +343,17 @@ pub async fn write_shard(
         .await
     {
         Ok(_) => (local_segment, local_counts),
-        // Another publisher beat us to the segment. Same revision should
-        // mean same bytes, but the manifest must describe what storage
-        // actually holds — a racing worker on a different build (mixed
-        // images mid-deploy) may have written subtly different bytes —
-        // so digest AND counts come from the stored artifact.
+        // Another publisher beat us to the segment. When its manifest
+        // landed too, the published Shard is the whole answer — done,
+        // without re-reading the artifact. Otherwise the manifest is
+        // ours to write, and it must describe what storage actually
+        // holds — a racing worker on a different build (mixed images
+        // mid-deploy) may have written subtly different bytes — so
+        // digest AND counts come from the stored artifact.
         Err(object_store::Error::AlreadyExists { .. }) => {
+            if let Some(published) = published_shard(store, repo_id, commit).await? {
+                return Ok(published);
+            }
             let stored = store
                 .get(&graph_key)
                 .await
@@ -384,8 +405,6 @@ pub async fn write_shard(
     Ok(PublishedShard {
         revision,
         manifest_key,
-        commit: commit.to_string(),
-        pass: SYNTACTIC_PASS.to_string(),
         node_count: counts.nodes,
         edge_count: counts.edges,
     })

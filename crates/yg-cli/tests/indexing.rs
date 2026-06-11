@@ -101,12 +101,15 @@ impl Harness {
         key
     }
 
-    /// The recorded Shard's graph-segment key, derived the same way the
-    /// reader will: beside its manifest.
+    /// The recorded Shard's graph-segment key, derived by the layout's
+    /// one definition rather than re-encoded here.
     async fn graph_key(&self) -> String {
-        self.manifest_key()
-            .await
-            .replace("manifest.json", "graph.sqlite")
+        let (repo_id, revision): (i64, String) =
+            sqlx::query_as("SELECT repo_id, revision FROM shards")
+                .fetch_one(&self.pool().await)
+                .await
+                .unwrap();
+        yg_shard::graph_segment_key(repo_id, &revision)
     }
 
     /// Raw bytes of one Shard object.
@@ -326,13 +329,7 @@ async fn a_failing_index_job_surfaces_its_error_backs_off_and_recovers() {
 
     // The worst case: the cache mirror is evicted AND the forge is
     // unreachable, so the worker can neither use nor refetch the mirror.
-    let mirror = std::fs::read_dir(&h.cache)
-        .unwrap()
-        .next()
-        .expect("the fetch must have left a mirror")
-        .unwrap()
-        .path();
-    std::fs::remove_dir_all(&mirror).unwrap();
+    std::fs::remove_dir_all(only_mirror(&h.cache)).unwrap();
     let hidden_origin = h.repo_dir.with_file_name("gadgets-offline");
     std::fs::rename(&h.repo_dir, &hidden_origin).unwrap();
 
@@ -643,31 +640,13 @@ async fn yg_admin_status_shows_the_shard_revision_and_counts() {
 /// HTTP client polls it from the same test runtime.
 #[tokio::test(flavor = "multi_thread")]
 async fn yg_serve_role_all_indexes_an_added_repo_end_to_end() {
-    use std::io::BufRead;
-
     let (fixture, _repo_dir, fixture_url) = go_fixture_repo();
     let db_name = create_test_db().await;
-    let child = std::process::Command::new(assert_cmd::cargo::cargo_bin("yg"))
-        .env("YG_LISTEN", "127.0.0.1:0")
-        .env("YG_DATABASE_URL", format!("{DEV_POSTGRES}/{db_name}"))
-        .env("YG_BOOTSTRAP_TOKEN", "ygt_test_token")
-        .env("YG_GIT_CACHE", fixture.path().join("git-cache"))
-        .args(["serve", "--role=all"])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .unwrap();
-    let mut server = KillOnDrop(child);
-    let stdout = server.0.stdout.take().unwrap();
-    let first_line = std::io::BufReader::new(stdout)
-        .lines()
-        .next()
-        .expect("yg serve must announce its address")
-        .unwrap();
-    let url = first_line
-        .strip_prefix("listening on ")
-        .unwrap()
-        .to_string();
+    let (_server, url) = spawn_yg_serve(|cmd| {
+        cmd.env("YG_DATABASE_URL", format!("{DEV_POSTGRES}/{db_name}"))
+            .env("YG_BOOTSTRAP_TOKEN", "ygt_test_token")
+            .env("YG_GIT_CACHE", fixture.path().join("git-cache"));
+    });
 
     post_repo(&url, serde_json::json!({"url": fixture_url})).await;
 

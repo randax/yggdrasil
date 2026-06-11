@@ -146,6 +146,66 @@ impl Drop for KillOnDrop {
     }
 }
 
+/// Spawn `yg serve --role=all` as a real process, wait for its address
+/// announcement, and return the kill guard plus base URL. `configure`
+/// adds the test's environment on top of `YG_LISTEN=127.0.0.1:0`. A
+/// server that dies before announcing panics with its stderr instead of
+/// an opaque unwrap; a live one has its stderr drained on a thread so a
+/// chatty run can never fill the pipe and block.
+pub fn spawn_yg_serve(
+    configure: impl FnOnce(&mut std::process::Command),
+) -> (KillOnDrop, String) {
+    use std::io::{BufRead, Read};
+    let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin("yg"));
+    cmd.env("YG_LISTEN", "127.0.0.1:0");
+    configure(&mut cmd);
+    let child = cmd
+        .args(["serve", "--role=all"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut server = KillOnDrop(child);
+    let mut stderr = server.0.stderr.take().unwrap();
+    let stderr_drain = std::thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = stderr.read_to_string(&mut buf);
+        buf
+    });
+    let stdout = server.0.stdout.take().unwrap();
+    let first_line = match std::io::BufReader::new(stdout).lines().next() {
+        Some(line) => line.unwrap(),
+        None => {
+            let _ = server.0.kill();
+            let stderr = stderr_drain.join().unwrap_or_default();
+            panic!("yg serve exited without announcing its address; stderr:\n{stderr}");
+        }
+    };
+    let url = first_line
+        .strip_prefix("listening on ")
+        .unwrap_or_else(|| panic!("unexpected announcement: {first_line}"))
+        .to_string();
+    (server, url)
+}
+
+/// The one repo mirror inside a worker's git cache. The cache root
+/// holds a `<id>.git` dir per synced repo beside lock files and,
+/// mid-clone, partial dirs — and these tests sync exactly one repo.
+pub fn only_mirror(cache: &std::path::Path) -> std::path::PathBuf {
+    let mirrors: Vec<_> = std::fs::read_dir(cache)
+        .expect("the worker must have created its git cache")
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.is_dir() && path.extension().is_some_and(|ext| ext == "git"))
+        .collect();
+    match mirrors.as_slice() {
+        [mirror] => mirror.clone(),
+        other => panic!(
+            "expected exactly one mirror in {}, found {other:?}",
+            cache.display()
+        ),
+    }
+}
+
 /// Run git in a directory, panicking (with stderr) on failure.
 pub fn git(dir: &std::path::Path, args: &[&str]) -> String {
     let out = std::process::Command::new("git")

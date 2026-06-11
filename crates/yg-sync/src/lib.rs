@@ -35,13 +35,17 @@ impl SyncWorker {
         };
         let clone_url = join_clone_url(&job.base_url, &job.slug);
         let token = forge_token(job.token_env.as_deref(), &clone_url);
-        let lock = mirror_lock(job.repo_id);
-        let _serialize_same_mirror = lock.lock().await;
-        match self
-            .fetcher
-            .sync(job.repo_id, &clone_url, token.as_deref(), job.fetch_depth)
-            .await
-        {
+        // A lock failure (cache dir on a dead disk) is a failed fetch,
+        // not a dead worker: record it and let backoff retry.
+        let synced = async {
+            let _serialize_same_mirror =
+                lock_mirror(self.fetcher.cache_dir(), job.repo_id).await?;
+            self.fetcher
+                .sync(job.repo_id, &clone_url, token.as_deref(), job.fetch_depth)
+                .await
+        }
+        .await;
+        match synced {
             Ok(commit) => {
                 if self.control.complete_fetch(&job, &commit).await? {
                     tracing::info!(slug = %job.slug, %commit, "synced");
@@ -95,6 +99,12 @@ impl GitFetcher {
         }
     }
 
+    /// The cache dir this fetcher mirrors into — what [`lock_mirror`]
+    /// guards and [`mirror_path`] resolves against.
+    pub fn cache_dir(&self) -> &std::path::Path {
+        &self.cache_dir
+    }
+
     /// Bare-clone `clone_url` on first sight, fetch it afterwards; either
     /// way the cache ends at the remote's current state. Returns the
     /// commit the remote's default branch points at.
@@ -103,9 +113,10 @@ impl GitFetcher {
     /// deletion) is discarded and re-cloned rather than left to fail
     /// every retry forever.
     ///
-    /// Callers hold the repo's [`mirror_lock`] across this call (and any
-    /// reads of the mirror they do around it) — the lock is not taken
-    /// here so a caller can keep it across a fetch-then-read sequence.
+    /// Callers hold the repo's [`lock_mirror`] guard across this call
+    /// (and any reads of the mirror they do around it) — the lock is not
+    /// taken here so a caller can keep it across a fetch-then-read
+    /// sequence.
     pub async fn sync(
         &self,
         repo_id: i64,
@@ -179,12 +190,54 @@ impl GitFetcher {
     }
 }
 
-/// Serializes same-process work on one repo's mirror — populating it
-/// *and* reading it (`git archive` mid-fetch sees half a mirror). The
-/// per-kind job leases don't prevent a fetch job and an index job from
-/// running concurrently on one repo. Cross-process overlap on a shared
-/// cache dir remains possible only through expired-lease races.
-pub fn mirror_lock(repo_id: i64) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+/// Holds one repo's mirror lock; work on the mirror — populating it
+/// *and* reading it — happens only under a live guard.
+pub struct MirrorGuard {
+    /// The OS releases the advisory lock when the file closes — guard
+    /// drop and worker crash alike.
+    _lock_file: std::fs::File,
+    _serialize_in_process: tokio::sync::OwnedMutexGuard<()>,
+}
+
+/// Serializes work on one repo's mirror — populating it *and* reading
+/// it (`git archive` mid-fetch sees half a mirror). The per-kind job
+/// leases don't prevent a fetch job and an index job from running
+/// concurrently on one repo, in one process or in two sharing a cache
+/// dir; two layers close both: an in-process mutex, then an advisory
+/// file lock beside the mirror. Advisory locks are unreliable on
+/// network filesystems — give a shared cache a local disk.
+pub async fn lock_mirror(
+    cache_dir: &std::path::Path,
+    repo_id: i64,
+) -> anyhow::Result<MirrorGuard> {
+    // In-process contenders queue on the mutex, so at most one task per
+    // process parks a blocking thread on the file lock below.
+    let in_process = mirror_mutex(repo_id).lock_owned().await;
+    let lock_path = cache_dir.join(format!("{repo_id}.git.lock"));
+    let cache_dir = cache_dir.to_path_buf();
+    let lock_file = tokio::task::spawn_blocking(move || -> anyhow::Result<std::fs::File> {
+        std::fs::create_dir_all(&cache_dir).context("creating the git cache directory")?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false) // the file carries no content, only the lock
+            .write(true)
+            .open(&lock_path)
+            .with_context(|| format!("opening the mirror lock {}", lock_path.display()))?;
+        file.lock()
+            .with_context(|| format!("locking the mirror lock {}", lock_path.display()))?;
+        Ok(file)
+    })
+    .await
+    .context("mirror lock task panicked")??;
+    Ok(MirrorGuard {
+        _lock_file: lock_file,
+        _serialize_in_process: in_process,
+    })
+}
+
+/// The in-process layer of [`lock_mirror`]. Entries are tiny and live
+/// for the process — a registry of every repo this worker ever touched.
+fn mirror_mutex(repo_id: i64) -> std::sync::Arc<tokio::sync::Mutex<()>> {
     static LOCKS: std::sync::LazyLock<
         std::sync::Mutex<std::collections::HashMap<i64, std::sync::Arc<tokio::sync::Mutex<()>>>>,
     > = std::sync::LazyLock::new(Default::default);
@@ -204,11 +257,10 @@ fn partial_prefix(repo_id: i64) -> String {
 
 /// Best-effort removal of wreckage from clone attempts that never made
 /// it into place — crashed workers and rename-race losers leave
-/// `<repo>.git.partial.*` directories behind. Sweeping may also kill a
-/// clone another *process* is running right now, but only when both hold
-/// the same repo (an expired-lease overlap): that worker fails, its
-/// result is fenced off anyway, and the queue retries. Within one
-/// process, [`mirror_lock`] keeps concurrent job kinds off each other.
+/// `<repo>.git.partial.*` directories behind. Callers run under the
+/// repo's [`lock_mirror`] guard, which keeps every live clone (this
+/// process or another sharing the cache) out of the sweep — only
+/// attempts that already died can match.
 async fn sweep_stale_partials(cache_dir: &std::path::Path, repo_id: i64) {
     let prefix = partial_prefix(repo_id);
     let Ok(mut entries) = tokio::fs::read_dir(cache_dir).await else {

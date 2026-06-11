@@ -17,7 +17,7 @@ use tokio::task::JoinHandle;
 use yg_control::ControlPlane;
 // Server config embeds the object-store half owned by yg-shard; clients
 // of this crate keep addressing it as `yg_api::ObjectStoreConfig`.
-pub use yg_shard::ObjectStoreConfig;
+pub use yg_shard::{ObjectStoreConfig, probe_object_store};
 use yg_sync::RepoLocator;
 
 pub struct ServerConfig {
@@ -131,14 +131,6 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<RunningServer> {
     });
 
     Ok(RunningServer { local_addr, handle })
-}
-
-/// Cheap reachability check that distinguishes "bucket missing/unreachable"
-/// from "bucket empty": a delimited list succeeds on an empty bucket but
-/// errors when the bucket doesn't exist.
-async fn probe_object_store(store: &dyn ObjectStore) -> anyhow::Result<()> {
-    store.list_with_delimiter(None).await?;
-    Ok(())
 }
 
 /// Every route — existing or not — requires the bootstrap Admin token;

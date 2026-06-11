@@ -14,8 +14,13 @@ use yg_control::ControlPlane;
 use yg_shard::{Edge, EdgeKind, Graph, Node, Provenance};
 
 /// How long a worker may hold an index job before a crashed run becomes
-/// claimable again. The syntactic pass targets minutes (RFC 0001 §4).
-const INDEX_LEASE: Duration = Duration::from_secs(15 * 60);
+/// claimable again. Budgeted for the worst case the path actually does:
+/// self-healing the mirror — a cold full-history clone, the whole of
+/// FETCH_LEASE's budget — plus checkout extraction plus the parse
+/// (minutes, RFC 0001 §4). An overrun loses no result — write_shard
+/// publishes before the fence, so a re-claim answers from storage — but
+/// it does buy a duplicate cold clone on another host.
+const INDEX_LEASE: Duration = Duration::from_secs(30 * 60);
 
 /// An indexing worker: drains the index queue, running the syntactic
 /// pass over synced checkouts and publishing Shards.
@@ -54,8 +59,8 @@ impl IndexWorker {
                         yg_control::ShardRecord {
                             revision: &shard.revision,
                             manifest_key: &shard.manifest_key,
-                            commit_sha: &shard.commit,
-                            provenance_level: &shard.pass,
+                            commit_sha: &job.commit,
+                            provenance_level: yg_shard::SYNTACTIC_PASS,
                             node_count: shard.node_count,
                             edge_count: shard.edge_count,
                         },
@@ -101,8 +106,8 @@ impl IndexWorker {
             // under git archive. Released before the parse — the pass
             // reads only the private checkout, and holding the repo's
             // lock through minutes of parsing would starve its fetches.
-            let lock = yg_sync::mirror_lock(job.repo_id);
-            let _serialize_same_mirror = lock.lock().await;
+            let _serialize_same_mirror =
+                yg_sync::lock_mirror(&self.git_cache, job.repo_id).await?;
             let mirror = self.ensure_mirror_has(job).await?;
             let commit = job.commit.clone();
             let dest = checkout.path().to_path_buf();
@@ -190,7 +195,10 @@ fn extract_tree(mirror: &Path, commit: &str, dest: &Path) -> anyhow::Result<()> 
         buf
     });
     let unpack = Command::new("tar")
-        .arg("-x")
+        // -f - pins the archive to stdin: without it, an inherited TAPE
+        // env var (or an odd compiled-in default) makes tar ignore the
+        // pipe entirely.
+        .args(["-x", "-f", "-"])
         .arg("-C")
         .arg(dest)
         .stdin(Stdio::from(
@@ -365,16 +373,27 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<FileEntry>) -> anyhow::R
         if file_type.is_dir() {
             collect_files(root, &entry.path(), out)?;
         } else {
-            let path = entry
-                .path()
-                .strip_prefix(root)
-                .expect("walk stays under root")
+            let full = entry.path();
+            let relative = full.strip_prefix(root).expect("walk stays under root");
+            // A non-UTF-8 name can't round-trip through the graph's
+            // string ids — converting it lossily would point the id at a
+            // path that doesn't exist (and could collide with a sibling
+            // differing only in the invalid bytes). Skip such entries;
+            // skipping is deterministic, so identical trees still yield
+            // identical artifacts.
+            let Some(components) = relative
                 .components()
-                .map(|c| c.as_os_str().to_string_lossy().into_owned())
-                .collect::<Vec<_>>()
-                .join("/");
+                .map(|c| c.as_os_str().to_str())
+                .collect::<Option<Vec<_>>>()
+            else {
+                tracing::warn!(
+                    path = %relative.display(),
+                    "skipping a checkout path that is not valid UTF-8"
+                );
+                continue;
+            };
             out.push(FileEntry {
-                path,
+                path: components.join("/"),
                 is_symlink: file_type.is_symlink(),
             });
         }

@@ -223,29 +223,17 @@ impl ControlPlane {
         &self,
         lease: std::time::Duration,
     ) -> anyhow::Result<Option<LeasedFetch>> {
-        let row = sqlx::query_as(
-            // `state <> 'done'` looks implied by the OR below (done rows
-            // have lease_until NULL), but the planner needs the partial
-            // index predicate verbatim to use jobs_claim_scan.
-            "WITH due AS (
-                 SELECT id FROM jobs
-                 WHERE kind = 'fetch' AND state <> 'done' AND run_after <= now()
-                   AND (state = 'queued' OR lease_until < now())
-                 ORDER BY priority DESC, run_after
-                 LIMIT 1
-                 FOR UPDATE SKIP LOCKED
-             )
-             UPDATE jobs j
-             SET state = 'leased', lease_until = now() + make_interval(secs => $1)
-             FROM due, repos r JOIN forges f ON f.id = r.forge_id
-             WHERE j.id = due.id AND r.id = j.repo_id
-             RETURNING j.id AS job_id, j.repo_id, j.attempts,
-                       r.slug, r.fetch_depth, f.base_url, f.token_env,
-                       j.lease_until::text AS lease_token",
-        )
-        .bind(lease.as_secs_f64())
-        .fetch_optional(&self.pool)
-        .await?;
+        // AssertSqlSafe: assembled from string constants in this file,
+        // no external input.
+        let sql = sqlx::AssertSqlSafe(claim_due_sql(
+            "fetch",
+            "",
+            "r.slug, r.fetch_depth, f.base_url, f.token_env",
+        ));
+        let row = sqlx::query_as(sql)
+            .bind(lease.as_secs_f64())
+            .fetch_optional(&self.pool)
+            .await?;
         Ok(row)
     }
 
@@ -300,31 +288,18 @@ impl ControlPlane {
         &self,
         lease: std::time::Duration,
     ) -> anyhow::Result<Option<LeasedIndex>> {
-        let row = sqlx::query_as(
-            // As in claim_due_fetch: `state <> 'done'` must appear
-            // verbatim — the planner needs the partial index predicate
-            // spelled out to use jobs_claim_scan.
-            "WITH due AS (
-                 SELECT j.id FROM jobs j JOIN repos r ON r.id = j.repo_id
-                 WHERE j.kind = 'index' AND j.state <> 'done' AND j.run_after <= now()
-                   AND (j.state = 'queued' OR j.lease_until < now())
-                   AND r.last_synced_commit IS NOT NULL
-                 ORDER BY j.priority DESC, j.run_after
-                 LIMIT 1
-                 FOR UPDATE OF j SKIP LOCKED
-             )
-             UPDATE jobs j
-             SET state = 'leased', lease_until = now() + make_interval(secs => $1)
-             FROM due, repos r JOIN forges f ON f.id = r.forge_id
-             WHERE j.id = due.id AND r.id = j.repo_id
-             RETURNING j.id AS job_id, j.repo_id, j.attempts,
-                       r.slug, r.last_synced_commit AS commit,
-                       f.base_url, f.token_env, r.fetch_depth,
-                       j.lease_until::text AS lease_token",
-        )
-        .bind(lease.as_secs_f64())
-        .fetch_optional(&self.pool)
-        .await?;
+        // AssertSqlSafe: assembled from string constants in this file,
+        // no external input.
+        let sql = sqlx::AssertSqlSafe(claim_due_sql(
+            "index",
+            "AND r.last_synced_commit IS NOT NULL",
+            "r.slug, r.last_synced_commit AS commit,
+             f.base_url, f.token_env, r.fetch_depth",
+        ));
+        let row = sqlx::query_as(sql)
+            .bind(lease.as_secs_f64())
+            .fetch_optional(&self.pool)
+            .await?;
         Ok(row)
     }
 
@@ -377,11 +352,24 @@ impl ControlPlane {
         .bind(shard.edge_count)
         .fetch_one(&mut *tx)
         .await?;
-        sqlx::query("UPDATE repos SET current_shard_id = $1 WHERE id = $2")
-            .bind(shard_id)
-            .bind(job.repo_id)
-            .execute(&mut *tx)
-            .await?;
+        // Swap the current-Shard pointer. A superseded result still
+        // swaps — serving a stale Shard while the re-queued job runs
+        // beats serving none — except when the pointer already holds the
+        // synced head's Shard: exactly-current must never move backward
+        // (a force-push to an older commit racing its own undo).
+        sqlx::query(
+            "UPDATE repos SET current_shard_id = $1
+             WHERE id = $2
+               AND ($3 OR current_shard_id IS NULL OR NOT EXISTS (
+                       SELECT 1 FROM shards s
+                       WHERE s.id = repos.current_shard_id
+                         AND s.commit_sha = repos.last_synced_commit))",
+        )
+        .bind(shard_id)
+        .bind(job.repo_id)
+        .bind(up_to_date)
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         Ok(true)
     }
@@ -438,6 +426,34 @@ impl ControlPlane {
         sqlx::query("SELECT 1").execute(&self.pool).await?;
         Ok(())
     }
+}
+
+/// The one lease-claim query, shared by every job kind so the claim
+/// protocol can't drift between kinds. `$1` is the lease in seconds.
+/// `state <> 'done'` looks implied by the queued-or-expired OR (done
+/// rows have lease_until NULL), but the planner needs the partial index
+/// predicate verbatim to use jobs_claim_scan. The lease_until::text
+/// rendering is the fencing token settle/fail compare against. Kind,
+/// an extra due-predicate (over jobs `j` and repos `r`), and the extra
+/// RETURNING columns are the only legitimate variation.
+fn claim_due_sql(kind: &str, extra_due_predicate: &str, returning: &str) -> String {
+    format!(
+        "WITH due AS (
+             SELECT j.id FROM jobs j JOIN repos r ON r.id = j.repo_id
+             WHERE j.kind = '{kind}' AND j.state <> 'done' AND j.run_after <= now()
+               AND (j.state = 'queued' OR j.lease_until < now())
+               {extra_due_predicate}
+             ORDER BY j.priority DESC, j.run_after
+             LIMIT 1
+             FOR UPDATE OF j SKIP LOCKED
+         )
+         UPDATE jobs j
+         SET state = 'leased', lease_until = now() + make_interval(secs => $1)
+         FROM due, repos r JOIN forges f ON f.id = r.forge_id
+         WHERE j.id = due.id AND r.id = j.repo_id
+         RETURNING j.id AS job_id, j.repo_id, j.attempts, {returning},
+                   j.lease_until::text AS lease_token"
+    )
 }
 
 /// Queue a job for the repo unless one of its kind is already in flight
