@@ -10,31 +10,13 @@ use yg_api::serve;
 /// A Go repo fixture standing in for a Forge-hosted one: two functions in
 /// main.go plus a README. Returns (fixture root guard, repo dir, URL).
 fn go_fixture_repo() -> (tempfile::TempDir, std::path::PathBuf, String) {
-    let root = tempfile::tempdir().unwrap();
-    let repo = root.path().join("fixtures/acme/gadgets");
-    std::fs::create_dir_all(&repo).unwrap();
-    git(&repo, &["init", "-b", "main"]);
-    git(&repo, &["config", "user.email", "fixture@example.com"]);
-    git(&repo, &["config", "user.name", "Fixture"]);
-    git(&repo, &["config", "commit.gpgsign", "false"]);
-    std::fs::write(
-        repo.join("main.go"),
-        "package main\n\nfunc Hello() string {\n\treturn \"hello\"\n}\n\nfunc main() {\n\tprintln(Hello())\n}\n",
-    )
-    .unwrap();
-    // The tempdir path makes the initial commit sha unique per test:
-    // Shard keys derive from (repo_id, commit), repo_id is 1 in every
-    // fresh test database, and the tests share one MinIO bucket — two
-    // tests minting the same sha would read each other's Shards.
-    std::fs::write(
-        repo.join("README.md"),
-        format!("# gadgets ({})\n", repo.display()),
-    )
-    .unwrap();
-    git(&repo, &["add", "."]);
-    git(&repo, &["commit", "-m", "initial"]);
-    let url = format!("file://{}", repo.display());
-    (root, repo, url)
+    fixture_repo_with(&[
+        (
+            "main.go",
+            "package main\n\nfunc Hello() string {\n\treturn \"hello\"\n}\n\nfunc main() {\n\tprintln(Hello())\n}\n",
+        ),
+        ("README.md", "# gadgets\n"),
+    ])
 }
 
 /// A booted server plus sync and index workers around one Go fixture
@@ -102,6 +84,43 @@ impl Harness {
     async fn shard_status(&self) -> serde_json::Value {
         admin_status_body(&self.base).await["repos"][0]["shard"].clone()
     }
+
+    /// A pool on the harness database, for SQL-level assertions.
+    async fn pool(&self) -> sqlx::PgPool {
+        sqlx::PgPool::connect(&format!("{DEV_POSTGRES}/{}", self.db_name))
+            .await
+            .unwrap()
+    }
+
+    /// The recorded Shard's manifest key (single-shard tests only).
+    async fn manifest_key(&self) -> String {
+        let (key,): (String,) = sqlx::query_as("SELECT manifest_key FROM shards")
+            .fetch_one(&self.pool().await)
+            .await
+            .unwrap();
+        key
+    }
+
+    /// The recorded Shard's graph-segment key, derived the same way the
+    /// reader will: beside its manifest.
+    async fn graph_key(&self) -> String {
+        self.manifest_key()
+            .await
+            .replace("manifest.json", "graph.sqlite")
+    }
+
+    /// Raw bytes of one Shard object.
+    async fn object_bytes(&self, key: &str) -> Vec<u8> {
+        use object_store::ObjectStoreExt;
+        self.store
+            .get(&object_store::path::Path::from(key))
+            .await
+            .unwrap_or_else(|e| panic!("shard object {key} must exist: {e}"))
+            .bytes()
+            .await
+            .unwrap()
+            .to_vec()
+    }
 }
 
 #[tokio::test]
@@ -146,11 +165,8 @@ async fn re_indexing_the_same_commit_is_idempotent() {
 
     // Idempotent means no second revision was recorded, not merely that
     // the pointer looks the same.
-    let pool = sqlx::PgPool::connect(&format!("{DEV_POSTGRES}/{}", h.db_name))
-        .await
-        .unwrap();
     let (revisions,): (i64,) = sqlx::query_as("SELECT count(*) FROM shards")
-        .fetch_one(&pool)
+        .fetch_one(&h.pool().await)
         .await
         .unwrap();
     assert_eq!(revisions, 1, "one commit, one Shard revision");
@@ -158,36 +174,16 @@ async fn re_indexing_the_same_commit_is_idempotent() {
 
 #[tokio::test]
 async fn a_new_commit_publishes_a_new_revision_and_never_mutates_the_old_shard() {
-    use object_store::ObjectStoreExt;
-
     let h = Harness::boot().await;
     h.add_repo().await;
     h.sync_and_index().await;
     let first = h.shard_status().await;
 
     // Pin the first Shard's bytes before the repo moves on.
-    let pool = sqlx::PgPool::connect(&format!("{DEV_POSTGRES}/{}", h.db_name))
-        .await
-        .unwrap();
-    let (manifest_key,): (String,) = sqlx::query_as("SELECT manifest_key FROM shards")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    let graph_key = manifest_key.replace("manifest.json", "graph.sqlite");
-    let bytes_of = |key: String| {
-        let store = h.store.clone();
-        async move {
-            store
-                .get(&key.as_str().into())
-                .await
-                .expect("shard object must exist")
-                .bytes()
-                .await
-                .unwrap()
-        }
-    };
-    let first_manifest = bytes_of(manifest_key.clone()).await;
-    let first_graph = bytes_of(graph_key.clone()).await;
+    let manifest_key = h.manifest_key().await;
+    let graph_key = h.graph_key().await;
+    let first_manifest = h.object_bytes(&manifest_key).await;
+    let first_graph = h.object_bytes(&graph_key).await;
 
     // The repo grows a function; sync and index pick it up.
     std::fs::write(
@@ -210,17 +206,17 @@ async fn a_new_commit_publishes_a_new_revision_and_never_mutates_the_old_shard()
 
     // Both revisions are recorded; the old Shard's objects are untouched.
     let (revisions,): (i64,) = sqlx::query_as("SELECT count(*) FROM shards")
-        .fetch_one(&pool)
+        .fetch_one(&h.pool().await)
         .await
         .unwrap();
     assert_eq!(revisions, 2, "every published revision stays recorded");
     assert_eq!(
-        bytes_of(manifest_key).await,
+        h.object_bytes(&manifest_key).await,
         first_manifest,
         "an existing Shard's manifest must never change"
     );
     assert_eq!(
-        bytes_of(graph_key).await,
+        h.object_bytes(&graph_key).await,
         first_graph,
         "an existing Shard's graph segment must never change"
     );
@@ -228,7 +224,6 @@ async fn a_new_commit_publishes_a_new_revision_and_never_mutates_the_old_shard()
 
 #[tokio::test]
 async fn the_manifest_records_commit_checksums_counts_and_schema_version() {
-    use object_store::ObjectStoreExt;
     use sha2::Digest;
 
     let h = Harness::boot().await;
@@ -237,22 +232,7 @@ async fn the_manifest_records_commit_checksums_counts_and_schema_version() {
     h.sync_and_index().await;
 
     let shard = h.shard_status().await;
-    let pool = sqlx::PgPool::connect(&format!("{DEV_POSTGRES}/{}", h.db_name))
-        .await
-        .unwrap();
-    let (manifest_key,): (String,) = sqlx::query_as("SELECT manifest_key FROM shards")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-
-    let manifest_bytes = h
-        .store
-        .get(&manifest_key.as_str().into())
-        .await
-        .expect("the manifest must be in object storage")
-        .bytes()
-        .await
-        .unwrap();
+    let manifest_bytes = h.object_bytes(&h.manifest_key().await).await;
     let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes).unwrap();
 
     assert_eq!(
@@ -270,19 +250,7 @@ async fn the_manifest_records_commit_checksums_counts_and_schema_version() {
 
     // The recorded checksum must verify the stored segment.
     let segment = &manifest["segments"]["graph.sqlite"];
-    let graph_bytes = h
-        .store
-        .get(
-            &manifest_key
-                .replace("manifest.json", "graph.sqlite")
-                .as_str()
-                .into(),
-        )
-        .await
-        .expect("the graph segment must be in object storage")
-        .bytes()
-        .await
-        .unwrap();
+    let graph_bytes = h.object_bytes(&h.graph_key().await).await;
     assert_eq!(
         segment["sha256"].as_str(),
         Some(hex::encode(sha2::Sha256::digest(&graph_bytes)).as_str()),
@@ -293,32 +261,11 @@ async fn the_manifest_records_commit_checksums_counts_and_schema_version() {
 
 #[tokio::test]
 async fn every_edge_row_carries_provenance_and_confidence() {
-    use object_store::ObjectStoreExt;
-
     let h = Harness::boot().await;
     h.add_repo().await;
     h.sync_and_index().await;
 
-    let pool = sqlx::PgPool::connect(&format!("{DEV_POSTGRES}/{}", h.db_name))
-        .await
-        .unwrap();
-    let (manifest_key,): (String,) = sqlx::query_as("SELECT manifest_key FROM shards")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    let graph_bytes = h
-        .store
-        .get(
-            &manifest_key
-                .replace("manifest.json", "graph.sqlite")
-                .as_str()
-                .into(),
-        )
-        .await
-        .expect("the graph segment must be in object storage")
-        .bytes()
-        .await
-        .unwrap();
+    let graph_bytes = h.object_bytes(&h.graph_key().await).await;
 
     // The graph segment is a queryable SQLite file (RFC 0001 §6).
     let dir = tempfile::tempdir().unwrap();
@@ -418,11 +365,8 @@ async fn a_failing_index_job_surfaces_its_error_backs_off_and_recovers() {
     // The cause clears (the forge is reachable again); once the backoff
     // elapses, indexing converges on its own by refetching the mirror.
     std::fs::rename(&hidden_origin, &h.repo_dir).unwrap();
-    let pool = sqlx::PgPool::connect(&format!("{DEV_POSTGRES}/{}", h.db_name))
-        .await
-        .unwrap();
     sqlx::query("UPDATE jobs SET run_after = now() WHERE kind = 'index'")
-        .execute(&pool)
+        .execute(&h.pool().await)
         .await
         .unwrap();
     assert!(
@@ -448,11 +392,8 @@ async fn re_indexing_a_published_commit_completes_without_a_checkout() {
     // new index job arrives for the same, already-published commit. The
     // published Shard answers it — no checkout required.
     std::fs::remove_dir_all(&h.cache).unwrap();
-    let pool = sqlx::PgPool::connect(&format!("{DEV_POSTGRES}/{}", h.db_name))
-        .await
-        .unwrap();
     sqlx::query("INSERT INTO jobs (kind, repo_id) SELECT 'index', id FROM repos")
-        .execute(&pool)
+        .execute(&h.pool().await)
         .await
         .unwrap();
 

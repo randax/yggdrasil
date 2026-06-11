@@ -165,6 +165,42 @@ pub fn git(dir: &std::path::Path, args: &[&str]) -> String {
 /// A local git repository standing in for a Forge-hosted one, addressable
 /// as `file://…/acme/widgets`. Returns (fixture root guard, repo dir, URL).
 pub fn fixture_repo(commits: usize) -> (tempfile::TempDir, std::path::PathBuf, String) {
+    let (root, repo, url) = empty_fixture_repo();
+    for n in 1..=commits {
+        std::fs::write(repo.join("README.md"), format!("revision {n}\n")).unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-m", &format!("commit {n}")]);
+    }
+    (root, repo, url)
+}
+
+/// Like [`fixture_repo`], but holding one commit of the given files.
+/// The commit message embeds the fixture's unique path so no two
+/// fixtures ever mint the same commit sha: Shard keys derive from
+/// (repo_id, commit), repo ids restart at 1 in every fresh test
+/// database, and all tests share the dev MinIO bucket — identical
+/// fixtures committed within the same second would otherwise read each
+/// other's Shards.
+pub fn fixture_repo_with(
+    files: &[(&str, &str)],
+) -> (tempfile::TempDir, std::path::PathBuf, String) {
+    let (root, repo, url) = empty_fixture_repo();
+    for (path, contents) in files {
+        let full = repo.join(path);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(full, contents).unwrap();
+    }
+    git(&repo, &["add", "."]);
+    git(
+        &repo,
+        &["commit", "-m", &format!("initial ({})", repo.display())],
+    );
+    (root, repo, url)
+}
+
+/// The shared scaffold: an initialized, empty repo with the machine-config
+/// guards every fixture needs.
+fn empty_fixture_repo() -> (tempfile::TempDir, std::path::PathBuf, String) {
     let root = tempfile::tempdir().unwrap();
     let repo = root.path().join("fixtures/acme/widgets");
     std::fs::create_dir_all(&repo).unwrap();
@@ -175,11 +211,6 @@ pub fn fixture_repo(commits: usize) -> (tempfile::TempDir, std::path::PathBuf, S
     // commits demand a signing key; fixtures must not depend on the
     // machine's git config.
     git(&repo, &["config", "commit.gpgsign", "false"]);
-    for n in 1..=commits {
-        std::fs::write(repo.join("README.md"), format!("revision {n}\n")).unwrap();
-        git(&repo, &["add", "."]);
-        git(&repo, &["commit", "-m", &format!("commit {n}")]);
-    }
     let url = format!("file://{}", repo.display());
     (root, repo, url)
 }
