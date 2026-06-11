@@ -264,16 +264,17 @@ impl ControlPlane {
         if !fence_job_done(&mut tx, job.job_id, &job.lease_token).await? {
             return Ok(false);
         }
-        sqlx::query("UPDATE repos SET last_synced_commit = $1 WHERE id = $2")
-            .bind(commit)
-            .bind(job.repo_id)
-            .execute(&mut *tx)
-            .await?;
         // Every synced commit wants indexing. The index job carries no
         // payload: a worker reads the repo's sync position at claim time.
         // If a job is already in flight this no-ops — a queued job will
         // pick the new commit up at claim, and a leased one is re-queued
         // by complete_index when it notices the repo moved on.
+        //
+        // Ordered before the repos update on purpose: this insert can
+        // block on a concurrent complete_index retiring the in-flight
+        // job (their unique-index entries conflict until it commits), and
+        // complete_index locks the repo row — taking the repo row here
+        // first would close a lock cycle and deadlock both completions.
         sqlx::query(
             "INSERT INTO jobs (kind, repo_id) VALUES ('index', $1)
              ON CONFLICT (repo_id, kind) WHERE state <> 'done' DO NOTHING",
@@ -281,6 +282,11 @@ impl ControlPlane {
         .bind(job.repo_id)
         .execute(&mut *tx)
         .await?;
+        sqlx::query("UPDATE repos SET last_synced_commit = $1 WHERE id = $2")
+            .bind(commit)
+            .bind(job.repo_id)
+            .execute(&mut *tx)
+            .await?;
         tx.commit().await?;
         Ok(true)
     }
@@ -304,6 +310,9 @@ impl ControlPlane {
         lease: std::time::Duration,
     ) -> anyhow::Result<Option<LeasedIndex>> {
         let row = sqlx::query_as(
+            // As in claim_due_fetch: `state <> 'done'` must appear
+            // verbatim — the planner needs the partial index predicate
+            // spelled out to use jobs_claim_scan.
             "WITH due AS (
                  SELECT j.id FROM jobs j JOIN repos r ON r.id = j.repo_id
                  WHERE j.kind = 'index' AND j.state <> 'done' AND j.run_after <= now()
