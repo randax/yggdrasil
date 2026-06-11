@@ -178,11 +178,11 @@ async fn admin_status(json: bool) -> anyhow::Result<()> {
 
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum Role {
-    /// REST + MCP API and a Sync worker in one process
+    /// REST + MCP API plus Sync and indexing workers in one process
     All,
     /// API only — pair with worker processes elsewhere
     Api,
-    /// Sync worker only: drains the fetch queue (no HTTP, no token)
+    /// Workers only: drain the fetch and index queues (no HTTP, no token)
     Worker,
 }
 

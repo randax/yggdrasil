@@ -261,21 +261,7 @@ impl ControlPlane {
     /// discarded.
     pub async fn complete_fetch(&self, job: &LeasedFetch, commit: &str) -> anyhow::Result<bool> {
         let mut tx = self.pool.begin().await?;
-        // The token is the lease's text rendering; comparing in the text
-        // domain avoids any text→timestamptz parse-back, so a session
-        // formatting quirk can only fail closed (result discarded, job
-        // re-runs at lease expiry), never match a stale claim.
-        let claimed = sqlx::query(
-            "UPDATE jobs SET state = 'done', lease_until = NULL
-             WHERE id = $1 AND state = 'leased' AND lease_until::text = $2",
-        )
-        .bind(job.job_id)
-        .bind(&job.lease_token)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected()
-            == 1;
-        if !claimed {
+        if !fence_job_done(&mut tx, job.job_id, &job.lease_token).await? {
             return Ok(false);
         }
         sqlx::query("UPDATE repos SET last_synced_commit = $1 WHERE id = $2")
@@ -305,22 +291,8 @@ impl ControlPlane {
     /// whether the failure was recorded; `false` means the lease had
     /// lapsed and the job belongs to a newer claim.
     pub async fn fail_fetch(&self, job: &LeasedFetch, error: &str) -> anyhow::Result<bool> {
-        let applied = sqlx::query(
-            "UPDATE jobs
-             SET state = 'queued', lease_until = NULL,
-                 attempts = attempts + 1, last_error = $2,
-                 run_after = now()
-                     + make_interval(secs => least(30 * 2 ^ least(attempts, 7), 3600))
-             WHERE id = $1 AND state = 'leased' AND lease_until::text = $3",
-        )
-        .bind(job.job_id)
-        .bind(error)
-        .bind(&job.lease_token)
-        .execute(&self.pool)
-        .await?
-        .rows_affected()
-            == 1;
-        Ok(applied)
+        self.fail_leased_job(job.job_id, &job.lease_token, error)
+            .await
     }
 
     /// Claim the next due index job under a lease, same protocol as
@@ -364,17 +336,7 @@ impl ControlPlane {
         shard: ShardRecord<'_>,
     ) -> anyhow::Result<bool> {
         let mut tx = self.pool.begin().await?;
-        let claimed = sqlx::query(
-            "UPDATE jobs SET state = 'done', lease_until = NULL
-             WHERE id = $1 AND state = 'leased' AND lease_until::text = $2",
-        )
-        .bind(job.job_id)
-        .bind(&job.lease_token)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected()
-            == 1;
-        if !claimed {
+        if !fence_job_done(&mut tx, job.job_id, &job.lease_token).await? {
             return Ok(false);
         }
         // Revisions are deterministic per (commit, pass, schema), so
@@ -413,6 +375,20 @@ impl ControlPlane {
     /// whether the failure was recorded; `false` means the lease had
     /// lapsed and the job belongs to a newer claim.
     pub async fn fail_index(&self, job: &LeasedIndex, error: &str) -> anyhow::Result<bool> {
+        self.fail_leased_job(job.job_id, &job.lease_token, error)
+            .await
+    }
+
+    /// Re-queue a leased job with exponential backoff (30s doubling per
+    /// attempt, capped at an hour), keeping the error for `yg admin
+    /// status`. Lease-fenced like completion: `false` means the lease had
+    /// lapsed and the failure was discarded.
+    async fn fail_leased_job(
+        &self,
+        job_id: i64,
+        lease_token: &str,
+        error: &str,
+    ) -> anyhow::Result<bool> {
         let applied = sqlx::query(
             "UPDATE jobs
              SET state = 'queued', lease_until = NULL,
@@ -421,9 +397,9 @@ impl ControlPlane {
                      + make_interval(secs => least(30 * 2 ^ least(attempts, 7), 3600))
              WHERE id = $1 AND state = 'leased' AND lease_until::text = $3",
         )
-        .bind(job.job_id)
+        .bind(job_id)
         .bind(error)
-        .bind(&job.lease_token)
+        .bind(lease_token)
         .execute(&self.pool)
         .await?
         .rows_affected()
@@ -444,4 +420,27 @@ impl ControlPlane {
         sqlx::query("SELECT 1").execute(&self.pool).await?;
         Ok(())
     }
+}
+
+/// Mark a leased job done, but only while the caller still holds its
+/// lease. The token is the lease's text rendering; comparing in the text
+/// domain avoids any text→timestamptz parse-back, so a session formatting
+/// quirk can only fail closed (result discarded, job re-runs at lease
+/// expiry), never match a stale claim.
+async fn fence_job_done(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    job_id: i64,
+    lease_token: &str,
+) -> anyhow::Result<bool> {
+    let claimed = sqlx::query(
+        "UPDATE jobs SET state = 'done', lease_until = NULL
+         WHERE id = $1 AND state = 'leased' AND lease_until::text = $2",
+    )
+    .bind(job_id)
+    .bind(lease_token)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected()
+        == 1;
+    Ok(claimed)
 }

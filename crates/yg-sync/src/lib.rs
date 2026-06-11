@@ -11,9 +11,6 @@ use yg_control::ControlPlane;
 /// claimable again. Generous: a cold full-history clone of a large repo.
 const FETCH_LEASE: Duration = Duration::from_secs(15 * 60);
 
-/// How long an idle worker sleeps between queue polls.
-const IDLE_POLL: Duration = Duration::from_secs(2);
-
 /// A Sync worker: drains the fetch queue, mirroring repos into the
 /// worker-local git cache and recording each repo's synced commit.
 pub struct SyncWorker {
@@ -68,15 +65,6 @@ impl SyncWorker {
             }
         }
         Ok(true)
-    }
-
-    /// Drain the queue forever, sleeping briefly when it's empty.
-    pub async fn run(&self) -> anyhow::Result<()> {
-        loop {
-            if !self.run_once().await? {
-                tokio::time::sleep(IDLE_POLL).await;
-            }
-        }
     }
 }
 

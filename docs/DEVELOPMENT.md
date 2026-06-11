@@ -51,9 +51,9 @@ which is required:
 | `YG_GITHUB_TOKEN` | — (optional) | Forge token for `github.com` Sync |
 
 `yg serve --role=api|worker|all` picks what the process runs: `api` serves
-HTTP only, `worker` drains the Sync queue only (it needs the control plane
-and a git cache, but no bootstrap token and no listen address), and `all`
-runs both in one process.
+HTTP only, `worker` drains the Sync and indexing queues only (it needs the
+control plane, a git cache, and object storage — Shards land there — but no
+bootstrap token and no listen address), and `all` runs both in one process.
 
 ### Forge token scope
 
@@ -79,7 +79,7 @@ cargo run -p yg-cli -- serve --role=all &
 export YG_TOKEN=$YG_BOOTSTRAP_TOKEN
 cargo run -p yg-cli -- status
 cargo run -p yg-cli -- admin repo add https://github.com/octocat/Hello-World
-cargo run -p yg-cli -- admin status   # shows the synced commit once fetched
+cargo run -p yg-cli -- admin status   # synced commit, then Shard revision + counts once indexed
 ```
 
 `GET /healthz` (no token) reports per-dependency readiness; every `/v1`
