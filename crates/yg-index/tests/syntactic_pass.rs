@@ -101,6 +101,97 @@ func (g Gadget) Render() string { return "g" }
 }
 
 #[test]
+fn duplicate_declarations_keep_distinct_node_ids() {
+    // Multiple `func init()` per file is legal Go; their node ids must
+    // not collide (the graph segment's id column is a primary key).
+    let graph = pass_over(&[(
+        "setup.go",
+        r#"package gadgets
+
+func init() { a() }
+
+func init() { b() }
+"#,
+    )]);
+
+    let inits: Vec<&str> = graph
+        .nodes
+        .iter()
+        .filter(|n| n.kind == NodeKind::Symbol)
+        .filter(|n| n.name.as_deref() == Some("init"))
+        .map(|n| n.id.as_str())
+        .collect();
+    assert_eq!(inits.len(), 2, "both init functions are Symbols");
+    let unique: BTreeSet<&str> = graph.nodes.iter().map(|n| n.id.as_str()).collect();
+    assert_eq!(
+        unique.len(),
+        graph.nodes.len(),
+        "node ids must be unique — got duplicates in {unique:?}"
+    );
+}
+
+#[test]
+fn a_method_with_an_unreadable_receiver_does_not_steal_a_type_from_elsewhere() {
+    // Mid-edit code: the receiver is empty, so there is no receiver type.
+    // The walk must not wander out of the receiver and pick up `Screen`.
+    let graph = pass_over(&[(
+        "broken.go",
+        r#"package gadgets
+
+func () Render(s Screen) string { return "x" }
+"#,
+    )]);
+
+    let names = symbol_names(&graph);
+    assert!(
+        !names.contains("Screen.Render"),
+        "the parameter type must not be mistaken for the receiver, got: {names:?}"
+    );
+    assert!(
+        names.contains("Render"),
+        "the method still yields a bare-named Symbol, got: {names:?}"
+    );
+}
+
+#[test]
+fn symlinks_become_file_nodes_but_are_never_read_through() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("real.go"),
+        "package gadgets\n\nfunc A() {}\n",
+    )
+    .unwrap();
+    // A symlinked .go: a File node, but its target (which could point
+    // anywhere, even outside the checkout) must not be parsed.
+    std::os::unix::fs::symlink("real.go", dir.path().join("link.go")).unwrap();
+
+    let graph = yg_index::syntactic_pass(dir.path()).expect("symlinks must not break the pass");
+
+    let files: BTreeSet<&str> = graph
+        .nodes
+        .iter()
+        .filter(|n| n.kind == NodeKind::File)
+        .map(|n| n.id.as_str())
+        .collect();
+    assert_eq!(
+        files,
+        BTreeSet::from(["file:real.go", "file:link.go"]),
+        "every tree entry, symlinks included, must be a File node"
+    );
+    let symbol_files: BTreeSet<&str> = graph
+        .nodes
+        .iter()
+        .filter(|n| n.kind == NodeKind::Symbol)
+        .filter_map(|n| n.path.as_deref())
+        .collect();
+    assert_eq!(
+        symbol_files,
+        BTreeSet::from(["real.go"]),
+        "symbols come only from real files, never through symlinks"
+    );
+}
+
+#[test]
 fn non_go_files_become_file_nodes_without_symbols() {
     let graph = pass_over(&[
         (

@@ -148,8 +148,12 @@ pub fn syntactic_pass(root: &Path) -> anyhow::Result<Graph> {
     collect_files(root, root, &mut paths)?;
     // Walk order must not depend on the filesystem: the graph segment is
     // checksummed, so identical trees should yield identical artifacts.
-    paths.sort();
-    for path in paths {
+    paths.sort_by(|a, b| a.path.cmp(&b.path));
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_go::LANGUAGE.into())
+        .context("loading the Go grammar")?;
+    for FileEntry { path, is_symlink } in paths {
         let file_id = format!("file:{path}");
         graph.nodes.push(Node {
             id: file_id.clone(),
@@ -157,10 +161,12 @@ pub fn syntactic_pass(root: &Path) -> anyhow::Result<Graph> {
             name: None,
             path: Some(path.clone()),
         });
-        if path.ends_with(".go") {
+        // Symlinks stay content-unread: their target can point anywhere,
+        // including outside the checkout.
+        if path.ends_with(".go") && !is_symlink {
             let source = std::fs::read(root.join(&path))
                 .with_context(|| format!("reading {path} from the checkout"))?;
-            extract_go_symbols(&path, &file_id, &source, &mut graph)?;
+            extract_go_symbols(&mut parser, &path, &file_id, &source, &mut graph);
         }
     }
     Ok(graph)
@@ -168,22 +174,22 @@ pub fn syntactic_pass(root: &Path) -> anyhow::Result<Graph> {
 
 /// Parse one Go file and append its Symbols and DEFINES edges.
 fn extract_go_symbols(
+    parser: &mut tree_sitter::Parser,
     path: &str,
     file_id: &str,
     source: &[u8],
     graph: &mut Graph,
-) -> anyhow::Result<()> {
-    let mut parser = tree_sitter::Parser::new();
-    parser
-        .set_language(&tree_sitter_go::LANGUAGE.into())
-        .context("loading the Go grammar")?;
+) {
     let Some(tree) = parser.parse(source, None) else {
         // tree-sitter only gives up on timeouts/cancellation, neither of
         // which we set; treat "no tree" as "no symbols" rather than
         // failing the whole pass over one file.
         tracing::warn!(path, "tree-sitter produced no tree; skipping symbols");
-        return Ok(());
+        return;
     };
+    // Duplicate names (multiple `func init()`, redeclarations mid-edit)
+    // must still mint unique node ids — the graph segment keys on them.
+    let mut id_uses: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
     let mut cursor = tree.root_node().walk();
     for declaration in tree.root_node().children(&mut cursor) {
         // CONTEXT.md's Symbol: function, method, type, constant. Each
@@ -220,7 +226,14 @@ fn extract_go_symbols(
             _ => continue,
         };
         for name in names {
-            let symbol_id = format!("sym:{path}#{name}");
+            let base_id = format!("sym:{path}#{name}");
+            let uses = id_uses.entry(base_id.clone()).or_insert(0);
+            *uses += 1;
+            let symbol_id = if *uses == 1 {
+                base_id
+            } else {
+                format!("{base_id}~{uses}")
+            };
             graph.nodes.push(Node {
                 id: symbol_id.clone(),
                 kind: NodeKind::Symbol,
@@ -238,7 +251,6 @@ fn extract_go_symbols(
             });
         }
     }
-    Ok(())
 }
 
 /// Text of a named field on a node, when present and valid UTF-8.
@@ -249,37 +261,39 @@ fn field_text<'a>(node: tree_sitter::Node<'_>, field: &str, source: &'a [u8]) ->
 
 /// The bare type name a method's receiver refers to: the first type
 /// identifier inside `(w *Widget)`, however the receiver is spelled
-/// (pointer, generic, parenthesized).
+/// (pointer, generic, parenthesized). The search never leaves the
+/// receiver subtree, so a receiver without one (mid-edit code) yields
+/// None rather than a type stolen from elsewhere in the file.
 fn receiver_type_name<'a>(method: tree_sitter::Node<'_>, source: &'a [u8]) -> Option<&'a str> {
-    let receiver = method.child_by_field_name("receiver")?;
-    let mut cursor = receiver.walk();
-    let mut walked_to_end = false;
-    while !walked_to_end {
-        if cursor.node().kind() == "type_identifier" {
-            return cursor.node().utf8_text(source).ok();
+    fn first_type_identifier<'a>(node: tree_sitter::Node<'_>, source: &'a [u8]) -> Option<&'a str> {
+        if node.kind() == "type_identifier" {
+            return node.utf8_text(source).ok();
         }
-        // Depth-first walk without recursion.
-        if !cursor.goto_first_child() {
-            while !cursor.goto_next_sibling() {
-                if !cursor.goto_parent() {
-                    walked_to_end = true;
-                    break;
-                }
-            }
-        }
+        let mut cursor = node.walk();
+        node.children(&mut cursor)
+            .find_map(|child| first_type_identifier(child, source))
     }
-    None
+    first_type_identifier(method.child_by_field_name("receiver")?, source)
 }
 
-/// Recursively collect repo-relative, slash-separated file paths.
-fn collect_files(root: &Path, dir: &Path, out: &mut Vec<String>) -> anyhow::Result<()> {
+/// One tree entry as the walk found it.
+struct FileEntry {
+    /// Repo-relative, slash-separated path.
+    path: String,
+    is_symlink: bool,
+}
+
+/// Recursively collect every non-directory tree entry. Symlinks count —
+/// they are blobs in the git tree — but are flagged so nothing reads
+/// through them.
+fn collect_files(root: &Path, dir: &Path, out: &mut Vec<FileEntry>) -> anyhow::Result<()> {
     for entry in std::fs::read_dir(dir).with_context(|| format!("walking {}", dir.display()))? {
         let entry = entry?;
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
             collect_files(root, &entry.path(), out)?;
-        } else if file_type.is_file() {
-            let relative = entry
+        } else {
+            let path = entry
                 .path()
                 .strip_prefix(root)
                 .expect("walk stays under root")
@@ -287,7 +301,10 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<String>) -> anyhow::Resu
                 .map(|c| c.as_os_str().to_string_lossy().into_owned())
                 .collect::<Vec<_>>()
                 .join("/");
-            out.push(relative);
+            out.push(FileEntry {
+                path,
+                is_symlink: file_type.is_symlink(),
+            });
         }
     }
     Ok(())
