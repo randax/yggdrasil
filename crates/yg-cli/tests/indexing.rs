@@ -22,7 +22,15 @@ fn go_fixture_repo() -> (tempfile::TempDir, std::path::PathBuf, String) {
         "package main\n\nfunc Hello() string {\n\treturn \"hello\"\n}\n\nfunc main() {\n\tprintln(Hello())\n}\n",
     )
     .unwrap();
-    std::fs::write(repo.join("README.md"), "# gadgets\n").unwrap();
+    // The tempdir path makes the initial commit sha unique per test:
+    // Shard keys derive from (repo_id, commit), repo_id is 1 in every
+    // fresh test database, and the tests share one MinIO bucket — two
+    // tests minting the same sha would read each other's Shards.
+    std::fs::write(
+        repo.join("README.md"),
+        format!("# gadgets ({})\n", repo.display()),
+    )
+    .unwrap();
     git(&repo, &["add", "."]);
     git(&repo, &["commit", "-m", "initial"]);
     let url = format!("file://{}", repo.display());
@@ -426,6 +434,39 @@ async fn a_failing_index_job_surfaces_its_error_backs_off_and_recovers() {
     assert!(
         body["repos"][0]["shard"]["revision"].as_str().is_some(),
         "recovery must publish the Shard, got: {body}"
+    );
+}
+
+#[tokio::test]
+async fn re_indexing_a_published_commit_completes_without_a_checkout() {
+    let h = Harness::boot().await;
+    h.add_repo().await;
+    h.sync_and_index().await;
+
+    // The git cache evaporates (cache eviction, fresh worker host) and a
+    // new index job arrives for the same, already-published commit. The
+    // published Shard answers it — no checkout required.
+    std::fs::remove_dir_all(&h.cache).unwrap();
+    let pool = sqlx::PgPool::connect(&format!("{DEV_POSTGRES}/{}", h.db_name))
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO jobs (kind, repo_id) SELECT 'index', id FROM repos")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    assert!(
+        h.indexer.run_once().await.unwrap(),
+        "the re-queued job must be claimed"
+    );
+    let body = admin_status_body(&h.base).await;
+    assert_eq!(
+        body["repos"][0]["index"]["state"], "indexed",
+        "an already-published revision must complete, not retry, got: {body}"
+    );
+    assert!(
+        body["repos"][0]["shard"]["revision"].as_str().is_some(),
+        "got: {body}"
     );
 }
 

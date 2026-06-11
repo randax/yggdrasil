@@ -11,7 +11,7 @@ use std::time::Duration;
 use anyhow::Context;
 use object_store::ObjectStore;
 use yg_control::ControlPlane;
-use yg_shard::{Edge, EdgeKind, Graph, Node, NodeKind, Provenance};
+use yg_shard::{Edge, EdgeKind, Graph, Node, Provenance};
 
 /// How long a worker may hold an index job before a crashed run becomes
 /// claimable again. The syntactic pass targets minutes (RFC 0001 §4).
@@ -55,7 +55,7 @@ impl IndexWorker {
                             revision: &shard.revision,
                             manifest_key: &shard.manifest_key,
                             commit_sha: &shard.commit,
-                            provenance_level: "syntactic",
+                            provenance_level: &shard.pass,
                             node_count: shard.node_count,
                             edge_count: shard.edge_count,
                         },
@@ -82,6 +82,14 @@ impl IndexWorker {
     /// Run the syntactic pass over `commit` of the repo's cached mirror
     /// and publish the resulting Shard.
     async fn index(&self, repo_id: i64, commit: &str) -> anyhow::Result<yg_shard::PublishedShard> {
+        // Revisions are deterministic per commit: when this one is
+        // already published (a re-add, a retried job, another worker got
+        // there first), answer from storage without touching git.
+        if let Some(published) =
+            yg_shard::published_shard(self.store.as_ref(), repo_id, commit).await?
+        {
+            return Ok(published);
+        }
         let mirror = self.git_cache.join(format!("{repo_id}.git"));
         let checkout = tempfile::tempdir().context("creating a scratch checkout dir")?;
         let graph = {
@@ -167,13 +175,9 @@ pub fn syntactic_pass(root: &Path) -> anyhow::Result<Graph> {
         .set_language(&tree_sitter_go::LANGUAGE.into())
         .context("loading the Go grammar")?;
     for FileEntry { path, is_symlink } in paths {
-        let file_id = format!("file:{path}");
-        graph.nodes.push(Node {
-            id: file_id.clone(),
-            kind: NodeKind::File,
-            name: None,
-            path: Some(path.clone()),
-        });
+        let file = Node::file(&path);
+        let file_id = file.id.clone();
+        graph.nodes.push(file);
         // Symlinks stay content-unread: their target can point anywhere,
         // including outside the checkout.
         if path.ends_with(".go") && !is_symlink {
@@ -239,20 +243,11 @@ fn extract_go_symbols(
             _ => continue,
         };
         for name in names {
-            let base_id = format!("sym:{path}#{name}");
-            let uses = id_uses.entry(base_id.clone()).or_insert(0);
+            let uses = id_uses.entry(name.clone()).or_insert(0);
             *uses += 1;
-            let symbol_id = if *uses == 1 {
-                base_id
-            } else {
-                format!("{base_id}~{uses}")
-            };
-            graph.nodes.push(Node {
-                id: symbol_id.clone(),
-                kind: NodeKind::Symbol,
-                name: Some(name),
-                path: Some(path.to_string()),
-            });
+            let symbol = Node::symbol(path, &name, *uses);
+            let symbol_id = symbol.id.clone();
+            graph.nodes.push(symbol);
             graph.edges.push(Edge {
                 src: file_id.to_string(),
                 dst: symbol_id,

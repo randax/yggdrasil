@@ -9,14 +9,24 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use object_store::aws::AmazonS3Builder;
-use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
+use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 /// Version of the Shard layout (graph tables + manifest shape). Part of
 /// every revision id: bumping it re-indexes the world rather than mixing
 /// layouts under one revision.
+///
+/// It also stands in for the pass implementation: a change to what the
+/// syntactic pass extracts must bump it, or already-published revisions
+/// keep their old artifacts (re-publishing an existing revision is a
+/// no-op by design).
 pub const SCHEMA_VERSION: u32 = 1;
+
+/// Name of the M0 indexing pass, as recorded in revision ids, manifests,
+/// and the control plane's `provenance_level`. The precise pass (M1)
+/// adds its own.
+pub const SYNTACTIC_PASS: &str = "syntactic";
 
 /// How a graph edge was derived (ADR 0002, CONTEXT.md). Carried by every
 /// edge from day one, even while only syntactic values exist.
@@ -84,6 +94,35 @@ pub struct Node {
     pub path: Option<String>,
 }
 
+impl Node {
+    /// The File node for a repo-relative path: id `file:<path>`.
+    pub fn file(path: &str) -> Self {
+        Self {
+            id: format!("file:{path}"),
+            kind: NodeKind::File,
+            name: None,
+            path: Some(path.to_string()),
+        }
+    }
+
+    /// A Symbol declared in `path`: id `sym:<path>#<name>`. `ordinal`
+    /// disambiguates same-named declarations in one file (multiple
+    /// `func init()`): the first is 1 (no suffix), later ones get `~n`.
+    pub fn symbol(path: &str, name: &str, ordinal: u32) -> Self {
+        let id = if ordinal <= 1 {
+            format!("sym:{path}#{name}")
+        } else {
+            format!("sym:{path}#{name}~{ordinal}")
+        };
+        Self {
+            id,
+            kind: NodeKind::Symbol,
+            name: Some(name.to_string()),
+            path: Some(path.to_string()),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Edge {
     pub src: String,
@@ -115,7 +154,7 @@ pub struct Manifest {
     pub segments: BTreeMap<String, Segment>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Counts {
     pub nodes: i64,
     pub edges: i64,
@@ -134,6 +173,9 @@ pub struct PublishedShard {
     pub revision: String,
     pub manifest_key: String,
     pub commit: String,
+    /// The pass that produced it (`provenance_level` in the control
+    /// plane) — carried from the manifest so callers never re-assert it.
+    pub pass: String,
     pub node_count: i64,
     pub edge_count: i64,
 }
@@ -185,16 +227,53 @@ impl ObjectStoreConfig {
     }
 }
 
+/// The Shard already published for `commit` at the current schema
+/// version, if any — read back from its manifest, so the returned counts
+/// describe the artifact actually in storage, not whatever a fresh run
+/// of the pass would produce.
+pub async fn published_shard(
+    store: &dyn ObjectStore,
+    repo_id: i64,
+    commit: &str,
+) -> anyhow::Result<Option<PublishedShard>> {
+    let revision = syntactic_revision(commit);
+    let manifest_key = format!("shards/{repo_id}/{revision}/manifest.json");
+    let bytes = match store.get(&manifest_key.as_str().into()).await {
+        Ok(get) => get
+            .bytes()
+            .await
+            .context("reading the published manifest")?,
+        Err(object_store::Error::NotFound { .. }) => return Ok(None),
+        Err(e) => return Err(e).context("checking for an already-published Shard"),
+    };
+    let manifest: Manifest =
+        serde_json::from_slice(&bytes).context("parsing the published manifest")?;
+    Ok(Some(PublishedShard {
+        revision,
+        manifest_key,
+        commit: manifest.commit,
+        pass: manifest.pass,
+        node_count: manifest.counts.nodes,
+        edge_count: manifest.counts.edges,
+    }))
+}
+
 /// Write a Shard for `commit` of repo `repo_id`: the graph segment, then
 /// the manifest. The manifest goes last — its presence marks a complete
 /// Shard, so a write that dies half-way leaves garbage, never a torn
-/// artifact.
+/// artifact. Published Shards are immutable: every put is create-only
+/// (If-None-Match), so even a stale lease holder racing a fresh one can
+/// never overwrite published objects, and an already-published revision
+/// is returned as-is.
 pub async fn write_shard(
     store: &dyn ObjectStore,
     repo_id: i64,
     commit: &str,
     graph: Graph,
 ) -> anyhow::Result<PublishedShard> {
+    if let Some(published) = published_shard(store, repo_id, commit).await? {
+        return Ok(published);
+    }
     let revision = syntactic_revision(commit);
     let prefix = format!("shards/{repo_id}/{revision}");
     let manifest_key = format!("{prefix}/manifest.json");
@@ -203,22 +282,6 @@ pub async fn write_shard(
         edges: graph.edges.len() as i64,
     };
 
-    // The manifest marks a complete Shard, and Shards are immutable: if
-    // this revision is already published, leave its objects untouched.
-    match store.head(&manifest_key.as_str().into()).await {
-        Ok(_) => {
-            return Ok(PublishedShard {
-                revision,
-                manifest_key,
-                commit: commit.to_string(),
-                node_count: counts.nodes,
-                edge_count: counts.edges,
-            });
-        }
-        Err(object_store::Error::NotFound { .. }) => {}
-        Err(e) => return Err(e).context("checking for an already-published Shard"),
-    }
-
     let graph_bytes = tokio::task::spawn_blocking(move || build_graph_sqlite(&graph))
         .await
         .context("graph segment build task panicked")??;
@@ -226,36 +289,55 @@ pub async fn write_shard(
         sha256: hex::encode(Sha256::digest(&graph_bytes)),
         bytes: graph_bytes.len() as u64,
     };
-    store
-        .put(
+    let create_only = PutOptions {
+        mode: PutMode::Create,
+        ..Default::default()
+    };
+    match store
+        .put_opts(
             &format!("{prefix}/graph.sqlite").into(),
             PutPayload::from(graph_bytes),
+            create_only.clone(),
         )
         .await
-        .context("uploading the graph segment")?;
+    {
+        // Another publisher beat us to the segment; same revision means
+        // same bytes by construction, so theirs is as good as ours.
+        Ok(_) | Err(object_store::Error::AlreadyExists { .. }) => {}
+        Err(e) => return Err(e).context("uploading the graph segment"),
+    }
 
     let manifest = Manifest {
         schema_version: SCHEMA_VERSION,
         commit: commit.to_string(),
-        pass: "syntactic".to_string(),
-        counts: Counts {
-            nodes: counts.nodes,
-            edges: counts.edges,
-        },
+        pass: SYNTACTIC_PASS.to_string(),
+        counts,
         segments: BTreeMap::from([("graph.sqlite".to_string(), segment)]),
     };
-    store
-        .put(
+    match store
+        .put_opts(
             &manifest_key.as_str().into(),
             PutPayload::from(serde_json::to_vec_pretty(&manifest)?),
+            create_only,
         )
         .await
-        .context("uploading the manifest")?;
+    {
+        Ok(_) => {}
+        // A racing publisher committed the manifest first: defer to the
+        // published artifact.
+        Err(object_store::Error::AlreadyExists { .. }) => {
+            return published_shard(store, repo_id, commit)
+                .await?
+                .context("a manifest that just existed has vanished");
+        }
+        Err(e) => return Err(e).context("uploading the manifest"),
+    }
 
     Ok(PublishedShard {
         revision,
         manifest_key,
         commit: commit.to_string(),
+        pass: SYNTACTIC_PASS.to_string(),
         node_count: counts.nodes,
         edge_count: counts.edges,
     })
