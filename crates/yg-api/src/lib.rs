@@ -51,13 +51,7 @@ impl ServerConfig {
                 .parse()
                 .context("parsing YG_LISTEN as host:port")?,
             database_url: var_or("YG_DATABASE_URL", yg_control::DEFAULT_DATABASE_URL),
-            object_store: ObjectStoreConfig {
-                endpoint: var_or("YG_S3_ENDPOINT", "http://localhost:9000"),
-                bucket: var_or("YG_S3_BUCKET", "yggdrasil"),
-                access_key: var_or("YG_S3_ACCESS_KEY", "yggdrasil"),
-                secret_key: var_or("YG_S3_SECRET_KEY", "yggdrasil"),
-                region: var_or("YG_S3_REGION", "us-east-1"),
-            },
+            object_store: ObjectStoreConfig::from_env(),
             bootstrap_token,
         })
     }

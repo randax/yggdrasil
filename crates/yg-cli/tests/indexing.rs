@@ -428,3 +428,54 @@ async fn a_failing_index_job_surfaces_its_error_backs_off_and_recovers() {
         "recovery must publish the Shard, got: {body}"
     );
 }
+
+/// multi_thread: the yg binary blocks this thread while the in-process
+/// HTTP client polls it from the same test runtime.
+#[tokio::test(flavor = "multi_thread")]
+async fn yg_serve_role_all_indexes_an_added_repo_end_to_end() {
+    use std::io::BufRead;
+
+    let (fixture, _repo_dir, fixture_url) = go_fixture_repo();
+    let db_name = create_test_db().await;
+    let child = std::process::Command::new(assert_cmd::cargo::cargo_bin("yg"))
+        .env("YG_LISTEN", "127.0.0.1:0")
+        .env("YG_DATABASE_URL", format!("{DEV_POSTGRES}/{db_name}"))
+        .env("YG_BOOTSTRAP_TOKEN", "ygt_test_token")
+        .env("YG_GIT_CACHE", fixture.path().join("git-cache"))
+        .args(["serve", "--role=all"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut server = KillOnDrop(child);
+    let stdout = server.0.stdout.take().unwrap();
+    let first_line = std::io::BufReader::new(stdout)
+        .lines()
+        .next()
+        .expect("yg serve must announce its address")
+        .unwrap();
+    let url = first_line
+        .strip_prefix("listening on ")
+        .unwrap()
+        .to_string();
+
+    post_repo(&url, serde_json::json!({"url": fixture_url})).await;
+
+    // The serve process syncs *and indexes* on its own — the issue's
+    // demo flow: add a Go repo, watch its Shard appear.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let body = admin_status_body(&url).await;
+        let shard = &body["repos"][0]["shard"];
+        if shard["revision"].as_str().is_some() {
+            assert_eq!(shard["nodes"], 4, "got: {body}");
+            assert_eq!(shard["edges"], 2, "got: {body}");
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "repo never got indexed; last status: {body}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}

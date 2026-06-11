@@ -1016,15 +1016,6 @@ async fn health_degrades_to_503_when_a_dependency_dies() {
     );
 }
 
-/// Kills the spawned server even when the test panics.
-struct KillOnDrop(std::process::Child);
-impl Drop for KillOnDrop {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn yg_serve_boots_from_env_and_answers_yg_status_end_to_end() {
     use std::io::BufRead;

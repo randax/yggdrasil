@@ -137,6 +137,15 @@ pub async fn admin_status_body(base: &str) -> serde_json::Value {
     serde_json::from_str(&text).expect("admin status must be JSON")
 }
 
+/// Kills a spawned server process even when the test panics.
+pub struct KillOnDrop(pub std::process::Child);
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 /// Run git in a directory, panicking (with stderr) on failure.
 pub fn git(dir: &std::path::Path, args: &[&str]) -> String {
     let out = std::process::Command::new("git")

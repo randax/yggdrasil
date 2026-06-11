@@ -9,7 +9,8 @@ use sqlx::postgres::PgPoolOptions;
 pub const DEFAULT_DATABASE_URL: &str = "postgres://yggdrasil:yggdrasil@localhost:5432/yggdrasil";
 
 /// Handle to the control-plane database. The single entry point for
-/// everything the Index Server keeps in Postgres.
+/// everything the Index Server keeps in Postgres. Clones share one pool.
+#[derive(Clone)]
 pub struct ControlPlane {
     pool: PgPool,
 }

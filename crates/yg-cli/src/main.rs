@@ -191,32 +191,52 @@ async fn serve(role: Role) -> anyhow::Result<()> {
             server.wait().await
         }
         Role::Worker => {
-            let worker = worker_from_env().await?;
+            let workers = workers_from_env().await?;
             println!("worker running");
-            worker.run().await
+            run_workers(workers).await
         }
         Role::All => {
             let server = yg_api::serve(yg_api::ServerConfig::from_env()?).await?;
             println!("listening on http://{}", server.local_addr());
-            let worker = worker_from_env().await?;
+            let workers = workers_from_env().await?;
             // Either side dying takes the process down — a half-alive
             // server that accepts repos it will never sync helps nobody.
             tokio::select! {
                 result = server.wait() => result,
-                result = worker.run() => result.context("worker exited"),
+                result = run_workers(workers) => result.context("worker exited"),
             }
         }
     }
 }
 
-/// Build a Sync worker from the `YG_*` environment. Workers need the
-/// control plane and a git cache directory — no bootstrap token.
-async fn worker_from_env() -> anyhow::Result<yg_sync::SyncWorker> {
+/// Build the worker pair from the `YG_*` environment. Workers need the
+/// control plane, the git cache, and object storage (Shards land there)
+/// — no bootstrap token.
+async fn workers_from_env() -> anyhow::Result<(yg_sync::SyncWorker, yg_index::IndexWorker)> {
     let database_url = std::env::var("YG_DATABASE_URL")
         .unwrap_or_else(|_| yg_control::DEFAULT_DATABASE_URL.to_string());
     let git_cache = std::env::var("YG_GIT_CACHE").unwrap_or_else(|_| "./data/git".to_string());
     let control = yg_control::ControlPlane::connect_and_migrate(&database_url).await?;
-    Ok(yg_sync::SyncWorker::new(control, git_cache))
+    let store = yg_api::ObjectStoreConfig::from_env().connect()?;
+    Ok((
+        yg_sync::SyncWorker::new(control.clone(), &git_cache),
+        yg_index::IndexWorker::new(control, store, &git_cache),
+    ))
+}
+
+/// Drain both job queues forever, sleeping briefly when idle. One pass
+/// per kind per iteration keeps a long fetch backlog from starving
+/// indexing (and the other way around).
+async fn run_workers(
+    (sync, index): (yg_sync::SyncWorker, yg_index::IndexWorker),
+) -> anyhow::Result<()> {
+    loop {
+        let fetched = sync.run_once().await?;
+        let indexed = index.run_once().await?;
+        if !fetched && !indexed {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+    }
 }
 
 async fn status(json: bool) -> anyhow::Result<()> {

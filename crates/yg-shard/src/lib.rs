@@ -155,6 +155,21 @@ pub struct ObjectStoreConfig {
 }
 
 impl ObjectStoreConfig {
+    /// Build from `YG_S3_*` environment variables, defaulting to the
+    /// in-repo dev compose stack (MinIO).
+    pub fn from_env() -> Self {
+        fn var_or(key: &str, default: &str) -> String {
+            std::env::var(key).unwrap_or_else(|_| default.to_string())
+        }
+        Self {
+            endpoint: var_or("YG_S3_ENDPOINT", "http://localhost:9000"),
+            bucket: var_or("YG_S3_BUCKET", "yggdrasil"),
+            access_key: var_or("YG_S3_ACCESS_KEY", "yggdrasil"),
+            secret_key: var_or("YG_S3_SECRET_KEY", "yggdrasil"),
+            region: var_or("YG_S3_REGION", "us-east-1"),
+        }
+    }
+
     pub fn connect(&self) -> anyhow::Result<Arc<dyn ObjectStore>> {
         Ok(Arc::new(
             AmazonS3Builder::new()
