@@ -182,10 +182,27 @@ pub async fn write_shard(
 ) -> anyhow::Result<PublishedShard> {
     let revision = syntactic_revision(commit);
     let prefix = format!("shards/{repo_id}/{revision}");
+    let manifest_key = format!("{prefix}/manifest.json");
     let counts = Counts {
         nodes: graph.nodes.len() as i64,
         edges: graph.edges.len() as i64,
     };
+
+    // The manifest marks a complete Shard, and Shards are immutable: if
+    // this revision is already published, leave its objects untouched.
+    match store.head(&manifest_key.as_str().into()).await {
+        Ok(_) => {
+            return Ok(PublishedShard {
+                revision,
+                manifest_key,
+                commit: commit.to_string(),
+                node_count: counts.nodes,
+                edge_count: counts.edges,
+            });
+        }
+        Err(object_store::Error::NotFound { .. }) => {}
+        Err(e) => return Err(e).context("checking for an already-published Shard"),
+    }
 
     let graph_bytes = tokio::task::spawn_blocking(move || build_graph_sqlite(&graph))
         .await
@@ -212,7 +229,6 @@ pub async fn write_shard(
         },
         segments: BTreeMap::from([("graph.sqlite".to_string(), segment)]),
     };
-    let manifest_key = format!("{prefix}/manifest.json");
     store
         .put(
             &manifest_key.as_str().into(),

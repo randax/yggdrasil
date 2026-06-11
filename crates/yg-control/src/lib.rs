@@ -364,10 +364,17 @@ impl ControlPlane {
         if !claimed {
             return Ok(false);
         }
+        // Revisions are deterministic per (commit, pass, schema), so
+        // re-indexing an unchanged repo arrives here with a revision
+        // that's already recorded: reuse the row instead of failing.
+        // DO UPDATE (with values identical by construction) rather than
+        // DO NOTHING so RETURNING yields the id on conflict too.
         let (shard_id,): (i64,) = sqlx::query_as(
             "INSERT INTO shards (repo_id, revision, manifest_key, commit_sha,
                                  provenance_level, node_count, edge_count)
              VALUES ($1, $2, $3, $4, $5, $6, $7)
+             ON CONFLICT (repo_id, revision) DO UPDATE
+             SET manifest_key = excluded.manifest_key
              RETURNING id",
         )
         .bind(job.repo_id)
