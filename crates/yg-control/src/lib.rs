@@ -264,7 +264,15 @@ impl ControlPlane {
     /// discarded.
     pub async fn complete_fetch(&self, job: &LeasedFetch, commit: &str) -> anyhow::Result<bool> {
         let mut tx = self.pool.begin().await?;
-        if !fence_job_done(&mut tx, job.job_id, &job.lease_token).await? {
+        // Lock order: repos before jobs, like every transaction that
+        // touches both (add_repo, complete_index). Mixed orders here
+        // deadlock — e.g. holding a jobs entry while waiting on a repo
+        // row another completion took first.
+        sqlx::query("SELECT 1 FROM repos WHERE id = $1 FOR UPDATE")
+            .bind(job.repo_id)
+            .execute(&mut *tx)
+            .await?;
+        if !settle_leased_job(&mut tx, job.job_id, &job.lease_token, true).await? {
             return Ok(false);
         }
         // Every synced commit wants indexing. The index job carries no
@@ -272,12 +280,6 @@ impl ControlPlane {
         // If a job is already in flight this no-ops — a queued job will
         // pick the new commit up at claim, and a leased one is re-queued
         // by complete_index when it notices the repo moved on.
-        //
-        // Ordered before the repos update on purpose: this insert can
-        // block on a concurrent complete_index retiring the in-flight
-        // job (their unique-index entries conflict until it commits), and
-        // complete_index locks the repo row — taking the repo row here
-        // first would close a lock cycle and deadlock both completions.
         sqlx::query(
             "INSERT INTO jobs (kind, repo_id) VALUES ('index', $1)
              ON CONFLICT (repo_id, kind) WHERE state <> 'done' DO NOTHING",
@@ -364,20 +366,7 @@ impl ControlPlane {
                 .fetch_one(&mut *tx)
                 .await?;
         let up_to_date = current_commit.as_deref() == Some(job.commit.as_str());
-        let claimed = sqlx::query(
-            "UPDATE jobs
-             SET state = CASE WHEN $3 THEN 'done' ELSE 'queued' END,
-                 lease_until = NULL, run_after = now()
-             WHERE id = $1 AND state = 'leased' AND lease_until::text = $2",
-        )
-        .bind(job.job_id)
-        .bind(&job.lease_token)
-        .bind(up_to_date)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected()
-            == 1;
-        if !claimed {
+        if !settle_leased_job(&mut tx, job.job_id, &job.lease_token, up_to_date).await? {
             return Ok(false);
         }
         // Revisions are deterministic per (commit, pass, schema), so
@@ -463,22 +452,33 @@ impl ControlPlane {
     }
 }
 
-/// Mark a leased job done, but only while the caller still holds its
-/// lease. The token is the lease's text rendering; comparing in the text
+/// Settle a leased job, but only while the caller still holds its lease.
+/// `done = true` retires it; otherwise it goes back to the queue as
+/// fresh, immediately-due work with the failure bookkeeping cleared —
+/// re-queuing is not a failure, and stale attempts would inflate the
+/// next backoff and read as "retrying" in admin status.
+///
+/// The token is the lease's text rendering; comparing in the text
 /// domain avoids any text→timestamptz parse-back, so a session formatting
 /// quirk can only fail closed (result discarded, job re-runs at lease
 /// expiry), never match a stale claim.
-async fn fence_job_done(
+async fn settle_leased_job(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     job_id: i64,
     lease_token: &str,
+    done: bool,
 ) -> anyhow::Result<bool> {
     let claimed = sqlx::query(
-        "UPDATE jobs SET state = 'done', lease_until = NULL
+        "UPDATE jobs
+         SET state = CASE WHEN $3 THEN 'done' ELSE 'queued' END,
+             attempts = CASE WHEN $3 THEN attempts ELSE 0 END,
+             last_error = CASE WHEN $3 THEN last_error ELSE NULL END,
+             lease_until = NULL, run_after = now()
          WHERE id = $1 AND state = 'leased' AND lease_until::text = $2",
     )
     .bind(job_id)
     .bind(lease_token)
+    .bind(done)
     .execute(&mut **tx)
     .await?
     .rows_affected()

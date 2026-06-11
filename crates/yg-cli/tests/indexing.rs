@@ -468,13 +468,20 @@ async fn a_commit_fetched_mid_index_still_gets_indexed() {
     h.add_repo().await;
     assert!(h.sync.run_once().await.unwrap(), "second fetch must run");
 
+    // The job carries old failure bookkeeping from earlier attempts.
+    sqlx::query("UPDATE jobs SET attempts = 3, last_error = 'old failure' WHERE kind = 'index'")
+        .execute(&h.pool().await)
+        .await
+        .unwrap();
+
     // The slow worker finishes its (now stale) run and reports it.
+    let revision = yg_shard::syntactic_revision(&job.commit);
     let applied = control
         .complete_index(
             &job,
             yg_control::ShardRecord {
-                revision: &format!("{}-syntactic-v1", job.commit),
-                manifest_key: &format!("shards/{}/test/manifest.json", job.repo_id),
+                revision: &revision,
+                manifest_key: &format!("shards/{}/{revision}/manifest.json", job.repo_id),
                 commit_sha: &job.commit,
                 provenance_level: "syntactic",
                 node_count: 4,
@@ -484,6 +491,15 @@ async fn a_commit_fetched_mid_index_still_gets_indexed() {
         .await
         .unwrap();
     assert!(applied, "the live lease holder's completion must apply");
+
+    // The re-queue is fresh work, not a retry: stale failure bookkeeping
+    // must not leak into the status surface or the next backoff.
+    let body = admin_status_body(&h.base).await;
+    assert_eq!(
+        body["repos"][0]["index"]["state"], "queued",
+        "a re-queued job must read as queued, got: {body}"
+    );
+    assert_eq!(body["repos"][0]["index"]["attempts"], 0, "got: {body}");
 
     // The newer commit must not be lost: indexing converges on it.
     assert!(
