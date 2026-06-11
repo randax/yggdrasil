@@ -279,3 +279,82 @@ async fn the_manifest_records_commit_checksums_counts_and_schema_version() {
     );
     assert_eq!(segment["bytes"], graph_bytes.len() as u64);
 }
+
+#[tokio::test]
+async fn every_edge_row_carries_provenance_and_confidence() {
+    use object_store::ObjectStoreExt;
+
+    let h = Harness::boot().await;
+    h.add_repo().await;
+    h.sync_and_index().await;
+
+    let pool = sqlx::PgPool::connect(&format!("{DEV_POSTGRES}/{}", h.db_name))
+        .await
+        .unwrap();
+    let (manifest_key,): (String,) = sqlx::query_as("SELECT manifest_key FROM shards")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let graph_bytes = h
+        .store
+        .get(
+            &manifest_key
+                .replace("manifest.json", "graph.sqlite")
+                .as_str()
+                .into(),
+        )
+        .await
+        .expect("the graph segment must be in object storage")
+        .bytes()
+        .await
+        .unwrap();
+
+    // The graph segment is a queryable SQLite file (RFC 0001 §6).
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("graph.sqlite");
+    std::fs::write(&path, &graph_bytes).unwrap();
+    let graph =
+        rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+
+    // The schema itself must demand the fields (ADR 0002: carried from
+    // day one), not merely happen to fill them.
+    let required_not_null: Vec<(String, bool)> = graph
+        .prepare("SELECT name, \"notnull\" FROM pragma_table_info('edges') WHERE name IN ('provenance', 'confidence')")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get::<_, i64>(1)? == 1)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        required_not_null.len(),
+        2,
+        "edges must have provenance and confidence columns"
+    );
+    for (column, not_null) in required_not_null {
+        assert!(not_null, "{column} must be NOT NULL in the edge schema");
+    }
+
+    // And every row must carry meaningful values: a known provenance and
+    // a confidence in (0, 1].
+    let edges: Vec<(String, String, String, f64)> = graph
+        .prepare("SELECT src, dst, provenance, confidence FROM edges")
+        .unwrap()
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert!(!edges.is_empty(), "the Go fixture must yield edges");
+    for (src, dst, provenance, confidence) in edges {
+        assert_eq!(
+            provenance, "syntactic",
+            "M0 edges all come from the syntactic pass ({src} → {dst})"
+        );
+        assert!(
+            confidence > 0.0 && confidence <= 1.0,
+            "confidence must be in (0, 1], got {confidence} on {src} → {dst}"
+        );
+    }
+}
