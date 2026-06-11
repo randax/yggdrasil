@@ -3368,6 +3368,7 @@ dependencies = [
  "tree-sitter-go",
  "yg-control",
  "yg-shard",
+ "yg-sync",
 ]
 
 [[package]]

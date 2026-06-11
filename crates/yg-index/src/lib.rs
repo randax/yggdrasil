@@ -45,7 +45,7 @@ impl IndexWorker {
         let Some(job) = self.control.claim_due_index(INDEX_LEASE).await? else {
             return Ok(false);
         };
-        match self.index(job.repo_id, &job.commit).await {
+        match self.index(&job).await {
             Ok(shard) => {
                 let applied = self
                     .control
@@ -79,22 +79,24 @@ impl IndexWorker {
         Ok(true)
     }
 
-    /// Run the syntactic pass over `commit` of the repo's cached mirror
-    /// and publish the resulting Shard.
-    async fn index(&self, repo_id: i64, commit: &str) -> anyhow::Result<yg_shard::PublishedShard> {
+    /// Run the syntactic pass over the job's commit and publish the
+    /// resulting Shard.
+    async fn index(
+        &self,
+        job: &yg_control::LeasedIndex,
+    ) -> anyhow::Result<yg_shard::PublishedShard> {
         // Revisions are deterministic per commit: when this one is
         // already published (a re-add, a retried job, another worker got
         // there first), answer from storage without touching git.
         if let Some(published) =
-            yg_shard::published_shard(self.store.as_ref(), repo_id, commit).await?
+            yg_shard::published_shard(self.store.as_ref(), job.repo_id, &job.commit).await?
         {
             return Ok(published);
         }
-        let mirror = self.git_cache.join(format!("{repo_id}.git"));
+        let mirror = self.ensure_mirror_has(job).await?;
         let checkout = tempfile::tempdir().context("creating a scratch checkout dir")?;
         let graph = {
-            let mirror = mirror.clone();
-            let commit = commit.to_string();
+            let commit = job.commit.clone();
             let dest = checkout.path().to_path_buf();
             tokio::task::spawn_blocking(move || -> anyhow::Result<Graph> {
                 extract_tree(&mirror, &commit, &dest)?;
@@ -103,8 +105,37 @@ impl IndexWorker {
             .await
             .context("syntactic pass task panicked")??
         };
-        yg_shard::write_shard(self.store.as_ref(), repo_id, commit, graph).await
+        yg_shard::write_shard(self.store.as_ref(), job.repo_id, &job.commit, graph).await
     }
+
+    /// The local mirror, guaranteed to contain the job's commit. The
+    /// cache is worker-local while the queue is not: a job can land on a
+    /// host whose cache never saw the repo (or saw an older commit), so
+    /// an indexing worker fetches the mirror itself when it must.
+    async fn ensure_mirror_has(&self, job: &yg_control::LeasedIndex) -> anyhow::Result<PathBuf> {
+        let mirror = yg_sync::mirror_path(&self.git_cache, job.repo_id);
+        if commit_available(&mirror, &job.commit).await {
+            return Ok(mirror);
+        }
+        let clone_url = yg_sync::join_clone_url(&job.base_url, &job.slug);
+        tracing::info!(slug = %job.slug, "local mirror lacks the commit; fetching");
+        let token = yg_sync::forge_token(job.token_env.as_deref(), &clone_url);
+        yg_sync::GitFetcher::new(&self.git_cache)
+            .sync(job.repo_id, &clone_url, token.as_deref(), job.fetch_depth)
+            .await
+            .context("fetching the mirror for indexing")?;
+        Ok(mirror)
+    }
+}
+
+/// Whether `commit` is present in the (possibly absent) bare mirror.
+async fn commit_available(mirror: &Path, commit: &str) -> bool {
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.arg("-C")
+        .arg(mirror)
+        .args(["cat-file", "-e", &format!("{commit}^{{commit}}")]);
+    cmd.kill_on_drop(true);
+    matches!(cmd.status().await, Ok(status) if status.success())
 }
 
 /// Materialize `commit`'s tree from a bare mirror into `dest`, without

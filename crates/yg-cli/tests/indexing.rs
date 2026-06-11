@@ -376,16 +376,17 @@ async fn a_failing_index_job_surfaces_its_error_backs_off_and_recovers() {
     h.add_repo().await;
     assert!(h.sync.run_once().await.unwrap(), "fetch job must run");
 
-    // The cache mirror vanishes between fetch and index (disk eviction,
-    // stray rm): the index job cannot materialize the checkout.
+    // The worst case: the cache mirror is evicted AND the forge is
+    // unreachable, so the worker can neither use nor refetch the mirror.
     let mirror = std::fs::read_dir(&h.cache)
         .unwrap()
         .next()
         .expect("the fetch must have left a mirror")
         .unwrap()
         .path();
-    let vandalized = h.cache.join("vandalized");
-    std::fs::rename(&mirror, &vandalized).unwrap();
+    std::fs::remove_dir_all(&mirror).unwrap();
+    let hidden_origin = h.repo_dir.with_file_name("gadgets-offline");
+    std::fs::rename(&h.repo_dir, &hidden_origin).unwrap();
 
     assert!(
         h.indexer
@@ -414,9 +415,9 @@ async fn a_failing_index_job_surfaces_its_error_backs_off_and_recovers() {
         "a failed job must not be due again immediately (backoff)"
     );
 
-    // The cause clears (the mirror is back); once the backoff elapses,
-    // indexing converges on its own.
-    std::fs::rename(&vandalized, &mirror).unwrap();
+    // The cause clears (the forge is reachable again); once the backoff
+    // elapses, indexing converges on its own by refetching the mirror.
+    std::fs::rename(&hidden_origin, &h.repo_dir).unwrap();
     let pool = sqlx::PgPool::connect(&format!("{DEV_POSTGRES}/{}", h.db_name))
         .await
         .unwrap();
@@ -468,6 +469,36 @@ async fn re_indexing_a_published_commit_completes_without_a_checkout() {
         body["repos"][0]["shard"]["revision"].as_str().is_some(),
         "got: {body}"
     );
+}
+
+#[tokio::test]
+async fn an_index_worker_without_the_mirror_fetches_it_itself() {
+    let h = Harness::boot().await;
+    h.add_repo().await;
+    assert!(h.sync.run_once().await.unwrap(), "fetch job must run");
+
+    // The index job lands on a different worker host: same control plane
+    // and object storage, but its own — empty — git cache.
+    let other_host_cache = tempfile::tempdir().unwrap();
+    let lone_indexer = yg_index::IndexWorker::new(
+        control_plane(&h.db_name).await,
+        h.store.clone(),
+        other_host_cache.path(),
+    );
+    assert!(
+        lone_indexer
+            .run_once()
+            .await
+            .expect("indexing must not error"),
+        "the index job must be claimed"
+    );
+
+    let body = admin_status_body(&h.base).await;
+    assert_eq!(
+        body["repos"][0]["index"]["state"], "indexed",
+        "a worker without the mirror must fetch it and index, got: {body}"
+    );
+    assert_eq!(body["repos"][0]["shard"]["nodes"], 4, "got: {body}");
 }
 
 #[tokio::test]

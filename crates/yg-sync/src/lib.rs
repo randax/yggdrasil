@@ -34,15 +34,7 @@ impl SyncWorker {
             return Ok(false);
         };
         let clone_url = join_clone_url(&job.base_url, &job.slug);
-        let token = job
-            .token_env
-            .as_deref()
-            .and_then(|var| std::env::var(var).ok())
-            .map(|token| token.trim().to_string())
-            .filter(|token| !token.is_empty())
-            // Defense in depth: whatever the control plane says, a Forge
-            // token only ever travels over TLS.
-            .filter(|_| clone_url.starts_with("https://"));
+        let token = forge_token(job.token_env.as_deref(), &clone_url);
         match self
             .fetcher
             .sync(job.repo_id, &clone_url, token.as_deref(), job.fetch_depth)
@@ -68,14 +60,34 @@ impl SyncWorker {
     }
 }
 
+/// Resolve the Forge token for a clone: read the env var the control
+/// plane names, if any. Defense in depth: whatever the control plane
+/// says, a Forge token only ever travels over TLS.
+pub fn forge_token(token_env: Option<&str>, clone_url: &str) -> Option<String> {
+    token_env
+        .and_then(|var| std::env::var(var).ok())
+        .map(|token| token.trim().to_string())
+        .filter(|token| !token.is_empty())
+        .filter(|_| clone_url.starts_with("https://"))
+}
+
+/// Where repo `repo_id`'s bare mirror lives inside a worker's git cache.
+/// The one definition of the cache layout — the fetch side writes here
+/// and the indexing side reads here.
+pub fn mirror_path(cache_dir: &std::path::Path, repo_id: i64) -> PathBuf {
+    cache_dir.join(format!("{repo_id}.git"))
+}
+
 /// Mirrors remote repositories into a local cache of bare clones, one
-/// `<repo-id>.git` per repo.
-struct GitFetcher {
+/// per repo at [`mirror_path`]. Used by the Sync worker on every fetch
+/// job, and by indexing workers to populate their local cache when a
+/// job lands on a host that hasn't fetched the repo.
+pub struct GitFetcher {
     cache_dir: PathBuf,
 }
 
 impl GitFetcher {
-    fn new(cache_dir: impl Into<PathBuf>) -> Self {
+    pub fn new(cache_dir: impl Into<PathBuf>) -> Self {
         Self {
             cache_dir: cache_dir.into(),
         }
@@ -88,14 +100,14 @@ impl GitFetcher {
     /// A mirror that exists but isn't usable (interrupted clone, stray
     /// deletion) is discarded and re-cloned rather than left to fail
     /// every retry forever.
-    async fn sync(
+    pub async fn sync(
         &self,
         repo_id: i64,
         clone_url: &str,
         token: Option<&str>,
         depth: Option<i32>,
     ) -> anyhow::Result<String> {
-        let local = self.cache_dir.join(format!("{repo_id}.git"));
+        let local = mirror_path(&self.cache_dir, repo_id);
         let depth_arg = depth.map(|n| format!("--depth={n}"));
         sweep_stale_partials(&self.cache_dir, repo_id).await;
         // Every bare repo has a HEAD file; a directory without one is

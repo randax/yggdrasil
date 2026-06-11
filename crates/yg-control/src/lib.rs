@@ -61,8 +61,9 @@ pub struct LeasedFetch {
     lease_token: String,
 }
 
-/// An index job a worker holds the lease on: which repo to index and the
-/// commit its sync position points at.
+/// An index job a worker holds the lease on: which repo to index, the
+/// commit its sync position points at, and where to clone from — an
+/// indexing worker whose local cache lacks the mirror fetches it itself.
 #[derive(sqlx::FromRow)]
 pub struct LeasedIndex {
     pub job_id: i64,
@@ -72,6 +73,12 @@ pub struct LeasedIndex {
     pub slug: String,
     /// The commit to index — the repo's sync position at claim time.
     pub commit: String,
+    /// Forge root; the clone URL is `{base_url}/{slug}`.
+    pub base_url: String,
+    /// Env var holding the Forge token, if the forge has one.
+    pub token_env: Option<String>,
+    /// Shallow-clone override; `None` = full history.
+    pub fetch_depth: Option<i32>,
     /// Opaque fencing token; see [`LeasedFetch::lease_token`].
     lease_token: String,
 }
@@ -324,10 +331,11 @@ impl ControlPlane {
              )
              UPDATE jobs j
              SET state = 'leased', lease_until = now() + make_interval(secs => $1)
-             FROM due, repos r
+             FROM due, repos r JOIN forges f ON f.id = r.forge_id
              WHERE j.id = due.id AND r.id = j.repo_id
              RETURNING j.id AS job_id, j.repo_id, j.attempts,
                        r.slug, r.last_synced_commit AS commit,
+                       f.base_url, f.token_env, r.fetch_depth,
                        j.lease_until::text AS lease_token",
         )
         .bind(lease.as_secs_f64())
