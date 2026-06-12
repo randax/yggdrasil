@@ -309,6 +309,18 @@ impl NeighborsOptions {
                 self.limit
             ));
         }
+        // An empty list is ambiguous ("no kinds" vs "no filter") and
+        // would render as invalid SQL (`IN ()`): the client must say
+        // which one they mean.
+        if self
+            .edge_kinds
+            .as_ref()
+            .is_some_and(|kinds| kinds.is_empty())
+        {
+            return Err(
+                "edge_kinds must name at least one kind; omit it to follow every kind".to_string(),
+            );
+        }
         Ok(())
     }
 }
@@ -681,5 +693,11 @@ mod tests {
             };
             assert!(options.validate().is_err(), "depth={depth} limit={limit}");
         }
+        // An empty kind filter would render as invalid SQL (`IN ()`).
+        let options = NeighborsOptions {
+            edge_kinds: Some(vec![]),
+            ..NeighborsOptions::default()
+        };
+        assert!(options.validate().is_err(), "empty edge_kinds");
     }
 }

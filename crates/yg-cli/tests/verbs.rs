@@ -327,6 +327,8 @@ async fn neighbors_rejects_nonsense_pagination_and_depth() {
         ("depth", json!(0)),
         ("depth", json!(4)),
         ("cursor", json!("not-a-cursor")),
+        // Empty kind filters are ambiguous and would render as `IN ()`.
+        ("edge_kinds", json!([])),
     ] {
         let mut req = json!({ "id": id });
         req[field] = value.clone();
