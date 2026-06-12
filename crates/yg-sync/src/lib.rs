@@ -283,8 +283,20 @@ fn head_names_a_ref(path: &std::path::Path) -> bool {
         return false; // unreadable: wreckage
     };
     let head = head.trim_ascii_end();
-    head.starts_with(b"ref: refs/")
-        || (head.len() >= 40 && head.iter().all(|b| b.is_ascii_hexdigit()))
+    // One logical line, no embedded NULs: a partial write can splice
+    // garbage after a valid-looking prefix, and accepting it would keep
+    // reusing (and failing on) a mirror the re-clone path should heal.
+    if head.iter().any(|b| matches!(b, 0 | b'\n' | b'\r')) {
+        return false;
+    }
+    match head.strip_prefix(b"ref: refs/") {
+        Some(target) => target.iter().any(|b| !b.is_ascii_whitespace()),
+        // Detached form: exactly a sha1 or sha256 — git writes nothing
+        // else, and an unbounded hex check would accept garbage blobs.
+        None => {
+            (head.len() == 40 || head.len() == 64) && head.iter().all(|b| b.is_ascii_hexdigit())
+        }
+    }
 }
 
 /// Where a remote's HEAD points, as `ls-remote --symref` advertises it.
@@ -735,6 +747,52 @@ mod tests {
 
     fn parsed(url: &str) -> RepoLocator {
         RepoLocator::parse(url).expect(url)
+    }
+
+    #[test]
+    fn head_validation_rejects_crash_artifacts_and_accepts_gits_shapes() {
+        let dir = tempfile::tempdir().unwrap();
+        let head = dir.path().join("HEAD");
+        let names_a_ref = |bytes: &[u8]| {
+            std::fs::write(&head, bytes).unwrap();
+            head_names_a_ref(&head)
+        };
+        // The shapes git writes.
+        assert!(names_a_ref(b"ref: refs/heads/main\n"));
+        assert!(
+            names_a_ref(b"ref: refs/heads/caf\xe9\n"),
+            "refnames may legally hold non-UTF-8"
+        );
+        assert!(
+            names_a_ref(b"0123456789abcdef0123456789abcdef01234567\n"),
+            "detached sha1"
+        );
+        assert!(
+            names_a_ref(format!("{}\n", "a".repeat(64)).as_bytes()),
+            "detached sha256"
+        );
+        // Crash artifacts and garbage.
+        assert!(!names_a_ref(b""), "empty");
+        assert!(!names_a_ref(b"\0\0\0\0\0"), "NUL-filled");
+        assert!(
+            !names_a_ref(b"ref: refs/heads/main\0\0\0"),
+            "NULs spliced after a valid-looking prefix"
+        );
+        assert!(!names_a_ref(b"ref: refs/   "), "no target after the prefix");
+        assert!(!names_a_ref(b"ref: re"), "truncated mid-prefix");
+        assert!(
+            !names_a_ref(b"ref: refs/heads/a\nref: refs/heads/b\n"),
+            "more than one line"
+        );
+        assert!(
+            !names_a_ref(b"0123456789abcdef\n"),
+            "hex but not an oid length"
+        );
+        assert!(
+            !names_a_ref("a".repeat(70).as_bytes()),
+            "hex garbage block of non-oid length"
+        );
+        assert!(!names_a_ref(b"not a head at all"), "prose");
     }
 
     #[test]
