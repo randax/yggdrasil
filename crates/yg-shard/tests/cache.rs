@@ -208,3 +208,38 @@ async fn a_restarted_cache_reuses_an_intact_segment_without_refetching_it() {
         "the one refetch is the manifest, never the segment"
     );
 }
+
+#[tokio::test]
+async fn a_manifest_recording_a_non_checksum_segment_name_is_refused() {
+    use object_store::ObjectStoreExt;
+    let store = Arc::new(CountingStore::new());
+    let commit = "abc123";
+    let revision = yg_shard::syntactic_revision(commit);
+
+    // A doctored manifest: consistent with its revision, but its
+    // segment "checksum" tries to reach outside the cache directory.
+    let manifest = serde_json::json!({
+        "schema_version": yg_shard::SCHEMA_VERSION,
+        "commit": commit,
+        "pass": yg_shard::SYNTACTIC_PASS,
+        "counts": {"nodes": 0, "edges": 0},
+        "segments": {"graph.sqlite": {"sha256": "../../../tmp/evil", "bytes": 1}},
+    });
+    store
+        .put(
+            &yg_shard::manifest_key(1, &revision).as_str().into(),
+            manifest.to_string().into(),
+        )
+        .await
+        .unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let err = ShardCache::new(store.clone(), dir.path())
+        .graph_path(1, &revision)
+        .await
+        .expect_err("a non-checksum segment name must be refused");
+    assert!(
+        err.to_string().contains("not a sha256 digest"),
+        "names the reason: {err:#}"
+    );
+}

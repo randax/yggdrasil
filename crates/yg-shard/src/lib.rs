@@ -442,10 +442,11 @@ pub async fn write_shard(
 pub struct ShardCache {
     store: Arc<dyn ObjectStore>,
     dir: std::path::PathBuf,
-    /// Manifests by manifest key.
-    manifests: tokio::sync::Mutex<std::collections::HashMap<String, Arc<Manifest>>>,
+    /// Manifests by manifest key. A std (not tokio) Mutex: these locks
+    /// only ever guard map lookups and inserts, never I/O or `.await`.
+    manifests: std::sync::Mutex<std::collections::HashMap<String, Arc<Manifest>>>,
     /// Checksums whose on-disk file this process has already verified.
-    verified: tokio::sync::Mutex<std::collections::HashSet<String>>,
+    verified: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 /// A revision whose manifest is not in object storage — distinct from
@@ -493,7 +494,17 @@ impl ShardCache {
         let segment = manifest.segments.get(GRAPH_SEGMENT_FILE).with_context(|| {
             format!("the manifest for {revision} records no {GRAPH_SEGMENT_FILE} segment")
         })?;
+        // The recorded checksum names a file in the cache directory:
+        // before it touches a path it must *be* a checksum (64 hex
+        // chars), or a doctored manifest could reach outside the cache
+        // (`../`, an absolute path) through the join below.
         let sha = segment.sha256.clone();
+        if sha.len() != 64 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+            anyhow::bail!(
+                "the manifest for {revision} records {sha:?} as a segment checksum, \
+                 which is not a sha256 digest; refusing to trust it"
+            );
+        }
         let path = self.dir.join(format!("{sha}.sqlite"));
 
         // The locks below guard only map lookups and inserts — never
@@ -501,7 +512,12 @@ impl ShardCache {
         // for others. Two requests racing the same cold revision both
         // fetch; the rename is idempotent and the artifact immutable,
         // so the duplicate work is bounded and harmless.
-        if self.verified.lock().await.contains(&sha) {
+        if self
+            .verified
+            .lock()
+            .expect("shard cache lock poisoned")
+            .contains(&sha)
+        {
             return Ok(path);
         }
         // Verification hashes a whole segment — off the runtime threads.
@@ -551,11 +567,22 @@ impl ShardCache {
             tokio::fs::write(&tmp, &fetched)
                 .await
                 .context("staging the graph segment into the cache")?;
-            tokio::fs::rename(&tmp, &path)
-                .await
-                .context("committing the graph segment into the cache")?;
+            if let Err(e) = tokio::fs::rename(&tmp, &path).await {
+                // On platforms where rename cannot replace (Windows),
+                // the loser of a cold-fetch race lands here with the
+                // winner's identical, verified bytes already committed
+                // — that's success, not an error.
+                let committed = tokio::fs::try_exists(&path).await.unwrap_or(false);
+                let _ = tokio::fs::remove_file(&tmp).await;
+                if !committed {
+                    return Err(e).context("committing the graph segment into the cache");
+                }
+            }
         }
-        self.verified.lock().await.insert(sha);
+        self.verified
+            .lock()
+            .expect("shard cache lock poisoned")
+            .insert(sha);
         Ok(path)
     }
 
@@ -567,7 +594,12 @@ impl ShardCache {
     /// repair gone wrong — must not be served as this revision.
     async fn manifest(&self, repo_id: i64, revision: &str) -> anyhow::Result<Arc<Manifest>> {
         let key = manifest_key(repo_id, revision);
-        if let Some(manifest) = self.manifests.lock().await.get(&key) {
+        if let Some(manifest) = self
+            .manifests
+            .lock()
+            .expect("shard cache lock poisoned")
+            .get(&key)
+        {
             return Ok(manifest.clone());
         }
         // Fetched outside the lock: a slow fetch of one revision must
@@ -600,7 +632,10 @@ impl ShardCache {
             );
         }
         let manifest = Arc::new(manifest);
-        self.manifests.lock().await.insert(key, manifest.clone());
+        self.manifests
+            .lock()
+            .expect("shard cache lock poisoned")
+            .insert(key, manifest.clone());
         Ok(manifest)
     }
 }
