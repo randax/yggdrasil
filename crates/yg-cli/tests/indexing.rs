@@ -5,81 +5,8 @@
 mod common;
 
 use common::*;
-use yg_api::serve;
-
-/// A Go repo fixture standing in for a Forge-hosted one: two functions in
-/// main.go plus a README. Returns (fixture root guard, repo dir, URL).
-fn go_fixture_repo() -> (tempfile::TempDir, std::path::PathBuf, String) {
-    fixture_repo_with(&[
-        (
-            "main.go",
-            "package main\n\nfunc Hello() string {\n\treturn \"hello\"\n}\n\nfunc main() {\n\tprintln(Hello())\n}\n",
-        ),
-        ("README.md", "# gadgets\n"),
-    ])
-}
-
-/// A booted server plus sync and index workers around one Go fixture
-/// repo: everything an indexing test drives.
-struct Harness {
-    /// Held for Drop: owns the fixture repo and git cache on disk.
-    _fixture: tempfile::TempDir,
-    repo_dir: std::path::PathBuf,
-    cache: std::path::PathBuf,
-    fixture_url: String,
-    db_name: String,
-    base: String,
-    _server: yg_api::RunningServer,
-    sync: yg_sync::SyncWorker,
-    indexer: yg_index::IndexWorker,
-    store: std::sync::Arc<dyn object_store::ObjectStore>,
-}
 
 impl Harness {
-    async fn boot() -> Self {
-        let (fixture, repo_dir, fixture_url) = go_fixture_repo();
-        let cache = fixture.path().join("git-cache");
-        let db_name = create_test_db().await;
-        let config = test_config(&db_name);
-        let store = config
-            .object_store
-            .connect()
-            .expect("dev MinIO must be reachable");
-        let server = serve(config).await.expect("boot");
-        let base = format!("http://{}", server.local_addr());
-        let sync = yg_sync::SyncWorker::new(control_plane(&db_name).await, &cache);
-        let indexer =
-            yg_index::IndexWorker::new(control_plane(&db_name).await, store.clone(), &cache);
-        Self {
-            _fixture: fixture,
-            repo_dir,
-            cache,
-            fixture_url,
-            db_name,
-            base,
-            _server: server,
-            sync,
-            indexer,
-            store,
-        }
-    }
-
-    async fn add_repo(&self) {
-        post_repo(&self.base, serde_json::json!({"url": self.fixture_url})).await;
-    }
-
-    /// Drive one fetch + one index through the workers.
-    async fn sync_and_index(&self) {
-        assert!(self.sync.run_once().await.unwrap(), "fetch job must run");
-        assert!(
-            self.indexer
-                .run_once()
-                .await
-                .expect("indexing must not error"),
-            "a successful fetch must queue an index job"
-        );
-    }
-
     /// The repo's `shard` object from admin status.
     async fn shard_status(&self) -> serde_json::Value {
         admin_status_body(&self.base).await["repos"][0]["shard"].clone()

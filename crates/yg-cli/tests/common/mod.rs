@@ -8,6 +8,10 @@
 
 use yg_api::{ObjectStoreConfig, RunningServer, ServerConfig, serve};
 
+/// The bearer token every harness server boots with and every helper
+/// presents.
+pub const TEST_TOKEN: &str = "ygt_test_token";
+
 pub const DEV_POSTGRES: &str = "postgres://yggdrasil:yggdrasil@localhost:5432";
 
 /// Each test boots against its own freshly created database so tests are
@@ -98,7 +102,11 @@ pub fn test_config(db_name: &str) -> ServerConfig {
             secret_key: "yggdrasil".into(),
             region: "us-east-1".into(),
         },
-        bootstrap_token: "ygt_test_token".into(),
+        bootstrap_token: TEST_TOKEN.into(),
+        // Per-test (db names are unique) so cache assertions never see
+        // another test's segments; content-addressing would make sharing
+        // safe, but isolation keeps the tests honest.
+        shard_cache: std::env::temp_dir().join(format!("yg-shard-cache-{db_name}")),
     }
 }
 
@@ -113,7 +121,7 @@ pub async fn control_plane(db_name: &str) -> yg_control::ControlPlane {
 pub async fn post_repo(base: &str, body: serde_json::Value) -> reqwest::Response {
     reqwest::Client::new()
         .post(format!("{base}/v1/admin/repos"))
-        .bearer_auth("ygt_test_token")
+        .bearer_auth(TEST_TOKEN)
         .json(&body)
         .send()
         .await
@@ -124,7 +132,7 @@ pub async fn post_repo(base: &str, body: serde_json::Value) -> reqwest::Response
 pub async fn admin_status_body(base: &str) -> serde_json::Value {
     let resp = reqwest::Client::new()
         .get(format!("{base}/v1/admin/status"))
-        .bearer_auth("ygt_test_token")
+        .bearer_auth(TEST_TOKEN)
         .send()
         .await
         .unwrap();
@@ -218,6 +226,151 @@ pub fn git(dir: &std::path::Path, args: &[&str]) -> String {
         String::from_utf8_lossy(&out.stderr)
     );
     String::from_utf8(out.stdout).unwrap().trim().to_string()
+}
+
+/// A Go repo fixture standing in for a Forge-hosted one: two functions in
+/// main.go plus a README, giving the graph File and Symbol nodes joined
+/// by DEFINES edges.
+pub fn go_fixture_repo() -> (tempfile::TempDir, std::path::PathBuf, String) {
+    fixture_repo_with(&[
+        (
+            "main.go",
+            "package main\n\nfunc Hello() string {\n\treturn \"hello\"\n}\n\nfunc main() {\n\tprintln(Hello())\n}\n",
+        ),
+        ("README.md", "# gadgets\n"),
+    ])
+}
+
+/// A booted server plus sync and index workers around one fixture repo:
+/// everything an indexing or Verb test drives. Per-target extras live in
+/// `impl Harness` blocks beside the tests that need them.
+pub struct Harness {
+    /// Held for Drop: owns the fixture repo and git cache on disk.
+    pub _fixture: tempfile::TempDir,
+    pub repo_dir: std::path::PathBuf,
+    pub cache: std::path::PathBuf,
+    pub fixture_url: String,
+    pub db_name: String,
+    pub base: String,
+    pub _server: yg_api::RunningServer,
+    pub sync: yg_sync::SyncWorker,
+    pub indexer: yg_index::IndexWorker,
+    pub store: std::sync::Arc<dyn object_store::ObjectStore>,
+}
+
+impl Harness {
+    pub async fn boot() -> Self {
+        Self::boot_around(go_fixture_repo()).await
+    }
+
+    /// Boot around a custom fixture for tests that need a particular
+    /// graph shape.
+    pub async fn boot_with(files: &[(&str, &str)]) -> Self {
+        Self::boot_around(fixture_repo_with(files)).await
+    }
+
+    pub async fn boot_around(
+        (fixture, repo_dir, fixture_url): (tempfile::TempDir, std::path::PathBuf, String),
+    ) -> Self {
+        let cache = fixture.path().join("git-cache");
+        let db_name = create_test_db().await;
+        let mut config = test_config(&db_name);
+        // Under the fixture guard so Drop reclaims it — shard caches
+        // left in the system temp dir would pile up run after run.
+        config.shard_cache = fixture.path().join("shard-cache");
+        let store = config
+            .object_store
+            .connect()
+            .expect("dev MinIO must be reachable");
+        let server = serve(config).await.expect("boot");
+        let base = format!("http://{}", server.local_addr());
+        let sync = yg_sync::SyncWorker::new(control_plane(&db_name).await, &cache);
+        let indexer =
+            yg_index::IndexWorker::new(control_plane(&db_name).await, store.clone(), &cache);
+        Self {
+            _fixture: fixture,
+            repo_dir,
+            cache,
+            fixture_url,
+            db_name,
+            base,
+            _server: server,
+            sync,
+            indexer,
+            store,
+        }
+    }
+
+    pub async fn add_repo(&self) {
+        post_repo(&self.base, serde_json::json!({"url": self.fixture_url})).await;
+    }
+
+    /// Drive one fetch + one index through the workers.
+    pub async fn sync_and_index(&self) {
+        assert!(self.sync.run_once().await.unwrap(), "fetch job must run");
+        assert!(
+            self.indexer
+                .run_once()
+                .await
+                .expect("indexing must not error"),
+            "a successful fetch must queue an index job"
+        );
+    }
+
+    /// The repo qualifier that prefixes this fixture's external node ids
+    /// (RFC 0001 §5): the Forge root sans scheme joined with the slug —
+    /// for a `file://` fixture, the repo's filesystem path.
+    pub fn qualifier(&self) -> String {
+        self.repo_dir.display().to_string()
+    }
+
+    /// POST a Verb request, returning (status, parsed body).
+    pub async fn verb(&self, verb: &str, body: serde_json::Value) -> (u16, serde_json::Value) {
+        let resp = reqwest::Client::new()
+            .post(format!("{}/v1/verbs/{verb}", self.base))
+            .bearer_auth(TEST_TOKEN)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status().as_u16();
+        let text = resp.text().await.unwrap();
+        let body = serde_json::from_str(&text)
+            .unwrap_or_else(|_| panic!("verb {verb} answered non-JSON ({status}): {text}"));
+        (status, body)
+    }
+
+    /// POST a Verb request that must succeed, returning its body.
+    pub async fn verb_ok(&self, verb: &str, body: serde_json::Value) -> serde_json::Value {
+        let (status, body) = self.verb(verb, body).await;
+        assert_eq!(status, 200, "verb must succeed, got: {body}");
+        body
+    }
+
+    /// Run the yg binary as a Member against this harness's server.
+    /// Off the runtime threads: the server answering the CLI lives on
+    /// this test's runtime, so blocking on the child in place would
+    /// deadlock the pair.
+    pub async fn yg(&self, args: &[&str]) -> std::process::Output {
+        let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin("yg"));
+        cmd.env("YG_SERVER", &self.base)
+            .env("YG_TOKEN", TEST_TOKEN)
+            .args(args);
+        tokio::task::spawn_blocking(move || cmd.output().expect("running yg"))
+            .await
+            .expect("yg task panicked")
+    }
+
+    /// Run yg expecting success, returning stdout.
+    pub async fn yg_ok(&self, args: &[&str]) -> String {
+        let out = self.yg(args).await;
+        assert!(
+            out.status.success(),
+            "yg {args:?} failed:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).expect("yg output is UTF-8")
+    }
 }
 
 /// A local git repository standing in for a Forge-hosted one, addressable

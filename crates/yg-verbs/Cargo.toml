@@ -8,3 +8,6 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+anyhow = "1.0.102"
+rusqlite = { version = "0.39", features = ["bundled"] }
+serde = { version = "1.0.228", features = ["derive"] }

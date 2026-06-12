@@ -25,6 +25,7 @@ yg-sync = { version = "0.1.0", path = "../yg-sync" }
 
 [dev-dependencies]
 assert_cmd = "2.2.2"
+base64 = "0.22.1"
 hex = "0.4.3"
 object_store = "0.13.2"
 predicates = "3.1.4"

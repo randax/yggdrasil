@@ -25,6 +25,9 @@ pub struct ServerConfig {
     pub database_url: String,
     pub object_store: ObjectStoreConfig,
     pub bootstrap_token: String,
+    /// Local tier for Shard segments (RFC 0001 §6): warm Verb queries
+    /// read from here instead of object storage.
+    pub shard_cache: std::path::PathBuf,
 }
 
 impl ServerConfig {
@@ -53,6 +56,7 @@ impl ServerConfig {
             database_url: var_or("YG_DATABASE_URL", yg_control::DEFAULT_DATABASE_URL),
             object_store: ObjectStoreConfig::from_env(),
             bootstrap_token,
+            shard_cache: var_or("YG_SHARD_CACHE", "./data/shard-cache").into(),
         })
     }
 }
@@ -81,6 +85,7 @@ impl RunningServer {
 struct AppState {
     control: ControlPlane,
     store: std::sync::Arc<dyn ObjectStore>,
+    shards: yg_shard::ShardCache,
     bootstrap_token: String,
     started: std::time::Instant,
 }
@@ -97,6 +102,7 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<RunningServer> {
 
     let state = Arc::new(AppState {
         control,
+        shards: yg_shard::ShardCache::new(store.clone(), config.shard_cache),
         store,
         bootstrap_token: config.bootstrap_token,
         started: std::time::Instant::now(),
@@ -109,6 +115,8 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<RunningServer> {
             "/v1",
             Router::new()
                 .route("/status", get(status))
+                .route("/verbs/node", post(verb_node))
+                .route("/verbs/neighbors", post(verb_neighbors))
                 .route("/admin/repos", post(admin_repo_add))
                 .route("/admin/status", get(admin_status)),
         )
@@ -174,6 +182,319 @@ fn error_json(status: StatusCode, message: impl Into<String>) -> Response {
 }
 
 #[derive(Deserialize)]
+struct NodeRequest {
+    id: String,
+}
+
+/// `POST /v1/verbs/node` (RFC 0001 §7): full node + edge summary.
+async fn verb_node(State(state): State<Arc<AppState>>, Json(req): Json<NodeRequest>) -> Response {
+    let id = match yg_verbs::VerbId::parse(&req.id) {
+        Ok(id) => id,
+        Err(reason) => return error_json(StatusCode::BAD_REQUEST, reason),
+    };
+    let (path, _) = match resolve_shard(&state, &id.repo, None).await {
+        Ok(resolved) => resolved,
+        Err(response) => return response,
+    };
+    match run_verb(path, id, yg_verbs::node).await {
+        Ok(response) => Json(response).into_response(),
+        Err(response) => response,
+    }
+}
+
+#[derive(Deserialize)]
+struct NeighborsRequest {
+    #[serde(flatten)]
+    shape: TraversalShape,
+    /// Page size in nodes: 1 to 1000, default 100. Deliberately not
+    /// part of the shape: pages of one traversal may vary in size.
+    limit: Option<u32>,
+    /// Resume an earlier traversal where its last page ended.
+    cursor: Option<String>,
+}
+
+/// The traversal-defining half of a `neighbors` request: origin and
+/// filters, exactly as the client spelled them. One definition, two
+/// homes — the request and the cursor — so "the cursor remembers what
+/// was asked" is a move, not a field-by-field copy that can drift.
+#[derive(Serialize, Deserialize, Clone)]
+struct TraversalShape {
+    id: String,
+    /// `"in"` | `"out"` | `"both"` (the default). A plain string so a
+    /// typo gets this server's error envelope, not a serde rejection.
+    direction: Option<String>,
+    /// Only follow edges of these kinds; omitted follows every kind.
+    edge_kinds: Option<Vec<String>>,
+    /// Hops to traverse: 1 (default) to 3 (RFC 0001 §7).
+    depth: Option<u32>,
+}
+
+/// What a `next_cursor` opaquely carries: the traversal position, the
+/// Shard revision it was read from, and the request shape it belongs
+/// to. Later pages stay on the pinned revision — Shards are immutable,
+/// so a paginated walk sees one consistent graph even across a pointer
+/// swap; only a *fresh* query picks up the new Shard. The request shape
+/// rides along because the page contract ("pages of one traversal union
+/// to the full induced subgraph") only holds when every page is
+/// computed with identical origin and filters: a replay that
+/// contradicts its cursor is rejected, never silently served from a
+/// different traversal.
+#[derive(Serialize, Deserialize)]
+struct NeighborsCursor {
+    rev: String,
+    #[serde(flatten)]
+    shape: TraversalShape,
+    after_depth: u32,
+    after: String,
+}
+
+impl NeighborsCursor {
+    fn encode(&self) -> String {
+        use base64::Engine;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(self).expect("a cursor serializes"))
+    }
+
+    fn decode(cursor: &str) -> Result<Self, String> {
+        use base64::Engine;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(cursor)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .ok_or_else(|| {
+                "invalid cursor: pass back next_cursor from a previous response, unmodified"
+                    .to_string()
+            })
+    }
+
+    /// The cursor remembers what the first page was asked; a follow-up
+    /// may repeat those fields (in any equivalent spelling) or omit
+    /// them, nothing else. Spellings are compared normalized: an
+    /// omitted direction and an explicit `"both"` mean the same
+    /// traversal, and edge-kind order carries no meaning.
+    fn agrees_with(&self, req: &TraversalShape) -> Result<(), String> {
+        fn direction(spelled: &Option<String>) -> Result<yg_verbs::Direction, String> {
+            spelled.as_deref().map_or(
+                Ok(yg_verbs::Direction::default()),
+                yg_verbs::Direction::parse,
+            )
+        }
+        fn kind_set(kinds: &Option<Vec<String>>) -> Option<Vec<String>> {
+            kinds.clone().map(|mut kinds| {
+                kinds.sort_unstable();
+                kinds.dedup();
+                kinds
+            })
+        }
+        let contradicts = req.id != self.shape.id
+            || (req.direction.is_some()
+                && direction(&req.direction)? != direction(&self.shape.direction)?)
+            || (req.edge_kinds.is_some()
+                && kind_set(&req.edge_kinds) != kind_set(&self.shape.edge_kinds))
+            || req
+                .depth
+                .is_some_and(|d| d != self.shape.depth.unwrap_or(1));
+        if contradicts {
+            return Err(
+                "this cursor belongs to a different request (id, direction, edge_kinds, \
+                 and depth must match the page it came from); start a fresh traversal \
+                 or pass the cursor with the original parameters"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
+/// `POST /v1/verbs/neighbors` (RFC 0001 §7): one page of the adjacent
+/// subgraph.
+async fn verb_neighbors(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<NeighborsRequest>,
+) -> Response {
+    let cursor = match req.cursor.as_deref().map(NeighborsCursor::decode) {
+        Some(Ok(cursor)) => Some(cursor),
+        Some(Err(reason)) => return error_json(StatusCode::BAD_REQUEST, reason),
+        None => None,
+    };
+    if let Some(cursor) = &cursor
+        && let Err(reason) = cursor.agrees_with(&req.shape)
+    {
+        return error_json(StatusCode::BAD_REQUEST, reason);
+    }
+    // The shape in force: the cursor's where present (it remembers the
+    // original request, and agrees_with just ruled out contradiction),
+    // the request's on a fresh traversal. Only the page size may vary
+    // mid-walk.
+    let shape = match cursor.as_ref() {
+        Some(cursor) => cursor.shape.clone(),
+        None => req.shape,
+    };
+    let direction = match shape.direction.as_deref().map(yg_verbs::Direction::parse) {
+        Some(Ok(direction)) => direction,
+        Some(Err(reason)) => return error_json(StatusCode::BAD_REQUEST, reason),
+        None => yg_verbs::Direction::default(),
+    };
+    let options = yg_verbs::NeighborsOptions {
+        direction,
+        edge_kinds: shape.edge_kinds.clone(),
+        depth: shape.depth.unwrap_or(1),
+        limit: req.limit.unwrap_or(100) as usize,
+        after: cursor.as_ref().map(|c| (c.after_depth, c.after.clone())),
+    };
+    if let Err(reason) = options.validate() {
+        return error_json(StatusCode::BAD_REQUEST, reason);
+    }
+
+    let id = match yg_verbs::VerbId::parse(&shape.id) {
+        Ok(id) => id,
+        Err(reason) => return error_json(StatusCode::BAD_REQUEST, reason),
+    };
+    // A cursor pins the revision its traversal started on; fresh
+    // queries resolve the current pointer.
+    let pinned = cursor.as_ref().map(|c| c.rev.clone());
+    let (path, revision) = match resolve_shard(&state, &id.repo, pinned).await {
+        Ok(resolved) => resolved,
+        Err(response) => return response,
+    };
+
+    let verb_options = options.clone();
+    let page = match run_verb(path, id, move |conn, id| {
+        yg_verbs::neighbors(conn, id, &verb_options)
+    })
+    .await
+    {
+        Ok(page) => page,
+        Err(response) => return response,
+    };
+
+    let next_cursor = page.next.as_ref().map(|(after_depth, after)| {
+        NeighborsCursor {
+            rev: revision.clone(),
+            shape: shape.clone(),
+            after_depth: *after_depth,
+            after: after.clone(),
+        }
+        .encode()
+    });
+    Json(NeighborsResponse {
+        nodes: page.nodes,
+        edges: page.edges,
+        next_cursor,
+    })
+    .into_response()
+}
+
+/// The `neighbors` wire response: one page plus the opaque cursor.
+#[derive(Serialize)]
+struct NeighborsResponse {
+    nodes: Vec<yg_verbs::NodeView>,
+    edges: Vec<yg_verbs::GraphEdge>,
+    next_cursor: Option<String>,
+}
+
+/// The shared back half of every node-addressed Verb: open the resolved
+/// graph segment and run the (blocking, SQLite-bound) verb off the
+/// runtime threads — the open does filesystem syscalls, so it belongs
+/// in the closure too. The verb's `None` is the client's 404; errors
+/// come back as ready-to-return responses.
+async fn run_verb<T, F>(
+    path: std::path::PathBuf,
+    id: yg_verbs::VerbId,
+    verb: F,
+) -> Result<T, Response>
+where
+    T: Send + 'static,
+    F: FnOnce(&rusqlite::Connection, &yg_verbs::VerbId) -> anyhow::Result<Option<T>>
+        + Send
+        + 'static,
+{
+    let external = id.external();
+    let outcome = tokio::task::spawn_blocking(move || {
+        let conn = rusqlite::Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .context("opening the cached graph segment")?;
+        verb(&conn, &id)
+    })
+    .await;
+    match outcome {
+        Ok(Ok(Some(response))) => Ok(response),
+        // "this", not "the current": a pagination cursor may have
+        // pinned an older revision than the pointer's.
+        Ok(Ok(None)) => Err(error_json(
+            StatusCode::NOT_FOUND,
+            format!("no node {external} in this repo's Shard"),
+        )),
+        Ok(Err(e)) => Err(error_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("{e:#}"),
+        )),
+        Err(e) => Err(error_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("verb task panicked: {e}"),
+        )),
+    }
+}
+
+/// Resolve a repo qualifier to the local path of a Shard's verified
+/// graph segment — the shared front half of every Verb. The pointer is
+/// re-resolved on every call, so a swap is picked up by the next query
+/// without a restart; `pinned` (from a pagination cursor) bypasses the
+/// pointer and reads that exact immutable revision instead. Errors come
+/// back as ready-to-return responses: unknown repos, never-indexed
+/// repos, and expired cursors are the client's to hear about, not 500s.
+async fn resolve_shard(
+    state: &AppState,
+    qualifier: &str,
+    pinned: Option<String>,
+) -> Result<(std::path::PathBuf, String), Response> {
+    let target = match state.control.verb_target(qualifier).await {
+        Ok(target) => target,
+        Err(e) => {
+            return Err(error_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("{e:#}"),
+            ));
+        }
+    };
+    let Some(target) = target else {
+        return Err(error_json(
+            StatusCode::NOT_FOUND,
+            format!("no indexed repository matches {qualifier:?}"),
+        ));
+    };
+    let from_cursor = pinned.is_some();
+    let revision = match pinned.or(target.revision) {
+        Some(revision) => revision,
+        None => {
+            return Err(error_json(
+                StatusCode::NOT_FOUND,
+                format!("{qualifier} is registered but not yet indexed; try again shortly"),
+            ));
+        }
+    };
+    match state.shards.graph_path(target.repo_id, &revision).await {
+        Ok(path) => Ok((path, revision)),
+        // A pinned revision that storage no longer holds is a cursor
+        // outliving its Shard (GC, a forged or mistyped cursor): the
+        // client must restart the traversal, the server is fine.
+        Err(e) if from_cursor && e.downcast_ref::<yg_shard::RevisionMissing>().is_some() => {
+            Err(error_json(
+                StatusCode::GONE,
+                "this cursor's Shard revision is no longer available; \
+                 restart the traversal without a cursor",
+            ))
+        }
+        Err(e) => Err(error_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("{e:#}"),
+        )),
+    }
+}
+
+#[derive(Deserialize)]
 struct AddRepoRequest {
     url: String,
     /// Shallow-clone override; omitted = full history.
@@ -204,6 +525,22 @@ async fn admin_repo_add(
         Ok(locator) => locator,
         Err(reason) => return error_json(StatusCode::BAD_REQUEST, reason),
     };
+    // Every node id this repo will ever mint embeds its qualifier
+    // (RFC 0001 §5); a qualifier the id grammar can't address — an
+    // IPv6 host, a path with a stray colon — would index a repo no
+    // query could reach. Refused here, with the reason, instead.
+    let qualifier = yg_control::repo_qualifier(&locator.base_url, &locator.slug);
+    if !yg_verbs::addressable_qualifier(&qualifier) {
+        return error_json(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "{} maps to repo qualifier {qualifier:?}, which node ids cannot address \
+                 (it contains a colon outside a numeric port); \
+                 use a hostname-based URL without colons in its path",
+                req.url
+            ),
+        );
+    }
     let outcome = state
         .control
         .add_repo(yg_control::AddRepo {
@@ -228,6 +565,11 @@ async fn admin_repo_add(
             }),
         )
             .into_response(),
+        // The same host/slug registered through a different forge URL
+        // (http vs https, say) is the caller's collision to resolve.
+        Err(e) if e.downcast_ref::<yg_control::QualifierConflict>().is_some() => {
+            error_json(StatusCode::CONFLICT, format!("{e}"))
+        }
         Err(e) => error_json(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
     }
 }

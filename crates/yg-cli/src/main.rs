@@ -28,6 +28,37 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Show one Knowledge Graph node with its edge summary
+    Node {
+        #[arg(help = "Node id, e.g. sym:github.com/acme/widgets:main.go#Hello")]
+        id: String,
+        /// Emit the raw JSON response instead of the human report
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show a node's neighboring subgraph
+    Neighbors {
+        #[arg(help = "Node id, e.g. file:github.com/acme/widgets:main.go")]
+        id: String,
+        /// Follow only edges pointing this way: in, out, or both
+        #[arg(long)]
+        direction: Option<String>,
+        /// Follow only edges of this kind (repeatable), e.g. DEFINES
+        #[arg(long = "kind")]
+        kinds: Vec<String>,
+        /// How many hops to traverse (1-3)
+        #[arg(long)]
+        depth: Option<u32>,
+        /// Nodes per page (1-1000)
+        #[arg(long)]
+        limit: Option<u32>,
+        /// Resume where the previous page's next_cursor left off
+        #[arg(long)]
+        cursor: Option<String>,
+        /// Emit the raw JSON response instead of the human report
+        #[arg(long)]
+        json: bool,
+    },
     /// Administer the Index Server (Admin token required)
     Admin {
         #[command(subcommand)]
@@ -68,6 +99,16 @@ async fn main() -> anyhow::Result<()> {
     match Cli::parse().command {
         Command::Serve { role } => serve(role).await,
         Command::Status { json } => status(json).await,
+        Command::Node { id, json } => node(id, json).await,
+        Command::Neighbors {
+            id,
+            direction,
+            kinds,
+            depth,
+            limit,
+            cursor,
+            json,
+        } => neighbors(id, direction, kinds, depth, limit, cursor, json).await,
         Command::Admin { command } => match command {
             AdminCommand::Repo {
                 command: RepoCommand::Add { url, depth },
@@ -87,17 +128,30 @@ fn client_env() -> anyhow::Result<(String, String)> {
     Ok((server, token))
 }
 
-async fn admin_repo_add(url: String, depth: Option<i32>) -> anyhow::Result<()> {
+/// One HTTP exchange with the Index Server, shared by every subcommand:
+/// send, then either parse the JSON response or fail with the server's
+/// own reason. The client is built once — it pools connections and is
+/// designed to be reused.
+async fn server_json(
+    method: reqwest::Method,
+    path: &str,
+    body: Option<serde_json::Value>,
+) -> anyhow::Result<serde_json::Value> {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     let (server, token) = client_env()?;
-    let resp = reqwest::Client::new()
-        .post(format!("{server}/v1/admin/repos"))
-        .bearer_auth(&token)
-        .json(&serde_json::json!({"url": url, "depth": depth}))
+    let mut request = CLIENT
+        .get_or_init(reqwest::Client::new)
+        .request(method, format!("{server}{path}"))
+        .bearer_auth(&token);
+    if let Some(body) = body {
+        request = request.json(&body);
+    }
+    let resp = request
         .send()
         .await
-        .with_context(|| format!("requesting {server}/v1/admin/repos"))?;
+        .with_context(|| format!("requesting {server}{path}"))?;
     let status = resp.status();
-    let text = resp.text().await.context("reading add response")?;
+    let text = resp.text().await.context("reading the server's response")?;
     if !status.is_success() {
         // Prefer the server's {"error": …} shape, but a proxy or crash
         // can answer with anything — show whatever came back.
@@ -105,9 +159,139 @@ async fn admin_repo_add(url: String, depth: Option<i32>) -> anyhow::Result<()> {
             .ok()
             .and_then(|body| body["error"].as_str().map(str::to_string))
             .unwrap_or(text);
-        bail!("server rejected the repository ({status}): {reason}");
+        bail!("the server answered {path} with {status}: {reason}");
     }
-    let body: serde_json::Value = serde_json::from_str(&text).context("parsing add response")?;
+    serde_json::from_str(&text).with_context(|| format!("parsing the response from {path}"))
+}
+
+/// POST one Verb request (RFC 0001 §7).
+async fn post_verb(verb: &str, body: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+    server_json(
+        reqwest::Method::POST,
+        &format!("/v1/verbs/{verb}"),
+        Some(body),
+    )
+    .await
+}
+
+async fn node(id: String, json: bool) -> anyhow::Result<()> {
+    let body = post_verb("node", serde_json::json!({"id": id})).await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&body)?);
+        return Ok(());
+    }
+    let node = &body["node"];
+    let kind = node["kind"].as_str().unwrap_or("?");
+    match node["name"].as_str() {
+        Some(name) => println!("{kind} {name}"),
+        None => println!("{kind}"),
+    }
+    println!("id:   {}", node["id"].as_str().unwrap_or("?"));
+    if let Some(path) = node["path"].as_str() {
+        println!("path: {path}");
+    }
+    for direction in ["in", "out"] {
+        // Pad "in:" so both directions' columns line up.
+        let label = if direction == "in" { "in: " } else { "out:" };
+        let summaries = body["edges"][direction]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        if summaries.is_empty() {
+            println!("{label}  (no edges)");
+            continue;
+        }
+        for summary in summaries {
+            // "in:   DEFINES ×1 (syntactic: 1)"
+            let provenance = summary["provenance"]
+                .as_object()
+                .map(|p| {
+                    p.iter()
+                        .map(|(how, n)| format!("{how}: {n}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            println!(
+                "{label}  {} ×{} ({provenance})",
+                summary["kind"].as_str().unwrap_or("?"),
+                summary["count"]
+            );
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn neighbors(
+    id: String,
+    direction: Option<String>,
+    kinds: Vec<String>,
+    depth: Option<u32>,
+    limit: Option<u32>,
+    cursor: Option<String>,
+    json: bool,
+) -> anyhow::Result<()> {
+    let mut req = serde_json::json!({"id": id});
+    if let Some(direction) = direction {
+        req["direction"] = direction.into();
+    }
+    if !kinds.is_empty() {
+        req["edge_kinds"] = kinds.into();
+    }
+    if let Some(depth) = depth {
+        req["depth"] = depth.into();
+    }
+    if let Some(limit) = limit {
+        req["limit"] = limit.into();
+    }
+    if let Some(cursor) = cursor {
+        req["cursor"] = cursor.into();
+    }
+    let body = post_verb("neighbors", req).await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&body)?);
+        return Ok(());
+    }
+    let nodes = body["nodes"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+    if nodes.is_empty() {
+        println!("no neighbors");
+        return Ok(());
+    }
+    for node in nodes {
+        print!(
+            "{}  {}",
+            node["kind"].as_str().unwrap_or("?"),
+            node["id"].as_str().unwrap_or("?")
+        );
+        if let Some(name) = node["name"].as_str() {
+            print!("  ({name})");
+        }
+        println!();
+    }
+    for edge in body["edges"].as_array().map(Vec::as_slice).unwrap_or(&[]) {
+        println!(
+            "{} -[{} {} {}]-> {}",
+            edge["src"].as_str().unwrap_or("?"),
+            edge["kind"].as_str().unwrap_or("?"),
+            edge["provenance"].as_str().unwrap_or("?"),
+            edge["confidence"],
+            edge["dst"].as_str().unwrap_or("?"),
+        );
+    }
+    if let Some(cursor) = body["next_cursor"].as_str() {
+        println!("more: pass --cursor {cursor}");
+    }
+    Ok(())
+}
+
+async fn admin_repo_add(url: String, depth: Option<i32>) -> anyhow::Result<()> {
+    let body = server_json(
+        reqwest::Method::POST,
+        "/v1/admin/repos",
+        Some(serde_json::json!({"url": url, "depth": depth})),
+    )
+    .await?;
     let slug = body["slug"].as_str().unwrap_or("?");
     let registered = if body["created"] == true {
         format!("registered {slug}")
@@ -124,21 +308,7 @@ async fn admin_repo_add(url: String, depth: Option<i32>) -> anyhow::Result<()> {
 }
 
 async fn admin_status(json: bool) -> anyhow::Result<()> {
-    let (server, token) = client_env()?;
-    let resp = reqwest::Client::new()
-        .get(format!("{server}/v1/admin/status"))
-        .bearer_auth(&token)
-        .send()
-        .await
-        .with_context(|| format!("requesting {server}/v1/admin/status"))?;
-    if !resp.status().is_success() {
-        bail!(
-            "server returned {}: {}",
-            resp.status(),
-            resp.text().await.unwrap_or_default()
-        );
-    }
-    let body: serde_json::Value = resp.json().await.context("parsing admin status")?;
+    let body = server_json(reqwest::Method::GET, "/v1/admin/status", None).await?;
 
     if json {
         println!("{}", serde_json::to_string_pretty(&body)?);
@@ -270,21 +440,8 @@ where
 }
 
 async fn status(json: bool) -> anyhow::Result<()> {
-    let (server, token) = client_env()?;
-    let resp = reqwest::Client::new()
-        .get(format!("{server}/v1/status"))
-        .bearer_auth(&token)
-        .send()
-        .await
-        .with_context(|| format!("requesting {server}/v1/status"))?;
-    if !resp.status().is_success() {
-        bail!(
-            "server returned {}: {}",
-            resp.status(),
-            resp.text().await.unwrap_or_default()
-        );
-    }
-    let body: serde_json::Value = resp.json().await.context("parsing status response")?;
+    let (server, _) = client_env()?;
+    let body = server_json(reqwest::Method::GET, "/v1/status", None).await?;
 
     if json {
         println!("{}", serde_json::to_string_pretty(&body)?);
