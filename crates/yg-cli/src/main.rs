@@ -162,6 +162,15 @@ async fn admin_status(json: bool) -> anyhow::Result<()> {
         if let Some(error) = repo["sync"]["last_error"].as_str() {
             print!("  [attempt {}: {error}]", repo["sync"]["attempts"]);
         }
+        if let Some(revision) = repo["shard"]["revision"].as_str() {
+            print!(
+                "  shard {revision} ({} nodes, {} edges)",
+                repo["shard"]["nodes"], repo["shard"]["edges"]
+            );
+        }
+        if let Some(error) = repo["index"]["last_error"].as_str() {
+            print!("  [index attempt {}: {error}]", repo["index"]["attempts"]);
+        }
         println!();
     }
     Ok(())
@@ -169,11 +178,11 @@ async fn admin_status(json: bool) -> anyhow::Result<()> {
 
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum Role {
-    /// REST + MCP API and a Sync worker in one process
+    /// REST + MCP API plus Sync and indexing workers in one process
     All,
     /// API only — pair with worker processes elsewhere
     Api,
-    /// Sync worker only: drains the fetch queue (no HTTP, no token)
+    /// Workers only: drain the fetch and index queues (no HTTP, no token)
     Worker,
 }
 
@@ -191,32 +200,73 @@ async fn serve(role: Role) -> anyhow::Result<()> {
             server.wait().await
         }
         Role::Worker => {
-            let worker = worker_from_env().await?;
+            let workers = workers_from_env().await?;
             println!("worker running");
-            worker.run().await
+            run_workers(workers).await
         }
         Role::All => {
             let server = yg_api::serve(yg_api::ServerConfig::from_env()?).await?;
+            let workers = workers_from_env().await?;
+            // Announce only once the whole process is up: scripts and
+            // the e2e harness treat this line as the readiness signal,
+            // and a worker-boot failure after it would read as a crash
+            // mid-serve instead of a boot failure.
             println!("listening on http://{}", server.local_addr());
-            let worker = worker_from_env().await?;
             // Either side dying takes the process down — a half-alive
             // server that accepts repos it will never sync helps nobody.
             tokio::select! {
                 result = server.wait() => result,
-                result = worker.run() => result.context("worker exited"),
+                result = run_workers(workers) => result.context("worker exited"),
             }
         }
     }
 }
 
-/// Build a Sync worker from the `YG_*` environment. Workers need the
-/// control plane and a git cache directory — no bootstrap token.
-async fn worker_from_env() -> anyhow::Result<yg_sync::SyncWorker> {
+/// Build the worker pair from the `YG_*` environment. Workers need the
+/// control plane, the git cache, and object storage (Shards land there)
+/// — no bootstrap token.
+async fn workers_from_env() -> anyhow::Result<(yg_sync::SyncWorker, yg_index::IndexWorker)> {
     let database_url = std::env::var("YG_DATABASE_URL")
         .unwrap_or_else(|_| yg_control::DEFAULT_DATABASE_URL.to_string());
     let git_cache = std::env::var("YG_GIT_CACHE").unwrap_or_else(|_| "./data/git".to_string());
     let control = yg_control::ControlPlane::connect_and_migrate(&database_url).await?;
-    Ok(yg_sync::SyncWorker::new(control, git_cache))
+    let store = yg_api::ObjectStoreConfig::from_env().connect()?;
+    // Fail at boot, not on every index job: connect() never touches the
+    // network, so this probe is the first thing that would notice a
+    // missing or wrong YG_S3_* configuration.
+    yg_api::probe_object_store(store.as_ref())
+        .await
+        .context("object storage unreachable at worker boot")?;
+    Ok((
+        yg_sync::SyncWorker::new(control.clone(), &git_cache),
+        yg_index::IndexWorker::new(control, store, &git_cache),
+    ))
+}
+
+/// Drain both job queues forever, each on its own loop so a slow job of
+/// one kind (a cold monorepo clone, a huge syntactic pass) never stalls
+/// the other queue. An error from either side ends both.
+async fn run_workers(
+    (sync, index): (yg_sync::SyncWorker, yg_index::IndexWorker),
+) -> anyhow::Result<()> {
+    tokio::try_join!(
+        drain_queue(|| sync.run_once()),
+        drain_queue(|| index.run_once()),
+    )?;
+    Ok(())
+}
+
+/// Run one queue's claim loop forever, sleeping briefly when it's empty.
+async fn drain_queue<F, Fut>(run_once: F) -> anyhow::Result<()>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<bool>>,
+{
+    loop {
+        if !run_once().await? {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+    }
 }
 
 async fn status(json: bool) -> anyhow::Result<()> {

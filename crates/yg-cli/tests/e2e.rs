@@ -2,101 +2,10 @@
 //! it up with the sequence in docs/DEVELOPMENT.md "Checks" (CI runs the
 //! same sequence).
 
-use yg_api::{ObjectStoreConfig, RunningServer, ServerConfig, serve};
+mod common;
 
-const DEV_POSTGRES: &str = "postgres://yggdrasil:yggdrasil@localhost:5432";
-
-/// Each test boots against its own freshly created database so tests are
-/// independent and re-runnable.
-async fn boot_test_server() -> RunningServer {
-    serve(test_config(&create_test_db().await))
-        .await
-        .expect("server should boot against the dev stack")
-}
-
-/// Postgres CREATE DATABASE statements conflict on the template-database
-/// lock when run concurrently; serialize them across parallel tests.
-static DB_CREATE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-async fn create_test_db() -> String {
-    // pid distinguishes parallel `cargo test` processes; the counter
-    // distinguishes parallel tests (the system clock does not — two tests
-    // can start within one clock tick); millis distinguish re-runs.
-    static UNIQUE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let db_name = format!(
-        "yg_test_{}_{}_{}",
-        std::process::id(),
-        UNIQUE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis()
-    );
-    let admin = admin_pool().await;
-    let _serialize_creates = DB_CREATE_LOCK.lock().await;
-    drop_stale_test_dbs(&admin).await;
-    // CREATE DATABASE cannot take bind parameters; the name is generated
-    // above from pid + counter + millis, not external input.
-    sqlx::query(sqlx::AssertSqlSafe(format!(
-        r#"CREATE DATABASE "{db_name}""#
-    )))
-    .execute(&admin)
-    .await
-    .unwrap();
-    db_name
-}
-
-async fn admin_pool() -> sqlx::PgPool {
-    sqlx::PgPool::connect(&format!("{DEV_POSTGRES}/yggdrasil"))
-        .await
-        .expect("dev compose Postgres must be up (see docs/DEVELOPMENT.md Checks)")
-}
-
-/// Best-effort cleanup of databases left behind by earlier runs. Skipped:
-/// our own databases (by pid) and anything younger than an hour (by the
-/// millis suffix in the name) — a concurrently running `cargo test`
-/// process may have created a database it hasn't connected to yet, so
-/// "not busy" alone doesn't mean abandoned.
-async fn drop_stale_test_dbs(admin: &sqlx::PgPool) {
-    let mine = format!("yg_test_{}_", std::process::id());
-    let hour_ago = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis()
-        .saturating_sub(60 * 60 * 1000);
-    let candidates: Vec<(String,)> =
-        sqlx::query_as("SELECT datname FROM pg_database WHERE datname LIKE 'yg_test_%'")
-            .fetch_all(admin)
-            .await
-            .unwrap_or_default();
-    for (name,) in candidates {
-        let created_millis: u128 = name
-            .rsplit('_')
-            .next()
-            .and_then(|m| m.parse().ok())
-            .unwrap_or(0); // unparseable = old naming scheme = stale
-        if !name.starts_with(&mine) && created_millis < hour_ago {
-            let _ = sqlx::query(sqlx::AssertSqlSafe(format!(r#"DROP DATABASE "{name}""#)))
-                .execute(admin)
-                .await;
-        }
-    }
-}
-
-fn test_config(db_name: &str) -> ServerConfig {
-    ServerConfig {
-        listen: "127.0.0.1:0".parse().unwrap(),
-        database_url: format!("{DEV_POSTGRES}/{db_name}"),
-        object_store: ObjectStoreConfig {
-            endpoint: "http://localhost:9000".into(),
-            bucket: "yggdrasil".into(),
-            access_key: "yggdrasil".into(),
-            secret_key: "yggdrasil".into(),
-            region: "us-east-1".into(),
-        },
-        bootstrap_token: "ygt_test_token".into(),
-    }
-}
+use common::*;
+use yg_api::serve;
 
 #[tokio::test]
 async fn admin_repo_add_registers_repo_and_admin_status_lists_it_queued() {
@@ -194,79 +103,6 @@ async fn admin_repo_add_rejects_urls_that_are_not_repositories() {
     );
 }
 
-/// The worker-side view of a test database.
-async fn control_plane(db_name: &str) -> yg_control::ControlPlane {
-    yg_control::ControlPlane::connect_and_migrate(&format!("{DEV_POSTGRES}/{db_name}"))
-        .await
-        .unwrap()
-}
-
-/// POST /v1/admin/repos as the test Admin.
-async fn post_repo(base: &str, body: serde_json::Value) -> reqwest::Response {
-    reqwest::Client::new()
-        .post(format!("{base}/v1/admin/repos"))
-        .bearer_auth("ygt_test_token")
-        .json(&body)
-        .send()
-        .await
-        .unwrap()
-}
-
-/// GET /v1/admin/status as the test Admin, parsed.
-async fn admin_status_body(base: &str) -> serde_json::Value {
-    let resp = reqwest::Client::new()
-        .get(format!("{base}/v1/admin/status"))
-        .bearer_auth("ygt_test_token")
-        .send()
-        .await
-        .unwrap();
-    let status = resp.status();
-    let text = resp.text().await.unwrap();
-    assert!(
-        status.is_success(),
-        "admin status returned {status}: {text}"
-    );
-    serde_json::from_str(&text).expect("admin status must be JSON")
-}
-
-/// Run git in a directory, panicking (with stderr) on failure.
-fn git(dir: &std::path::Path, args: &[&str]) -> String {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
-        .expect("git must be installed to run the sync tests");
-    assert!(
-        out.status.success(),
-        "git {args:?} failed:\n{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8(out.stdout).unwrap().trim().to_string()
-}
-
-/// A local git repository standing in for a Forge-hosted one, addressable
-/// as `file://…/acme/widgets`. Returns (fixture root guard, repo dir, URL).
-fn fixture_repo(commits: usize) -> (tempfile::TempDir, std::path::PathBuf, String) {
-    let root = tempfile::tempdir().unwrap();
-    let repo = root.path().join("fixtures/acme/widgets");
-    std::fs::create_dir_all(&repo).unwrap();
-    git(&repo, &["init", "-b", "main"]);
-    git(&repo, &["config", "user.email", "fixture@example.com"]);
-    git(&repo, &["config", "user.name", "Fixture"]);
-    // A developer's global commit.gpgsign=true would make fixture
-    // commits demand a signing key; fixtures must not depend on the
-    // machine's git config.
-    git(&repo, &["config", "commit.gpgsign", "false"]);
-    for n in 1..=commits {
-        std::fs::write(repo.join("README.md"), format!("revision {n}\n")).unwrap();
-        git(&repo, &["add", "."]);
-        git(&repo, &["commit", "-m", &format!("commit {n}")]);
-    }
-    let url = format!("file://{}", repo.display());
-    (root, repo, url)
-}
-
 #[tokio::test]
 async fn worker_syncs_added_repo_and_status_shows_its_commit() {
     let (fixture, repo_dir, fixture_url) = fixture_repo(1);
@@ -359,12 +195,7 @@ async fn a_vandalized_cache_mirror_heals_on_the_next_sync() {
     assert!(worker.run_once().await.unwrap());
 
     // A crashed clone, a stray rm, a partial disk: the mirror is junk now.
-    let mirror = std::fs::read_dir(&cache)
-        .unwrap()
-        .next()
-        .expect("mirror must exist")
-        .unwrap()
-        .path();
+    let mirror = only_mirror(&cache);
     std::fs::remove_dir_all(&mirror).unwrap();
     std::fs::create_dir_all(mirror.join("not-a-git-repo")).unwrap();
 
@@ -447,12 +278,7 @@ async fn stale_partial_clones_are_swept_on_the_next_sync() {
     assert!(worker.run_once().await.unwrap());
 
     // Wreckage from a crashed clone attempt sits beside the mirror.
-    let mirror_name = std::fs::read_dir(&cache)
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .file_name();
+    let mirror_name = only_mirror(&cache).file_name().unwrap().to_owned();
     let stale = cache.join(format!("{}.partial.4242-7", mirror_name.to_string_lossy()));
     std::fs::create_dir_all(stale.join("objects")).unwrap();
 
@@ -720,17 +546,8 @@ async fn depth_override_clones_shallow_while_default_keeps_full_history() {
     let cache = fixture.path().join("git-cache");
     let worker = yg_sync::SyncWorker::new(control, &cache);
 
-    let commit_count_in_cache = |cache: std::path::PathBuf| {
-        // The cache holds one bare mirror per synced repo; with a single
-        // repo added, the single entry is it.
-        let mirror = std::fs::read_dir(&cache)
-            .unwrap()
-            .next()
-            .expect("the worker must have cloned into the cache")
-            .unwrap()
-            .path();
-        git(&mirror, &["rev-list", "--count", "HEAD"])
-    };
+    let commit_count_in_cache =
+        |cache: std::path::PathBuf| git(&only_mirror(&cache), &["rev-list", "--count", "HEAD"]);
 
     post_repo(&base, serde_json::json!({"url": fixture_url, "depth": 1})).await;
     assert!(worker.run_once().await.unwrap());
@@ -775,12 +592,7 @@ async fn removing_the_depth_override_restores_full_history() {
     post_repo(&base, serde_json::json!({"url": fixture_url, "depth": 1})).await;
     assert!(worker.run_once().await.unwrap());
 
-    let mirror = std::fs::read_dir(&cache)
-        .unwrap()
-        .next()
-        .expect("mirror must exist")
-        .unwrap()
-        .path();
+    let mirror = only_mirror(&cache);
     assert_eq!(
         git(&mirror, &["rev-list", "--count", "HEAD"]),
         "1",
@@ -874,33 +686,15 @@ async fn yg_admin_repo_add_and_admin_status_drive_the_admin_surface() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn yg_serve_role_all_syncs_an_added_repo_without_a_separate_worker() {
-    use std::io::BufRead;
-
     let (fixture, repo_dir, fixture_url) = fixture_repo(1);
     let head = git(&repo_dir, &["rev-parse", "HEAD"]);
 
     let db_name = create_test_db().await;
-    let child = std::process::Command::new(assert_cmd::cargo::cargo_bin("yg"))
-        .env("YG_LISTEN", "127.0.0.1:0")
-        .env("YG_DATABASE_URL", format!("{DEV_POSTGRES}/{db_name}"))
-        .env("YG_BOOTSTRAP_TOKEN", "ygt_test_token")
-        .env("YG_GIT_CACHE", fixture.path().join("git-cache"))
-        .args(["serve", "--role=all"])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .unwrap();
-    let mut server = KillOnDrop(child);
-    let stdout = server.0.stdout.take().unwrap();
-    let first_line = std::io::BufReader::new(stdout)
-        .lines()
-        .next()
-        .expect("yg serve must announce its address")
-        .unwrap();
-    let url = first_line
-        .strip_prefix("listening on ")
-        .unwrap()
-        .to_string();
+    let (_server, url) = spawn_yg_serve(|cmd| {
+        cmd.env("YG_DATABASE_URL", format!("{DEV_POSTGRES}/{db_name}"))
+            .env("YG_BOOTSTRAP_TOKEN", "ygt_test_token")
+            .env("YG_GIT_CACHE", fixture.path().join("git-cache"));
+    });
 
     assert_cmd::Command::cargo_bin("yg")
         .unwrap()
@@ -1180,50 +974,15 @@ async fn health_degrades_to_503_when_a_dependency_dies() {
     );
 }
 
-/// Kills the spawned server even when the test panics.
-struct KillOnDrop(std::process::Child);
-impl Drop for KillOnDrop {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn yg_serve_boots_from_env_and_answers_yg_status_end_to_end() {
-    use std::io::BufRead;
-
     let db_name = create_test_db().await;
-    let child = std::process::Command::new(assert_cmd::cargo::cargo_bin("yg"))
-        .env("YG_LISTEN", "127.0.0.1:0")
-        .env("YG_DATABASE_URL", format!("{DEV_POSTGRES}/{db_name}"))
-        // Padded on purpose: env files commonly leak whitespace around
-        // secrets; clients present the clean token below.
-        .env("YG_BOOTSTRAP_TOKEN", " ygt_test_token\n")
-        .args(["serve", "--role=all"])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut server = KillOnDrop(child);
-
-    let stdout = server.0.stdout.take().unwrap();
-    let first_line = match std::io::BufReader::new(stdout).lines().next() {
-        Some(line) => line.unwrap(),
-        None => {
-            use std::io::Read;
-            let _ = server.0.kill();
-            let mut stderr = String::new();
-            if let Some(mut err) = server.0.stderr.take() {
-                let _ = err.read_to_string(&mut stderr);
-            }
-            panic!("yg serve exited without announcing its address; stderr:\n{stderr}");
-        }
-    };
-    let url = first_line
-        .strip_prefix("listening on ")
-        .unwrap_or_else(|| panic!("unexpected announcement: {first_line}"))
-        .to_string();
+    let (_server, url) = spawn_yg_serve(|cmd| {
+        cmd.env("YG_DATABASE_URL", format!("{DEV_POSTGRES}/{db_name}"))
+            // Padded on purpose: env files commonly leak whitespace
+            // around secrets; clients present the clean token below.
+            .env("YG_BOOTSTRAP_TOKEN", " ygt_test_token\n");
+    });
 
     assert_cmd::Command::cargo_bin("yg")
         .unwrap()

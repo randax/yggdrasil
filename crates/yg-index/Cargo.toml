@@ -8,3 +8,13 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+anyhow = "1.0.102"
+object_store = "0.13.2"
+tempfile = "3.27.0"
+tokio = { version = "1.52.3", features = ["rt", "process"] }
+tracing = "0.1.44"
+tree-sitter = "0.26.9"
+tree-sitter-go = "0.25.0"
+yg-control = { version = "0.1.0", path = "../yg-control" }
+yg-shard = { version = "0.1.0", path = "../yg-shard" }
+yg-sync = { version = "0.1.0", path = "../yg-sync" }

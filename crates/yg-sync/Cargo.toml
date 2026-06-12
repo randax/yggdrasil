@@ -13,3 +13,6 @@ base64 = "0.22.1"
 tokio = { version = "1.52.3", features = ["fs", "process", "time"] }
 tracing = "0.1.44"
 yg-control = { version = "0.1.0", path = "../yg-control" }
+
+[dev-dependencies]
+tempfile = "3.27.0"

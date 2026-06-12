@@ -11,11 +11,13 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use object_store::ObjectStore;
-use object_store::aws::AmazonS3Builder;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use yg_control::ControlPlane;
+// Server config embeds the object-store half owned by yg-shard; clients
+// of this crate keep addressing it as `yg_api::ObjectStoreConfig`.
+pub use yg_shard::{ObjectStoreConfig, probe_object_store};
 use yg_sync::RepoLocator;
 
 pub struct ServerConfig {
@@ -23,14 +25,6 @@ pub struct ServerConfig {
     pub database_url: String,
     pub object_store: ObjectStoreConfig,
     pub bootstrap_token: String,
-}
-
-pub struct ObjectStoreConfig {
-    pub endpoint: String,
-    pub bucket: String,
-    pub access_key: String,
-    pub secret_key: String,
-    pub region: String,
 }
 
 impl ServerConfig {
@@ -57,13 +51,7 @@ impl ServerConfig {
                 .parse()
                 .context("parsing YG_LISTEN as host:port")?,
             database_url: var_or("YG_DATABASE_URL", yg_control::DEFAULT_DATABASE_URL),
-            object_store: ObjectStoreConfig {
-                endpoint: var_or("YG_S3_ENDPOINT", "http://localhost:9000"),
-                bucket: var_or("YG_S3_BUCKET", "yggdrasil"),
-                access_key: var_or("YG_S3_ACCESS_KEY", "yggdrasil"),
-                secret_key: var_or("YG_S3_SECRET_KEY", "yggdrasil"),
-                region: var_or("YG_S3_REGION", "us-east-1"),
-            },
+            object_store: ObjectStoreConfig::from_env(),
             bootstrap_token,
         })
     }
@@ -92,7 +80,7 @@ impl RunningServer {
 
 struct AppState {
     control: ControlPlane,
-    store: Box<dyn ObjectStore>,
+    store: std::sync::Arc<dyn ObjectStore>,
     bootstrap_token: String,
     started: std::time::Instant,
 }
@@ -102,17 +90,7 @@ struct AppState {
 pub async fn serve(config: ServerConfig) -> anyhow::Result<RunningServer> {
     let control = ControlPlane::connect_and_migrate(&config.database_url).await?;
 
-    let store: Box<dyn ObjectStore> = Box::new(
-        AmazonS3Builder::new()
-            .with_endpoint(&config.object_store.endpoint)
-            .with_bucket_name(&config.object_store.bucket)
-            .with_access_key_id(&config.object_store.access_key)
-            .with_secret_access_key(&config.object_store.secret_key)
-            .with_region(&config.object_store.region)
-            .with_allow_http(true)
-            .build()
-            .context("configuring object store client")?,
-    );
+    let store = config.object_store.connect()?;
     probe_object_store(store.as_ref())
         .await
         .context("object storage unreachable at boot")?;
@@ -153,14 +131,6 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<RunningServer> {
     });
 
     Ok(RunningServer { local_addr, handle })
-}
-
-/// Cheap reachability check that distinguishes "bucket missing/unreachable"
-/// from "bucket empty": a delimited list succeeds on an empty bucket but
-/// errors when the bucket doesn't exist.
-async fn probe_object_store(store: &dyn ObjectStore) -> anyhow::Result<()> {
-    store.list_with_delimiter(None).await?;
-    Ok(())
 }
 
 /// Every route — existing or not — requires the bootstrap Admin token;
@@ -272,14 +242,26 @@ struct AdminRepoStatus {
     slug: String,
     forge: String,
     last_synced_commit: Option<String>,
-    sync: SyncStatus,
+    sync: JobStatus,
+    index: JobStatus,
+    /// The repo's current Shard; null until first indexed.
+    shard: Option<ShardStatus>,
 }
 
+/// One pipeline stage's position, as admin status reports it for both
+/// sync and index.
 #[derive(Serialize)]
-struct SyncStatus {
+struct JobStatus {
     state: &'static str,
     attempts: i32,
     last_error: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ShardStatus {
+    revision: String,
+    nodes: i64,
+    edges: i64,
 }
 
 async fn admin_status(State(state): State<Arc<AppState>>) -> Response {
@@ -290,15 +272,40 @@ async fn admin_status(State(state): State<Arc<AppState>>) -> Response {
     let repos = repos
         .into_iter()
         .map(|r| AdminRepoStatus {
-            sync: SyncStatus {
-                state: sync_state(
+            sync: JobStatus {
+                state: job_state(
                     r.job_state.as_deref(),
                     r.attempts,
                     r.last_synced_commit.is_some(),
+                    StageWords {
+                        active: "syncing",
+                        done: "synced",
+                        never_ran: "registered",
+                    },
                 ),
                 attempts: r.attempts,
                 last_error: r.last_error,
             },
+            index: JobStatus {
+                state: job_state(
+                    r.index_job_state.as_deref(),
+                    r.index_attempts,
+                    r.shard_revision.is_some(),
+                    StageWords {
+                        active: "indexing",
+                        done: "indexed",
+                        never_ran: "pending",
+                    },
+                ),
+                attempts: r.index_attempts,
+                last_error: r.index_last_error,
+            },
+            shard: r.shard_revision.map(|revision| ShardStatus {
+                revision,
+                // Set together with the revision when a Shard is recorded.
+                nodes: r.shard_node_count.unwrap_or(0),
+                edges: r.shard_edge_count.unwrap_or(0),
+            }),
             slug: r.slug,
             forge: r.forge,
             last_synced_commit: r.last_synced_commit,
@@ -307,18 +314,31 @@ async fn admin_status(State(state): State<Arc<AppState>>) -> Response {
     Json(AdminStatusResponse { repos }).into_response()
 }
 
-/// Collapse a repo's queue position into the one word `yg admin status`
-/// shows for it. `attempts` only ever rises above zero through fetch
-/// failures (`fail_fetch` re-queues with a backoff), so a queued job
+/// The stage-specific words [`job_state`] fills in: what to call a
+/// leased job, a stage that finished, and one that never ran.
+struct StageWords {
+    active: &'static str,
+    done: &'static str,
+    never_ran: &'static str,
+}
+
+/// Collapse a pipeline stage's queue position into the one word
+/// `yg admin status` shows for it. `attempts` only ever rises above zero
+/// through failures (`fail_*` re-queues with a backoff), so a queued job
 /// with attempts is a retry, not a first run.
-fn sync_state(job_state: Option<&str>, attempts: i32, has_synced_commit: bool) -> &'static str {
-    match (job_state, attempts, has_synced_commit) {
-        (Some("leased"), ..) => "syncing",
+fn job_state(
+    job_state: Option<&str>,
+    attempts: i32,
+    has_output: bool,
+    words: StageWords,
+) -> &'static str {
+    match (job_state, attempts, has_output) {
+        (Some("leased"), ..) => words.active,
         (Some("queued"), 0, _) => "queued",
         (Some("queued"), ..) => "retrying",
         (Some(_), ..) => "unknown",
-        (None, _, true) => "synced",
-        (None, _, false) => "registered",
+        (None, _, true) => words.done,
+        (None, _, false) => words.never_ran,
     }
 }
 
