@@ -21,7 +21,10 @@ use sha2::{Digest, Sha256};
 /// syntactic pass extracts must bump it, or already-published revisions
 /// keep their old artifacts (re-publishing an existing revision is a
 /// no-op by design).
-pub const SCHEMA_VERSION: u32 = 1;
+///
+/// v2: indexes on edges(src) and edges(dst) — the read path's neighbor
+/// and summary lookups are index seeks instead of table scans.
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Name of the M0 indexing pass, as recorded in revision ids, manifests,
 /// and the control plane's `provenance_level`. The precise pass (M1)
@@ -340,7 +343,7 @@ pub async fn write_shard(
         tokio::task::spawn_blocking(move || -> anyhow::Result<(Vec<u8>, Segment)> {
             let bytes = build_graph_sqlite(&graph)?;
             let segment = Segment {
-                sha256: hex::encode(Sha256::digest(&bytes)),
+                sha256: sha256_hex(&bytes),
                 bytes: bytes.len() as u64,
             };
             Ok((bytes, segment))
@@ -380,7 +383,7 @@ pub async fn write_shard(
                 .context("reading the segment another publisher just wrote")?;
             tokio::task::spawn_blocking(move || -> anyhow::Result<(Segment, Counts)> {
                 let segment = Segment {
-                    sha256: hex::encode(Sha256::digest(&stored)),
+                    sha256: sha256_hex(&stored),
                     bytes: stored.len() as u64,
                 };
                 let counts = read_graph_counts(&stored)
@@ -425,6 +428,214 @@ pub async fn write_shard(
         node_count: counts.nodes,
         edge_count: counts.edges,
     })
+}
+
+/// The query side's local Shard tier (RFC 0001 §6): graph segments are
+/// materialized once into `dir` under their checksum and reused for
+/// every later query, so warm queries never touch object storage.
+///
+/// Everything cached is immutable — manifests by their key (published
+/// revisions are never rewritten), segments by their checksum — so
+/// nothing here ever invalidates; pointer swaps are picked up because
+/// the *caller* resolves the current revision per query and only then
+/// asks this cache.
+pub struct ShardCache {
+    store: Arc<dyn ObjectStore>,
+    dir: std::path::PathBuf,
+    /// Manifests by manifest key.
+    manifests: tokio::sync::Mutex<std::collections::HashMap<String, Arc<Manifest>>>,
+    /// Checksums whose on-disk file this process has already verified.
+    verified: tokio::sync::Mutex<std::collections::HashSet<String>>,
+}
+
+/// A revision whose manifest is not in object storage — distinct from
+/// transport or corruption errors because callers holding the revision
+/// from a client (a pagination cursor) must answer "your cursor
+/// expired", not "the server broke". Detect with
+/// `err.downcast_ref::<RevisionMissing>()`.
+#[derive(Debug)]
+pub struct RevisionMissing {
+    pub revision: String,
+}
+
+impl std::fmt::Display for RevisionMissing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "no Shard published for revision {}", self.revision)
+    }
+}
+
+impl std::error::Error for RevisionMissing {}
+
+impl ShardCache {
+    pub fn new(store: Arc<dyn ObjectStore>, dir: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            store,
+            dir: dir.into(),
+            manifests: Default::default(),
+            verified: Default::default(),
+        }
+    }
+
+    /// Local path of the verified graph segment for a revision, fetching
+    /// from object storage only when the local tier can't answer: a warm
+    /// revision costs no storage round-trips at all, and a cached file
+    /// whose checksum no longer matches its name is refetched, not
+    /// trusted.
+    ///
+    /// A revision that was never published (or has been GC'd) fails
+    /// with [`RevisionMissing`].
+    pub async fn graph_path(
+        &self,
+        repo_id: i64,
+        revision: &str,
+    ) -> anyhow::Result<std::path::PathBuf> {
+        let manifest = self.manifest(repo_id, revision).await?;
+        let segment = manifest.segments.get(GRAPH_SEGMENT_FILE).with_context(|| {
+            format!("the manifest for {revision} records no {GRAPH_SEGMENT_FILE} segment")
+        })?;
+        let sha = segment.sha256.clone();
+        let path = self.dir.join(format!("{sha}.sqlite"));
+
+        // The locks below guard only map lookups and inserts — never
+        // I/O — so a cold fetch of one revision cannot stall queries
+        // for others. Two requests racing the same cold revision both
+        // fetch; the rename is idempotent and the artifact immutable,
+        // so the duplicate work is bounded and harmless.
+        if self.verified.lock().await.contains(&sha) {
+            return Ok(path);
+        }
+        // Verification hashes a whole segment — off the runtime threads.
+        let on_disk = match tokio::fs::read(&path).await {
+            Ok(bytes) => digest_off_thread(bytes).await?.1 == sha,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => return Err(e).context("reading the cached graph segment"),
+        };
+        if !on_disk {
+            let fetched = match self
+                .store
+                .get(&graph_segment_key(repo_id, revision).as_str().into())
+                .await
+            {
+                Ok(get) => get.bytes().await.context("fetching the graph segment")?,
+                // A manifest without its segment: the revision is being
+                // (or was partially) GC'd — gone for the caller's
+                // purposes, same as a missing manifest.
+                Err(object_store::Error::NotFound { .. }) => {
+                    return Err(anyhow::Error::new(RevisionMissing {
+                        revision: revision.to_string(),
+                    }));
+                }
+                Err(e) => return Err(e).context("fetching the graph segment"),
+            };
+            let (fetched, digest) = digest_off_thread(fetched).await?;
+            if digest != sha {
+                anyhow::bail!(
+                    "the graph segment for {revision} does not match its manifest \
+                     (manifest says sha256 {sha}, storage holds {digest}); refusing to serve it"
+                );
+            }
+            tokio::fs::create_dir_all(&self.dir)
+                .await
+                .context("creating the shard cache directory")?;
+            // Write-then-rename so a crash mid-write leaves a stray temp
+            // file, never a checksum-named file with wrong contents. The
+            // temp name is unique per attempt — pid alone would let two
+            // tasks racing the same cold revision share (and tear) one
+            // staging file.
+            static ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let tmp = self.dir.join(format!(
+                "{sha}.sqlite.tmp-{}-{}",
+                std::process::id(),
+                ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            tokio::fs::write(&tmp, &fetched)
+                .await
+                .context("staging the graph segment into the cache")?;
+            tokio::fs::rename(&tmp, &path)
+                .await
+                .context("committing the graph segment into the cache")?;
+        }
+        self.verified.lock().await.insert(sha);
+        Ok(path)
+    }
+
+    /// A revision's manifest, fetched at most once per process: published
+    /// manifests are immutable, so a cached one is true forever. Fetched
+    /// manifests get the same fail-closed scrutiny as [`published_shard`]:
+    /// the revision id asserts (commit, pass, schema), and a manifest
+    /// that disagrees — bucket aliasing across deployments, a manual
+    /// repair gone wrong — must not be served as this revision.
+    async fn manifest(&self, repo_id: i64, revision: &str) -> anyhow::Result<Arc<Manifest>> {
+        let key = manifest_key(repo_id, revision);
+        if let Some(manifest) = self.manifests.lock().await.get(&key) {
+            return Ok(manifest.clone());
+        }
+        // Fetched outside the lock: a slow fetch of one revision must
+        // not stall cached lookups of others. Racing duplicate fetches
+        // of one immutable manifest are harmless.
+        let bytes = match self.store.get(&key.as_str().into()).await {
+            Ok(get) => get
+                .bytes()
+                .await
+                .with_context(|| format!("fetching the manifest for revision {revision}"))?,
+            Err(object_store::Error::NotFound { .. }) => {
+                return Err(anyhow::Error::new(RevisionMissing {
+                    revision: revision.to_string(),
+                }));
+            }
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("fetching the manifest for revision {revision}"));
+            }
+        };
+        let manifest: Manifest =
+            serde_json::from_slice(&bytes).context("parsing the fetched manifest")?;
+        if manifest_disagrees_with_revision(&manifest, revision) {
+            anyhow::bail!(
+                "the manifest at {key} does not describe revision {revision} \
+                 (it says commit {}, pass {}, schema v{}); refusing to trust it",
+                manifest.commit,
+                manifest.pass,
+                manifest.schema_version
+            );
+        }
+        let manifest = Arc::new(manifest);
+        self.manifests.lock().await.insert(key, manifest.clone());
+        Ok(manifest)
+    }
+}
+
+/// Whether a fetched manifest contradicts what its revision id asserts.
+/// Checked by *recomposing* — minting the revision a manifest with these
+/// fields would get and comparing — never by parsing the revision apart,
+/// so the check can't drift from the minting grammar (a pass name
+/// containing `-` parses ambiguously but recomposes exactly).
+fn manifest_disagrees_with_revision(manifest: &Manifest, revision: &str) -> bool {
+    let recomposed = format!(
+        "{}-{}-v{}",
+        manifest.commit, manifest.pass, manifest.schema_version
+    );
+    recomposed != revision
+}
+
+/// The one digest the Shard layout uses, writer and reader alike:
+/// lowercase hex SHA-256.
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
+/// Hash a whole segment off the runtime threads — as blocking as
+/// building one — handing the bytes back beside their digest: the one
+/// verification every cache path runs.
+async fn digest_off_thread<B: AsRef<[u8]> + Send + 'static>(
+    bytes: B,
+) -> anyhow::Result<(B, String)> {
+    tokio::task::spawn_blocking(move || {
+        let digest = sha256_hex(bytes.as_ref());
+        (bytes, digest)
+    })
+    .await
+    .context("segment verification task panicked")
 }
 
 /// Node/edge counts of a serialized graph segment, read back from its
@@ -473,7 +684,13 @@ fn build_graph_sqlite(graph: &Graph) -> anyhow::Result<Vec<u8>> {
              kind       TEXT NOT NULL,
              provenance TEXT NOT NULL,
              confidence REAL NOT NULL
-         );",
+         );
+         -- Two single-column indexes, not one composite: the read
+         -- path's incident-edge lookup is (src = ? OR dst = ?), which
+         -- SQLite turns into two index seeks only when each side has
+         -- its own index.
+         CREATE INDEX edges_src ON edges (src);
+         CREATE INDEX edges_dst ON edges (dst);",
     )?;
     conn.execute(
         "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)",

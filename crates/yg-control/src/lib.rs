@@ -95,6 +95,53 @@ pub struct ShardRecord<'a> {
     pub edge_count: i64,
 }
 
+/// The repo qualifier (RFC 0001 §5): the Forge root sans scheme joined
+/// with the slug — `github.com/acme/widgets` — the repo part of every
+/// external node id. This is the one definition: computed here when a
+/// repo is registered, stored on its row, and matched verbatim by
+/// [`ControlPlane::verb_target`]. (yg-verbs owns the matching grammar
+/// that extracts it back out of ids.)
+pub fn repo_qualifier(base_url: &str, slug: &str) -> String {
+    let root = base_url
+        .split_once("://")
+        .map_or(base_url, |(_, rest)| rest);
+    // The degenerate forge root (`file:///`) leaves a bare slash; the
+    // qualifier joins with exactly one.
+    let root = root.trim_end_matches('/');
+    format!("{root}/{slug}")
+}
+
+/// A registration that collides with an existing repo's qualifier —
+/// the same host/slug already registered through a different Forge
+/// root (say, http vs https). The caller chose the conflicting URL, so
+/// this is theirs to hear about, not a server fault. Detect with
+/// `err.downcast_ref::<QualifierConflict>()`.
+#[derive(Debug)]
+pub struct QualifierConflict {
+    pub qualifier: String,
+}
+
+impl std::fmt::Display for QualifierConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} is already registered through a different forge URL",
+            self.qualifier
+        )
+    }
+}
+
+impl std::error::Error for QualifierConflict {}
+
+/// What a Verb request resolves its repo qualifier to: the repo plus its
+/// current Shard pointer.
+#[derive(sqlx::FromRow)]
+pub struct VerbTarget {
+    pub repo_id: i64,
+    /// Current Shard revision; `None` until the repo is first indexed.
+    pub revision: Option<String>,
+}
+
 /// One repo's row in `yg admin status`.
 #[derive(sqlx::FromRow)]
 pub struct RepoSyncStatus {
@@ -158,17 +205,28 @@ impl ControlPlane {
         .fetch_one(&mut *tx)
         .await?;
         // (xmax = 0) distinguishes a fresh insert from an upsert of an
-        // existing row.
-        let (repo_id, created): (i64, bool) = sqlx::query_as(
-            "INSERT INTO repos (forge_id, slug, fetch_depth) VALUES ($1, $2, $3)
+        // existing row. The qualifier is deterministic from (base_url,
+        // slug), so the upsert never changes it; a unique violation on
+        // it means the same qualifier arrived via a different forge row.
+        let qualifier = repo_qualifier(repo.base_url, repo.slug);
+        let inserted: Result<(i64, bool), sqlx::Error> = sqlx::query_as(
+            "INSERT INTO repos (forge_id, slug, fetch_depth, qualifier) VALUES ($1, $2, $3, $4)
              ON CONFLICT (forge_id, slug) DO UPDATE SET fetch_depth = excluded.fetch_depth
              RETURNING id, (xmax = 0)",
         )
         .bind(forge_id)
         .bind(repo.slug)
         .bind(repo.fetch_depth)
+        .bind(&qualifier)
         .fetch_one(&mut *tx)
-        .await?;
+        .await;
+        let (repo_id, created) = match inserted {
+            Ok(row) => row,
+            Err(sqlx::Error::Database(e)) if e.constraint() == Some("repos_qualifier") => {
+                return Err(anyhow::Error::new(QualifierConflict { qualifier }));
+            }
+            Err(e) => return Err(e.into()),
+        };
         sqlx::query(
             "INSERT INTO rules (forge_id, pattern, action) VALUES ($1, $2, 'include')
              ON CONFLICT (forge_id, pattern, action) DO NOTHING",
@@ -428,6 +486,22 @@ impl ControlPlane {
         Ok(count)
     }
 
+    /// Resolve a repo qualifier (see [`repo_qualifier`]) to the repo and
+    /// its current Shard pointer. Resolved per query, so a pointer swap
+    /// is picked up by the very next request, no restart.
+    pub async fn verb_target(&self, qualifier: &str) -> anyhow::Result<Option<VerbTarget>> {
+        let target = sqlx::query_as(
+            "SELECT r.id AS repo_id, s.revision FROM repos r
+             LEFT JOIN shards s ON s.id = r.current_shard_id
+             WHERE r.qualifier = $1",
+        )
+        .bind(qualifier)
+        .fetch_optional(&self.pool)
+        .await
+        .context("resolving the repo qualifier")?;
+        Ok(target)
+    }
+
     /// Liveness probe used by the server's health endpoint.
     pub async fn ping(&self) -> anyhow::Result<()> {
         sqlx::query("SELECT 1").execute(&self.pool).await?;
@@ -516,4 +590,28 @@ async fn settle_leased_job(
     .rows_affected()
         == 1;
     Ok(claimed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::repo_qualifier;
+
+    #[test]
+    fn qualifiers_join_the_schemeless_forge_root_with_the_slug() {
+        assert_eq!(
+            repo_qualifier("https://github.com", "acme/widgets"),
+            "github.com/acme/widgets"
+        );
+        assert_eq!(
+            repo_qualifier("https://git.corp.example:8443", "acme/widgets"),
+            "git.corp.example:8443/acme/widgets"
+        );
+        // The degenerate file root ("file:///", RepoLocator's base for a
+        // two-segment path) must not double the slash.
+        assert_eq!(repo_qualifier("file:///", "srv/repo"), "/srv/repo");
+        assert_eq!(
+            repo_qualifier("file:///tmp/fixtures", "acme/widgets"),
+            "/tmp/fixtures/acme/widgets"
+        );
+    }
 }

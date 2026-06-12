@@ -1,0 +1,210 @@
+//! The query side's local Shard tier: warm queries answer without
+//! object storage, and a cached segment that no longer matches its
+//! checksum is refetched, never trusted.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use object_store::memory::InMemory;
+use object_store::{GetOptions, GetResult, ObjectStore, PutOptions, PutPayload, PutResult};
+use yg_shard::{Edge, EdgeKind, Graph, Node, Provenance, ShardCache, write_shard};
+
+/// An object store that counts reads, so tests can assert which queries
+/// went to storage and which the local tier answered.
+#[derive(Debug)]
+struct CountingStore {
+    inner: InMemory,
+    gets: AtomicUsize,
+    /// Every key fetched, in order — for asserting *what* was read,
+    /// not just how often.
+    fetched: std::sync::Mutex<Vec<String>>,
+}
+
+impl CountingStore {
+    fn new() -> Self {
+        Self {
+            inner: InMemory::new(),
+            gets: AtomicUsize::new(0),
+            fetched: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn gets(&self) -> usize {
+        self.gets.load(Ordering::SeqCst)
+    }
+
+    fn fetched(&self) -> Vec<String> {
+        self.fetched.lock().unwrap().clone()
+    }
+}
+
+impl std::fmt::Display for CountingStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CountingStore({})", self.inner)
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for CountingStore {
+    async fn put_opts(
+        &self,
+        location: &object_store::path::Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> object_store::Result<PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &object_store::path::Path,
+        opts: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &object_store::path::Path,
+        options: GetOptions,
+    ) -> object_store::Result<GetResult> {
+        self.gets.fetch_add(1, Ordering::SeqCst);
+        self.fetched.lock().unwrap().push(location.to_string());
+        self.inner.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<
+            'static,
+            object_store::Result<object_store::path::Path>,
+        >,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        options: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+/// A tiny published Shard to read back: one File defining one Symbol.
+async fn publish_fixture_shard(store: &dyn ObjectStore, repo_id: i64, commit: &str) -> String {
+    let graph = Graph {
+        nodes: vec![Node::file("main.go"), Node::symbol("main.go", "Hello", 1)],
+        edges: vec![Edge {
+            src: "file:main.go".into(),
+            dst: "sym:main.go#Hello".into(),
+            kind: EdgeKind::Defines,
+            provenance: Provenance::Syntactic,
+            confidence: 0.9,
+        }],
+    };
+    write_shard(store, repo_id, commit, graph)
+        .await
+        .expect("publishing the fixture Shard")
+        .revision
+}
+
+#[tokio::test]
+async fn warm_queries_answer_from_the_local_tier_without_object_storage() {
+    let store = Arc::new(CountingStore::new());
+    let revision = publish_fixture_shard(store.as_ref(), 1, "abc123").await;
+    let dir = tempfile::tempdir().unwrap();
+    let cache = ShardCache::new(store.clone(), dir.path());
+
+    let cold = cache.graph_path(1, &revision).await.unwrap();
+    let cold_gets = store.gets();
+    assert!(cold_gets > 0, "a cold query must fetch from storage");
+
+    for _ in 0..3 {
+        let warm = cache.graph_path(1, &revision).await.unwrap();
+        assert_eq!(warm, cold, "the same revision maps to the same file");
+    }
+    assert_eq!(
+        store.gets(),
+        cold_gets,
+        "warm queries must not touch object storage"
+    );
+}
+
+#[tokio::test]
+async fn a_cached_segment_failing_its_checksum_is_refetched_not_trusted() {
+    let store = Arc::new(CountingStore::new());
+    let revision = publish_fixture_shard(store.as_ref(), 1, "abc123").await;
+    let dir = tempfile::tempdir().unwrap();
+
+    let path = ShardCache::new(store.clone(), dir.path())
+        .graph_path(1, &revision)
+        .await
+        .unwrap();
+    let pristine = std::fs::read(&path).unwrap();
+    std::fs::write(&path, b"flipped bits, not a graph segment").unwrap();
+
+    // A fresh cache (a restarted query node) must notice and repair.
+    let gets_before = store.gets();
+    let repaired = ShardCache::new(store.clone(), dir.path())
+        .graph_path(1, &revision)
+        .await
+        .unwrap();
+    assert_eq!(repaired, path);
+    assert_eq!(
+        std::fs::read(&repaired).unwrap(),
+        pristine,
+        "the corrupt file must be replaced by the artifact from storage"
+    );
+    assert!(
+        store.gets() > gets_before,
+        "a checksum mismatch must refetch from storage"
+    );
+}
+
+#[tokio::test]
+async fn a_restarted_cache_reuses_an_intact_segment_without_refetching_it() {
+    let store = Arc::new(CountingStore::new());
+    let revision = publish_fixture_shard(store.as_ref(), 1, "abc123").await;
+    let dir = tempfile::tempdir().unwrap();
+
+    ShardCache::new(store.clone(), dir.path())
+        .graph_path(1, &revision)
+        .await
+        .unwrap();
+    let segment_key = yg_shard::graph_segment_key(1, &revision);
+    let fetches_before = store.fetched().len();
+
+    // A restarted query node re-reads the manifest (cheap) but must
+    // verify and reuse the segment already on disk.
+    ShardCache::new(store.clone(), dir.path())
+        .graph_path(1, &revision)
+        .await
+        .unwrap();
+    let after_restart = &store.fetched()[fetches_before..];
+    assert_eq!(
+        after_restart.len(),
+        1,
+        "only one refetch after a restart: {after_restart:?}"
+    );
+    assert_ne!(
+        after_restart[0], segment_key,
+        "the one refetch is the manifest, never the segment"
+    );
+}

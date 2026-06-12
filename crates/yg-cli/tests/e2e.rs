@@ -444,7 +444,7 @@ async fn admin_repo_add_rejects_non_positive_depth() {
     let cli = assert_cmd::Command::cargo_bin("yg")
         .unwrap()
         .env("YG_SERVER", &base)
-        .env("YG_TOKEN", "ygt_test_token")
+        .env("YG_TOKEN", TEST_TOKEN)
         .args([
             "admin",
             "repo",
@@ -616,7 +616,7 @@ async fn yg_admin_repo_add_and_admin_status_drive_the_admin_surface() {
     let server = boot_test_server().await;
     let env = [
         ("YG_SERVER", format!("http://{}", server.local_addr())),
-        ("YG_TOKEN", "ygt_test_token".into()),
+        ("YG_TOKEN", TEST_TOKEN.into()),
     ];
 
     let add = assert_cmd::Command::cargo_bin("yg")
@@ -692,14 +692,14 @@ async fn yg_serve_role_all_syncs_an_added_repo_without_a_separate_worker() {
     let db_name = create_test_db().await;
     let (_server, url) = spawn_yg_serve(|cmd| {
         cmd.env("YG_DATABASE_URL", format!("{DEV_POSTGRES}/{db_name}"))
-            .env("YG_BOOTSTRAP_TOKEN", "ygt_test_token")
+            .env("YG_BOOTSTRAP_TOKEN", TEST_TOKEN)
             .env("YG_GIT_CACHE", fixture.path().join("git-cache"));
     });
 
     assert_cmd::Command::cargo_bin("yg")
         .unwrap()
         .env("YG_SERVER", &url)
-        .env("YG_TOKEN", "ygt_test_token")
+        .env("YG_TOKEN", TEST_TOKEN)
         .args(["admin", "repo", "add", &fixture_url])
         .assert()
         .success();
@@ -801,7 +801,7 @@ async fn requests_without_a_valid_token_get_401_except_health() {
     }
     let authed_unknown = client
         .get(format!("{base}/v1/nonexistent"))
-        .bearer_auth("ygt_test_token")
+        .bearer_auth(TEST_TOKEN)
         .send()
         .await
         .unwrap();
@@ -810,7 +810,7 @@ async fn requests_without_a_valid_token_get_401_except_health() {
     // RFC 9110: the auth scheme is case-insensitive.
     let lowercase_scheme = client
         .get(format!("{base}/v1/status"))
-        .header("Authorization", "bearer ygt_test_token")
+        .header("Authorization", format!("bearer {TEST_TOKEN}"))
         .send()
         .await
         .unwrap();
@@ -856,7 +856,7 @@ async fn status_reports_version_uptime_and_repo_count_to_a_valid_token() {
 
     let resp = reqwest::Client::new()
         .get(format!("http://{}/v1/status", server.local_addr()))
-        .bearer_auth("ygt_test_token")
+        .bearer_auth(TEST_TOKEN)
         .send()
         .await
         .unwrap();
@@ -884,7 +884,7 @@ async fn migrations_are_idempotent_across_server_restarts() {
 
     let resp = reqwest::Client::new()
         .get(format!("http://{}/v1/status", second.local_addr()))
-        .bearer_auth("ygt_test_token")
+        .bearer_auth(TEST_TOKEN)
         .send()
         .await
         .unwrap();
@@ -900,7 +900,7 @@ async fn yg_status_prints_a_human_readable_report() {
     let assert = assert_cmd::Command::cargo_bin("yg")
         .unwrap()
         .env("YG_SERVER", format!("http://{}", server.local_addr()))
-        .env("YG_TOKEN", "ygt_test_token")
+        .env("YG_TOKEN", TEST_TOKEN)
         .arg("status")
         .assert()
         .success();
@@ -928,7 +928,7 @@ async fn yg_status_json_emits_machine_readable_output() {
         .unwrap()
         // Trailing slash on purpose: the CLI must not build a `//v1/…` URL.
         .env("YG_SERVER", format!("http://{}/", server.local_addr()))
-        .env("YG_TOKEN", "ygt_test_token")
+        .env("YG_TOKEN", TEST_TOKEN)
         .args(["status", "--json"])
         .assert()
         .success();
@@ -987,7 +987,7 @@ async fn yg_serve_boots_from_env_and_answers_yg_status_end_to_end() {
     assert_cmd::Command::cargo_bin("yg")
         .unwrap()
         .env("YG_SERVER", &url)
-        .env("YG_TOKEN", "ygt_test_token")
+        .env("YG_TOKEN", TEST_TOKEN)
         .arg("status")
         .assert()
         .success()
