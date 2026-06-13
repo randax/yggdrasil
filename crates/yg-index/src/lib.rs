@@ -726,9 +726,15 @@ fn site(path: &str, node: tree_sitter::Node<'_>) -> String {
 /// witnessed in the source, not guessed; only the pass is syntactic.
 /// An import that go.mod places inside this repo additionally connects
 /// the File to the package's Go files (RFC 0001 §5: IMPORTS is File →
-/// File/Package) at SYNTACTIC_MATCH — the directory resolution is the
-/// heuristic part — but never to the importing file itself: an
-/// external `_test` package lives in the very directory it imports.
+/// File/Package) — the directory resolution is the heuristic part — but
+/// never to the importing file itself: an external `_test` package
+/// lives in the very directory it imports. When an import path resolves
+/// to several candidate directories (tied module-path declarations),
+/// those directories are alternatives, so confidence spreads across
+/// them per ADR 0006; the files within one resolved package are all
+/// genuinely imported, so they share that directory's confidence rather
+/// than splitting it further. The common single-directory case keeps
+/// SYNTACTIC_MATCH.
 fn emit_import_edges(
     file: &GoFileFacts,
     index: &SymbolIndex,
@@ -749,7 +755,9 @@ fn emit_import_edges(
             confidence: 1.0,
             location: Some(import.location.clone()),
         });
-        for dir in index.dirs_of(&import.path) {
+        let dirs = index.dirs_of(&import.path);
+        let confidence = SYNTACTIC_MATCH / dirs.len().max(1) as f64;
+        for dir in dirs {
             for target in index
                 .files_by_dir
                 .get(dir)
@@ -764,7 +772,7 @@ fn emit_import_edges(
                     dst: target.clone(),
                     kind: EdgeKind::Imports,
                     provenance: Provenance::Syntactic,
-                    confidence: SYNTACTIC_MATCH,
+                    confidence,
                     location: Some(import.location.clone()),
                 });
             }

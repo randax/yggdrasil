@@ -851,3 +851,64 @@ fn a_dot_import_still_resolves_a_same_package_call() {
     assert_eq!(calls.len(), 1, "got {calls:?}");
     assert_eq!(calls[0].dst, "sym:app/main.go#helper");
 }
+
+#[test]
+fn an_ambiguous_in_repo_import_spreads_confidence_across_candidate_dirs() {
+    // Two go.mod files declaring the SAME module path (a broken/mid-edit
+    // repo) make an import resolve to two candidate directories. Those
+    // directories are alternatives, so per ADR 0006 the File→File edges
+    // spread confidence across them (0.9/2), rather than asserting 0.9
+    // for each as if both were certain.
+    let graph = pass_over(&[
+        ("a/go.mod", "module example.com/dup\n\ngo 1.22\n"),
+        ("a/a.go", "package a\n\nfunc A() {}\n"),
+        ("b/go.mod", "module example.com/dup\n\ngo 1.22\n"),
+        ("b/b.go", "package b\n\nfunc B() {}\n"),
+        (
+            "app/main.go",
+            "package main\n\nimport \"example.com/dup\"\n\nfunc main() {}\n",
+        ),
+    ]);
+
+    let mut file_edges: Vec<(&str, f64)> = edges_of_kind(&graph, EdgeKind::Imports)
+        .iter()
+        .filter(|e| e.dst.starts_with("file:"))
+        .map(|e| (e.dst.as_str(), e.confidence))
+        .collect();
+    file_edges.sort_by(|x, y| x.0.cmp(y.0));
+    assert_eq!(
+        file_edges,
+        vec![("file:a/a.go", 0.45), ("file:b/b.go", 0.45)],
+        "two candidate directories split 0.9"
+    );
+}
+
+#[test]
+fn an_unambiguous_in_repo_import_keeps_full_confidence_across_its_files() {
+    // The common case: one resolved directory. All its Go files are
+    // genuinely imported together (not alternatives), so each keeps the
+    // full SYNTACTIC_MATCH — the spread is across directories, never
+    // across files within one package.
+    let graph = pass_over(&[
+        ("go.mod", "module example.com/mod\n\ngo 1.22\n"),
+        ("util/a.go", "package util\n\nfunc A() {}\n"),
+        ("util/b.go", "package util\n\nfunc B() {}\n"),
+        (
+            "app/main.go",
+            "package main\n\nimport \"example.com/mod/util\"\n\nfunc main() {}\n",
+        ),
+    ]);
+
+    let confidences: Vec<f64> = edges_of_kind(&graph, EdgeKind::Imports)
+        .iter()
+        .filter(|e| e.dst.starts_with("file:"))
+        .map(|e| e.confidence)
+        .collect();
+    assert_eq!(confidences.len(), 2, "both package files are linked");
+    for c in confidences {
+        assert!(
+            (c - 0.9).abs() < 1e-6,
+            "one directory, full confidence per file, got {c}"
+        );
+    }
+}

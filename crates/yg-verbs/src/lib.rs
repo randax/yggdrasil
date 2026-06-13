@@ -226,8 +226,9 @@ pub struct GraphEdge {
     pub kind: String,
     pub provenance: String,
     pub confidence: f64,
-    /// Where the edge was witnessed (`<path>:<line>`, repo-relative,
-    /// 1-based), for edges that have a site — a CALLS edge's call site.
+    /// Where the edge was witnessed (`<path>:<line>:<col>`,
+    /// repo-relative, 1-based; `col` is a byte offset within the line),
+    /// for edges that have a site — a CALLS edge's call site.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub location: Option<String>,
 }

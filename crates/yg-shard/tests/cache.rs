@@ -291,3 +291,54 @@ async fn a_shard_from_an_older_schema_is_refused_with_a_typed_error() {
         "the graph segment must not be fetched once the schema is stale"
     );
 }
+
+#[tokio::test]
+async fn a_stale_revision_is_fetched_at_most_once_per_process() {
+    use object_store::ObjectStoreExt;
+    let store = Arc::new(CountingStore::new());
+    let commit = "abc123";
+
+    // An honest older-schema manifest, as a deploy rollout leaves behind
+    // until re-indexing converges.
+    let older = yg_shard::SCHEMA_VERSION - 1;
+    let revision = format!("{commit}-{}-v{older}", yg_shard::SYNTACTIC_PASS);
+    let manifest = serde_json::json!({
+        "schema_version": older,
+        "commit": commit,
+        "pass": yg_shard::SYNTACTIC_PASS,
+        "counts": {"nodes": 0, "edges": 0},
+        "segments": {"graph.sqlite": {"sha256": "0".repeat(64), "bytes": 1}},
+    });
+    store
+        .put(
+            &yg_shard::manifest_key(1, &revision).as_str().into(),
+            manifest.to_string().into(),
+        )
+        .await
+        .unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let cache = ShardCache::new(store.clone(), dir.path());
+
+    // A hot repo mid-rollout: many queries hit the same stale revision.
+    // Each must still be refused — but the manifest is fetched once and
+    // the verdict served from the warm cache, not refetched per query.
+    for _ in 0..5 {
+        let err = cache
+            .graph_path(1, &revision)
+            .await
+            .expect_err("a stale revision stays refused");
+        assert!(err.downcast_ref::<yg_shard::SchemaOutdated>().is_some());
+    }
+    let manifest_fetches = store
+        .fetched()
+        .iter()
+        .filter(|key| key.ends_with("manifest.json"))
+        .count();
+    assert_eq!(
+        manifest_fetches,
+        1,
+        "the stale manifest is fetched once, then served from cache: {:?}",
+        store.fetched()
+    );
+}

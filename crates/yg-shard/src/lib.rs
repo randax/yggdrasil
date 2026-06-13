@@ -726,20 +726,53 @@ impl ShardCache {
     /// the revision id asserts (commit, pass, schema), and a manifest
     /// that disagrees — bucket aliasing across deployments, a manual
     /// repair gone wrong — must not be served as this revision.
+    ///
+    /// A manifest from another schema version is refused with a typed
+    /// [`SchemaOutdated`] — but only after it is cached: it honestly
+    /// describes its (older) revision and is immutable, so caching it
+    /// means a stale revision read during a deploy rollout costs one
+    /// object-store fetch total, not one per query. The gate runs on
+    /// both the cache-hit and fresh-fetch paths, so a warm entry can
+    /// never smuggle an unreadable artifact past it.
     async fn manifest(&self, repo_id: i64, revision: &str) -> anyhow::Result<Arc<Manifest>> {
         let key = manifest_key(repo_id, revision);
-        if let Some(manifest) = self
+        let cached = self
             .manifests
             .lock()
             .expect("shard cache lock poisoned")
             .get(&key)
-        {
-            return Ok(manifest.clone());
+            .cloned();
+        let manifest = match cached {
+            Some(manifest) => manifest,
+            None => self.fetch_and_cache_manifest(&key, revision).await?,
+        };
+        // Gate after the cache lookup so cache hits are screened too:
+        // this binary cannot read another schema version's segment, and
+        // saying so here beats the v-mismatched SQL inside the segment
+        // saying it cryptically.
+        if manifest.schema_version != SCHEMA_VERSION {
+            return Err(anyhow::Error::new(SchemaOutdated {
+                revision: revision.to_string(),
+                schema_version: manifest.schema_version,
+            }));
         }
+        Ok(manifest)
+    }
+
+    /// Fetch a manifest from object storage, validate it agrees with its
+    /// revision id, and cache it. A disagreeing manifest (corruption,
+    /// bucket aliasing) is never cached — it bails. An honest manifest
+    /// is cached even if its schema is outdated; the schema gate lives
+    /// in [`Self::manifest`], applied to every read.
+    async fn fetch_and_cache_manifest(
+        &self,
+        key: &str,
+        revision: &str,
+    ) -> anyhow::Result<Arc<Manifest>> {
         // Fetched outside the lock: a slow fetch of one revision must
         // not stall cached lookups of others. Racing duplicate fetches
         // of one immutable manifest are harmless.
-        let bytes = match self.store.get(&key.as_str().into()).await {
+        let bytes = match self.store.get(&key.into()).await {
             Ok(get) => get
                 .bytes()
                 .await
@@ -765,23 +798,11 @@ impl ShardCache {
                 manifest.schema_version
             );
         }
-        // An honest manifest from another schema version (a pinned
-        // cursor outliving a deploy, a pointer not yet re-indexed):
-        // this binary cannot read its artifact — say so with a typed
-        // error, before the v-mismatched SQL inside the segment would
-        // say it cryptically. Checked before caching, so the gate can't
-        // be bypassed by a warm map entry.
-        if manifest.schema_version != SCHEMA_VERSION {
-            return Err(anyhow::Error::new(SchemaOutdated {
-                revision: revision.to_string(),
-                schema_version: manifest.schema_version,
-            }));
-        }
         let manifest = Arc::new(manifest);
         self.manifests
             .lock()
             .expect("shard cache lock poisoned")
-            .insert(key, manifest.clone());
+            .insert(key.to_string(), manifest.clone());
         Ok(manifest)
     }
 }
