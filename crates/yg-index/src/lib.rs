@@ -278,7 +278,7 @@ fn extract_tree(mirror: &Path, commit: &str, dest: &Path) -> anyhow::Result<()> 
 /// CALLS / IMPORTS / EXTENDS / IMPLEMENTS edges (ADR 0006).
 ///
 /// Phase 1 parses one file at a time, mints its Symbols, and distills
-/// the parse tree into compact [`GoFileFacts`] — tree and source are
+/// the parse tree into compact `GoFileFacts` — tree and source are
 /// released before the next file parses, so memory scales with facts
 /// (names and positions), never with a monorepo's worth of parse trees.
 /// Phase 2 resolves the facts repo-wide; it cannot run until every file
