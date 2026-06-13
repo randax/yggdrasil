@@ -363,19 +363,87 @@ fn guard_query_complexity(query: &str) -> Result<(), QueryMalformed> {
             "query nests parentheses {deepest} deep; the limit is {MAX_QUERY_DEPTH}"
         )));
     }
-    // A tantivy range query (`field:[a TO z]`) streams every term in the
-    // range out of the dictionary and unions all their postings *before*
-    // the page limit applies — an unbounded per-repo cost (measured ~400x a
-    // term query) from a tiny query, and a range is meaningless for lexical
-    // search. A range is the only construct combining the ` TO ` keyword
-    // with a `[`/`{` bracket, so refuse that pair (a stray uppercase "TO" in
-    // ordinary text, with no bracket, is left alone).
-    if query.contains(" TO ") && (query.contains('[') || query.contains('{')) {
-        return Err(QueryMalformed(
-            "range queries (`[a TO z]`) are not supported".to_string(),
-        ));
+    // A tantivy range query streams every term in the range out of the
+    // dictionary and unions all their postings *before* the page limit
+    // applies — an unbounded per-repo cost (measured ~200x a term query at 80k
+    // docs, and climbing with corpus size) from a tiny query, and a range is
+    // meaningless for lexical search. tantivy spells a range three ways, all of
+    // which must be refused:
+    //
+    //   1. bracket form  `field:[a TO z]` / `field:{a TO *}` — note tantivy
+    //      accepts *any* whitespace around `TO` (tab, newline), not just the
+    //      ASCII space, so a `" TO "` substring test misses `[a\tTO\tz]`.
+    //   2. elastic form  `field:>a`, `field:<z`, `field:>=a`, `field:<=z` —
+    //      no bracket and no `TO` at all (tantivy's grammar enters a range on
+    //      `peek(one_of("{[><"))`).
+    //
+    // Detect the entry tokens structurally rather than by the `TO` keyword: a
+    // `{` (only ranges use it), a `[` that is not an `IN [` set, or a `<`/`>`
+    // in leaf position (query start, or after `(`/whitespace/`:`). `<`/`>`
+    // mid-word (`a->b`, `Vec<T>`) is an ordinary term and is left alone.
+    if let Some(reason) = range_query_reason(query) {
+        return Err(QueryMalformed(reason.to_string()));
     }
     Ok(())
+}
+
+/// Why a query is a (refused) range query, or `None` if it is not one. Mirrors
+/// tantivy's range-entry dispatch so no spelling — bracket with exotic
+/// whitespace around `TO`, or the bracketless elastic `>`/`<` comparison —
+/// slips through to the unbounded term-dictionary scan.
+fn range_query_reason(query: &str) -> Option<&'static str> {
+    let bytes = query.as_bytes();
+    // `{` is used by nothing but a range. A `[` is a range unless it opens an
+    // `IN [...]` set, which prior analysis found bounded by its listed
+    // elements — allow only that one bracket use.
+    if bytes.contains(&b'{') {
+        return Some("range queries (`{a TO z}`) are not supported");
+    }
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'[' if !is_in_set_bracket(query, i) => {
+                return Some("range queries (`[a TO z]`) are not supported");
+            }
+            // Elastic comparison range (`>a`, `<=z`): a `<`/`>` only enters a
+            // range in leaf position — at the query start or right after a
+            // clause opener (`(`), a field colon (`:`), or whitespace. The
+            // same byte mid-token (`a->b`) is an ordinary term character.
+            b'<' | b'>' if at_leaf_start(bytes, i) => {
+                return Some("range queries (`field:>a`) are not supported");
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Whether the `[` at byte `i` opens an `IN [` set rather than a range — i.e.
+/// it is preceded by `IN` and optional whitespace (tantivy: `tag("IN"),
+/// multispace1, char('[')`, with leading `multispace0`).
+fn is_in_set_bracket(query: &str, i: usize) -> bool {
+    let prefix = query[..i].trim_end();
+    // The set keyword is `IN`; tantivy requires whitespace before the `[`, so a
+    // trimmed prefix ending in `IN` (and `IN` standing alone as a token) marks
+    // the set form. `field:IN [..]` and bare `IN [..]` both qualify.
+    let stripped = prefix.strip_suffix("IN").filter(|before| {
+        before
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_alphanumeric() && c != '_')
+    });
+    // Require that whitespace actually separated `IN` from `[` (the trim above
+    // removed it), so `IN[` — not a set — is treated as a range bracket.
+    stripped.is_some() && query[..i].ends_with(char::is_whitespace)
+}
+
+/// Whether byte `i` sits in leaf-start position: the start of the query, or
+/// immediately after a clause opener (`(`), a field colon (`:`), or
+/// whitespace — the positions where tantivy's grammar may begin a range.
+fn at_leaf_start(bytes: &[u8], i: usize) -> bool {
+    match i.checked_sub(1).map(|p| bytes[p]) {
+        None => true,
+        Some(p) => p == b'(' || p == b':' || p.is_ascii_whitespace(),
+    }
 }
 
 /// Parse a user query against the matchable fields (`terms` boosted over
@@ -539,12 +607,23 @@ mod tests {
         assert!(guard_query_complexity(&"(".repeat(MAX_QUERY_DEPTH)).is_ok());
         assert!(guard_query_complexity(&"(".repeat(MAX_QUERY_DEPTH + 1)).is_err());
         assert!(guard_query_complexity(&"() ".repeat(200)).is_ok());
-        // A range query (bracket + ` TO `) is refused; a stray uppercase TO
-        // with no bracket, and an ordinary bracket with no TO, are not.
+        // Range queries are refused in every spelling tantivy accepts:
+        // bracket (with any whitespace around `TO`, not just spaces), the
+        // exclusive `{}` form, and the bracketless elastic `>`/`<`/`>=`.
         assert!(guard_query_complexity("body:[a TO z]").is_err());
         assert!(guard_query_complexity("terms:{a TO *}").is_err());
+        assert!(guard_query_complexity("body:[a\tTO\tz]").is_err());
+        assert!(guard_query_complexity("body:[a\nTO\nz]").is_err());
+        assert!(guard_query_complexity("body:>a").is_err());
+        assert!(guard_query_complexity("terms:<=z").is_err());
+        assert!(guard_query_complexity(">a").is_err());
+        // ...but ordinary code queries that merely contain `<`/`>`/`TO`, and
+        // the bounded `IN [...]` set, are left alone.
         assert!(guard_query_complexity("convert TO json").is_ok());
         assert!(guard_query_complexity("rate limit").is_ok());
+        assert!(guard_query_complexity("a->b").is_ok());
+        assert!(guard_query_complexity("Vec<T>").is_ok());
+        assert!(guard_query_complexity("foo IN [a b c]").is_ok());
     }
 
     #[test]
