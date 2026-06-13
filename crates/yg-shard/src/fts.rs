@@ -1,7 +1,11 @@
 //! The full-text segment (RFC 0001 §6): a tantivy index over a repo's
-//! Symbol and File nodes, packed into a single content-addressed artifact
-//! so it lives in a Shard exactly like `graph.sqlite` — one segment file,
-//! one checksum, materialized by the cache tier and read in-process.
+//! Symbol and File nodes, packed into a single checksummed artifact so it
+//! lives in a Shard exactly like `graph.sqlite` — one segment file under
+//! the revision's key, one integrity checksum the cache tier verifies on
+//! materialize, read in-process. (The checksum guards integrity, not
+//! reproducibility: tantivy stamps each build with random segment ids, so
+//! the bytes are not stable across rebuilds of identical content. The
+//! Shard is addressed by repo+revision, never by this checksum.)
 //!
 //! The lexical search Verb reads it: a query returns ranked hits whose
 //! node ids feed straight into `node`/`neighbors`. Writer and reader share
@@ -316,11 +320,56 @@ pub fn open_fts(dir: &Path) -> anyhow::Result<FtsIndex> {
     })
 }
 
+/// A query longer than this many bytes is refused before parsing. Real
+/// lexical queries are short; the cap also bounds the cursor that carries
+/// the query and the CPU one query can spend fanning out across repos.
+const MAX_QUERY_BYTES: usize = 1024;
+
+/// The deepest run of nested `(` a query may contain. tantivy's query
+/// grammar parses a parenthesised group by **recursing**, so a long enough
+/// run of `(` overflows the worker thread's stack and aborts the whole
+/// process — an uncatchable crash, not a recoverable panic (verified: a few
+/// hundred unbalanced `(` suffice). No real query nests more than a handful.
+const MAX_QUERY_DEPTH: usize = 32;
+
+/// Refuse queries that would crash or pin tantivy's parser before it ever
+/// sees them, surfaced as the same client-facing [`QueryMalformed`] (400)
+/// as any other unparseable query. Every parse path funnels through
+/// [`parse_user_query`] — ranking, snippet hydration, and the query a
+/// cursor carries — so guarding here covers all of them.
+fn guard_query_complexity(query: &str) -> Result<(), QueryMalformed> {
+    if query.len() > MAX_QUERY_BYTES {
+        return Err(QueryMalformed(format!(
+            "query is {} bytes; the limit is {MAX_QUERY_BYTES}",
+            query.len()
+        )));
+    }
+    let mut depth = 0usize;
+    let mut deepest = 0usize;
+    for byte in query.bytes() {
+        match byte {
+            b'(' => {
+                depth += 1;
+                deepest = deepest.max(depth);
+            }
+            b')' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    if deepest > MAX_QUERY_DEPTH {
+        return Err(QueryMalformed(format!(
+            "query nests parentheses {deepest} deep; the limit is {MAX_QUERY_DEPTH}"
+        )));
+    }
+    Ok(())
+}
+
 /// Parse a user query against the matchable fields (`terms` boosted over
 /// `body`). A query that won't parse is a client error, surfaced as
 /// [`QueryMalformed`]. Shared by ranking and snippet hydration so both
 /// interpret the query identically.
 fn parse_user_query(index: &FtsIndex, query: &str) -> anyhow::Result<Box<dyn Query>> {
+    guard_query_complexity(query).map_err(anyhow::Error::new)?;
     let mut parser =
         QueryParser::for_index(&index.index, vec![index.fields.terms, index.fields.body]);
     // A name hit (a Symbol called RateLimit) should outrank prose that
@@ -453,7 +502,9 @@ impl std::error::Error for QueryMalformed {}
 
 #[cfg(test)]
 mod tests {
-    use super::identifier_words;
+    use super::{
+        MAX_QUERY_BYTES, MAX_QUERY_DEPTH, guard_query_complexity, identifier_words, unpack_fts,
+    };
 
     #[test]
     fn identifier_words_splits_camel_snake_and_acronyms() {
@@ -462,5 +513,44 @@ mod tests {
         assert_eq!(identifier_words("HTTPServer"), ["http", "server"]);
         assert_eq!(identifier_words("parseURL"), ["parse", "url"]);
         assert_eq!(identifier_words("main.go"), ["main", "go"]);
+    }
+
+    #[test]
+    fn guard_allows_queries_at_the_limits_and_rejects_past_them() {
+        // The length cap is inclusive: exactly at the limit is fine.
+        assert!(guard_query_complexity(&"a".repeat(MAX_QUERY_BYTES)).is_ok());
+        assert!(guard_query_complexity(&"a".repeat(MAX_QUERY_BYTES + 1)).is_err());
+        // Nesting is counted by depth, not by count: many shallow groups
+        // pass, but one level past the cap is refused.
+        assert!(guard_query_complexity(&"(".repeat(MAX_QUERY_DEPTH)).is_ok());
+        assert!(guard_query_complexity(&"(".repeat(MAX_QUERY_DEPTH + 1)).is_err());
+        assert!(guard_query_complexity(&"() ".repeat(200)).is_ok());
+    }
+
+    #[test]
+    fn unpack_refuses_an_entry_that_escapes_its_directory() {
+        // A doctored segment whose entry carries a path component (not a
+        // bare file name) must be refused, never written outside `dest`.
+        let mut builder = tar::Builder::new(Vec::new());
+        let payload = b"pwned";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(payload.len() as u64);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "sub/escape", &payload[..])
+            .unwrap();
+        let bytes = builder.into_inner().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let err = unpack_fts(&bytes, dir.path())
+            .expect_err("an entry with a path component is refused");
+        assert!(
+            err.to_string().contains("unexpected path"),
+            "the escape is rejected by path: {err:#}"
+        );
+        assert!(
+            !dir.path().join("sub").exists() && !dir.path().join("escape").exists(),
+            "nothing was written outside a bare file name"
+        );
     }
 }

@@ -113,6 +113,55 @@ fn the_kind_filter_restricts_hits_to_the_named_kinds() {
         symbols.iter().all(|h| h.kind == "Symbol"),
         "a Symbol filter yields only Symbols: {symbols:?}"
     );
+    // ...and the matching Symbol is still present — an empty result would
+    // satisfy the `all` above vacuously, hiding an over-eager filter.
+    assert!(
+        symbols.iter().any(|h| h.node_id == "sym:limit.go#RateLimit"),
+        "the matching Symbol survives the Symbol filter: {symbols:?}"
+    );
+}
+
+#[test]
+fn a_pathologically_nested_query_is_refused_not_crashed() {
+    // tantivy's parser recurses per '(', so a long run overflows the stack
+    // and *aborts the process* — uncatchable. The guard must turn it into a
+    // clean QueryMalformed (a client 400) instead of crashing the server.
+    let (_dir, index) = open_built(&rate_limit_corpus());
+    let nested = "(".repeat(5_000);
+    let err = search(
+        &index,
+        &SearchParams {
+            query: &nested,
+            kinds: None,
+            limit: 10,
+        },
+    )
+    .expect_err("a pathologically nested query errors, never crashes");
+    assert!(
+        err.downcast_ref::<yg_shard::QueryMalformed>().is_some(),
+        "the guard surfaces a client error: {err:#}"
+    );
+}
+
+#[test]
+fn an_over_long_query_is_refused() {
+    // A multi-kilobyte query (no nesting) is rejected before tantivy sees
+    // it — bounding parser CPU and the cursor that would carry the query.
+    let (_dir, index) = open_built(&rate_limit_corpus());
+    let long = "a ".repeat(2_000);
+    let err = search(
+        &index,
+        &SearchParams {
+            query: &long,
+            kinds: None,
+            limit: 10,
+        },
+    )
+    .expect_err("an over-long query errors");
+    assert!(
+        err.downcast_ref::<yg_shard::QueryMalformed>().is_some(),
+        "the guard surfaces a client error: {err:#}"
+    );
 }
 
 #[test]

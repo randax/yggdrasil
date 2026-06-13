@@ -845,8 +845,18 @@ async fn resolve_search_targets(
     state: &AppState,
     repos: Option<&[String]>,
 ) -> Result<Vec<SearchTarget>, Response> {
-    match repos {
+    let targets = match repos {
         Some(repos) => {
+            // An explicit empty list is ambiguous (no repos vs no filter)
+            // and rejected, mirroring the empty-`kinds` rule; omit `repos`
+            // to search every indexed repo.
+            if repos.is_empty() {
+                return Err(error_json(
+                    StatusCode::BAD_REQUEST,
+                    "repos must name at least one repository; omit it to search every indexed repo"
+                        .to_string(),
+                ));
+            }
             let mut targets = Vec::with_capacity(repos.len());
             let mut seen = std::collections::HashSet::new();
             for qualifier in repos {
@@ -882,23 +892,42 @@ async fn resolve_search_targets(
                     revision,
                 });
             }
-            Ok(targets)
+            targets
         }
         None => match state.control.indexed_repos().await {
-            Ok(repos) => Ok(repos
+            Ok(repos) => repos
                 .into_iter()
                 .map(|r| SearchTarget {
                     repo_id: r.repo_id,
                     qualifier: r.qualifier,
                     revision: r.revision,
                 })
-                .collect()),
-            Err(e) => Err(error_json(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("{e:#}"),
-            )),
+                .collect(),
+            Err(e) => {
+                return Err(error_json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("{e:#}"),
+                ));
+            }
         },
+    };
+
+    // The cursor that carries this fan-out is capped at MAX_SEARCH_TARGETS
+    // so a tampered cursor can't fan out unboundedly; the fresh path must
+    // honour the same bound, or a legitimately-minted cursor over a larger
+    // fan-out would be rejected on its next page. Beyond the cap, search
+    // needs a `repos` filter — org-wide tiering is M3 (RFC 0001 §11).
+    if targets.len() > MAX_SEARCH_TARGETS {
+        return Err(error_json(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "the search spans {} repositories, more than the {MAX_SEARCH_TARGETS} one query \
+                 covers; narrow it with the repos filter",
+                targets.len()
+            ),
+        ));
     }
+    Ok(targets)
 }
 
 /// Drop repeated repositories from a fan-out set, keeping first occurrence

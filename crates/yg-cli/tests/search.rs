@@ -82,6 +82,92 @@ async fn the_kind_filter_narrows_hits_to_the_named_kinds() {
             .is_some_and(|s| s.contains("<b>rate</b>") || s.contains("<b>limit</b>")),
         "the File hit carries a highlighted snippet: {body}"
     );
+
+    // Symmetric exclusion: filtering to Symbol drops the README File that
+    // an unfiltered search returns — the filter removes, not just relabels.
+    let body = h
+        .verb_ok("search", json!({"query": "rate limit", "kinds": ["Symbol"]}))
+        .await;
+    let hits = body["hits"].as_array().expect("hits array");
+    assert!(
+        hits.iter().all(|h| h["kind"] == "Symbol"),
+        "a Symbol filter yields only Symbols: {body}"
+    );
+    assert!(
+        hits.iter()
+            .all(|h| !h["id"].as_str().unwrap().ends_with("README.md")),
+        "the README File is excluded under the Symbol filter: {body}"
+    );
+    assert!(
+        hits.iter()
+            .any(|h| h["id"].as_str().unwrap().ends_with("RateLimit")),
+        "the RateLimit Symbol still matches under the Symbol filter: {body}"
+    );
+}
+
+#[tokio::test]
+async fn an_empty_repos_filter_is_refused_like_an_empty_kinds_filter() {
+    let h = Harness::boot_with(RATE_LIMIT_FIXTURE).await;
+    h.add_repo().await;
+    h.sync_and_index().await;
+
+    // An explicit empty list is ambiguous (no repos vs no filter); it's a
+    // 400, the same as an empty `kinds` — omit the filter to search all.
+    let (status, body) = h
+        .verb("search", json!({"query": "rate limit", "repos": []}))
+        .await;
+    assert_eq!(status, 400, "an explicit empty repos list is a 400: {body}");
+
+    let (status, body) = h
+        .verb("search", json!({"query": "rate limit", "kinds": []}))
+        .await;
+    assert_eq!(status, 400, "an explicit empty kinds list is a 400: {body}");
+}
+
+#[tokio::test]
+async fn a_garbled_cursor_is_a_client_error_not_a_panic() {
+    let h = Harness::boot_with(RATE_LIMIT_FIXTURE).await;
+    h.add_repo().await;
+    h.sync_and_index().await;
+
+    // A cursor is untrusted input; an undecodable one is the client's 400,
+    // not a 500 or a crash.
+    let (status, body) = h
+        .verb(
+            "search",
+            json!({"query": "rate limit", "cursor": "!!!not-base64!!!"}),
+        )
+        .await;
+    assert_eq!(status, 400, "a malformed cursor is a 400: {body}");
+}
+
+#[tokio::test]
+async fn a_cursor_re_sent_with_a_different_query_is_refused() {
+    let h = Harness::boot_with(RATE_LIMIT_FIXTURE).await;
+    h.add_repo().await;
+    h.sync_and_index().await;
+
+    // A first page small enough to leave a cursor.
+    let first = h
+        .verb_ok("search", json!({"query": "rate limit", "limit": 1}))
+        .await;
+    let cursor = first["next_cursor"]
+        .as_str()
+        .expect("a multi-hit search leaves a cursor")
+        .to_string();
+
+    // Re-using that cursor under a different query must be refused, never
+    // silently answered against the wrong ranking.
+    let (status, body) = h
+        .verb(
+            "search",
+            json!({"query": "something unrelated", "limit": 1, "cursor": cursor}),
+        )
+        .await;
+    assert_eq!(
+        status, 400,
+        "a cursor bound to another query is a 400: {body}"
+    );
 }
 
 #[tokio::test]

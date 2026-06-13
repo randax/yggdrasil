@@ -238,6 +238,62 @@ async fn a_cached_segment_failing_its_checksum_is_refetched_not_trusted() {
 }
 
 #[tokio::test]
+async fn a_cached_full_text_segment_failing_its_checksum_is_refetched_not_trusted() {
+    let store = Arc::new(CountingStore::new());
+    let revision = publish_fixture_shard(store.as_ref(), 1, "abc123").await;
+    let dir = tempfile::tempdir().unwrap();
+
+    // Materialize once, then vandalize the cached archive and drop the
+    // unpacked dir — a restarted query node must notice, refetch, re-unpack.
+    let unpacked = ShardCache::new(store.clone(), dir.path())
+        .fts_path(1, &revision)
+        .await
+        .unwrap();
+    let sha = unpacked
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.strip_suffix(".fts"))
+        .expect("the unpacked segment dir is named <sha>.fts")
+        .to_string();
+    let archive = dir.path().join(format!("{sha}.tar"));
+    let pristine = std::fs::read(&archive).unwrap();
+    std::fs::write(&archive, b"flipped bits, not a tantivy segment").unwrap();
+    std::fs::remove_dir_all(&unpacked).unwrap();
+
+    let gets_before = store.gets();
+    let repaired = ShardCache::new(store.clone(), dir.path())
+        .fts_path(1, &revision)
+        .await
+        .unwrap();
+    assert_eq!(repaired, unpacked, "the same revision maps to the same dir");
+    assert_eq!(
+        std::fs::read(&archive).unwrap(),
+        pristine,
+        "the corrupt archive must be replaced by the artifact from storage"
+    );
+    assert!(
+        store.gets() > gets_before,
+        "a checksum mismatch must refetch from storage"
+    );
+
+    // The healed segment is a working tantivy index again.
+    let index = yg_shard::open_fts(&repaired).expect("the re-unpacked segment opens");
+    let hits = yg_shard::search(
+        &index,
+        &SearchParams {
+            query: "Hello",
+            kinds: None,
+            limit: 10,
+        },
+    )
+    .expect("search runs over the healed segment");
+    assert!(
+        hits.iter().any(|h| h.node_id == "sym:main.go#Hello"),
+        "the healed segment finds the indexed symbol: {hits:?}"
+    );
+}
+
+#[tokio::test]
 async fn a_restarted_cache_reuses_an_intact_segment_without_refetching_it() {
     let store = Arc::new(CountingStore::new());
     let revision = publish_fixture_shard(store.as_ref(), 1, "abc123").await;
