@@ -144,6 +144,28 @@ fn a_pathologically_nested_query_is_refused_not_crashed() {
 }
 
 #[test]
+fn a_range_query_is_refused() {
+    // Range queries force a full term-dictionary scan whose cost ignores the
+    // page limit — refused before tantivy runs them.
+    let (_dir, index) = open_built(&rate_limit_corpus());
+    for q in ["body:[a TO z]", "body:{a TO z}", "terms:[a TO *]"] {
+        let err = search(
+            &index,
+            &SearchParams {
+                query: q,
+                kinds: None,
+                limit: 10,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.downcast_ref::<yg_shard::QueryMalformed>().is_some(),
+            "{q} is refused as a client error: {err:#}"
+        );
+    }
+}
+
+#[test]
 fn an_over_long_query_is_refused() {
     // A multi-kilobyte query (no nesting) is rejected before tantivy sees
     // it — bounding parser CPU and the cursor that would carry the query.

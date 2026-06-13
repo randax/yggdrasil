@@ -363,6 +363,18 @@ fn guard_query_complexity(query: &str) -> Result<(), QueryMalformed> {
             "query nests parentheses {deepest} deep; the limit is {MAX_QUERY_DEPTH}"
         )));
     }
+    // A tantivy range query (`field:[a TO z]`) streams every term in the
+    // range out of the dictionary and unions all their postings *before*
+    // the page limit applies — an unbounded per-repo cost (measured ~400x a
+    // term query) from a tiny query, and a range is meaningless for lexical
+    // search. A range is the only construct combining the ` TO ` keyword
+    // with a `[`/`{` bracket, so refuse that pair (a stray uppercase "TO" in
+    // ordinary text, with no bracket, is left alone).
+    if query.contains(" TO ") && (query.contains('[') || query.contains('{')) {
+        return Err(QueryMalformed(
+            "range queries (`[a TO z]`) are not supported".to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -527,6 +539,12 @@ mod tests {
         assert!(guard_query_complexity(&"(".repeat(MAX_QUERY_DEPTH)).is_ok());
         assert!(guard_query_complexity(&"(".repeat(MAX_QUERY_DEPTH + 1)).is_err());
         assert!(guard_query_complexity(&"() ".repeat(200)).is_ok());
+        // A range query (bracket + ` TO `) is refused; a stray uppercase TO
+        // with no bracket, and an ordinary bracket with no TO, are not.
+        assert!(guard_query_complexity("body:[a TO z]").is_err());
+        assert!(guard_query_complexity("terms:{a TO *}").is_err());
+        assert!(guard_query_complexity("convert TO json").is_ok());
+        assert!(guard_query_complexity("rate limit").is_ok());
     }
 
     #[test]

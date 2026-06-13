@@ -896,7 +896,11 @@ async fn resolve_search_targets(
             }
             targets
         }
-        None => match state.control.indexed_repos().await {
+        None => match state
+            .control
+            .indexed_repos(&yg_shard::syntactic_revision_suffix())
+            .await
+        {
             Ok(repos) => repos
                 .into_iter()
                 .map(|r| SearchTarget {

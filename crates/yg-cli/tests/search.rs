@@ -526,6 +526,35 @@ async fn a_search_filtered_to_an_unindexed_kind_is_empty_not_an_error() {
 }
 
 #[tokio::test]
+async fn the_org_wide_fan_out_excludes_repos_on_an_outdated_schema() {
+    // The fan-out treats one repo's shard-read error as fatal (it aborts the
+    // whole search). After a schema bump, repos still pointing at an older
+    // shard would otherwise 503 every org-wide search for the entire
+    // re-index window. `indexed_repos` filters by the current revision
+    // suffix, so such a repo is simply absent from the fan-out — searched
+    // only once it carries a current-schema (hence searchable) segment.
+    let h = Harness::boot_with(RATE_LIMIT_FIXTURE).await;
+    h.add_repo().await;
+    h.sync_and_index().await;
+    let control = control_plane(&h.db_name).await;
+
+    // The freshly indexed repo is at the current schema...
+    let current = control
+        .indexed_repos(&yg_shard::syntactic_revision_suffix())
+        .await
+        .unwrap();
+    assert_eq!(current.len(), 1, "the indexed repo joins the fan-out");
+
+    // ...and is excluded under any other schema suffix — the discriminator
+    // that keeps an as-yet-unmigrated repo from failing the whole search.
+    let other_schema = control.indexed_repos("-syntactic-v0").await.unwrap();
+    assert!(
+        other_schema.is_empty(),
+        "a repo whose shard is on a different schema is filtered out: {other_schema:?}"
+    );
+}
+
+#[tokio::test]
 async fn searching_before_anything_is_indexed_is_empty_not_an_error() {
     // A fresh server with no indexed repos: an org-wide search is a valid
     // empty result, not a failure.
