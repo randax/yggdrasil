@@ -554,8 +554,13 @@ async fn verb_search(
     // on a fresh search.
     let (query, kind_strings, mode, targets, offset) = match cursor {
         Some(cursor) => {
-            // A query may be re-sent alongside the cursor (compared trimmed,
-            // since a fresh search stores the trimmed form) but must match.
+            // The cursor pins the whole search — query, filters, and fan-out
+            // set — so one cursor pages one fixed result set. A request may
+            // re-send any of these alongside the cursor (a client that just
+            // appends `cursor` to its last request), but a re-sent value that
+            // *contradicts* the cursor is the client's error, not a silent
+            // re-pin onto a different search. Mirrors `neighbors`'
+            // shape-agreement check; `limit` is the one field free to vary.
             if let Some(q) = req.query.as_deref()
                 && q.trim() != cursor.query
             {
@@ -563,6 +568,41 @@ async fn verb_search(
                     StatusCode::BAD_REQUEST,
                     "this cursor belongs to a different query; start a fresh search or \
                      pass the cursor without a query"
+                        .to_string(),
+                );
+            }
+            if let Some(mode) = &req.mode
+                && mode != &cursor.mode
+            {
+                return error_json(
+                    StatusCode::BAD_REQUEST,
+                    "this cursor belongs to a different search mode; page it without a \
+                     mode, or start a fresh search"
+                        .to_string(),
+                );
+            }
+            if let Some(kinds) = &req.kinds
+                && str_set(kinds) != str_set(cursor.kinds.as_deref().unwrap_or_default())
+            {
+                return error_json(
+                    StatusCode::BAD_REQUEST,
+                    "this cursor belongs to a different kinds filter; page it without \
+                     kinds, or start a fresh search"
+                        .to_string(),
+                );
+            }
+            if let Some(repos) = &req.repos
+                && str_set(repos)
+                    != cursor
+                        .targets
+                        .iter()
+                        .map(|t| t.qualifier.as_str())
+                        .collect()
+            {
+                return error_json(
+                    StatusCode::BAD_REQUEST,
+                    "this cursor belongs to a different repos filter; page it without \
+                     repos, or start a fresh search"
                         .to_string(),
                 );
             }
@@ -768,19 +808,21 @@ async fn hydrate_snippets(
             yg_shard::snippets_for(&index, &query, &local_ids)
         })
         .await;
+        // Snippets are a non-critical enhancement: the ranked hits and their
+        // node ids — the result that feeds node/neighbors — are already in
+        // hand. A snippet-generation failure for one repo degrades that
+        // repo's hits to no highlight rather than sinking the whole search.
         let snippets = match snippets {
             Ok(Ok(snippets)) => snippets,
             Ok(Err(e)) => {
-                return Err(error_json(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("{e:#}"),
-                ));
+                tracing::warn!(
+                    "fts snippet generation failed; returning hits unhighlighted: {e:#}"
+                );
+                continue;
             }
             Err(e) => {
-                return Err(error_json(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("snippet task panicked: {e}"),
-                ));
+                tracing::warn!("fts snippet task panicked; returning hits unhighlighted: {e}");
+                continue;
             }
         };
         for &i in &indices {
@@ -934,6 +976,12 @@ async fn resolve_search_targets(
         ));
     }
     Ok(targets)
+}
+
+/// The set of a list filter's values, for comparing a re-sent cursor filter
+/// against the cursor's pinned one regardless of order or repeats.
+fn str_set(items: &[String]) -> std::collections::HashSet<&str> {
+    items.iter().map(String::as_str).collect()
 }
 
 /// Drop repeated repositories from a fan-out set, keeping first occurrence

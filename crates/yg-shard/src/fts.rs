@@ -312,7 +312,15 @@ pub fn unpack_fts(bytes: &[u8], dest: &Path) -> anyhow::Result<()> {
 pub fn open_fts(dir: &Path) -> anyhow::Result<FtsIndex> {
     let index = Index::open_in_dir(dir).context("opening the fts segment")?;
     let fields = Fields::of(&index.schema())?;
-    let reader = index.reader().context("opening the fts segment reader")?;
+    // A Shard segment is immutable, so the reader never reloads. Manual
+    // avoids the background watch thread the default (`OnCommit`) policy
+    // spawns per reader — which would otherwise leak as searches reopen
+    // segments.
+    let reader: IndexReader = index
+        .reader_builder()
+        .reload_policy(tantivy::ReloadPolicy::Manual)
+        .try_into()
+        .context("opening the fts segment reader")?;
     Ok(FtsIndex {
         index,
         reader,
@@ -595,6 +603,9 @@ mod tests {
         assert_eq!(identifier_words("HTTPServer"), ["http", "server"]);
         assert_eq!(identifier_words("parseURL"), ["parse", "url"]);
         assert_eq!(identifier_words("main.go"), ["main", "go"]);
+        // An acronym trailed by a short lowercase suffix splits at the last
+        // capital before the suffix (the documented approximate behavior).
+        assert_eq!(identifier_words("URLs"), ["ur", "ls"]);
     }
 
     #[test]
@@ -641,8 +652,8 @@ mod tests {
         let bytes = builder.into_inner().unwrap();
 
         let dir = tempfile::tempdir().unwrap();
-        let err = unpack_fts(&bytes, dir.path())
-            .expect_err("an entry with a path component is refused");
+        let err =
+            unpack_fts(&bytes, dir.path()).expect_err("an entry with a path component is refused");
         assert!(
             err.to_string().contains("unexpected path"),
             "the escape is rejected by path: {err:#}"

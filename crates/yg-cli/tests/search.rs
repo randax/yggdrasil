@@ -86,7 +86,10 @@ async fn the_kind_filter_narrows_hits_to_the_named_kinds() {
     // Symmetric exclusion: filtering to Symbol drops the README File that
     // an unfiltered search returns — the filter removes, not just relabels.
     let body = h
-        .verb_ok("search", json!({"query": "rate limit", "kinds": ["Symbol"]}))
+        .verb_ok(
+            "search",
+            json!({"query": "rate limit", "kinds": ["Symbol"]}),
+        )
         .await;
     let hits = body["hits"].as_array().expect("hits array");
     assert!(
@@ -168,6 +171,45 @@ async fn a_cursor_re_sent_with_a_different_query_is_refused() {
         status, 400,
         "a cursor bound to another query is a 400: {body}"
     );
+}
+
+#[tokio::test]
+async fn a_cursor_re_sent_with_a_changed_filter_is_refused() {
+    let h = Harness::boot_with(RATE_LIMIT_FIXTURE).await;
+    h.add_repo().await;
+    h.sync_and_index().await;
+
+    // A first page (no filters) that leaves a cursor.
+    let first = h
+        .verb_ok("search", json!({"query": "rate limit", "limit": 1}))
+        .await;
+    let cursor = first["next_cursor"]
+        .as_str()
+        .expect("a multi-hit search leaves a cursor")
+        .to_string();
+
+    // The cursor pins the filters too: re-sending it with a kinds (or repos)
+    // filter the original search didn't have must be refused, not silently
+    // ignored — the client would otherwise think it narrowed the results.
+    let (status, body) = h
+        .verb(
+            "search",
+            json!({"query": "rate limit", "limit": 1, "kinds": ["Symbol"], "cursor": cursor}),
+        )
+        .await;
+    assert_eq!(
+        status, 400,
+        "a cursor re-sent with a new kinds filter is a 400: {body}"
+    );
+
+    // Re-sending it unchanged (filters omitted) still pages cleanly.
+    let (status, _) = h
+        .verb(
+            "search",
+            json!({"query": "rate limit", "limit": 1, "cursor": cursor}),
+        )
+        .await;
+    assert_eq!(status, 200, "the unchanged cursor still pages");
 }
 
 #[tokio::test]

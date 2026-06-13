@@ -116,7 +116,9 @@ fn the_kind_filter_restricts_hits_to_the_named_kinds() {
     // ...and the matching Symbol is still present — an empty result would
     // satisfy the `all` above vacuously, hiding an over-eager filter.
     assert!(
-        symbols.iter().any(|h| h.node_id == "sym:limit.go#RateLimit"),
+        symbols
+            .iter()
+            .any(|h| h.node_id == "sym:limit.go#RateLimit"),
         "the matching Symbol survives the Symbol filter: {symbols:?}"
     );
 }
