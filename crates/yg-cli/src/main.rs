@@ -43,8 +43,8 @@ enum Command {
         /// Follow only edges pointing this way: in, out, or both
         #[arg(long)]
         direction: Option<String>,
-        /// Follow only edges of this kind (repeatable), e.g. DEFINES
-        #[arg(long = "kind")]
+        /// Follow only edges of this kind (repeatable), e.g. CALLS
+        #[arg(long = "kind", visible_alias = "edge-kinds")]
         kinds: Vec<String>,
         /// How many hops to traverse (1-3)
         #[arg(long)]
@@ -270,7 +270,7 @@ async fn neighbors(
         println!();
     }
     for edge in body["edges"].as_array().map(Vec::as_slice).unwrap_or(&[]) {
-        println!(
+        print!(
             "{} -[{} {} {}]-> {}",
             edge["src"].as_str().unwrap_or("?"),
             edge["kind"].as_str().unwrap_or("?"),
@@ -278,6 +278,12 @@ async fn neighbors(
             edge["confidence"],
             edge["dst"].as_str().unwrap_or("?"),
         );
+        // The edge's witnessed site (a CALLS edge's call site), when it
+        // has one.
+        if let Some(location) = edge["location"].as_str() {
+            print!("  @ {location}");
+        }
+        println!();
     }
     if let Some(cursor) = body["next_cursor"].as_str() {
         println!("more: pass --cursor {cursor}");
@@ -419,6 +425,17 @@ async fn workers_from_env() -> anyhow::Result<(yg_sync::SyncWorker, yg_index::In
 async fn run_workers(
     (sync, index): (yg_sync::SyncWorker, yg_index::IndexWorker),
 ) -> anyhow::Result<()> {
+    // Converge after a deploy that bumped the Shard schema: the read
+    // path refuses artifacts from older schema versions, so every
+    // stranded Shard needs re-indexing. Queued once at boot, then
+    // drained like any other index work. A control-plane hiccup here
+    // shouldn't keep the workers from starting — the next boot retries.
+    if let Err(e) = index.requeue_outdated_shards().await {
+        tracing::warn!(
+            error = format!("{e:#}"),
+            "could not queue re-index of outdated Shards"
+        );
+    }
     tokio::try_join!(
         drain_queue(|| sync.run_once()),
         drain_queue(|| index.run_once()),

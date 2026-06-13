@@ -487,6 +487,25 @@ async fn resolve_shard(
                  restart the traversal without a cursor",
             ))
         }
+        // A revision published under an older index schema: a cursor
+        // that outlived a deploy has simply expired; a current pointer
+        // is already queued for re-indexing (worker boot requeues every
+        // outdated Shard), so the client should retry, not despair.
+        Err(e) if e.downcast_ref::<yg_shard::SchemaOutdated>().is_some() => {
+            if from_cursor {
+                Err(error_json(
+                    StatusCode::GONE,
+                    "this cursor's Shard revision predates the current index schema; \
+                     restart the traversal without a cursor",
+                ))
+            } else {
+                Err(error_json(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "this repo's Shard predates the current index schema and is being \
+                     re-indexed; try again shortly",
+                ))
+            }
+        }
         Err(e) => Err(error_json(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("{e:#}"),
@@ -741,4 +760,51 @@ async fn healthz(State(state): State<Arc<AppState>>) -> (StatusCode, Json<Health
         StatusCode::SERVICE_UNAVAILABLE
     };
     (code, Json(body))
+}
+
+#[cfg(test)]
+mod tests {
+    //! Cross-crate drift guards: the id grammar (yg-verbs) and the
+    //! filter vocabulary (yg-verbs) each duplicate vocabulary that the
+    //! Shard writer (yg-shard) owns, on purpose — the read path doesn't
+    //! depend on the artifact writer. yg-api is the one crate that sees
+    //! both, so these are the tests that catch a node or edge kind added
+    //! to yg-shard but never taught to the read path.
+
+    /// Every node kind the Shard writer mints must produce an external
+    /// id the read path can parse and round-trip — otherwise a node is
+    /// stored and counted but its `node`/`neighbors` ids 400 as
+    /// malformed (this is exactly how `pkg:` would have regressed).
+    #[test]
+    fn every_node_kind_prefix_round_trips_through_the_id_grammar() {
+        let repo = "github.com/acme/widgets";
+        for kind in yg_shard::NodeKind::ALL {
+            // A representative local part per prefix; the grammar cares
+            // only about the prefix and a non-empty local part.
+            let local = match kind.id_prefix() {
+                "sym" => "cmd/main.go#Hello".to_string(),
+                other => format!("{other}-local/part"),
+            };
+            let external = format!("{}:{repo}:{local}", kind.id_prefix());
+            let parsed = yg_verbs::VerbId::parse(&external)
+                .unwrap_or_else(|e| panic!("{kind:?} id {external:?} must parse: {e}"));
+            assert_eq!(parsed.repo, repo, "{kind:?}");
+            assert_eq!(parsed.external(), external, "{kind:?} must round-trip");
+        }
+    }
+
+    /// The `edge_kinds` filter vocabulary must be exactly the set of
+    /// edge kinds the Shard writer emits — no more (a filter for a kind
+    /// no Shard holds), no fewer (a real kind a client can't filter to).
+    #[test]
+    fn known_edge_kinds_match_the_writer_exactly() {
+        let mut written: Vec<&str> = yg_shard::EdgeKind::ALL.iter().map(|k| k.as_str()).collect();
+        written.sort_unstable();
+        let mut filterable: Vec<&str> = yg_verbs::KNOWN_EDGE_KINDS.to_vec();
+        filterable.sort_unstable();
+        assert_eq!(
+            written, filterable,
+            "yg_verbs::KNOWN_EDGE_KINDS must mirror yg_shard::EdgeKind"
+        );
+    }
 }

@@ -439,6 +439,37 @@ impl ControlPlane {
         Ok(true)
     }
 
+    /// Queue a re-index for every repo whose current Shard's revision
+    /// doesn't end with `current_suffix` — the pass+schema suffix every
+    /// revision id this binary publishes carries. After a deploy that
+    /// bumps the Shard schema, the read path refuses the old artifacts
+    /// (they predate the schema this binary reads), and this — run at
+    /// worker boot — is what re-converges the fleet: revisions are
+    /// deterministic, so each re-index publishes the new revision
+    /// idempotently and swaps the pointer. Returns how many repos were
+    /// queued; repos with a job already in flight count as covered.
+    pub async fn requeue_outdated_shards(&self, current_suffix: &str) -> anyhow::Result<u64> {
+        let mut tx = self.pool.begin().await?;
+        let outdated: Vec<(i64,)> = sqlx::query_as(
+            "SELECT r.id FROM repos r
+             JOIN shards s ON s.id = r.current_shard_id
+             WHERE r.last_synced_commit IS NOT NULL
+               AND right(s.revision, length($1)) <> $1
+             ORDER BY r.id",
+        )
+        .bind(current_suffix)
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut queued = 0;
+        for (repo_id,) in outdated {
+            if enqueue_job_unless_in_flight(&mut tx, "index", repo_id).await? {
+                queued += 1;
+            }
+        }
+        tx.commit().await?;
+        Ok(queued)
+    }
+
     /// Record a failed index run: back the job off and keep the error
     /// for `yg admin status`, exactly like [`Self::fail_fetch`]. Returns
     /// whether the failure was recorded; `false` means the lease had

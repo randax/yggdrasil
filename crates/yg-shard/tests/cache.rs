@@ -117,6 +117,7 @@ async fn publish_fixture_shard(store: &dyn ObjectStore, repo_id: i64, commit: &s
             kind: EdgeKind::Defines,
             provenance: Provenance::Syntactic,
             confidence: 0.9,
+            location: None,
         }],
     };
     write_shard(store, repo_id, commit, graph)
@@ -241,5 +242,103 @@ async fn a_manifest_recording_a_non_checksum_segment_name_is_refused() {
     assert!(
         err.to_string().contains("not a sha256 digest"),
         "names the reason: {err:#}"
+    );
+}
+
+#[tokio::test]
+async fn a_shard_from_an_older_schema_is_refused_with_a_typed_error() {
+    use object_store::ObjectStoreExt;
+    let store = Arc::new(CountingStore::new());
+    let commit = "abc123";
+
+    // A manifest honestly describing an older-schema revision — exactly
+    // what a pre-deploy Shard looks like to a binary that has since
+    // bumped SCHEMA_VERSION. It agrees with its own revision id, so the
+    // disagreement check passes; only the schema gate may stop it.
+    let older = yg_shard::SCHEMA_VERSION - 1;
+    let revision = format!("{commit}-{}-v{older}", yg_shard::SYNTACTIC_PASS);
+    let manifest = serde_json::json!({
+        "schema_version": older,
+        "commit": commit,
+        "pass": yg_shard::SYNTACTIC_PASS,
+        "counts": {"nodes": 0, "edges": 0},
+        "segments": {"graph.sqlite": {"sha256": "0".repeat(64), "bytes": 1}},
+    });
+    store
+        .put(
+            &yg_shard::manifest_key(1, &revision).as_str().into(),
+            manifest.to_string().into(),
+        )
+        .await
+        .unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let err = ShardCache::new(store.clone(), dir.path())
+        .graph_path(1, &revision)
+        .await
+        .expect_err("an older-schema Shard must be refused, not read");
+    let outdated = err
+        .downcast_ref::<yg_shard::SchemaOutdated>()
+        .unwrap_or_else(|| panic!("must be a typed SchemaOutdated, got: {err:#}"));
+    assert_eq!(outdated.schema_version, older, "carries the stale version");
+    // The gate fires on the manifest alone — the segment is never read,
+    // so its missing-column SQL never gets a chance to fail cryptically.
+    assert!(
+        !store
+            .fetched()
+            .iter()
+            .any(|key| key.ends_with(yg_shard::GRAPH_SEGMENT_FILE)),
+        "the graph segment must not be fetched once the schema is stale"
+    );
+}
+
+#[tokio::test]
+async fn a_stale_revision_is_fetched_at_most_once_per_process() {
+    use object_store::ObjectStoreExt;
+    let store = Arc::new(CountingStore::new());
+    let commit = "abc123";
+
+    // An honest older-schema manifest, as a deploy rollout leaves behind
+    // until re-indexing converges.
+    let older = yg_shard::SCHEMA_VERSION - 1;
+    let revision = format!("{commit}-{}-v{older}", yg_shard::SYNTACTIC_PASS);
+    let manifest = serde_json::json!({
+        "schema_version": older,
+        "commit": commit,
+        "pass": yg_shard::SYNTACTIC_PASS,
+        "counts": {"nodes": 0, "edges": 0},
+        "segments": {"graph.sqlite": {"sha256": "0".repeat(64), "bytes": 1}},
+    });
+    store
+        .put(
+            &yg_shard::manifest_key(1, &revision).as_str().into(),
+            manifest.to_string().into(),
+        )
+        .await
+        .unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let cache = ShardCache::new(store.clone(), dir.path());
+
+    // A hot repo mid-rollout: many queries hit the same stale revision.
+    // Each must still be refused — but the manifest is fetched once and
+    // the verdict served from the warm cache, not refetched per query.
+    for _ in 0..5 {
+        let err = cache
+            .graph_path(1, &revision)
+            .await
+            .expect_err("a stale revision stays refused");
+        assert!(err.downcast_ref::<yg_shard::SchemaOutdated>().is_some());
+    }
+    let manifest_fetches = store
+        .fetched()
+        .iter()
+        .filter(|key| key.ends_with("manifest.json"))
+        .count();
+    assert_eq!(
+        manifest_fetches,
+        1,
+        "the stale manifest is fetched once, then served from cache: {:?}",
+        store.fetched()
     );
 }

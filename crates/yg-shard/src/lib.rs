@@ -24,7 +24,15 @@ use sha2::{Digest, Sha256};
 ///
 /// v2: indexes on edges(src) and edges(dst) — the read path's neighbor
 /// and summary lookups are index seeks instead of table scans.
-pub const SCHEMA_VERSION: u32 = 2;
+/// v3: edges carry a nullable location (`<path>:<line>:<col>`, 1-based)
+/// — the call site of a CALLS edge, the import spec of an IMPORTS edge
+/// (RFC 0001 §5: "locations where applicable").
+///
+/// Bumping this changes every revision id (see
+/// [`syntactic_revision_suffix`]): readers refuse artifacts from other
+/// schema versions ([`SchemaOutdated`]), and worker boot queues a
+/// re-index for every repo still pointing at an outdated revision.
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// Name of the M0 indexing pass, as recorded in revision ids, manifests,
 /// and the control plane's `provenance_level`. The precise pass (M1)
@@ -60,13 +68,53 @@ impl Provenance {
 pub enum NodeKind {
     File,
     Symbol,
+    /// An imported package, named by import path (RFC 0001 §5) — the
+    /// target IMPORTS edges point at whether or not the package's source
+    /// is in this repo.
+    Package,
 }
 
+/// Compile-time backstop for `NodeKind::ALL`: a new variant makes this
+/// match non-exhaustive (build error), forcing whoever adds it to come
+/// here — next to `ALL` and its length assert — rather than silently
+/// leaving `ALL` short. The assert pins the count so a forgotten `ALL`
+/// entry fails the build too. (Set *equality* with the variants — e.g.
+/// catching a duplicate that masks a drop — is enforced by the
+/// cross-crate drift test in yg-api, which compares against the writer.)
+const _: () = {
+    fn count(kind: NodeKind) -> usize {
+        match kind {
+            NodeKind::File => 1,
+            NodeKind::Symbol => 1,
+            NodeKind::Package => 1,
+        }
+    }
+    let _ = count;
+    assert!(NodeKind::ALL.len() == 3);
+};
+
 impl NodeKind {
+    /// Every node kind, for exhaustive checks (a cross-crate test holds
+    /// the id grammar in yg-verbs to this list; the `const _` block
+    /// above pins its length, the yg-api drift test its contents).
+    pub const ALL: &'static [NodeKind] = &[NodeKind::File, NodeKind::Symbol, NodeKind::Package];
+
     pub fn as_str(self) -> &'static str {
         match self {
             NodeKind::File => "File",
             NodeKind::Symbol => "Symbol",
+            NodeKind::Package => "Package",
+        }
+    }
+
+    /// The id prefix a node of this kind carries (`file:…`, `sym:…`,
+    /// `pkg:…`) — the one place the wire prefix is defined, used by the
+    /// `Node` constructors and matched by yg-verbs' id grammar.
+    pub fn id_prefix(self) -> &'static str {
+        match self {
+            NodeKind::File => "file",
+            NodeKind::Symbol => "sym",
+            NodeKind::Package => "pkg",
         }
     }
 }
@@ -74,12 +122,48 @@ impl NodeKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EdgeKind {
     Defines,
+    Calls,
+    Imports,
+    Extends,
+    Implements,
 }
 
+/// Compile-time backstop for `EdgeKind::ALL` — see the guard above
+/// [`NodeKind::ALL`] for the mechanism and its limits.
+const _: () = {
+    fn count(kind: EdgeKind) -> usize {
+        match kind {
+            EdgeKind::Defines => 1,
+            EdgeKind::Calls => 1,
+            EdgeKind::Imports => 1,
+            EdgeKind::Extends => 1,
+            EdgeKind::Implements => 1,
+        }
+    }
+    let _ = count;
+    assert!(EdgeKind::ALL.len() == 5);
+};
+
 impl EdgeKind {
+    /// Every edge kind, for exhaustive checks (a cross-crate test holds
+    /// yg-verbs' `KNOWN_EDGE_KINDS` filter vocabulary to this list; the
+    /// `const _` block above pins its length, the yg-api drift test its
+    /// contents).
+    pub const ALL: &'static [EdgeKind] = &[
+        EdgeKind::Defines,
+        EdgeKind::Calls,
+        EdgeKind::Imports,
+        EdgeKind::Extends,
+        EdgeKind::Implements,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             EdgeKind::Defines => "DEFINES",
+            EdgeKind::Calls => "CALLS",
+            EdgeKind::Imports => "IMPORTS",
+            EdgeKind::Extends => "EXTENDS",
+            EdgeKind::Implements => "IMPLEMENTS",
         }
     }
 }
@@ -101,10 +185,20 @@ impl Node {
     /// The File node for a repo-relative path: id `file:<path>`.
     pub fn file(path: &str) -> Self {
         Self {
-            id: format!("file:{path}"),
+            id: format!("{}:{path}", NodeKind::File.id_prefix()),
             kind: NodeKind::File,
             name: None,
             path: Some(path.to_string()),
+        }
+    }
+
+    /// The Package node for an import path: id `pkg:<import-path>`.
+    pub fn package(import_path: &str) -> Self {
+        Self {
+            id: format!("{}:{import_path}", NodeKind::Package.id_prefix()),
+            kind: NodeKind::Package,
+            name: Some(import_path.to_string()),
+            path: None,
         }
     }
 
@@ -112,10 +206,11 @@ impl Node {
     /// disambiguates same-named declarations in one file (multiple
     /// `func init()`): the first is 1 (no suffix), later ones get `~n`.
     pub fn symbol(path: &str, name: &str, ordinal: u32) -> Self {
+        let prefix = NodeKind::Symbol.id_prefix();
         let id = if ordinal <= 1 {
-            format!("sym:{path}#{name}")
+            format!("{prefix}:{path}#{name}")
         } else {
-            format!("sym:{path}#{name}~{ordinal}")
+            format!("{prefix}:{path}#{name}~{ordinal}")
         };
         Self {
             id,
@@ -132,8 +227,15 @@ pub struct Edge {
     pub dst: String,
     pub kind: EdgeKind,
     pub provenance: Provenance,
-    /// In [0, 1]: how sure the producing pass is (ADR 0002).
-    pub confidence: f32,
+    /// In [0, 1]: how sure the producing pass is (ADR 0002). f64
+    /// because the artifact stores REAL and the wire serves f64: an f32
+    /// here would put float noise (0.8999999…) on every response.
+    pub confidence: f64,
+    /// Where in the source this edge was witnessed
+    /// (`<path>:<line>:<col>`, 1-based; `col` is a byte offset within
+    /// the line), for edges that have a site — a CALLS edge's call
+    /// site. RFC 0001 §5: "locations where applicable".
+    pub location: Option<String>,
 }
 
 /// The graph segment of one Shard, as produced by an indexing pass.
@@ -185,7 +287,14 @@ pub struct PublishedShard {
 /// Deterministic on purpose: re-indexing the same commit derives the same
 /// revision, which is what makes re-indexing idempotent.
 pub fn syntactic_revision(commit: &str) -> String {
-    format!("{commit}-{SYNTACTIC_PASS}-v{SCHEMA_VERSION}")
+    format!("{commit}{}", syntactic_revision_suffix())
+}
+
+/// The pass+schema suffix every current syntactic revision id ends with
+/// — what worker boot hands the control plane to find repos whose
+/// current Shard predates this binary's schema.
+pub fn syntactic_revision_suffix() -> String {
+    format!("-{SYNTACTIC_PASS}-v{SCHEMA_VERSION}")
 }
 
 /// Object key of a revision's manifest — the one definition of the
@@ -467,6 +576,31 @@ impl std::fmt::Display for RevisionMissing {
 
 impl std::error::Error for RevisionMissing {}
 
+/// A revision published under a different [`SCHEMA_VERSION`] than this
+/// binary reads — a pre-deploy Shard met post-deploy code. Distinct
+/// from corruption errors because callers can say something useful: a
+/// pinned pagination cursor has expired, and a current pointer is
+/// re-indexed at worker boot (the queue is populated from the same
+/// revision-suffix check), so "try again shortly" is true. Detect with
+/// `err.downcast_ref::<SchemaOutdated>()`.
+#[derive(Debug)]
+pub struct SchemaOutdated {
+    pub revision: String,
+    pub schema_version: u32,
+}
+
+impl std::fmt::Display for SchemaOutdated {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "revision {} was published under schema v{}; this server reads v{SCHEMA_VERSION}",
+            self.revision, self.schema_version
+        )
+    }
+}
+
+impl std::error::Error for SchemaOutdated {}
+
 impl ShardCache {
     pub fn new(store: Arc<dyn ObjectStore>, dir: impl Into<std::path::PathBuf>) -> Self {
         Self {
@@ -592,20 +726,53 @@ impl ShardCache {
     /// the revision id asserts (commit, pass, schema), and a manifest
     /// that disagrees — bucket aliasing across deployments, a manual
     /// repair gone wrong — must not be served as this revision.
+    ///
+    /// A manifest from another schema version is refused with a typed
+    /// [`SchemaOutdated`] — but only after it is cached: it honestly
+    /// describes its (older) revision and is immutable, so caching it
+    /// means a stale revision read during a deploy rollout costs one
+    /// object-store fetch total, not one per query. The gate runs on
+    /// both the cache-hit and fresh-fetch paths, so a warm entry can
+    /// never smuggle an unreadable artifact past it.
     async fn manifest(&self, repo_id: i64, revision: &str) -> anyhow::Result<Arc<Manifest>> {
         let key = manifest_key(repo_id, revision);
-        if let Some(manifest) = self
+        let cached = self
             .manifests
             .lock()
             .expect("shard cache lock poisoned")
             .get(&key)
-        {
-            return Ok(manifest.clone());
+            .cloned();
+        let manifest = match cached {
+            Some(manifest) => manifest,
+            None => self.fetch_and_cache_manifest(&key, revision).await?,
+        };
+        // Gate after the cache lookup so cache hits are screened too:
+        // this binary cannot read another schema version's segment, and
+        // saying so here beats the v-mismatched SQL inside the segment
+        // saying it cryptically.
+        if manifest.schema_version != SCHEMA_VERSION {
+            return Err(anyhow::Error::new(SchemaOutdated {
+                revision: revision.to_string(),
+                schema_version: manifest.schema_version,
+            }));
         }
+        Ok(manifest)
+    }
+
+    /// Fetch a manifest from object storage, validate it agrees with its
+    /// revision id, and cache it. A disagreeing manifest (corruption,
+    /// bucket aliasing) is never cached — it bails. An honest manifest
+    /// is cached even if its schema is outdated; the schema gate lives
+    /// in [`Self::manifest`], applied to every read.
+    async fn fetch_and_cache_manifest(
+        &self,
+        key: &str,
+        revision: &str,
+    ) -> anyhow::Result<Arc<Manifest>> {
         // Fetched outside the lock: a slow fetch of one revision must
         // not stall cached lookups of others. Racing duplicate fetches
         // of one immutable manifest are harmless.
-        let bytes = match self.store.get(&key.as_str().into()).await {
+        let bytes = match self.store.get(&key.into()).await {
             Ok(get) => get
                 .bytes()
                 .await
@@ -635,7 +802,7 @@ impl ShardCache {
         self.manifests
             .lock()
             .expect("shard cache lock poisoned")
-            .insert(key, manifest.clone());
+            .insert(key.to_string(), manifest.clone());
         Ok(manifest)
     }
 }
@@ -718,7 +885,8 @@ fn build_graph_sqlite(graph: &Graph) -> anyhow::Result<Vec<u8>> {
              dst        TEXT NOT NULL,
              kind       TEXT NOT NULL,
              provenance TEXT NOT NULL,
-             confidence REAL NOT NULL
+             confidence REAL NOT NULL,
+             location   TEXT
          );
          -- Two single-column indexes, not one composite: the read
          -- path's incident-edge lookup is (src = ? OR dst = ?), which
@@ -745,8 +913,8 @@ fn build_graph_sqlite(graph: &Graph) -> anyhow::Result<Vec<u8>> {
                 ])?;
             }
             let mut insert_edge = tx.prepare(
-                "INSERT INTO edges (src, dst, kind, provenance, confidence)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO edges (src, dst, kind, provenance, confidence, location)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             )?;
             for edge in &graph.edges {
                 insert_edge.execute(rusqlite::params![
@@ -754,7 +922,8 @@ fn build_graph_sqlite(graph: &Graph) -> anyhow::Result<Vec<u8>> {
                     edge.dst,
                     edge.kind.as_str(),
                     edge.provenance.as_str(),
-                    edge.confidence
+                    edge.confidence,
+                    edge.location
                 ])?;
             }
         }

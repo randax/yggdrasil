@@ -74,9 +74,9 @@ async fn indexing_a_synced_go_repo_publishes_a_shard_with_symbols_and_counts() {
         "an indexed repo must show its Shard revision, got: {shard}"
     );
     // main.go and README.md are File nodes; Hello and main are Symbols,
-    // each defined by main.go.
+    // each defined by main.go — plus the CALLS edge main → Hello.
     assert_eq!(shard["nodes"], 4, "got: {shard}");
-    assert_eq!(shard["edges"], 2, "got: {shard}");
+    assert_eq!(shard["edges"], 3, "got: {shard}");
 
     assert!(
         !h.indexer.run_once().await.unwrap(),
@@ -141,7 +141,7 @@ async fn a_new_commit_publishes_a_new_revision_and_never_mutates_the_old_shard()
         "a new commit must publish a new Shard revision"
     );
     assert_eq!(second["nodes"], 5, "the new Shard sees Bye, got: {second}");
-    assert_eq!(second["edges"], 3, "got: {second}");
+    assert_eq!(second["edges"], 4, "got: {second}");
 
     // Both revisions are recorded; the old Shard's objects are untouched.
     let (revisions,): (i64,) = sqlx::query_as("SELECT count(*) FROM shards")
@@ -313,6 +313,61 @@ async fn a_failing_index_job_surfaces_its_error_backs_off_and_recovers() {
     assert!(
         body["repos"][0]["shard"]["revision"].as_str().is_some(),
         "recovery must publish the Shard, got: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_shard_from_an_older_schema_is_requeued_for_reindex_at_worker_boot() {
+    let h = Harness::boot().await;
+    h.add_repo().await;
+    h.sync_and_index().await;
+    let pool = h.pool().await;
+
+    // A clean index leaves no pending index job.
+    let pending = |pool: sqlx::PgPool| async move {
+        let (n,): (i64,) =
+            sqlx::query_as("SELECT count(*) FROM jobs WHERE kind = 'index' AND state <> 'done'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        n
+    };
+    assert_eq!(pending(pool.clone()).await, 0, "index job settled");
+
+    // Age the current Shard's revision so it no longer ends with this
+    // binary's pass+schema suffix — exactly the state a SCHEMA_VERSION
+    // bump leaves every previously-published Shard in.
+    let aged = sqlx::query("UPDATE shards SET revision = revision || '-pre-deploy'")
+        .execute(&pool)
+        .await
+        .unwrap()
+        .rows_affected();
+    assert_eq!(aged, 1, "one shard to age");
+
+    // Worker boot notices and queues a re-index — exactly once.
+    let queued = h.indexer.requeue_outdated_shards().await.unwrap();
+    assert_eq!(queued, 1, "the outdated Shard's repo is queued");
+    assert_eq!(pending(pool.clone()).await, 1, "an index job is now due");
+    assert_eq!(
+        h.indexer.requeue_outdated_shards().await.unwrap(),
+        0,
+        "a second boot must not double-queue a job already in flight"
+    );
+
+    // And the queued job re-indexes to a current-schema Shard.
+    assert!(h.indexer.run_once().await.unwrap(), "the re-index runs");
+    let revision = h.shard_status().await["revision"]
+        .as_str()
+        .expect("indexed")
+        .to_string();
+    assert!(
+        revision.ends_with(&yg_shard::syntactic_revision_suffix()),
+        "the new Shard carries the current schema suffix, got: {revision}"
+    );
+    assert_eq!(
+        pending(pool).await,
+        0,
+        "the re-index settled the requeued job"
     );
 }
 
@@ -621,7 +676,7 @@ async fn yg_admin_status_shows_the_shard_revision_and_counts() {
         "the human report must show the Shard revision, got:\n{stdout}"
     );
     assert!(
-        stdout.contains("4 nodes") && stdout.contains("2 edges"),
+        stdout.contains("4 nodes") && stdout.contains("3 edges"),
         "the human report must show the graph counts, got:\n{stdout}"
     );
 }
@@ -648,7 +703,7 @@ async fn yg_serve_role_all_indexes_an_added_repo_end_to_end() {
         let shard = &body["repos"][0]["shard"];
         if shard["revision"].as_str().is_some() {
             assert_eq!(shard["nodes"], 4, "got: {body}");
-            assert_eq!(shard["edges"], 2, "got: {body}");
+            assert_eq!(shard["edges"], 3, "got: {body}");
             break;
         }
         assert!(

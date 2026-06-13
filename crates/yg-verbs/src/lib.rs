@@ -13,6 +13,7 @@
 //! repo:github.com/acme/widgets
 //! file:github.com/acme/widgets:cmd/main.go
 //! sym:github.com/acme/widgets:cmd/main.go#Hello
+//! pkg:github.com/acme/widgets:golang.org/x/net/html
 //! ```
 //!
 //! Shards store the repo-relative form (`file:cmd/main.go`,
@@ -78,7 +79,8 @@ impl VerbId {
         let malformed = || {
             format!(
                 "malformed node id {id:?}: expected repo:<repo>, \
-                 file:<repo>:<path>, or sym:<repo>:<path>#<name>"
+                 file:<repo>:<path>, sym:<repo>:<path>#<name>, or \
+                 pkg:<repo>:<import-path>"
             )
         };
         let (kind, rest) = id.split_once(':').ok_or_else(malformed)?;
@@ -92,7 +94,7 @@ impl VerbId {
                     local: None,
                 })
             }
-            "file" | "sym" => {
+            "file" | "sym" | "pkg" => {
                 let (repo, local) = split_qualifier(rest).ok_or_else(malformed)?;
                 if repo.is_empty() || local.is_empty() {
                     return Err(malformed());
@@ -224,6 +226,11 @@ pub struct GraphEdge {
     pub kind: String,
     pub provenance: String,
     pub confidence: f64,
+    /// Where the edge was witnessed (`<path>:<line>:<col>`,
+    /// repo-relative, 1-based; `col` is a byte offset within the line),
+    /// for edges that have a site — a CALLS edge's call site.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub location: Option<String>,
 }
 
 /// One page of the `neighbors` Verb's answer: the next slice of the
@@ -265,6 +272,14 @@ impl Direction {
         }
     }
 }
+
+/// Every edge kind a Shard can hold, as the wire spells them — the
+/// vocabulary `edge_kinds` filters validate against, so a typo
+/// (`CALL`, lowercase `calls`) errors instead of silently matching
+/// nothing. Must agree with yg-shard's `EdgeKind::as_str` values; a
+/// drift-guard test in yg-api holds the two together (this crate
+/// deliberately doesn't depend on the artifact writer).
+pub const KNOWN_EDGE_KINDS: &[&str] = &["CALLS", "DEFINES", "EXTENDS", "IMPLEMENTS", "IMPORTS"];
 
 /// The `neighbors` Verb's filters and pagination, validated by the
 /// caller (limits, depth bounds, cursor decoding are wire concerns).
@@ -320,6 +335,19 @@ impl NeighborsOptions {
             return Err(
                 "edge_kinds must name at least one kind; omit it to follow every kind".to_string(),
             );
+        }
+        // A kind no Shard holds would silently match zero edges —
+        // indistinguishable from a genuinely isolated node.
+        if let Some(unknown) = self
+            .edge_kinds
+            .iter()
+            .flatten()
+            .find(|kind| !KNOWN_EDGE_KINDS.contains(&kind.as_str()))
+        {
+            return Err(format!(
+                "unknown edge kind {unknown:?}: expected any of {}",
+                KNOWN_EDGE_KINDS.join(", ")
+            ));
         }
         Ok(())
     }
@@ -440,6 +468,7 @@ pub fn neighbors(
             kind: edge.kind.clone(),
             provenance: edge.provenance.clone(),
             confidence: edge.confidence,
+            location: edge.location.clone(),
         });
     };
     if start == 0 {
@@ -560,9 +589,9 @@ fn incident_edges(
         None => String::new(),
     };
     let mut stmt = conn.prepare(&format!(
-        "SELECT src, dst, kind, provenance, confidence FROM edges
+        "SELECT src, dst, kind, provenance, confidence, location FROM edges
          WHERE (src = ?1 OR dst = ?1){kinds}
-         ORDER BY src, dst, kind"
+         ORDER BY src, dst, kind, location"
     ))?;
     let edges = stmt
         .query_map(rusqlite::params_from_iter(params), |row| {
@@ -572,6 +601,7 @@ fn incident_edges(
                 kind: row.get(2)?,
                 provenance: row.get(3)?,
                 confidence: row.get(4)?,
+                location: row.get(5)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()
@@ -586,6 +616,7 @@ struct RawEdge {
     kind: String,
     provenance: String,
     confidence: f64,
+    location: Option<String>,
 }
 
 impl RawEdge {
@@ -655,6 +686,15 @@ mod tests {
     }
 
     #[test]
+    fn pkg_ids_round_trip_with_slashes_in_the_import_path() {
+        let id = "pkg:github.com/acme/widgets:golang.org/x/net/html";
+        let parsed = VerbId::parse(id).unwrap();
+        assert_eq!(parsed.repo, "github.com/acme/widgets");
+        assert_eq!(parsed.local.as_deref(), Some("pkg:golang.org/x/net/html"));
+        assert_eq!(parsed.external(), id);
+    }
+
+    #[test]
     fn ids_with_path_qualifiers_round_trip() {
         // file:// fixtures: the qualifier is a filesystem path, whose
         // leading '/' must not be mistaken for an authority.
@@ -699,5 +739,26 @@ mod tests {
             ..NeighborsOptions::default()
         };
         assert!(options.validate().is_err(), "empty edge_kinds");
+    }
+
+    #[test]
+    fn unknown_edge_kinds_are_rejected_with_the_vocabulary() {
+        // A typo'd kind would otherwise match zero edges silently.
+        for bad in ["CALL", "calls", "DEFINED"] {
+            let options = NeighborsOptions {
+                edge_kinds: Some(vec![bad.to_string()]),
+                ..NeighborsOptions::default()
+            };
+            let reason = options.validate().expect_err(bad);
+            assert!(
+                reason.contains(bad) && reason.contains("CALLS"),
+                "names the typo and the vocabulary: {reason}"
+            );
+        }
+        let options = NeighborsOptions {
+            edge_kinds: Some(vec!["CALLS".to_string(), "IMPORTS".to_string()]),
+            ..NeighborsOptions::default()
+        };
+        assert!(options.validate().is_ok(), "known kinds pass");
     }
 }
