@@ -15,7 +15,14 @@ async fn yg_node_reports_the_symbol_humanly_and_as_raw_json() {
     let id = format!("sym:{}:main.go#Hello", h.qualifier());
 
     let human = h.yg_ok(&["node", &id]).await;
-    for needle in ["Symbol", "Hello", "main.go", "DEFINES", "syntactic"] {
+    for needle in [
+        "Symbol",
+        "Hello",
+        "main.go",
+        "DEFINES",
+        "CALLS",
+        "syntactic",
+    ] {
         assert!(
             human.contains(needle),
             "human output lacks {needle:?}:\n{human}"
@@ -25,7 +32,10 @@ async fn yg_node_reports_the_symbol_humanly_and_as_raw_json() {
     let json: serde_json::Value = serde_json::from_str(&h.yg_ok(&["node", &id, "--json"]).await)
         .expect("--json emits the raw response");
     assert_eq!(json["node"]["id"], id);
-    assert_eq!(json["edges"]["in"][0]["kind"], "DEFINES");
+    // Summaries are kind-ordered: Hello is called by main and defined
+    // by main.go.
+    assert_eq!(json["edges"]["in"][0]["kind"], "CALLS");
+    assert_eq!(json["edges"]["in"][1]["kind"], "DEFINES");
 }
 
 #[tokio::test]
@@ -80,6 +90,29 @@ async fn yg_neighbors_lists_the_subgraph_humanly_and_as_raw_json() {
 }
 
 #[tokio::test]
+async fn yg_neighbors_edge_kinds_calls_lists_the_callers_of_a_function() {
+    // Issue #6's demo flow, verbatim flag spelling included.
+    let h = Harness::boot().await;
+    h.add_repo().await;
+    h.sync_and_index().await;
+
+    let id = format!("sym:{}:main.go#Hello", h.qualifier());
+    let human = h.yg_ok(&["neighbors", &id, "--edge-kinds", "CALLS"]).await;
+    assert!(
+        human.contains("main") && human.contains("CALLS"),
+        "the caller and how it was found:\n{human}"
+    );
+    assert!(
+        !human.contains("file:"),
+        "DEFINES neighbors are filtered out:\n{human}"
+    );
+    assert!(
+        human.contains("main.go:8"),
+        "the call site rides along:\n{human}"
+    );
+}
+
+#[tokio::test]
 async fn yg_node_surfaces_the_servers_reason_on_failure() {
     let h = Harness::boot().await;
     h.add_repo().await;
@@ -109,13 +142,17 @@ async fn node_returns_a_symbol_with_its_defines_edge_summary() {
     assert_eq!(body["node"]["name"], "Hello");
     assert_eq!(body["node"]["path"], "main.go");
 
-    // The defining File reaches this Symbol by one inbound DEFINES edge,
-    // and the summary says how that edge was derived.
+    // The defining File reaches this Symbol by one inbound DEFINES
+    // edge, main calls it once, and each summary says how its edges
+    // were derived. Summaries are kind-ordered: CALLS before DEFINES.
     let inbound = body["edges"]["in"].as_array().expect("edge summary");
-    assert_eq!(inbound.len(), 1, "exactly one inbound edge kind: {body}");
-    assert_eq!(inbound[0]["kind"], "DEFINES");
+    assert_eq!(inbound.len(), 2, "two inbound edge kinds: {body}");
+    assert_eq!(inbound[0]["kind"], "CALLS");
     assert_eq!(inbound[0]["count"], 1);
     assert_eq!(inbound[0]["provenance"]["syntactic"], 1);
+    assert_eq!(inbound[1]["kind"], "DEFINES");
+    assert_eq!(inbound[1]["count"], 1);
+    assert_eq!(inbound[1]["provenance"]["syntactic"], 1);
     assert_eq!(
         body["edges"]["out"].as_array().expect("edge summary").len(),
         0,
@@ -187,11 +224,11 @@ async fn neighbors_returns_the_adjacent_subgraph_with_full_edge_detail() {
         "main.go's neighbors are exactly the symbols it defines"
     );
 
+    // The induced subgraph: both DEFINES edges from the File, plus the
+    // CALLS edge between the two reached Symbols.
     let edges = body["edges"].as_array().expect("edges");
-    assert_eq!(edges.len(), 2, "{body}");
+    assert_eq!(edges.len(), 3, "{body}");
     for edge in edges {
-        assert_eq!(edge["src"], id, "edges keep their stored direction");
-        assert_eq!(edge["kind"], "DEFINES");
         assert_eq!(edge["provenance"], "syntactic");
         let confidence = edge["confidence"].as_f64().expect("confidence");
         assert!(
@@ -199,6 +236,18 @@ async fn neighbors_returns_the_adjacent_subgraph_with_full_edge_detail() {
             "confidence in (0,1]: {edge}"
         );
     }
+    let defines: Vec<_> = edges.iter().filter(|e| e["kind"] == "DEFINES").collect();
+    assert_eq!(defines.len(), 2, "{body}");
+    for edge in defines {
+        assert_eq!(edge["src"], id, "edges keep their stored direction");
+    }
+    let calls: Vec<_> = edges.iter().filter(|e| e["kind"] == "CALLS").collect();
+    assert_eq!(calls.len(), 1, "{body}");
+    assert_eq!(calls[0]["src"], node_ids[1], "main calls Hello");
+    assert_eq!(calls[0]["dst"], node_ids[0], "main calls Hello");
+    // Issue #6: call-site locations ride the edge all the way to the
+    // wire. The fixture's one call sits on main.go line 8.
+    assert_eq!(calls[0]["location"], "main.go:8:10", "{body}");
     assert!(
         body["next_cursor"].is_null(),
         "two neighbors fit one page: {body}"
@@ -271,14 +320,18 @@ async fn neighbors_depth_reaches_across_hops_breadth_first() {
     h.add_repo().await;
     h.sync_and_index().await;
 
-    // From Hello: hop 1 is its defining File, hop 2 crosses the File to
-    // the sibling Symbol.
+    // From Hello, following only DEFINES (the CALLS edge main → Hello
+    // would otherwise make the sibling adjacent in one hop): hop 1 is
+    // its defining File, hop 2 crosses the File to the sibling Symbol.
     let origin = format!("sym:{}:main.go#Hello", h.qualifier());
     let file = format!("file:{}:main.go", h.qualifier());
     let sibling = format!("sym:{}:main.go#main", h.qualifier());
 
     let body = h
-        .verb_ok("neighbors", json!({ "id": origin, "depth": 1 }))
+        .verb_ok(
+            "neighbors",
+            json!({ "id": origin, "depth": 1, "edge_kinds": ["DEFINES"] }),
+        )
         .await;
     let ids: Vec<&str> = body["nodes"]
         .as_array()
@@ -289,7 +342,10 @@ async fn neighbors_depth_reaches_across_hops_breadth_first() {
     assert_eq!(ids, vec![file.as_str()], "depth 1 stops at the File");
 
     let body = h
-        .verb_ok("neighbors", json!({ "id": origin, "depth": 2 }))
+        .verb_ok(
+            "neighbors",
+            json!({ "id": origin, "depth": 2, "edge_kinds": ["DEFINES"] }),
+        )
         .await;
     let ids: Vec<&str> = body["nodes"]
         .as_array()
@@ -311,6 +367,83 @@ async fn neighbors_depth_reaches_across_hops_breadth_first() {
             .iter()
             .any(|e| e["src"] == file.as_str() && e["dst"] == sibling.as_str()),
         "the sibling's DEFINES edge is part of the subgraph: {body}"
+    );
+}
+
+#[tokio::test]
+async fn neighbors_default_traversal_dedups_a_node_reachable_by_two_kinds_and_depths() {
+    // The default traversal follows every kind, so the new CALLS edges
+    // make the graph denser and a node reachable more than one way. A
+    // node found at one depth must never reappear at another, and each
+    // edge of the induced subgraph must arrive exactly once — pin the
+    // mixed-kind BFS that no kind-filtered test exercises.
+    //
+    //   leaf  <- mid (CALLS)   <- top (CALLS)
+    //   leaf, mid, top all DEFINES-linked to chain.go
+    // From `top`, leaf is reachable at depth 2 two ways: chain.go
+    // DEFINES leaf, and mid CALLS leaf. It must appear once.
+    let h = Harness::boot_with(&[(
+        "chain.go",
+        "package lib\n\nfunc leaf() {}\n\nfunc mid() {\n\tleaf()\n}\n\nfunc top() {\n\tmid()\n}\n",
+    )])
+    .await;
+    h.add_repo().await;
+    h.sync_and_index().await;
+
+    let q = h.qualifier();
+    let top = format!("sym:{q}:chain.go#top");
+    let body = h
+        .verb_ok("neighbors", json!({ "id": top, "depth": 2, "limit": 1000 }))
+        .await;
+
+    let mut ids: Vec<&str> = body["nodes"]
+        .as_array()
+        .expect("nodes")
+        .iter()
+        .map(|n| n["id"].as_str().unwrap())
+        .collect();
+    let unique: std::collections::BTreeSet<&str> = ids.iter().copied().collect();
+    assert_eq!(
+        ids.len(),
+        unique.len(),
+        "no node appears twice across depths/kinds: {ids:?}"
+    );
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        vec![
+            format!("file:{q}:chain.go"),
+            format!("sym:{q}:chain.go#leaf"),
+            format!("sym:{q}:chain.go#mid"),
+        ],
+        "top reaches its file and (transitively) mid and leaf within 2 hops"
+    );
+
+    // Every induced edge once: top's DEFINES (from file) + mid's +
+    // leaf's = 3 DEFINES, plus top→mid and mid→leaf CALLS = 5. The
+    // file→top DEFINES edge sits on the origin's own page.
+    let edges = body["edges"].as_array().expect("edges");
+    let mut seen: Vec<(String, String, String)> = edges
+        .iter()
+        .map(|e| {
+            (
+                e["src"].as_str().unwrap().to_string(),
+                e["kind"].as_str().unwrap().to_string(),
+                e["dst"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    seen.sort();
+    let dedup_len = {
+        let mut u = seen.clone();
+        u.dedup();
+        u.len()
+    };
+    assert_eq!(seen.len(), dedup_len, "no edge appears twice: {seen:?}");
+    assert_eq!(
+        seen.len(),
+        5,
+        "3 DEFINES + 2 CALLS in the induced subgraph: {seen:?}"
     );
 }
 
@@ -346,14 +479,15 @@ async fn neighbors_filters_by_direction_and_edge_kind() {
     let symbol = format!("sym:{}:main.go#Hello", h.qualifier());
     let file = format!("file:{}:main.go", h.qualifier());
 
-    // The Symbol's one edge is inbound (its defining File): direction
-    // "in" finds it, "out" finds nothing.
+    // Both of the Symbol's edges point in (its defining File, its
+    // caller): direction "in" finds them, "out" finds nothing.
     let body = h
         .verb_ok("neighbors", json!({ "id": symbol, "direction": "in" }))
         .await;
     let nodes = body["nodes"].as_array().expect("nodes");
-    assert_eq!(nodes.len(), 1, "{body}");
+    assert_eq!(nodes.len(), 2, "{body}");
     assert_eq!(nodes[0]["id"], file);
+    assert_eq!(nodes[1]["name"], "main", "main calls Hello");
 
     let body = h
         .verb_ok("neighbors", json!({ "id": symbol, "direction": "out" }))
@@ -427,6 +561,50 @@ async fn node_serves_file_nodes_with_their_outbound_defines_summary() {
     assert_eq!(out[0]["kind"], "DEFINES");
     assert_eq!(out[0]["count"], 2);
     assert_eq!(out[0]["provenance"]["syntactic"], 2);
+}
+
+#[tokio::test]
+async fn package_nodes_are_addressable_and_reached_over_imports_edges() {
+    let h = Harness::boot_with(&[
+        ("go.mod", "module example.com/mod\n\ngo 1.22\n"),
+        (
+            "main.go",
+            "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tfmt.Println(\"hi\")\n}\n",
+        ),
+    ])
+    .await;
+    h.add_repo().await;
+    h.sync_and_index().await;
+
+    // The imported package is a first-class node: `node` answers for
+    // its external id, with the IMPORTS edge in its summary.
+    let pkg = format!("pkg:{}:fmt", h.qualifier());
+    let body = h.verb_ok("node", json!({ "id": pkg })).await;
+    assert_eq!(body["node"]["id"], pkg, "{body}");
+    assert_eq!(body["node"]["kind"], "Package");
+    assert_eq!(body["node"]["name"], "fmt");
+    let inbound = body["edges"]["in"].as_array().expect("edge summary");
+    assert_eq!(inbound.len(), 1, "{body}");
+    assert_eq!(inbound[0]["kind"], "IMPORTS");
+    assert_eq!(inbound[0]["provenance"]["syntactic"], 1);
+
+    // And `neighbors` reaches it from the importing file, the edge
+    // locating the import spec.
+    let file = format!("file:{}:main.go", h.qualifier());
+    let body = h
+        .verb_ok(
+            "neighbors",
+            json!({ "id": file, "edge_kinds": ["IMPORTS"] }),
+        )
+        .await;
+    let nodes = body["nodes"].as_array().expect("nodes");
+    assert_eq!(nodes.len(), 1, "{body}");
+    assert_eq!(nodes[0]["id"], pkg);
+    let edges = body["edges"].as_array().expect("edges");
+    assert_eq!(edges.len(), 1, "{body}");
+    assert_eq!(edges[0]["src"], file);
+    assert_eq!(edges[0]["dst"], pkg);
+    assert_eq!(edges[0]["location"], "main.go:3:8");
 }
 
 /// Forge a neighbors cursor the way only a client tampering with (or

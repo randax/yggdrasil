@@ -3358,6 +3358,7 @@ dependencies = [
  "sqlx",
  "tempfile",
  "tokio",
+ "tracing",
  "tracing-subscriber",
  "yg-api",
  "yg-control",
