@@ -326,11 +326,13 @@ pub fn open_fts(dir: &Path) -> anyhow::Result<FtsIndex> {
 const MAX_QUERY_BYTES: usize = 1024;
 
 /// The deepest run of nested `(` a query may contain. tantivy's query
-/// grammar parses a parenthesised group by **recursing**, so a long enough
-/// run of `(` overflows the worker thread's stack and aborts the whole
-/// process — an uncatchable crash, not a recoverable panic (verified: a few
-/// hundred unbalanced `(` suffice). No real query nests more than a handful.
-const MAX_QUERY_DEPTH: usize = 32;
+/// grammar parses a parenthesised group by backtracking recursion, so parse
+/// time grows ~4x per nesting level (measured: depth 8 ≈ 5 ms, depth 14 ≈
+/// 0.2 s, depth 18 ≈ 3.5 s) on the way to an outright stack-overflow abort
+/// far deeper. Either way a tiny query — about one byte per level — would
+/// pin a worker thread, so the cap sits well below the exponential knee. No
+/// real query nests more than a handful.
+const MAX_QUERY_DEPTH: usize = 8;
 
 /// Refuse queries that would crash or pin tantivy's parser before it ever
 /// sees them, surfaced as the same client-facing [`QueryMalformed`] (400)

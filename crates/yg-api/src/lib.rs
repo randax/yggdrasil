@@ -814,7 +814,9 @@ fn qualify_hit(qualifier: &str, hit: yg_shard::LocalHit) -> SearchHit {
 
 /// Parse and validate the `kinds` filter. An empty list is ambiguous (no
 /// kinds vs no filter) and rejected; an unknown kind errors with the
-/// vocabulary rather than silently matching nothing.
+/// vocabulary rather than silently matching nothing. A real kind that
+/// carries no searchable text yet (Package) is a valid filter that simply
+/// matches nothing — forward-compatible with a pass that later indexes it.
 fn parse_search_kinds(kinds: Option<&[String]>) -> Result<Option<Vec<yg_shard::NodeKind>>, String> {
     let Some(kinds) = kinds else { return Ok(None) };
     if kinds.is_empty() {
