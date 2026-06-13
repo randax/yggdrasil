@@ -142,6 +142,16 @@ pub struct VerbTarget {
     pub revision: Option<String>,
 }
 
+/// One indexed repo in the `search` Verb's fan-out set: its id, the
+/// qualifier that prefixes its external node ids, and the current Shard
+/// revision to read.
+#[derive(Debug, sqlx::FromRow)]
+pub struct IndexedRepo {
+    pub repo_id: i64,
+    pub qualifier: String,
+    pub revision: String,
+}
+
 /// One repo's row in `yg admin status`.
 #[derive(sqlx::FromRow)]
 pub struct RepoSyncStatus {
@@ -531,6 +541,28 @@ impl ControlPlane {
         .await
         .context("resolving the repo qualifier")?;
         Ok(target)
+    }
+
+    /// Every indexed repo whose current Shard is at the caller's revision
+    /// suffix — the fan-out set the lexical `search` Verb queries when no
+    /// `repos` filter narrows it (RFC 0001 §7). The suffix encodes the pass
+    /// and schema version (`-syntactic-v4`), so a repo still pointing at an
+    /// older-schema Shard mid-migration is simply absent (it has no
+    /// current-schema segment to search yet), rather than failing the whole
+    /// org-wide search. Resolved per query, so a newly indexed repo joins
+    /// the next search and a pointer swap is picked up without a restart.
+    pub async fn indexed_repos(&self, revision_suffix: &str) -> anyhow::Result<Vec<IndexedRepo>> {
+        let repos = sqlx::query_as(
+            "SELECT r.id AS repo_id, r.qualifier, s.revision FROM repos r
+             JOIN shards s ON s.id = r.current_shard_id
+             WHERE right(s.revision, length($1)) = $1
+             ORDER BY r.qualifier",
+        )
+        .bind(revision_suffix)
+        .fetch_all(&self.pool)
+        .await
+        .context("listing indexed repos for search")?;
+        Ok(repos)
     }
 
     /// Liveness probe used by the server's health endpoint.

@@ -14,7 +14,13 @@ use std::time::Duration;
 use anyhow::Context;
 use object_store::ObjectStore;
 use yg_control::ControlPlane;
-use yg_shard::{Edge, EdgeKind, Graph, Node, Provenance};
+use yg_shard::{Edge, EdgeKind, Graph, Node, NodeKind, Provenance, SearchDoc};
+
+/// Cap on the text indexed per file (RFC 0001 §6 full-text segment): a
+/// giant generated or vendored blob must not bloat the segment. Past this,
+/// the file is searchable by name; its content is truncated on a char
+/// boundary.
+const MAX_BODY_BYTES: usize = 512 * 1024;
 
 /// How long a worker may hold an index job before a crashed run becomes
 /// claimable again. Budgeted for the worst case the path actually does:
@@ -138,13 +144,20 @@ impl IndexWorker {
                 .await
                 .context("checkout extraction task panicked")??;
         }
-        let graph = {
+        let (graph, search_docs) = {
             let dest = checkout.path().to_path_buf();
             tokio::task::spawn_blocking(move || syntactic_pass(&dest))
                 .await
                 .context("syntactic pass task panicked")??
         };
-        yg_shard::write_shard(self.store.as_ref(), job.repo_id, &job.commit, graph).await
+        yg_shard::write_shard(
+            self.store.as_ref(),
+            job.repo_id,
+            &job.commit,
+            graph,
+            search_docs,
+        )
+        .await
     }
 
     /// The local mirror, guaranteed to contain the job's commit. The
@@ -283,7 +296,7 @@ fn extract_tree(mirror: &Path, commit: &str, dest: &Path) -> anyhow::Result<()> 
 /// (names and positions), never with a monorepo's worth of parse trees.
 /// Phase 2 resolves the facts repo-wide; it cannot run until every file
 /// is parsed.
-pub fn syntactic_pass(root: &Path) -> anyhow::Result<Graph> {
+pub fn syntactic_pass(root: &Path) -> anyhow::Result<(Graph, Vec<SearchDoc>)> {
     let mut graph = Graph::default();
     let mut paths = Vec::new();
     collect_files(root, root, &mut paths)?;
@@ -296,6 +309,11 @@ pub fn syntactic_pass(root: &Path) -> anyhow::Result<Graph> {
         .context("loading the Go grammar")?;
     let mut files = Vec::new();
     let mut modules = Vec::new();
+    // The text of each file, for the full-text segment — valid UTF-8 only
+    // (a binary blob is searchable by name alone), keyed by repo-relative
+    // path so the Symbol/File documents can be assembled once the graph is
+    // built.
+    let mut file_text: HashMap<String, String> = HashMap::new();
     for FileEntry { path, is_symlink } in paths {
         let file = Node::file(&path);
         let file_id = file.id.clone();
@@ -305,22 +323,34 @@ pub fn syntactic_pass(root: &Path) -> anyhow::Result<Graph> {
         if is_symlink {
             continue;
         }
+        // Read once: the bytes feed both the Go parse and the full-text
+        // body. Other passes read only Go and go.mod, but the segment
+        // indexes every file's text (code and markdown alike).
+        let bytes = std::fs::read(root.join(&path))
+            .with_context(|| format!("reading {path} from the checkout"))?;
         if path.ends_with(".go") {
-            let source = std::fs::read(root.join(&path))
-                .with_context(|| format!("reading {path} from the checkout"))?;
-            if let Some(facts) = extract_go_facts(&mut parser, &path, &file_id, &source, &mut graph)
+            if let Some(facts) = extract_go_facts(&mut parser, &path, &file_id, &bytes, &mut graph)
             {
                 files.push(facts);
             }
         } else if path == "go.mod" || path.ends_with("/go.mod") {
-            let bytes = std::fs::read(root.join(&path))
-                .with_context(|| format!("reading {path} from the checkout"))?;
             // Lossy, never fail: synced repos are arbitrary, and a junk
             // file named go.mod must cost module resolution at worst —
             // a failed pass would retry forever, identically.
             if let Some(module) = go_mod_module(&String::from_utf8_lossy(&bytes)) {
                 modules.push((package_dir(&path).to_string(), module));
             }
+        }
+        if let Ok(text) = String::from_utf8(bytes) {
+            if text.len() > MAX_BODY_BYTES {
+                tracing::debug!(
+                    path,
+                    bytes = text.len(),
+                    cap = MAX_BODY_BYTES,
+                    "truncating an oversized file body for the full-text segment"
+                );
+            }
+            file_text.insert(path, cap_body(text));
         }
     }
     let index = SymbolIndex::build(&files, &modules);
@@ -331,7 +361,63 @@ pub fn syntactic_pass(root: &Path) -> anyhow::Result<Graph> {
         emit_extends_edges(file, &index, &mut graph);
     }
     emit_implements_edges(&files, &mut graph);
-    Ok(graph)
+    let search_docs = build_search_docs(&graph, &file_text);
+    Ok((graph, search_docs))
+}
+
+/// The full-text documents for a built graph: one per Symbol (searchable
+/// by name) and one per File (searchable by its text), assembled from the
+/// graph's nodes and the file text gathered during the walk. Package nodes
+/// carry no searchable text and are skipped.
+fn build_search_docs(graph: &Graph, file_text: &HashMap<String, String>) -> Vec<SearchDoc> {
+    graph
+        .nodes
+        .iter()
+        .filter_map(|node| match node.kind {
+            NodeKind::Symbol => Some(SearchDoc {
+                node_id: node.id.clone(),
+                kind: NodeKind::Symbol,
+                name: node.name.clone(),
+                path: node.path.clone(),
+                content: String::new(),
+            }),
+            NodeKind::File => {
+                let path = node.path.as_deref();
+                Some(SearchDoc {
+                    node_id: node.id.clone(),
+                    kind: NodeKind::File,
+                    // A File node carries no name; its file name (the last
+                    // path segment) is what a query would spell.
+                    name: path.map(|p| file_name(p).to_string()),
+                    path: node.path.clone(),
+                    content: path
+                        .and_then(|p| file_text.get(p))
+                        .cloned()
+                        .unwrap_or_default(),
+                })
+            }
+            NodeKind::Package => None,
+        })
+        .collect()
+}
+
+/// Truncate text to [`MAX_BODY_BYTES`] on a char boundary — search reaches
+/// the head of an oversized file, never a torn UTF-8 sequence.
+fn cap_body(mut text: String) -> String {
+    if text.len() > MAX_BODY_BYTES {
+        let mut end = MAX_BODY_BYTES;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+    }
+    text
+}
+
+/// The last path segment of a repo-relative path — a File's searchable
+/// name (`README.md`, `main.go`).
+fn file_name(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
 }
 
 /// The module path a go.mod declares, if any.

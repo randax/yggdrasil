@@ -13,7 +13,9 @@ fn pass_over(files: &[(&str, &str)]) -> Graph {
         std::fs::create_dir_all(full.parent().unwrap()).unwrap();
         std::fs::write(full, contents).unwrap();
     }
-    yg_index::syntactic_pass(dir.path()).expect("the pass must handle a plain tree")
+    yg_index::syntactic_pass(dir.path())
+        .expect("the pass must handle a plain tree")
+        .0
 }
 
 fn edges_of_kind(graph: &Graph, kind: EdgeKind) -> Vec<&Edge> {
@@ -602,8 +604,9 @@ fn a_go_mod_that_is_not_utf8_never_fails_the_pass() {
     )
     .unwrap();
 
-    let graph =
-        yg_index::syntactic_pass(dir.path()).expect("a junk go.mod must not fail the whole pass");
+    let graph = yg_index::syntactic_pass(dir.path())
+        .expect("a junk go.mod must not fail the whole pass")
+        .0;
     assert!(
         graph.nodes.iter().any(|n| n.id == "sym:main.go#main"),
         "the rest of the repo still indexes"
