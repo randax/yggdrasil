@@ -117,6 +117,7 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<RunningServer> {
                 .route("/status", get(status))
                 .route("/verbs/node", post(verb_node))
                 .route("/verbs/neighbors", post(verb_neighbors))
+                .route("/verbs/search", post(verb_search))
                 .route("/admin/repos", post(admin_repo_add))
                 .route("/admin/status", get(admin_status)),
         )
@@ -391,6 +392,561 @@ struct NeighborsResponse {
     nodes: Vec<yg_verbs::NodeView>,
     edges: Vec<yg_verbs::GraphEdge>,
     next_cursor: Option<String>,
+}
+
+/// Default and maximum page size for `search`, plus the deepest a cursor
+/// may page. The window also bounds the fan-out: each repo is asked for a
+/// constant top-[`MAX_SEARCH_WINDOW`] hits (the deepest reachable page),
+/// which both keeps the merged ranking stable across pages and caps the
+/// work an unbounded offset could demand.
+const DEFAULT_SEARCH_LIMIT: usize = 20;
+const MAX_SEARCH_LIMIT: usize = 100;
+const MAX_SEARCH_WINDOW: usize = 1000;
+
+/// The most repositories one search may fan out over — the width bound a
+/// cursor's (unsigned, hence untrusted) target list is held to, so a
+/// tampered cursor can't amplify one request into unbounded segment opens.
+/// Generous for M0; org-wide fan-out beyond this is the tiering work
+/// deferred to M3 (RFC 0001 §11 Q5).
+const MAX_SEARCH_TARGETS: usize = 1000;
+
+#[derive(Deserialize)]
+struct SearchRequest {
+    /// The query — required on a fresh search; a resume carries it in the
+    /// cursor instead (and a query passed alongside a cursor must match).
+    query: Option<String>,
+    /// Restrict hits to these node kinds (`Symbol`, `File`); omitted
+    /// searches every kind.
+    kinds: Option<Vec<String>>,
+    /// Restrict the fan-out to these repo qualifiers; omitted searches
+    /// every indexed repo (RFC 0001 §7).
+    repos: Option<Vec<String>>,
+    /// `lexical` (the only M0 mode, and the default); `semantic`/`hybrid`
+    /// arrive with embeddings (M3).
+    mode: Option<String>,
+    /// Page size in hits: 1 to [`MAX_SEARCH_LIMIT`], default
+    /// [`DEFAULT_SEARCH_LIMIT`]. May vary between pages of one search.
+    limit: Option<u32>,
+    /// Resume an earlier search where its last page ended.
+    cursor: Option<String>,
+}
+
+/// One repo in a search's pinned fan-out set: queried at this exact
+/// immutable revision, so every page of one search sees the same corpus
+/// even across a pointer swap (only a fresh search picks up new Shards).
+#[derive(Serialize, Deserialize, Clone)]
+struct SearchTarget {
+    repo_id: i64,
+    qualifier: String,
+    revision: String,
+}
+
+/// What a search `next_cursor` opaquely carries: the query state and the
+/// pinned fan-out set, plus how many hits have already been returned.
+/// Pages are recomputed from the top each time over the deterministic
+/// merged ranking and sliced by `offset` — the same recompute-and-window
+/// approach `neighbors` takes, here across repos instead of hops.
+#[derive(Serialize, Deserialize)]
+struct SearchCursor {
+    query: String,
+    kinds: Option<Vec<String>>,
+    mode: String,
+    targets: Vec<SearchTarget>,
+    offset: usize,
+}
+
+impl SearchCursor {
+    fn encode(&self) -> String {
+        use base64::Engine;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(self).expect("a cursor serializes"))
+    }
+
+    fn decode(cursor: &str) -> Result<Self, String> {
+        use base64::Engine;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(cursor)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .ok_or_else(|| {
+                "invalid cursor: pass back next_cursor from a previous response, unmodified"
+                    .to_string()
+            })
+    }
+}
+
+/// One ranked hit: an external node id usable in `node`/`neighbors`, the
+/// repo it came from, the score, and a highlighted snippet where the match
+/// has one.
+#[derive(Serialize)]
+struct SearchHit {
+    id: String,
+    kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    repo: String,
+    score: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    snippet: Option<String>,
+    /// The Shard-internal id, kept off the wire — the snippet-hydration
+    /// pass looks the hit up in its repo's segment by this.
+    #[serde(skip)]
+    local_id: String,
+}
+
+#[derive(Serialize)]
+struct SearchResponse {
+    hits: Vec<SearchHit>,
+    next_cursor: Option<String>,
+}
+
+/// The page size to actually serve at `offset`: the requested `limit`,
+/// clamped so the page never runs past the pagination window. A request
+/// whose `limit` would overshoot the window gets a final short page rather
+/// than a `next_cursor` the follow-up request would reject.
+fn clamped_page_limit(offset: usize, limit: usize) -> usize {
+    limit.min(MAX_SEARCH_WINDOW.saturating_sub(offset))
+}
+
+/// Merge per-repo hits into one ranking and return the page after
+/// `offset`. The order is total and deterministic — score descending, then
+/// repo qualifier, then id — so a cursor resumed against the same pinned
+/// revisions and the same constant per-repo fetch sees exactly the pages
+/// one uninterrupted read would have. `has_more` reports whether the
+/// merged ranking holds anything past this page.
+fn merge_paginate(mut all: Vec<SearchHit>, offset: usize, limit: usize) -> (Vec<SearchHit>, bool) {
+    all.sort_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then_with(|| a.repo.cmp(&b.repo))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    let has_more = all.len() > offset + limit;
+    let page = all.into_iter().skip(offset).take(limit).collect();
+    (page, has_more)
+}
+
+/// `POST /v1/verbs/search` (RFC 0001 §7): lexical search, fanned out over
+/// the indexed repos, returning one ranked page with snippets and node ids.
+async fn verb_search(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<SearchRequest>,
+) -> Response {
+    let cursor = match req.cursor.as_deref().map(SearchCursor::decode) {
+        Some(Ok(cursor)) => Some(cursor),
+        Some(Err(reason)) => return error_json(StatusCode::BAD_REQUEST, reason),
+        None => None,
+    };
+
+    // Page size may vary between pages; everything else is fixed at the
+    // first page and carried by the cursor.
+    let limit = req.limit.map_or(DEFAULT_SEARCH_LIMIT, |l| l as usize);
+    if !(1..=MAX_SEARCH_LIMIT).contains(&limit) {
+        return error_json(
+            StatusCode::BAD_REQUEST,
+            format!("limit must be between 1 and {MAX_SEARCH_LIMIT}, got {limit}"),
+        );
+    }
+
+    // The query state in force: the cursor's where present, the request's
+    // on a fresh search.
+    let (query, kind_strings, mode, targets, offset) = match cursor {
+        Some(cursor) => {
+            // A query may be re-sent alongside the cursor (compared trimmed,
+            // since a fresh search stores the trimmed form) but must match.
+            if let Some(q) = req.query.as_deref()
+                && q.trim() != cursor.query
+            {
+                return error_json(
+                    StatusCode::BAD_REQUEST,
+                    "this cursor belongs to a different query; start a fresh search or \
+                     pass the cursor without a query"
+                        .to_string(),
+                );
+            }
+            // The cursor is unsigned, so its target list is untrusted: a
+            // tampered cursor could repeat or pad it to fan a single
+            // request out across an unbounded number of segment opens. Cap
+            // and dedup it, mirroring the fresh path's `resolve_search_targets`.
+            if cursor.targets.len() > MAX_SEARCH_TARGETS {
+                return error_json(
+                    StatusCode::BAD_REQUEST,
+                    "invalid cursor: it names too many repositories".to_string(),
+                );
+            }
+            (
+                cursor.query,
+                cursor.kinds,
+                cursor.mode,
+                dedup_targets(cursor.targets),
+                cursor.offset,
+            )
+        }
+        None => {
+            let query = match req.query.as_deref().map(str::trim) {
+                Some(q) if !q.is_empty() => q.to_string(),
+                _ => {
+                    return error_json(
+                        StatusCode::BAD_REQUEST,
+                        "search needs a non-empty query".to_string(),
+                    );
+                }
+            };
+            let mode = req.mode.unwrap_or_else(|| "lexical".to_string());
+            let targets = match resolve_search_targets(&state, req.repos.as_deref()).await {
+                Ok(targets) => targets,
+                Err(response) => return response,
+            };
+            (query, req.kinds, mode, targets, 0)
+        }
+    };
+
+    // The mode gate runs on the in-force value, so a forged or stale cursor
+    // can't smuggle an unsupported mode past the fresh-search check.
+    if mode != "lexical" {
+        return error_json(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "search mode {mode:?} is not available; only \"lexical\" is supported \
+                 (semantic and hybrid arrive with embeddings)"
+            ),
+        );
+    }
+
+    // A cursor's offset is client-supplied (the cursor is unsigned), so
+    // bound it before any arithmetic: past the window there is nothing to
+    // serve, and an unbounded offset would overflow `offset + …` below.
+    if offset >= MAX_SEARCH_WINDOW {
+        return error_json(
+            StatusCode::BAD_REQUEST,
+            format!("cannot page beyond {MAX_SEARCH_WINDOW} results"),
+        );
+    }
+    // Clamp this page to the window: a requested limit that would run past
+    // it serves a final short page rather than stranding reachable hits
+    // behind a cursor the next request would reject.
+    let page_limit = clamped_page_limit(offset, limit);
+
+    // Validate (and parse) the kind filter against the node-kind
+    // vocabulary, so a typo errors instead of silently matching nothing.
+    let kinds = match parse_search_kinds(kind_strings.as_deref()) {
+        Ok(kinds) => kinds,
+        Err(reason) => return error_json(StatusCode::BAD_REQUEST, reason),
+    };
+
+    // No indexed repos at all (a fresh org-wide search before anything is
+    // indexed): an empty result, not an error.
+    if targets.is_empty() {
+        return Json(SearchResponse {
+            hits: vec![],
+            next_cursor: None,
+        })
+        .into_response();
+    }
+
+    // Each repo returns a *constant* top-K (the deepest reachable page),
+    // independent of the offset. That keeps the merged ranking identical
+    // across pages — a varying fetch would let tantivy's score-then-docid
+    // truncation pick different tied hits per page, so a score tie at a
+    // page boundary could drop or duplicate a hit. With a constant K the
+    // global ranking is stable and offset-slicing is exact. A cursor pins
+    // revisions, so a missing/outdated one is the cursor's to hear about.
+    //
+    // Cost note: this fans out *sequentially* and asks each repo for up to
+    // K hits, so per-query work scales with the number of indexed repos —
+    // fine at M0's scale, but the org-wide tiering and early termination an
+    // org of thousands of repos needs are deliberately deferred to M3
+    // (RFC 0001 §11 Q5). Sequential (not concurrent) is also the bound that
+    // keeps a forged cursor's repo set from fanning out unboundedly at once.
+    let fetch_each = MAX_SEARCH_WINDOW;
+    let from_cursor = req.cursor.is_some();
+    let mut all = Vec::new();
+    for target in &targets {
+        let dir = match state
+            .shards
+            .fts_path(target.repo_id, &target.revision)
+            .await
+        {
+            Ok(dir) => dir,
+            Err(e) => return map_search_shard_error(e, from_cursor),
+        };
+        let query = query.clone();
+        let kinds = kinds.clone();
+        let qualifier = target.qualifier.clone();
+        let hits = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<SearchHit>> {
+            let index = yg_shard::open_fts(&dir)?;
+            // Ranking only — snippets are hydrated below for the page that
+            // survives the merge, never for every fetched candidate.
+            let local = yg_shard::search(
+                &index,
+                &yg_shard::SearchParams {
+                    query: &query,
+                    kinds: kinds.as_deref(),
+                    limit: fetch_each,
+                },
+            )?;
+            Ok(local
+                .into_iter()
+                .map(|hit| qualify_hit(&qualifier, hit))
+                .collect())
+        })
+        .await;
+        match hits {
+            Ok(Ok(hits)) => all.extend(hits),
+            Ok(Err(e)) => return map_search_query_error(e),
+            Err(e) => {
+                return error_json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("search task panicked: {e}"),
+                );
+            }
+        }
+    }
+
+    let (mut page, has_more) = merge_paginate(all, offset, page_limit);
+    if let Err(response) = hydrate_snippets(&state, &targets, &query, from_cursor, &mut page).await
+    {
+        return response;
+    }
+    // Offer a next page only while one is both available and reachable
+    // (paging stops at the window).
+    let next_cursor = (has_more && offset + page_limit < MAX_SEARCH_WINDOW).then(|| {
+        SearchCursor {
+            query,
+            kinds: kind_strings,
+            mode,
+            targets,
+            offset: offset + page_limit,
+        }
+        .encode()
+    });
+    Json(SearchResponse {
+        hits: page,
+        next_cursor,
+    })
+    .into_response()
+}
+
+/// Fill in the snippet of each hit on the final page, querying each repo's
+/// segment once for just that page's hits — so snippet generation costs
+/// scale with the page, not with everything the fan-out ranked. A repo's
+/// segment is already warm from ranking, so this is a local reopen.
+async fn hydrate_snippets(
+    state: &AppState,
+    targets: &[SearchTarget],
+    query: &str,
+    from_cursor: bool,
+    page: &mut [SearchHit],
+) -> Result<(), Response> {
+    use std::collections::HashMap;
+    let target_by_qualifier: HashMap<&str, &SearchTarget> =
+        targets.iter().map(|t| (t.qualifier.as_str(), t)).collect();
+    // Page-hit indices grouped by the repo they came from. Owned keys, so
+    // this grouping doesn't borrow `page` while we write snippets back.
+    let mut by_repo: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, hit) in page.iter().enumerate() {
+        by_repo.entry(hit.repo.clone()).or_default().push(i);
+    }
+    for (qualifier, indices) in by_repo {
+        let Some(target) = target_by_qualifier.get(qualifier.as_str()) else {
+            continue;
+        };
+        let dir = match state
+            .shards
+            .fts_path(target.repo_id, &target.revision)
+            .await
+        {
+            Ok(dir) => dir,
+            Err(e) => return Err(map_search_shard_error(e, from_cursor)),
+        };
+        let local_ids: Vec<String> = indices.iter().map(|&i| page[i].local_id.clone()).collect();
+        let query = query.to_string();
+        let snippets = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let index = yg_shard::open_fts(&dir)?;
+            yg_shard::snippets_for(&index, &query, &local_ids)
+        })
+        .await;
+        let snippets = match snippets {
+            Ok(Ok(snippets)) => snippets,
+            Ok(Err(e)) => {
+                return Err(error_json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("{e:#}"),
+                ));
+            }
+            Err(e) => {
+                return Err(error_json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("snippet task panicked: {e}"),
+                ));
+            }
+        };
+        for &i in &indices {
+            page[i].snippet = snippets.get(&page[i].local_id).cloned();
+        }
+    }
+    Ok(())
+}
+
+/// Qualify one segment-local hit into a wire hit: the repo qualifier
+/// spliced into the node id (RFC 0001 §5), so the id feeds straight into
+/// `node`/`neighbors`.
+fn qualify_hit(qualifier: &str, hit: yg_shard::LocalHit) -> SearchHit {
+    let local_id = hit.node_id.clone();
+    let id = yg_verbs::VerbId {
+        repo: qualifier.to_string(),
+        local: Some(hit.node_id),
+    }
+    .external();
+    SearchHit {
+        id,
+        kind: hit.kind,
+        name: hit.name,
+        path: hit.path,
+        repo: qualifier.to_string(),
+        score: hit.score,
+        snippet: hit.snippet,
+        local_id,
+    }
+}
+
+/// Parse and validate the `kinds` filter. An empty list is ambiguous (no
+/// kinds vs no filter) and rejected; an unknown kind errors with the
+/// vocabulary rather than silently matching nothing.
+fn parse_search_kinds(kinds: Option<&[String]>) -> Result<Option<Vec<yg_shard::NodeKind>>, String> {
+    let Some(kinds) = kinds else { return Ok(None) };
+    if kinds.is_empty() {
+        return Err(
+            "kinds must name at least one node kind; omit it to search every kind".to_string(),
+        );
+    }
+    kinds
+        .iter()
+        .map(|kind| {
+            yg_shard::NodeKind::parse(kind).ok_or_else(|| {
+                let vocab: Vec<&str> = yg_shard::NodeKind::ALL.iter().map(|k| k.as_str()).collect();
+                format!(
+                    "unknown node kind {kind:?}: expected any of {}",
+                    vocab.join(", ")
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
+}
+
+/// Resolve the fan-out set: the named repos when `repos` is given (each
+/// must be indexed), or every indexed repo otherwise. Errors come back as
+/// ready-to-return responses — an unknown or unindexed named repo is the
+/// client's to hear about.
+async fn resolve_search_targets(
+    state: &AppState,
+    repos: Option<&[String]>,
+) -> Result<Vec<SearchTarget>, Response> {
+    match repos {
+        Some(repos) => {
+            let mut targets = Vec::with_capacity(repos.len());
+            let mut seen = std::collections::HashSet::new();
+            for qualifier in repos {
+                // A repo named twice is one target: otherwise its hits
+                // would appear twice in the merged page.
+                if !seen.insert(qualifier.as_str()) {
+                    continue;
+                }
+                let target = match state.control.verb_target(qualifier).await {
+                    Ok(Some(target)) => target,
+                    Ok(None) => {
+                        return Err(error_json(
+                            StatusCode::NOT_FOUND,
+                            format!("no indexed repository matches {qualifier:?}"),
+                        ));
+                    }
+                    Err(e) => {
+                        return Err(error_json(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("{e:#}"),
+                        ));
+                    }
+                };
+                let Some(revision) = target.revision else {
+                    return Err(error_json(
+                        StatusCode::NOT_FOUND,
+                        format!("{qualifier} is registered but not yet indexed; try again shortly"),
+                    ));
+                };
+                targets.push(SearchTarget {
+                    repo_id: target.repo_id,
+                    qualifier: qualifier.clone(),
+                    revision,
+                });
+            }
+            Ok(targets)
+        }
+        None => match state.control.indexed_repos().await {
+            Ok(repos) => Ok(repos
+                .into_iter()
+                .map(|r| SearchTarget {
+                    repo_id: r.repo_id,
+                    qualifier: r.qualifier,
+                    revision: r.revision,
+                })
+                .collect()),
+            Err(e) => Err(error_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("{e:#}"),
+            )),
+        },
+    }
+}
+
+/// Drop repeated repositories from a fan-out set, keeping first occurrence
+/// order — a repo searched twice would otherwise return each hit twice in
+/// the merged page. The fresh path dedups while resolving; this is the
+/// same guarantee applied to a cursor's untrusted target list.
+fn dedup_targets(targets: Vec<SearchTarget>) -> Vec<SearchTarget> {
+    let mut seen = std::collections::HashSet::new();
+    targets
+        .into_iter()
+        .filter(|t| seen.insert(t.qualifier.clone()))
+        .collect()
+}
+
+/// Map a shard-resolution error from the search fan-out, the same way
+/// [`resolve_shard`] does for the node-addressed Verbs.
+fn map_search_shard_error(e: anyhow::Error, from_cursor: bool) -> Response {
+    if from_cursor && e.downcast_ref::<yg_shard::RevisionMissing>().is_some() {
+        return error_json(
+            StatusCode::GONE,
+            "this cursor's Shard revision is no longer available; restart the search without a cursor",
+        );
+    }
+    if e.downcast_ref::<yg_shard::SchemaOutdated>().is_some() {
+        return if from_cursor {
+            error_json(
+                StatusCode::GONE,
+                "this cursor's Shard revision predates the current index schema; \
+                 restart the search without a cursor",
+            )
+        } else {
+            error_json(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "a repo's Shard predates the current index schema and is being re-indexed; \
+                 try again shortly",
+            )
+        };
+    }
+    error_json(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))
+}
+
+/// Map a search-execution error: a query tantivy can't parse is the
+/// client's to fix (400); anything else is a 500.
+fn map_search_query_error(e: anyhow::Error) -> Response {
+    match e.downcast_ref::<yg_shard::QueryMalformed>() {
+        Some(malformed) => error_json(StatusCode::BAD_REQUEST, malformed.to_string()),
+        None => error_json(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+    }
 }
 
 /// The shared back half of every node-addressed Verb: open the resolved
@@ -791,6 +1347,201 @@ mod tests {
             assert_eq!(parsed.repo, repo, "{kind:?}");
             assert_eq!(parsed.external(), external, "{kind:?} must round-trip");
         }
+    }
+
+    use super::SearchHit;
+
+    fn test_hit(repo: &str, id: &str, score: f32) -> SearchHit {
+        SearchHit {
+            id: id.to_string(),
+            kind: "Symbol".to_string(),
+            name: None,
+            path: None,
+            repo: repo.to_string(),
+            score,
+            snippet: None,
+            local_id: id.to_string(),
+        }
+    }
+
+    fn page_ids(page: Vec<SearchHit>) -> Vec<String> {
+        page.into_iter().map(|h| h.id).collect()
+    }
+
+    /// Cross-repo merge: a total, deterministic order (score desc, then
+    /// repo, then id) and exact offset paging — the contract the search
+    /// cursor relies on to resume one consistent ranking.
+    #[test]
+    fn merge_paginate_orders_across_repos_and_pages_by_offset() {
+        use super::merge_paginate;
+        // Two repos' hits, interleaved by score, with a score tie that the
+        // repo qualifier breaks ("a" before "b").
+        let corpus = || {
+            vec![
+                test_hit("a", "sym:a:x#1", 1.0),
+                test_hit("b", "sym:b:y#1", 3.0),
+                test_hit("a", "sym:a:x#2", 2.0),
+                test_hit("b", "sym:b:y#2", 2.0),
+            ]
+        };
+
+        let (first, more) = merge_paginate(corpus(), 0, 2);
+        assert_eq!(
+            page_ids(first),
+            ["sym:b:y#1", "sym:a:x#2"],
+            "score desc, tie by repo"
+        );
+        assert!(more, "two hits remain");
+
+        let (second, more) = merge_paginate(corpus(), 2, 2);
+        assert_eq!(page_ids(second), ["sym:b:y#2", "sym:a:x#1"]);
+        assert!(!more, "the ranking is exhausted");
+    }
+
+    /// The final tiebreak is the id: same score, same repo, ordered by id;
+    /// and `has_more` is exact at the page boundary and past the end.
+    #[test]
+    fn merge_paginate_breaks_score_and_repo_ties_by_id_and_bounds_pages() {
+        use super::merge_paginate;
+        // All same score and repo: only the id tiebreak orders them.
+        let corpus = || {
+            vec![
+                test_hit("a", "sym:a:c", 2.0),
+                test_hit("a", "sym:a:a", 2.0),
+                test_hit("a", "sym:a:b", 2.0),
+            ]
+        };
+
+        let (page, more) = merge_paginate(corpus(), 0, 3);
+        assert_eq!(
+            page_ids(page),
+            ["sym:a:a", "sym:a:b", "sym:a:c"],
+            "the id breaks score+repo ties"
+        );
+        // The page consumes the whole ranking exactly: no next page.
+        assert!(!more, "offset+limit == len is not 'more'");
+
+        // A page that exactly reaches the end has no more.
+        let (page, more) = merge_paginate(corpus(), 0, 2);
+        assert_eq!(page_ids(page), ["sym:a:a", "sym:a:b"]);
+        assert!(more, "one hit remains after a 2-of-3 page");
+
+        // An offset past the end is an empty page, not an error.
+        let (page, more) = merge_paginate(corpus(), 5, 2);
+        assert!(page.is_empty(), "offset past the end yields nothing");
+        assert!(!more);
+    }
+
+    /// A page is clamped to the pagination window so a `limit` that doesn't
+    /// divide it never strands reachable hits behind a rejected cursor: the
+    /// last page is short, and `offset + page_limit` lands exactly on the
+    /// window so no further cursor is offered.
+    #[test]
+    fn page_limit_is_clamped_to_the_window() {
+        use super::{MAX_SEARCH_WINDOW, clamped_page_limit};
+        assert_eq!(clamped_page_limit(0, 20), 20, "well inside the window");
+        assert_eq!(
+            clamped_page_limit(MAX_SEARCH_WINDOW - 40, 30),
+            30,
+            "a full page still fits"
+        );
+        // A limit overshooting the window is clamped to the remainder, and
+        // the next offset lands on the window edge — no next page offered.
+        let near = MAX_SEARCH_WINDOW - 10;
+        let clamped = clamped_page_limit(near, 30);
+        assert_eq!(clamped, 10, "clamped to the window remainder");
+        assert_eq!(
+            near + clamped,
+            MAX_SEARCH_WINDOW,
+            "the next offset is the edge"
+        );
+        // At the edge the remainder is zero (the handler rejects offset ==
+        // window before this, so this is just the saturating boundary).
+        assert_eq!(clamped_page_limit(MAX_SEARCH_WINDOW, 30), 0);
+    }
+
+    /// A cursor's (untrusted) target list is deduped by qualifier, keeping
+    /// first-seen order — so a tampered cursor repeating a repo can't
+    /// double its hits or fan the request out redundantly.
+    #[test]
+    fn dedup_targets_collapses_repeated_repos() {
+        use super::{SearchTarget, dedup_targets};
+        let target = |id: i64, q: &str| SearchTarget {
+            repo_id: id,
+            qualifier: q.to_string(),
+            revision: "rev".to_string(),
+        };
+        let deduped = dedup_targets(vec![
+            target(1, "a"),
+            target(2, "b"),
+            target(1, "a"),
+            target(1, "a"),
+            target(3, "c"),
+        ]);
+        let qualifiers: Vec<&str> = deduped.iter().map(|t| t.qualifier.as_str()).collect();
+        assert_eq!(qualifiers, ["a", "b", "c"], "repeats dropped, order kept");
+    }
+
+    /// Shard-resolution errors during search map to the same client
+    /// statuses `resolve_shard` uses: a cursor outliving its Shard is the
+    /// client's to restart (410), a re-indexing Shard is a retry (503).
+    #[test]
+    fn search_shard_errors_map_to_client_statuses() {
+        use super::map_search_shard_error;
+        use axum::http::StatusCode;
+        let missing = || {
+            anyhow::Error::new(yg_shard::RevisionMissing {
+                revision: "r".to_string(),
+            })
+        };
+        let outdated = || {
+            anyhow::Error::new(yg_shard::SchemaOutdated {
+                revision: "r".to_string(),
+                schema_version: 1,
+            })
+        };
+        assert_eq!(
+            map_search_shard_error(missing(), true).status(),
+            StatusCode::GONE
+        );
+        assert_eq!(
+            map_search_shard_error(outdated(), true).status(),
+            StatusCode::GONE
+        );
+        assert_eq!(
+            map_search_shard_error(outdated(), false).status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        // A fresh search resolves a current pointer, so a missing revision
+        // there is an unexpected server fault, not a client-expired cursor.
+        assert_eq!(
+            map_search_shard_error(missing(), false).status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    /// The `kinds` filter is validated against the node-kind vocabulary:
+    /// an empty list is ambiguous, an unknown kind names the vocabulary.
+    #[test]
+    fn parse_search_kinds_validates_the_vocabulary() {
+        use super::parse_search_kinds;
+        assert!(parse_search_kinds(None).unwrap().is_none(), "no filter");
+        assert!(
+            parse_search_kinds(Some(&[])).is_err(),
+            "an empty list is ambiguous"
+        );
+        let err = parse_search_kinds(Some(&["Frobnicate".to_string()])).unwrap_err();
+        assert!(
+            err.contains("Frobnicate") && err.contains("Symbol"),
+            "names the typo and the vocabulary: {err}"
+        );
+        let ok = parse_search_kinds(Some(&["Symbol".to_string(), "File".to_string()]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            ok,
+            vec![yg_shard::NodeKind::Symbol, yg_shard::NodeKind::File]
+        );
     }
 
     /// The `edge_kinds` filter vocabulary must be exactly the set of

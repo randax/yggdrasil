@@ -85,6 +85,33 @@ async fn indexing_a_synced_go_repo_publishes_a_shard_with_symbols_and_counts() {
 }
 
 #[tokio::test]
+async fn the_published_manifest_records_the_full_text_segment() {
+    let h = Harness::boot().await;
+    h.add_repo().await;
+    h.sync_and_index().await;
+
+    let manifest_key = h.manifest_key().await;
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&h.object_bytes(&manifest_key).await).expect("the manifest is JSON");
+    let segments = &manifest["segments"];
+
+    // A v4 Shard carries both the graph and the full-text segments.
+    assert!(
+        segments.get(yg_shard::GRAPH_SEGMENT_FILE).is_some(),
+        "the graph segment is recorded: {manifest}"
+    );
+    let fts = &segments[yg_shard::FTS_SEGMENT_FILE];
+    assert!(
+        fts["sha256"].as_str().is_some_and(|s| s.len() == 64),
+        "the full-text segment is recorded with a checksum: {manifest}"
+    );
+    assert!(
+        fts["bytes"].as_u64().is_some_and(|b| b > 0),
+        "the full-text segment has a nonzero size: {manifest}"
+    );
+}
+
+#[tokio::test]
 async fn re_indexing_the_same_commit_is_idempotent() {
     let h = Harness::boot().await;
     h.add_repo().await;

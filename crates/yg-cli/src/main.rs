@@ -59,6 +59,27 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Search the Knowledge Graph for symbols, code, and docs
+    Search {
+        #[arg(help = "Query, e.g. \"rate limit\"")]
+        query: String,
+        /// Restrict to this node kind (repeatable), e.g. Symbol or File
+        #[arg(long = "kind")]
+        kinds: Vec<String>,
+        /// Restrict to this repo qualifier (repeatable), e.g.
+        /// github.com/acme/widgets
+        #[arg(long = "repo")]
+        repos: Vec<String>,
+        /// Hits per page (1-100)
+        #[arg(long)]
+        limit: Option<u32>,
+        /// Resume where the previous page's next_cursor left off
+        #[arg(long)]
+        cursor: Option<String>,
+        /// Emit the raw JSON response instead of the human report
+        #[arg(long)]
+        json: bool,
+    },
     /// Administer the Index Server (Admin token required)
     Admin {
         #[command(subcommand)]
@@ -109,6 +130,14 @@ async fn main() -> anyhow::Result<()> {
             cursor,
             json,
         } => neighbors(id, direction, kinds, depth, limit, cursor, json).await,
+        Command::Search {
+            query,
+            kinds,
+            repos,
+            limit,
+            cursor,
+            json,
+        } => search(query, kinds, repos, limit, cursor, json).await,
         Command::Admin { command } => match command {
             AdminCommand::Repo {
                 command: RepoCommand::Add { url, depth },
@@ -289,6 +318,74 @@ async fn neighbors(
         println!("more: pass --cursor {cursor}");
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn search(
+    query: String,
+    kinds: Vec<String>,
+    repos: Vec<String>,
+    limit: Option<u32>,
+    cursor: Option<String>,
+    json: bool,
+) -> anyhow::Result<()> {
+    let mut req = serde_json::json!({"query": query});
+    if !kinds.is_empty() {
+        req["kinds"] = kinds.into();
+    }
+    if !repos.is_empty() {
+        req["repos"] = repos.into();
+    }
+    if let Some(limit) = limit {
+        req["limit"] = limit.into();
+    }
+    if let Some(cursor) = cursor {
+        req["cursor"] = cursor.into();
+    }
+    let body = post_verb("search", req).await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&body)?);
+        return Ok(());
+    }
+    let hits = body["hits"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+    if hits.is_empty() {
+        println!("no matches");
+        return Ok(());
+    }
+    for hit in hits {
+        print!(
+            "{}  {}",
+            hit["kind"].as_str().unwrap_or("?"),
+            hit["id"].as_str().unwrap_or("?")
+        );
+        if let Some(name) = hit["name"].as_str() {
+            print!("  ({name})");
+        }
+        println!();
+        // The snippet rides along on its own indented line, with the
+        // server's <b>…</b> match highlighting flattened to plain text.
+        if let Some(snippet) = hit["snippet"].as_str() {
+            println!("    {}", plain_snippet(snippet));
+        }
+    }
+    if let Some(cursor) = body["next_cursor"].as_str() {
+        println!("more: pass --cursor {cursor}");
+    }
+    Ok(())
+}
+
+/// Flatten the server's HTML-highlighted snippet (`<b>…</b>`, with the
+/// surrounding text HTML-escaped) into plain text for the terminal.
+fn plain_snippet(html: &str) -> String {
+    html.replace("<b>", "")
+        .replace("</b>", "")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#x27;", "'")
+        // &amp; last, so an escaped entity in the source text isn't
+        // double-unescaped.
+        .replace("&amp;", "&")
 }
 
 async fn admin_repo_add(url: String, depth: Option<i32>) -> anyhow::Result<()> {

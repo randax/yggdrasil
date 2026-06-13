@@ -1,8 +1,9 @@
 //! Shard read/write, cache tier, formats.
 //!
 //! A Shard is the immutable per-repo index artifact (RFC 0001 §6): a
-//! graph segment plus a manifest, written to object storage under
-//! `shards/<repo-id>/<revision>/` and never mutated afterwards.
+//! graph segment, a full-text segment, and a manifest, written to object
+//! storage under `shards/<repo-id>/<revision>/` and never mutated
+//! afterwards.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -12,6 +13,12 @@ use object_store::aws::AmazonS3Builder;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+mod fts;
+pub use fts::{
+    FTS_SEGMENT_FILE, FtsIndex, LocalHit, QueryMalformed, SearchDoc, SearchParams, build_fts,
+    open_fts, search, snippets_for, unpack_fts,
+};
 
 /// Version of the Shard layout (graph tables + manifest shape). Part of
 /// every revision id: bumping it re-indexes the world rather than mixing
@@ -27,12 +34,14 @@ use sha2::{Digest, Sha256};
 /// v3: edges carry a nullable location (`<path>:<line>:<col>`, 1-based)
 /// — the call site of a CALLS edge, the import spec of an IMPORTS edge
 /// (RFC 0001 §5: "locations where applicable").
+/// v4: a Shard carries a full-text segment ([`FTS_SEGMENT_FILE`]) beside
+/// the graph — the tantivy index the lexical `search` Verb reads.
 ///
 /// Bumping this changes every revision id (see
 /// [`syntactic_revision_suffix`]): readers refuse artifacts from other
 /// schema versions ([`SchemaOutdated`]), and worker boot queues a
 /// re-index for every repo still pointing at an outdated revision.
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// Name of the M0 indexing pass, as recorded in revision ids, manifests,
 /// and the control plane's `provenance_level`. The precise pass (M1)
@@ -105,6 +114,12 @@ impl NodeKind {
             NodeKind::Symbol => "Symbol",
             NodeKind::Package => "Package",
         }
+    }
+
+    /// Parse the wire spelling (the [`Self::as_str`] form) back to a kind
+    /// — the `search` Verb's `kinds` filter validates against this.
+    pub fn parse(kind: &str) -> Option<NodeKind> {
+        NodeKind::ALL.iter().copied().find(|k| k.as_str() == kind)
     }
 
     /// The id prefix a node of this kind carries (`file:…`, `sym:…`,
@@ -314,6 +329,12 @@ pub fn graph_segment_key(repo_id: i64, revision: &str) -> String {
     format!("shards/{repo_id}/{revision}/{GRAPH_SEGMENT_FILE}")
 }
 
+/// Object key of a revision's full-text segment, beside its manifest —
+/// the packed tantivy index the lexical `search` Verb reads.
+pub fn fts_segment_key(repo_id: i64, revision: &str) -> String {
+    format!("shards/{repo_id}/{revision}/{FTS_SEGMENT_FILE}")
+}
+
 /// S3-compatible object storage holding the Shards (ADR 0005).
 pub struct ObjectStoreConfig {
     pub endpoint: String,
@@ -411,11 +432,13 @@ pub async fn published_shard(
     // Trusting it would surface as a missing segment at first read,
     // far from the cause — and the deterministic revision plus
     // create-only puts mean nothing would ever repair it.
-    if !manifest.segments.contains_key(GRAPH_SEGMENT_FILE) {
-        anyhow::bail!(
-            "the published manifest at {manifest_key} records no {GRAPH_SEGMENT_FILE} segment; \
-             refusing to trust it"
-        );
+    for required in [GRAPH_SEGMENT_FILE, FTS_SEGMENT_FILE] {
+        if !manifest.segments.contains_key(required) {
+            anyhow::bail!(
+                "the published manifest at {manifest_key} records no {required} segment; \
+                 refusing to trust it"
+            );
+        }
     }
     Ok(Some(PublishedShard {
         revision,
@@ -426,39 +449,48 @@ pub async fn published_shard(
 }
 
 /// Write a syntactic-pass Shard for `commit` of repo `repo_id`: the
-/// graph segment, then the manifest. The manifest goes last — its
-/// presence marks a complete Shard, so a write that dies half-way leaves
-/// garbage, never a torn artifact. Published Shards are immutable: every
-/// put is create-only (If-None-Match), so even a stale lease holder
-/// racing a fresh one can never overwrite published objects, and an
-/// already-published revision is returned as-is.
+/// graph segment, the full-text segment, then the manifest. The manifest
+/// goes last — its presence marks a complete Shard, so a write that dies
+/// half-way leaves garbage, never a torn artifact. Published Shards are
+/// immutable: every put is create-only (If-None-Match), so even a stale
+/// lease holder racing a fresh one can never overwrite published objects,
+/// and an already-published revision is returned as-is.
 pub async fn write_shard(
     store: &dyn ObjectStore,
     repo_id: i64,
     commit: &str,
     graph: Graph,
+    search_docs: Vec<SearchDoc>,
 ) -> anyhow::Result<PublishedShard> {
     let revision = syntactic_revision(commit);
     let manifest_key = manifest_key(repo_id, &revision);
     let graph_key = object_store::path::Path::from(graph_segment_key(repo_id, &revision));
+    let fts_key = object_store::path::Path::from(fts_segment_key(repo_id, &revision));
     let local_counts = Counts {
         nodes: graph.nodes.len() as i64,
         edges: graph.edges.len() as i64,
     };
 
-    // Build and digest together off the runtime threads: hashing a large
-    // artifact is as blocking as building it.
-    let (graph_bytes, local_segment) =
-        tokio::task::spawn_blocking(move || -> anyhow::Result<(Vec<u8>, Segment)> {
-            let bytes = build_graph_sqlite(&graph)?;
-            let segment = Segment {
-                sha256: sha256_hex(&bytes),
-                bytes: bytes.len() as u64,
+    // Build and digest both segments off the runtime threads: building a
+    // tantivy index and hashing a large artifact are as blocking as the
+    // graph build.
+    let (graph_bytes, local_segment, fts_bytes, local_fts_segment) = tokio::task::spawn_blocking(
+        move || -> anyhow::Result<(Vec<u8>, Segment, Vec<u8>, Segment)> {
+            let graph_bytes = build_graph_sqlite(&graph)?;
+            let graph_segment = Segment {
+                sha256: sha256_hex(&graph_bytes),
+                bytes: graph_bytes.len() as u64,
             };
-            Ok((bytes, segment))
-        })
-        .await
-        .context("graph segment build task panicked")??;
+            let fts_bytes = build_fts(&search_docs)?;
+            let fts_segment = Segment {
+                sha256: sha256_hex(&fts_bytes),
+                bytes: fts_bytes.len() as u64,
+            };
+            Ok((graph_bytes, graph_segment, fts_bytes, fts_segment))
+        },
+    )
+    .await
+    .context("shard segment build task panicked")??;
     let create_only = PutOptions {
         mode: PutMode::Create,
         ..Default::default()
@@ -505,12 +537,43 @@ pub async fn write_shard(
         Err(e) => return Err(e).context("uploading the graph segment"),
     };
 
+    // The full-text segment, same create-only race handling: a publisher
+    // that lost the put defers to the published Shard, or — manifest not
+    // yet written — digests the bytes storage actually holds (a racing
+    // worker on a different build writes a different, but equally valid,
+    // tantivy index).
+    let fts_segment = match store
+        .put_opts(&fts_key, PutPayload::from(fts_bytes), create_only.clone())
+        .await
+    {
+        Ok(_) => local_fts_segment,
+        Err(object_store::Error::AlreadyExists { .. }) => {
+            if let Some(published) = published_shard(store, repo_id, commit).await? {
+                return Ok(published);
+            }
+            let stored = store
+                .get(&fts_key)
+                .await
+                .context("reading the full-text segment another publisher just wrote")?
+                .bytes()
+                .await
+                .context("reading the full-text segment another publisher just wrote")?;
+            let bytes = stored.len() as u64;
+            let (_, sha256) = digest_off_thread(stored).await?;
+            Segment { sha256, bytes }
+        }
+        Err(e) => return Err(e).context("uploading the full-text segment"),
+    };
+
     let manifest = Manifest {
         schema_version: SCHEMA_VERSION,
         commit: commit.to_string(),
         pass: SYNTACTIC_PASS.to_string(),
         counts,
-        segments: BTreeMap::from([(GRAPH_SEGMENT_FILE.to_string(), segment)]),
+        segments: BTreeMap::from([
+            (GRAPH_SEGMENT_FILE.to_string(), segment),
+            (FTS_SEGMENT_FILE.to_string(), fts_segment),
+        ]),
     };
     match store
         .put_opts(
@@ -625,99 +688,208 @@ impl ShardCache {
         revision: &str,
     ) -> anyhow::Result<std::path::PathBuf> {
         let manifest = self.manifest(repo_id, revision).await?;
-        let segment = manifest.segments.get(GRAPH_SEGMENT_FILE).with_context(|| {
-            format!("the manifest for {revision} records no {GRAPH_SEGMENT_FILE} segment")
-        })?;
-        // The recorded checksum names a file in the cache directory:
-        // before it touches a path it must *be* a checksum (64 hex
-        // chars), or a doctored manifest could reach outside the cache
-        // (`../`, an absolute path) through the join below.
-        let sha = segment.sha256.clone();
-        if sha.len() != 64 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
-            anyhow::bail!(
-                "the manifest for {revision} records {sha:?} as a segment checksum, \
-                 which is not a sha256 digest; refusing to trust it"
-            );
-        }
+        let sha = checked_segment_sha(&manifest, revision, GRAPH_SEGMENT_FILE)?;
         let path = self.dir.join(format!("{sha}.sqlite"));
-
-        // The locks below guard only map lookups and inserts — never
-        // I/O — so a cold fetch of one revision cannot stall queries
-        // for others. Two requests racing the same cold revision both
-        // fetch; the rename is idempotent and the artifact immutable,
-        // so the duplicate work is bounded and harmless.
-        if self
-            .verified
-            .lock()
-            .expect("shard cache lock poisoned")
-            .contains(&sha)
-        {
+        // The lock guards only the set lookup/insert — never I/O — so a
+        // cold fetch of one revision cannot stall queries for others.
+        if self.is_verified(&sha) {
             return Ok(path);
         }
-        // Verification hashes a whole segment — off the runtime threads.
-        let on_disk = match tokio::fs::read(&path).await {
-            Ok(bytes) => digest_off_thread(bytes).await?.1 == sha,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-            Err(e) => return Err(e).context("reading the cached graph segment"),
-        };
-        if !on_disk {
-            let fetched = match self
-                .store
-                .get(&graph_segment_key(repo_id, revision).as_str().into())
-                .await
-            {
-                Ok(get) => get.bytes().await.context("fetching the graph segment")?,
-                // A manifest without its segment: the revision is being
-                // (or was partially) GC'd — gone for the caller's
-                // purposes, same as a missing manifest.
-                Err(object_store::Error::NotFound { .. }) => {
-                    return Err(anyhow::Error::new(RevisionMissing {
-                        revision: revision.to_string(),
-                    }));
-                }
-                Err(e) => return Err(e).context("fetching the graph segment"),
-            };
-            let (fetched, digest) = digest_off_thread(fetched).await?;
-            if digest != sha {
-                anyhow::bail!(
-                    "the graph segment for {revision} does not match its manifest \
-                     (manifest says sha256 {sha}, storage holds {digest}); refusing to serve it"
-                );
-            }
-            tokio::fs::create_dir_all(&self.dir)
-                .await
-                .context("creating the shard cache directory")?;
-            // Write-then-rename so a crash mid-write leaves a stray temp
-            // file, never a checksum-named file with wrong contents. The
-            // temp name is unique per attempt — pid alone would let two
-            // tasks racing the same cold revision share (and tear) one
-            // staging file.
-            static ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let tmp = self.dir.join(format!(
-                "{sha}.sqlite.tmp-{}-{}",
-                std::process::id(),
-                ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            ));
-            tokio::fs::write(&tmp, &fetched)
-                .await
-                .context("staging the graph segment into the cache")?;
-            if let Err(e) = tokio::fs::rename(&tmp, &path).await {
-                // On platforms where rename cannot replace (Windows),
-                // the loser of a cold-fetch race lands here with the
-                // winner's identical, verified bytes already committed
-                // — that's success, not an error.
-                let committed = tokio::fs::try_exists(&path).await.unwrap_or(false);
-                let _ = tokio::fs::remove_file(&tmp).await;
-                if !committed {
-                    return Err(e).context("committing the graph segment into the cache");
-                }
-            }
-        }
+        self.fetch_verify_into(
+            revision,
+            &sha,
+            &path,
+            graph_segment_key(repo_id, revision),
+            "graph segment",
+        )
+        .await?;
+        self.mark_verified(sha);
+        Ok(path)
+    }
+
+    /// Whether this process has already verified the artifact named by
+    /// `sha` (segments are content-addressed and immutable, so once true
+    /// it stays true).
+    fn is_verified(&self, sha: &str) -> bool {
+        self.verified
+            .lock()
+            .expect("shard cache lock poisoned")
+            .contains(sha)
+    }
+
+    fn mark_verified(&self, sha: String) {
         self.verified
             .lock()
             .expect("shard cache lock poisoned")
             .insert(sha);
-        Ok(path)
+    }
+
+    /// Ensure the content-addressed cache file `local` holds the bytes
+    /// whose sha256 is `sha`, fetching `object_key` from storage and
+    /// verifying it whenever the local copy is absent or no longer matches.
+    /// A segment storage no longer holds surfaces as [`RevisionMissing`].
+    /// Hashing and the staging write run off the runtime threads; two
+    /// requests racing one cold revision both fetch, harmlessly, since the
+    /// rename is idempotent and the artifact immutable. (Callers needn't
+    /// know whether a fetch happened: the file is content-addressed, so any
+    /// artifact derived from it — an unpacked directory named by the same
+    /// sha — is already correct for that sha.)
+    async fn fetch_verify_into(
+        &self,
+        revision: &str,
+        sha: &str,
+        local: &std::path::Path,
+        object_key: String,
+        what: &str,
+    ) -> anyhow::Result<()> {
+        let on_disk = match tokio::fs::read(local).await {
+            Ok(bytes) => digest_off_thread(bytes).await?.1 == sha,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => return Err(e).with_context(|| format!("reading the cached {what}")),
+        };
+        if on_disk {
+            return Ok(());
+        }
+        let fetched = match self.store.get(&object_key.as_str().into()).await {
+            Ok(get) => get
+                .bytes()
+                .await
+                .with_context(|| format!("fetching the {what}"))?,
+            // A manifest without its segment: the revision is being (or
+            // was partially) GC'd — gone for the caller's purposes, same
+            // as a missing manifest.
+            Err(object_store::Error::NotFound { .. }) => {
+                return Err(anyhow::Error::new(RevisionMissing {
+                    revision: revision.to_string(),
+                }));
+            }
+            Err(e) => return Err(e).with_context(|| format!("fetching the {what}")),
+        };
+        let (fetched, digest) = digest_off_thread(fetched).await?;
+        if digest != sha {
+            anyhow::bail!(
+                "the {what} for {revision} does not match its manifest \
+                 (manifest says sha256 {sha}, storage holds {digest}); refusing to serve it"
+            );
+        }
+        tokio::fs::create_dir_all(&self.dir)
+            .await
+            .context("creating the shard cache directory")?;
+        // Write-then-rename so a crash mid-write leaves a stray temp file,
+        // never a checksum-named file with wrong contents. The temp name
+        // is unique per attempt — pid alone would let two tasks racing the
+        // same cold revision share (and tear) one staging file.
+        static ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let file_name = local
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("segment");
+        let tmp = self.dir.join(format!(
+            "{file_name}.tmp-{}-{}",
+            std::process::id(),
+            ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        tokio::fs::write(&tmp, &fetched)
+            .await
+            .with_context(|| format!("staging the {what} into the cache"))?;
+        if let Err(e) = tokio::fs::rename(&tmp, local).await {
+            // On platforms where rename cannot replace (Windows), the
+            // loser of a cold-fetch race lands here with the winner's
+            // identical, verified bytes already committed — success, not
+            // an error.
+            let committed = tokio::fs::try_exists(local).await.unwrap_or(false);
+            let _ = tokio::fs::remove_file(&tmp).await;
+            if !committed {
+                return Err(e).with_context(|| format!("committing the {what} into the cache"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Local path of the unpacked full-text segment directory for a
+    /// revision — the tantivy index the `search` Verb opens. Like
+    /// [`Self::graph_path`], the packed artifact is fetched only when the
+    /// local tier can't answer and is verified against its manifest
+    /// checksum before use; here it is additionally unpacked into a
+    /// checksum-named directory, derived fresh from the verified archive.
+    ///
+    /// A revision that was never published (or has been GC'd) fails with
+    /// [`RevisionMissing`].
+    pub async fn fts_path(
+        &self,
+        repo_id: i64,
+        revision: &str,
+    ) -> anyhow::Result<std::path::PathBuf> {
+        let manifest = self.manifest(repo_id, revision).await?;
+        let sha = checked_segment_sha(&manifest, revision, FTS_SEGMENT_FILE)?;
+        let archive_path = self.dir.join(format!("{sha}.tar"));
+        let unpacked = self.dir.join(format!("{sha}.fts"));
+
+        // Warm: this process already verified the archive and unpacked it.
+        if self.is_verified(&sha) && tokio::fs::try_exists(&unpacked).await.unwrap_or(false) {
+            return Ok(unpacked);
+        }
+
+        // The packed archive, fetched and checksum-verified through the
+        // shared dance. The unpacked directory is content-addressed by the
+        // same sha (it is only ever created by an atomic rename of a
+        // fully-unpacked temp dir), so an existing one is by definition the
+        // correct content — there is nothing to invalidate on a refetch,
+        // and deleting it would yank it out from under a concurrent reader.
+        self.fetch_verify_into(
+            revision,
+            &sha,
+            &archive_path,
+            fts_segment_key(repo_id, revision),
+            "fts segment",
+        )
+        .await?;
+
+        // Unpack the verified archive into its directory if absent.
+        if !tokio::fs::try_exists(&unpacked).await.unwrap_or(false) {
+            let archive = tokio::fs::read(&archive_path)
+                .await
+                .context("reading the cached fts segment")?;
+            let dir_root = self.dir.clone();
+            let target = unpacked.clone();
+            let sha_for_tmp = sha.clone();
+            // Untarring is blocking fs work; keep it off the runtime threads.
+            tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                static ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let tmp = dir_root.join(format!(
+                    "{sha_for_tmp}.fts.tmp-{}-{}",
+                    std::process::id(),
+                    ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                ));
+                // A previous crashed unpack may have left this temp dir.
+                let _ = std::fs::remove_dir_all(&tmp);
+                // Clean the temp dir on any failure (a partial unpack, a
+                // rename race) so a failed attempt never leaks it.
+                let unpack_and_commit = || -> anyhow::Result<()> {
+                    unpack_fts(&archive, &tmp)?;
+                    match std::fs::rename(&tmp, &target) {
+                        Ok(()) => Ok(()),
+                        // Another task unpacked the same revision first —
+                        // its directory is the complete one; ours is
+                        // redundant.
+                        Err(_) if target.exists() => Ok(()),
+                        Err(e) => {
+                            Err(e).context("committing the unpacked fts segment into the cache")
+                        }
+                    }
+                };
+                let result = unpack_and_commit();
+                if result.is_err() || tmp.exists() {
+                    let _ = std::fs::remove_dir_all(&tmp);
+                }
+                result
+            })
+            .await
+            .context("fts segment unpack task panicked")??;
+        }
+
+        self.mark_verified(sha);
+        Ok(unpacked)
     }
 
     /// A revision's manifest, fetched at most once per process: published
@@ -818,6 +990,25 @@ fn manifest_disagrees_with_revision(manifest: &Manifest, revision: &str) -> bool
         manifest.commit, manifest.pass, manifest.schema_version
     );
     recomposed != revision
+}
+
+/// The validated sha256 of a manifest's named segment — confirmed to be a
+/// checksum (64 hex chars) before it is ever joined onto a cache path, so
+/// a doctored manifest (`../`, an absolute path) can't escape the cache
+/// directory through the join.
+fn checked_segment_sha(manifest: &Manifest, revision: &str, file: &str) -> anyhow::Result<String> {
+    let segment = manifest
+        .segments
+        .get(file)
+        .with_context(|| format!("the manifest for {revision} records no {file} segment"))?;
+    let sha = segment.sha256.clone();
+    if sha.len() != 64 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+        anyhow::bail!(
+            "the manifest for {revision} records {sha:?} as a segment checksum, \
+             which is not a sha256 digest; refusing to trust it"
+        );
+    }
+    Ok(sha)
 }
 
 /// The one digest the Shard layout uses, writer and reader alike:

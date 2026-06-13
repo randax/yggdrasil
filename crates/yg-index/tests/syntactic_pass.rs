@@ -4,10 +4,11 @@
 
 use std::collections::BTreeSet;
 
-use yg_shard::{EdgeKind, Graph, NodeKind};
+use yg_shard::{EdgeKind, Graph, NodeKind, SearchDoc};
 
-/// Run the pass over an in-memory tree laid out in a tempdir.
-fn pass_over(files: &[(&str, &str)]) -> Graph {
+/// Run the pass over an in-memory tree laid out in a tempdir, returning
+/// the graph and the full-text documents it extracts.
+fn pass_full(files: &[(&str, &str)]) -> (Graph, Vec<SearchDoc>) {
     let dir = tempfile::tempdir().unwrap();
     for (path, contents) in files {
         let full = dir.path().join(path);
@@ -15,6 +16,48 @@ fn pass_over(files: &[(&str, &str)]) -> Graph {
         std::fs::write(full, contents).unwrap();
     }
     yg_index::syntactic_pass(dir.path()).expect("the pass must handle a plain tree")
+}
+
+/// Just the graph, for the tests that only assert graph shape.
+fn pass_over(files: &[(&str, &str)]) -> Graph {
+    pass_full(files).0
+}
+
+#[test]
+fn search_docs_cover_symbol_names_and_file_content() {
+    let (_graph, docs) = pass_full(&[
+        (
+            "limit.go",
+            "package svc\n\n// RateLimit throttles requests.\nfunc RateLimit() {}\n",
+        ),
+        ("README.md", "# Service\n\nConfigure the rate limit here.\n"),
+    ]);
+
+    // The markdown File carries its prose, so content search can reach it.
+    let readme = docs
+        .iter()
+        .find(|d| d.node_id == "file:README.md")
+        .expect("a search doc per File node");
+    assert_eq!(readme.kind, NodeKind::File);
+    assert!(
+        readme.content.contains("rate limit"),
+        "the File's content is indexed: {:?}",
+        readme.content
+    );
+
+    // The Go function is searchable by its name.
+    let symbol = docs
+        .iter()
+        .find(|d| d.node_id == "sym:limit.go#RateLimit")
+        .expect("a search doc per Symbol node");
+    assert_eq!(symbol.kind, NodeKind::Symbol);
+    assert_eq!(symbol.name.as_deref(), Some("RateLimit"));
+
+    // Package nodes carry no searchable text; they stay out of the index.
+    assert!(
+        docs.iter().all(|d| d.kind != NodeKind::Package),
+        "Package nodes are not search documents"
+    );
 }
 
 fn symbol_names(graph: &Graph) -> BTreeSet<&str> {
@@ -165,7 +208,9 @@ fn symlinks_become_file_nodes_but_are_never_read_through() {
     // anywhere, even outside the checkout) must not be parsed.
     std::os::unix::fs::symlink("real.go", dir.path().join("link.go")).unwrap();
 
-    let graph = yg_index::syntactic_pass(dir.path()).expect("symlinks must not break the pass");
+    let graph = yg_index::syntactic_pass(dir.path())
+        .expect("symlinks must not break the pass")
+        .0;
 
     let files: BTreeSet<&str> = graph
         .nodes
