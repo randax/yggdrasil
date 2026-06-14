@@ -117,6 +117,7 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<RunningServer> {
                 .route("/status", get(status))
                 .route("/verbs/node", post(verb_node))
                 .route("/verbs/neighbors", post(verb_neighbors))
+                .route("/verbs/history", post(verb_history))
                 .route("/verbs/search", post(verb_search))
                 .route("/admin/repos", post(admin_repo_add))
                 .route("/admin/status", get(admin_status)),
@@ -392,6 +393,211 @@ struct NeighborsResponse {
     nodes: Vec<yg_verbs::NodeView>,
     edges: Vec<yg_verbs::GraphEdge>,
     next_cursor: Option<String>,
+}
+
+/// Default and maximum page size for `history`, in commits.
+const DEFAULT_HISTORY_LIMIT: usize = 50;
+const MAX_HISTORY_LIMIT: usize = 1000;
+
+#[derive(Deserialize)]
+struct HistoryRequest {
+    /// The node whose history to take. Always present, even on a resume —
+    /// the cursor must agree with it.
+    id: String,
+    /// Only commits at or after this date: RFC3339 (`2024-01-01T00:00:00Z`)
+    /// or a plain `YYYY-MM-DD` (midnight UTC). Omitted imposes no floor.
+    since: Option<String>,
+    /// Page size in commits: 1 to [`MAX_HISTORY_LIMIT`], default
+    /// [`DEFAULT_HISTORY_LIMIT`]. May vary between pages of one history.
+    limit: Option<u32>,
+    /// Resume an earlier history where its last page ended.
+    cursor: Option<String>,
+}
+
+/// One commit on the wire: the Verb's commit plus a display-ready date —
+/// the server owns rendering (like search snippets), so clients print it
+/// verbatim instead of each re-deriving a format from `committed_at`.
+#[derive(Serialize)]
+struct HistoryCommitView {
+    #[serde(flatten)]
+    commit: yg_verbs::HistoryCommit,
+    /// `committed_at` as RFC3339 UTC (`2024-01-01T00:00:00Z`).
+    date: String,
+}
+
+/// The `history` wire response: one page of commits plus the opaque cursor.
+#[derive(Serialize)]
+struct HistoryResponse {
+    commits: Vec<HistoryCommitView>,
+    next_cursor: Option<String>,
+}
+
+/// Render a unix-seconds committer date as RFC3339 UTC for display.
+fn render_date(committed_at: i64) -> String {
+    use chrono::{SecondsFormat, TimeZone, Utc};
+    Utc.timestamp_opt(committed_at, 0)
+        .single()
+        .map(|dt| dt.to_rfc3339_opts(SecondsFormat::Secs, true))
+        .unwrap_or_default()
+}
+
+/// What a history `next_cursor` opaquely carries: the resume position, the
+/// Shard revision it was read from, and the request it belongs to. Later
+/// pages stay on the pinned revision — Shards are immutable, so a
+/// paginated history is one consistent walk even across a pointer swap;
+/// only a fresh request picks up a newer Shard. The id and `since` ride
+/// along because the page contract only holds when every page is the same
+/// query: a replay that contradicts its cursor is rejected, never served
+/// from a different history.
+#[derive(Serialize, Deserialize)]
+struct HistoryCursor {
+    rev: String,
+    id: String,
+    /// The normalized `since` floor (unix seconds) the first page used.
+    since: Option<i64>,
+    after_committed_at: i64,
+    after_sha: String,
+}
+
+impl HistoryCursor {
+    fn encode(&self) -> String {
+        use base64::Engine;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(self).expect("a cursor serializes"))
+    }
+
+    fn decode(cursor: &str) -> Result<Self, String> {
+        use base64::Engine;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(cursor)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .ok_or_else(|| {
+                "invalid cursor: pass back next_cursor from a previous response, unmodified"
+                    .to_string()
+            })
+    }
+
+    /// A follow-up may repeat the original id and `since` or omit `since`,
+    /// nothing else. The `since` is compared already-normalized, so two
+    /// spellings of the same instant agree.
+    fn agrees_with(&self, req_id: &str, req_since: Option<i64>) -> Result<(), String> {
+        if req_id != self.id || (req_since.is_some() && req_since != self.since) {
+            return Err(
+                "this cursor belongs to a different request (id and since must match the \
+                 page it came from); start a fresh history or pass the cursor with the \
+                 original parameters"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Parse a `history` `since` filter into unix seconds: an RFC3339 instant
+/// first, then a plain `YYYY-MM-DD` taken at midnight UTC. The error is
+/// client-facing.
+fn parse_since(raw: &str) -> Result<i64, String> {
+    use chrono::{NaiveDate, NaiveTime, TimeZone, Utc};
+    if let Ok(instant) = chrono::DateTime::parse_from_rfc3339(raw) {
+        return Ok(instant.timestamp());
+    }
+    if let Ok(date) = NaiveDate::parse_from_str(raw, "%Y-%m-%d") {
+        return Ok(Utc
+            .from_utc_datetime(&date.and_time(NaiveTime::MIN))
+            .timestamp());
+    }
+    Err(format!(
+        "invalid since {raw:?}: expected an RFC3339 timestamp \
+         (2024-01-01T00:00:00Z) or a date (2024-01-01)"
+    ))
+}
+
+/// `POST /v1/verbs/history` (RFC 0001 §7): commits touching a File (or a
+/// Symbol's defining file), newest-first, with a `since` floor and cursor
+/// pagination.
+async fn verb_history(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<HistoryRequest>,
+) -> Response {
+    let cursor = match req.cursor.as_deref().map(HistoryCursor::decode) {
+        Some(Ok(cursor)) => Some(cursor),
+        Some(Err(reason)) => return error_json(StatusCode::BAD_REQUEST, reason),
+        None => None,
+    };
+    let req_since = match req.since.as_deref().map(parse_since) {
+        Some(Ok(since)) => Some(since),
+        Some(Err(reason)) => return error_json(StatusCode::BAD_REQUEST, reason),
+        None => None,
+    };
+    if let Some(cursor) = &cursor
+        && let Err(reason) = cursor.agrees_with(&req.id, req_since)
+    {
+        return error_json(StatusCode::BAD_REQUEST, reason);
+    }
+    // The id + since in force: the cursor's where resuming (it remembers
+    // the original, and agrees_with ruled out contradiction), the
+    // request's on a fresh history.
+    let (id_str, since) = match &cursor {
+        Some(cursor) => (cursor.id.clone(), cursor.since),
+        None => (req.id.clone(), req_since),
+    };
+    let id = match yg_verbs::VerbId::parse(&id_str) {
+        Ok(id) => id,
+        Err(reason) => return error_json(StatusCode::BAD_REQUEST, reason),
+    };
+    let limit = req.limit.map_or(DEFAULT_HISTORY_LIMIT, |l| l as usize);
+    if !(1..=MAX_HISTORY_LIMIT).contains(&limit) {
+        return error_json(
+            StatusCode::BAD_REQUEST,
+            format!("limit must be between 1 and {MAX_HISTORY_LIMIT}, got {limit}"),
+        );
+    }
+    // A cursor pins the revision its history started on; fresh queries
+    // resolve the current pointer.
+    let pinned = cursor.as_ref().map(|c| c.rev.clone());
+    let (path, revision) = match resolve_shard(&state, &id.repo, pinned).await {
+        Ok(resolved) => resolved,
+        Err(response) => return response,
+    };
+    let options = yg_verbs::HistoryOptions {
+        limit,
+        since,
+        after: cursor
+            .as_ref()
+            .map(|c| (c.after_committed_at, c.after_sha.clone())),
+    };
+    let page = match run_verb(path, id, move |conn, id| {
+        yg_verbs::history(conn, id, &options)
+    })
+    .await
+    {
+        Ok(page) => page,
+        Err(response) => return response,
+    };
+    let next_cursor = page.next.as_ref().map(|(at, sha)| {
+        HistoryCursor {
+            rev: revision.clone(),
+            id: id_str.clone(),
+            since,
+            after_committed_at: *at,
+            after_sha: sha.clone(),
+        }
+        .encode()
+    });
+    let commits = page
+        .commits
+        .into_iter()
+        .map(|commit| HistoryCommitView {
+            date: render_date(commit.committed_at),
+            commit,
+        })
+        .collect();
+    Json(HistoryResponse {
+        commits,
+        next_cursor,
+    })
+    .into_response()
 }
 
 /// Default and maximum page size for `search`, plus the deepest a cursor
@@ -857,8 +1063,10 @@ fn qualify_hit(qualifier: &str, hit: yg_shard::LocalHit) -> SearchHit {
 /// Parse and validate the `kinds` filter. An empty list is ambiguous (no
 /// kinds vs no filter) and rejected; an unknown kind errors with the
 /// vocabulary rather than silently matching nothing. A real kind that
-/// carries no searchable text yet (Package) is a valid filter that simply
-/// matches nothing — forward-compatible with a pass that later indexes it.
+/// carries no searchable text (Package, Commit, Contributor) is a valid
+/// filter that simply matches nothing — forward-compatible with a pass
+/// that later indexes it (the deliberate contract pinned by the
+/// `a_search_filtered_to_an_unindexed_kind_is_empty_not_an_error` test).
 fn parse_search_kinds(kinds: Option<&[String]>) -> Result<Option<Vec<yg_shard::NodeKind>>, String> {
     let Some(kinds) = kinds else { return Ok(None) };
     if kinds.is_empty() {

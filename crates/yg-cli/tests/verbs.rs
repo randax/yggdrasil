@@ -57,7 +57,8 @@ async fn yg_neighbors_lists_the_subgraph_humanly_and_as_raw_json() {
     let json: serde_json::Value =
         serde_json::from_str(&h.yg_ok(&["neighbors", &id, "--json"]).await)
             .expect("--json emits the raw response");
-    assert_eq!(json["nodes"].as_array().expect("nodes").len(), 2);
+    // Hello and main (DEFINES), plus the commit that touched main.go.
+    assert_eq!(json["nodes"].as_array().expect("nodes").len(), 3);
     assert!(json["next_cursor"].is_null());
 
     // Filters and pagination ride along to the server.
@@ -86,7 +87,9 @@ async fn yg_neighbors_lists_the_subgraph_humanly_and_as_raw_json() {
             .await,
     )
     .expect("--json emits the raw response");
-    assert_eq!(json["nodes"].as_array().expect("nodes").len(), 1);
+    // The resume carries no --limit, so it returns the rest in one page:
+    // the two neighbors after the first (of three: Hello, main, commit).
+    assert_eq!(json["nodes"].as_array().expect("nodes").len(), 2);
 }
 
 #[tokio::test]
@@ -206,7 +209,16 @@ async fn neighbors_returns_the_adjacent_subgraph_with_full_edge_detail() {
     h.sync_and_index().await;
 
     let id = format!("file:{}:main.go", h.qualifier());
-    let body = h.verb_ok("neighbors", json!({ "id": id })).await;
+    // Filtered to the code edges this test is about: main.go is also
+    // TOUCHES-linked to the commit that added it, which the default
+    // traversal would surface (see the dedup test) but isn't the subject
+    // here.
+    let body = h
+        .verb_ok(
+            "neighbors",
+            json!({ "id": id, "edge_kinds": ["DEFINES", "CALLS"] }),
+        )
+        .await;
 
     let mut node_ids: Vec<&str> = body["nodes"]
         .as_array()
@@ -277,7 +289,10 @@ async fn neighbors_paginates_with_a_cursor_without_gaps_or_duplicates() {
     let mut cursor = serde_json::Value::Null;
     let mut pages = 0;
     loop {
-        let mut req = json!({ "id": id, "limit": 2 });
+        // DEFINES only: lib.go is also TOUCHES-linked to its commit, which
+        // would otherwise add a sixth neighbor and a sixth edge to the
+        // five-symbol shape this test paginates.
+        let mut req = json!({ "id": id, "limit": 2, "edge_kinds": ["DEFINES"] });
         if !cursor.is_null() {
             req["cursor"] = cursor.clone();
         }
@@ -391,6 +406,7 @@ async fn neighbors_default_traversal_dedups_a_node_reachable_by_two_kinds_and_de
     h.sync_and_index().await;
 
     let q = h.qualifier();
+    let head = git(&h.repo_dir, &["rev-parse", "HEAD"]);
     let top = format!("sym:{q}:chain.go#top");
     let body = h
         .verb_ok("neighbors", json!({ "id": top, "depth": 2, "limit": 1000 }))
@@ -412,15 +428,21 @@ async fn neighbors_default_traversal_dedups_a_node_reachable_by_two_kinds_and_de
     assert_eq!(
         ids,
         vec![
+            // The commit that touched chain.go, reached at depth 2 through
+            // the file's inbound TOUCHES — history joins the default
+            // traversal like any other edge, and must dedup the same way.
+            format!("commit:{q}:{head}"),
             format!("file:{q}:chain.go"),
             format!("sym:{q}:chain.go#leaf"),
             format!("sym:{q}:chain.go#mid"),
         ],
-        "top reaches its file and (transitively) mid and leaf within 2 hops"
+        "top reaches its file, the commit that touched it, and \
+         (transitively) mid and leaf within 2 hops"
     );
 
     // Every induced edge once: top's DEFINES (from file) + mid's +
-    // leaf's = 3 DEFINES, plus top→mid and mid→leaf CALLS = 5. The
+    // leaf's = 3 DEFINES, plus top→mid and mid→leaf CALLS, plus the
+    // commit→chain.go TOUCHES joining the reached commit = 6. The
     // file→top DEFINES edge sits on the origin's own page.
     let edges = body["edges"].as_array().expect("edges");
     let mut seen: Vec<(String, String, String)> = edges
@@ -442,8 +464,8 @@ async fn neighbors_default_traversal_dedups_a_node_reachable_by_two_kinds_and_de
     assert_eq!(seen.len(), dedup_len, "no edge appears twice: {seen:?}");
     assert_eq!(
         seen.len(),
-        5,
-        "3 DEFINES + 2 CALLS in the induced subgraph: {seen:?}"
+        6,
+        "3 DEFINES + 2 CALLS + 1 TOUCHES in the induced subgraph: {seen:?}"
     );
 }
 

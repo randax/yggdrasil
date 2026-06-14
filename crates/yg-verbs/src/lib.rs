@@ -79,8 +79,9 @@ impl VerbId {
         let malformed = || {
             format!(
                 "malformed node id {id:?}: expected repo:<repo>, \
-                 file:<repo>:<path>, sym:<repo>:<path>#<name>, or \
-                 pkg:<repo>:<import-path>"
+                 file:<repo>:<path>, sym:<repo>:<path>#<name>, \
+                 pkg:<repo>:<import-path>, commit:<repo>:<sha>, or \
+                 contributor:<repo>:<email>"
             )
         };
         let (kind, rest) = id.split_once(':').ok_or_else(malformed)?;
@@ -94,7 +95,7 @@ impl VerbId {
                     local: None,
                 })
             }
-            "file" | "sym" | "pkg" => {
+            "file" | "sym" | "pkg" | "commit" | "contributor" => {
                 let (repo, local) = split_qualifier(rest).ok_or_else(malformed)?;
                 if repo.is_empty() || local.is_empty() {
                     return Err(malformed());
@@ -129,7 +130,9 @@ impl VerbId {
 }
 
 /// A node as Verb responses carry it: the external id plus everything
-/// the Shard knows about the node itself.
+/// the Shard knows about the node itself. A Commit's committer date is
+/// deliberately not here — it is surfaced by the `history` Verb, the one
+/// place commit dates are answered; `node`/`neighbors` describe structure.
 #[derive(Debug, Serialize)]
 pub struct NodeView {
     pub id: String,
@@ -279,7 +282,15 @@ impl Direction {
 /// nothing. Must agree with yg-shard's `EdgeKind::as_str` values; a
 /// drift-guard test in yg-api holds the two together (this crate
 /// deliberately doesn't depend on the artifact writer).
-pub const KNOWN_EDGE_KINDS: &[&str] = &["CALLS", "DEFINES", "EXTENDS", "IMPLEMENTS", "IMPORTS"];
+pub const KNOWN_EDGE_KINDS: &[&str] = &[
+    "AUTHORED",
+    "CALLS",
+    "DEFINES",
+    "EXTENDS",
+    "IMPLEMENTS",
+    "IMPORTS",
+    "TOUCHES",
+];
 
 /// The `neighbors` Verb's filters and pagination, validated by the
 /// caller (limits, depth bounds, cursor decoding are wire concerns).
@@ -668,6 +679,234 @@ fn edge_summary(
     Ok(summaries)
 }
 
+/// One commit in the `history` Verb's answer: the commit, when it landed,
+/// what it was, and who wrote it (RFC 0001 §7).
+#[derive(Debug, Serialize)]
+pub struct HistoryCommit {
+    /// External commit id (`commit:<repo>:<sha>`).
+    pub commit: String,
+    /// The bare commit sha.
+    pub sha: String,
+    /// First line of the commit message, when it has one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    /// Committer date in unix seconds — the newest-first ordering key. The
+    /// wire layer renders it RFC3339; the cursor carries it raw.
+    pub committed_at: i64,
+    /// The author, when the commit carried an attributable email.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author: Option<HistoryAuthor>,
+}
+
+/// A commit's author, as a Contributor reference (CONTEXT.md): deduped by
+/// email within this repo's Shard — cross-Forge identity merge is M2.
+#[derive(Debug, Serialize)]
+pub struct HistoryAuthor {
+    /// External contributor id (`contributor:<repo>:<email>`).
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub email: String,
+}
+
+/// One page of the `history` Verb's answer: commits newest-first.
+///
+/// `next` is the resume position — `(committed_at, sha)` of the last
+/// commit here — for the caller to wrap into its opaque cursor; `None`
+/// means the history is exhausted. The sha (not the external id) is
+/// carried because it is repo-independent and orders identically to the
+/// Shard-internal `commit:<sha>` id the keyset resumes on.
+#[derive(Debug, Serialize)]
+pub struct HistoryPage {
+    pub commits: Vec<HistoryCommit>,
+    #[serde(skip)]
+    pub next: Option<(i64, String)>,
+}
+
+/// The `history` Verb's filters and pagination, validated by the caller
+/// (the page size and `since` spelling are wire concerns).
+#[derive(Debug, Clone)]
+pub struct HistoryOptions {
+    /// Page size, in commits.
+    pub limit: usize,
+    /// Only commits whose committer date is at or after this (unix
+    /// seconds); `None` imposes no lower bound.
+    pub since: Option<i64>,
+    /// Resume after this `(committed_at, sha)` position — the previous
+    /// page's last commit, in the `(committer date desc, id asc)` order.
+    pub after: Option<(i64, String)>,
+}
+
+/// The `history` Verb: commits that touched a File — or a Symbol's
+/// defining file — newest-first, or `None` when the Shard holds no such
+/// node (the caller's 404).
+///
+/// Commits are ordered by committer date descending, the external commit
+/// id breaking ties — a total, Shard-stable order, so a cursor resumed
+/// against the same immutable revision sees exactly the page a single
+/// uninterrupted read would have.
+pub fn history(
+    conn: &rusqlite::Connection,
+    id: &VerbId,
+    options: &HistoryOptions,
+) -> anyhow::Result<Option<HistoryPage>> {
+    let Some(local) = &id.local else {
+        // The Repo node has no file to take a history of (M0).
+        return Ok(None);
+    };
+    let Some(file_local) = resolve_history_file(conn, local)? else {
+        return Ok(None);
+    };
+
+    // Assembled with `?` placeholders bound in push order: the `since`
+    // floor and the keyset resume clause are optional, so the SQL grows
+    // to match. Fetch one past the page so the presence of a next page is
+    // known without a second query. AUTHORED is a left join: an
+    // unattributable commit (no author email) still appears, authorless.
+    let mut sql = String::from(
+        "SELECT c.id, c.name, c.committed_at, a.src, who.name
+         FROM edges t
+         JOIN nodes c ON c.id = t.src
+         LEFT JOIN edges a ON a.dst = c.id AND a.kind = 'AUTHORED'
+         LEFT JOIN nodes who ON who.id = a.src
+         WHERE t.kind = 'TOUCHES' AND t.dst = ?",
+    );
+    // The keyset resumes on the Shard-internal `commit:<sha>` id, which
+    // orders identically to the bare sha the cursor carries.
+    let after_id = options
+        .after
+        .as_ref()
+        .map(|(_, sha)| format!("commit:{sha}"));
+    let after_at = options.after.as_ref().map(|(at, _)| *at);
+    // The caller bounds `limit`, but this is a public API: a huge `usize`
+    // from another caller must neither overflow the +1 nor wrap negative on
+    // the i64 cast (SQLite reads a negative LIMIT as unlimited). Saturate,
+    // then clamp into i64 — a limit no real page ever reaches.
+    let limit_plus_one = i64::try_from(options.limit.saturating_add(1)).unwrap_or(i64::MAX);
+    let mut params: Vec<&dyn rusqlite::ToSql> = vec![&file_local];
+    if let Some(since) = options.since.as_ref() {
+        sql.push_str(" AND c.committed_at >= ?");
+        params.push(since);
+    }
+    // A row falls after `(at, id)` in the (date desc, id asc) order when
+    // it is strictly older, or same-date with a later id.
+    if let (Some(at), Some(id)) = (after_at.as_ref(), after_id.as_ref()) {
+        sql.push_str(" AND (c.committed_at < ? OR (c.committed_at = ? AND c.id > ?))");
+        params.push(at);
+        params.push(at);
+        params.push(id);
+    }
+    sql.push_str(" ORDER BY c.committed_at DESC, c.id ASC LIMIT ?");
+    params.push(&limit_plus_one);
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(params), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .context("reading a file's commit history")?;
+
+    let mut commits: Vec<HistoryCommit> = rows
+        .into_iter()
+        .map(
+            |(commit_local, subject, committed_at, author_local, author_name)| {
+                history_commit(
+                    id,
+                    &commit_local,
+                    subject,
+                    committed_at,
+                    author_local,
+                    author_name,
+                )
+            },
+        )
+        .collect();
+    // A full extra row means there is another page; trim to it and hand
+    // back the last commit's (date, sha) as the resume point.
+    let next = if commits.len() > options.limit {
+        commits.truncate(options.limit);
+        commits
+            .last()
+            .map(|last| (last.committed_at, last.sha.clone()))
+    } else {
+        None
+    };
+    Ok(Some(HistoryPage { commits, next }))
+}
+
+/// The Shard-internal File id whose history answers for `local`: the File
+/// itself, or a Symbol's defining file (RFC 0001 §7) — the Symbol carries
+/// that file's path, so its history is the file's. A node the Shard
+/// doesn't hold, or one that is neither (a Package, Commit, Contributor),
+/// yields `None` — the caller's 404, since M0 history is file-anchored.
+fn resolve_history_file(
+    conn: &rusqlite::Connection,
+    local: &str,
+) -> anyhow::Result<Option<String>> {
+    let found = conn
+        .query_row(
+            "SELECT kind, path FROM nodes WHERE id = ?1",
+            [local],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .map(Some)
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            e => Err(e),
+        })
+        .context("looking up the history target")?;
+    let Some((kind, path)) = found else {
+        return Ok(None);
+    };
+    match kind.as_str() {
+        "File" => Ok(Some(local.to_string())),
+        // The Symbol's path is its defining file; map it to that File id.
+        // A Symbol without a path (which the writer never mints) has no
+        // file history to give.
+        "Symbol" => Ok(path.map(|path| format!("file:{path}"))),
+        _ => Ok(None),
+    }
+}
+
+/// Assemble one [`HistoryCommit`] from its stored row, qualifying the
+/// commit and contributor ids into their external form and splitting the
+/// sha and email back out of the Shard-internal ids.
+fn history_commit(
+    id: &VerbId,
+    commit_local: &str,
+    subject: Option<String>,
+    committed_at: i64,
+    author_local: Option<String>,
+    author_name: Option<String>,
+) -> HistoryCommit {
+    let sha = commit_local
+        .strip_prefix("commit:")
+        .unwrap_or(commit_local)
+        .to_string();
+    let author = author_local.map(|local| HistoryAuthor {
+        email: local
+            .strip_prefix("contributor:")
+            .unwrap_or(&local)
+            .to_string(),
+        id: id.qualify(&local),
+        name: author_name,
+    });
+    HistoryCommit {
+        commit: id.qualify(commit_local),
+        sha,
+        subject,
+        committed_at,
+        author,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -683,6 +922,37 @@ mod tests {
         let repo = VerbId::parse("repo:git.corp.example:8443/acme/widgets").unwrap();
         assert_eq!(repo.repo, "git.corp.example:8443/acme/widgets");
         assert_eq!(repo.local, None);
+    }
+
+    #[test]
+    fn contributor_ids_round_trip_with_colons_in_the_email() {
+        // A Contributor id carries the author's email as its local part,
+        // and an email can contain a colon. The repo qualifier always holds
+        // a '/', so the repo/local boundary lands at the first colon and the
+        // whole email survives — even one that itself looks port-like.
+        for email in [
+            "alice@example.com",
+            "weird:user@example.com",
+            "9999/bot@x.io",
+        ] {
+            let id = format!("contributor:github.com/acme/widgets:{email}");
+            let parsed = VerbId::parse(&id).unwrap_or_else(|e| panic!("{id:?}: {e}"));
+            assert_eq!(parsed.repo, "github.com/acme/widgets");
+            assert_eq!(
+                parsed.local.as_deref(),
+                Some(format!("contributor:{email}").as_str())
+            );
+            assert_eq!(parsed.external(), id, "{id:?} must round-trip");
+        }
+    }
+
+    #[test]
+    fn commit_ids_round_trip() {
+        let id = "commit:github.com/acme/widgets:1a2b3c4d5e6f";
+        let parsed = VerbId::parse(id).unwrap();
+        assert_eq!(parsed.repo, "github.com/acme/widgets");
+        assert_eq!(parsed.local.as_deref(), Some("commit:1a2b3c4d5e6f"));
+        assert_eq!(parsed.external(), id);
     }
 
     #[test]

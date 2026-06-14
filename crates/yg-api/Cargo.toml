@@ -22,3 +22,6 @@ yg-sync = { version = "0.1.0", path = "../yg-sync" }
 rusqlite = { version = "0.39", features = ["bundled"] }
 yg-verbs = { version = "0.1.0", path = "../yg-verbs" }
 base64 = "0.22.1"
+# Parsing the `history` Verb's RFC3339 `since` and rendering commit dates.
+# No clock needed — disable the default `now`/`clock` features.
+chrono = { version = "0.4.45", default-features = false, features = ["std"] }
