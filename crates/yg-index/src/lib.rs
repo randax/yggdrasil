@@ -308,7 +308,7 @@ fn extract_tree(mirror: &Path, commit: &str, dest: &Path) -> anyhow::Result<()> 
 /// A TOUCHES edge is emitted for *every* path a commit changed, named as
 /// the File node it would have (`file:<path>`). The history walk can't see
 /// which of those Files the syntactic pass minted nodes for (a since-deleted
-/// path, a non-UTF-8 name it skipped), so [`merge_history`] prunes TOUCHES
+/// path, a non-UTF-8 name it skipped), so `merge_history` prunes TOUCHES
 /// to absent Files when folding this into the syntactic graph — the read
 /// path refuses a graph with edges to nodes it doesn't hold. Commits whose
 /// every changed path is gone still become Commit nodes (full history is
@@ -470,7 +470,7 @@ const HISTORY_LOG_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// `git log -- <path>` on the linear/first-parent history the tracer
 /// targets. Merge-commit path attribution is later-milestone work.
 ///
-/// `kill_on_drop` + a timeout, like [`yg_sync::run_git`]: a wedged git
+/// `kill_on_drop` + a timeout, like `yg_sync`'s `run_git`: a wedged git
 /// must not hold the mirror lock forever (the future being dropped reaps
 /// the child). Lossy UTF-8 decode: a repo's history is arbitrary, and a
 /// latin-1 author name must cost a replacement character at worst, never a
