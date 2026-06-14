@@ -778,9 +778,11 @@ pub fn history(
         .as_ref()
         .map(|(_, sha)| format!("commit:{sha}"));
     let after_at = options.after.as_ref().map(|(at, _)| *at);
-    // saturating: the caller bounds `limit`, but this is a public API — a
-    // `usize::MAX` from some other caller must not overflow the +1.
-    let limit_plus_one = options.limit.saturating_add(1) as i64;
+    // The caller bounds `limit`, but this is a public API: a huge `usize`
+    // from another caller must neither overflow the +1 nor wrap negative on
+    // the i64 cast (SQLite reads a negative LIMIT as unlimited). Saturate,
+    // then clamp into i64 — a limit no real page ever reaches.
+    let limit_plus_one = i64::try_from(options.limit.saturating_add(1)).unwrap_or(i64::MAX);
     let mut params: Vec<&dyn rusqlite::ToSql> = vec![&file_local];
     if let Some(since) = options.since.as_ref() {
         sql.push_str(" AND c.committed_at >= ?");

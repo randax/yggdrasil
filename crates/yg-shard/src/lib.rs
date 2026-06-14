@@ -273,12 +273,16 @@ impl Node {
     }
 
     /// The Contributor node for an email: id `contributor:<email>` (the
-    /// dedup key within this repo's Shard), name the display name.
+    /// dedup key within this repo's Shard), name the display name. A blank
+    /// or whitespace-only name is stored as `None`, not `Some("")`, so the
+    /// optional field's absence is honest and consumers (the `history`
+    /// response, the CLI) fall back to the email instead of a blank name.
     pub fn contributor(email: &str, name: &str) -> Self {
+        let name = name.trim();
         Self {
             id: format!("{}:{email}", NodeKind::Contributor.id_prefix()),
             kind: NodeKind::Contributor,
-            name: Some(name.to_string()),
+            name: (!name.is_empty()).then(|| name.to_string()),
             path: None,
             committed_at: None,
         }
@@ -1194,4 +1198,31 @@ fn build_graph_sqlite(graph: &Graph) -> anyhow::Result<Vec<u8>> {
     }
     conn.close().map_err(|(_, e)| e)?;
     std::fs::read(&path).context("reading the built graph segment")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn contributor_blank_name_is_none_so_the_email_can_stand_in() {
+        // A real, non-blank name is kept (and surrounding whitespace trimmed).
+        assert_eq!(
+            Node::contributor("alice@example.com", "Alice")
+                .name
+                .as_deref(),
+            Some("Alice")
+        );
+        assert_eq!(
+            Node::contributor("bob@example.com", "  Bob  ")
+                .name
+                .as_deref(),
+            Some("Bob")
+        );
+        // A blank or whitespace-only name becomes None, not Some("") — so
+        // the `history` response omits it and the CLI falls back to email
+        // rather than printing a blank author.
+        assert_eq!(Node::contributor("x@example.com", "").name, None);
+        assert_eq!(Node::contributor("y@example.com", "   ").name, None);
+    }
 }

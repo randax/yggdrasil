@@ -330,45 +330,58 @@ fn extract_tree(mirror: &Path, commit: &str, dest: &Path) -> anyhow::Result<()> 
 /// out of a missing mirror into an enclosing checkout.
 pub async fn extract_history(git_dir: &Path, commit: &str) -> anyhow::Result<Graph> {
     let log = git_log_history(git_dir, commit).await?;
+    // Walk the log off the runtime threads: every other CPU-bound pass
+    // (syntactic_pass, extract_tree, the segment builds in write_shard)
+    // runs in spawn_blocking, and a large repo's history is non-trivial to
+    // parse — keep it off the async executor.
+    tokio::task::spawn_blocking(move || parse_history(&log))
+        .await
+        .context("history parse task panicked")?
+}
+
+/// Parse the NUL-framed `git log -z` output into a history graph. Split
+/// from [`extract_history`] so the CPU-bound walk can run in spawn_blocking.
+///
+/// The `-z` stream is NUL-separated tokens: each record is the five header
+/// fields (`%H %ct %an %ae %s`, each NUL-terminated) followed by the
+/// `--name-only` paths (NUL-terminated), then a NUL record separator (an
+/// empty token). Only the first path of a record carries git's leading
+/// `\n` separator between the format and the file list. Iterating the
+/// split directly avoids materializing one big Vec of token slices.
+fn parse_history(log: &str) -> anyhow::Result<Graph> {
     let mut graph = Graph::default();
     // Emit each contributor's node once; AUTHORED edges still attribute
     // every commit, deduping only the node by email.
     let mut seen_contributors: HashSet<String> = HashSet::new();
-    // The `-z` stream is NUL-separated tokens: each record is the five
-    // header fields (`%H %ct %an %ae %s`, each NUL-terminated) followed by
-    // the `--name-only` paths (NUL-terminated), then a NUL record
-    // separator (which surfaces as an empty token). Only the first path of
-    // a record carries git's leading `\n` separator between the format and
-    // the file list.
-    let tokens: Vec<&str> = log.split('\0').collect();
-    let mut i = 0;
-    while i < tokens.len() {
+    let mut tokens = log.split('\0');
+    while let Some(sha) = tokens.next() {
         // Skip record separators and the trailing empty token.
-        if tokens[i].is_empty() {
-            i += 1;
+        if sha.is_empty() {
             continue;
         }
-        // A record needs all five header fields; a short tail is truncation.
-        let Some(header) = tokens.get(i..i + 5) else {
+        // The rest of the five-field header; a short tail is truncation.
+        let (Some(ct), Some(name), Some(email), Some(subject)) =
+            (tokens.next(), tokens.next(), tokens.next(), tokens.next())
+        else {
             break;
         };
-        let [sha, ct, name, email, subject] =
-            [header[0], header[1], header[2], header[3], header[4]];
-        i += 5;
-        // Paths run until the record-separator (empty) token or the end.
+        // Paths run until the record-separator (empty) token or the end;
+        // the `for` consumes that separator so the next record starts clean.
         let mut paths: Vec<&str> = Vec::new();
         let mut first_path = true;
-        while i < tokens.len() && !tokens[i].is_empty() {
+        for token in tokens.by_ref() {
+            if token.is_empty() {
+                break;
+            }
             // git inserts a `\n` between the format and the file list; it
             // rides on the first path token only.
             let path = if first_path {
-                tokens[i].strip_prefix('\n').unwrap_or(tokens[i])
+                token.strip_prefix('\n').unwrap_or(token)
             } else {
-                tokens[i]
+                token
             };
             first_path = false;
             paths.push(path);
-            i += 1;
         }
         // Defense in depth: NUL framing already prevents forged records, but
         // a misframed record (a future git output change) would desync —
