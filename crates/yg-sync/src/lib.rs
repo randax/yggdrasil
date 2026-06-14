@@ -1,7 +1,9 @@
 //! Forge trait + GitHub/GitLab/Forgejo (Codeberg runs Forgejo) adapters, webhooks.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use base64::Engine;
@@ -16,6 +18,12 @@ const FETCH_LEASE: Duration = Duration::from_secs(15 * 60);
 pub struct SyncWorker {
     control: ControlPlane,
     fetcher: GitFetcher,
+    /// Per-forge rate budgets, keyed by forge id. Created on first poll
+    /// of a forge and kept for the worker's life; the poll loop spends a
+    /// token per conditional request and backs the forge off on a
+    /// rate-limit signal. In-process: one worker's view of its own
+    /// request rate (the per-repo interval smooths the fleet's).
+    poll_buckets: Mutex<HashMap<i64, TokenBucket>>,
 }
 
 impl SyncWorker {
@@ -23,6 +31,7 @@ impl SyncWorker {
         Self {
             control,
             fetcher: GitFetcher::new(git_cache),
+            poll_buckets: Mutex::new(HashMap::new()),
         }
     }
 
@@ -64,6 +73,249 @@ impl SyncWorker {
         }
         Ok(true)
     }
+}
+
+/// How the poll loop is paced: the default interval between a repo's
+/// default-branch head checks, and the jitter spread (a fraction of the
+/// interval) that keeps a forge's repos from polling in lockstep. A
+/// per-repo `poll_interval_seconds` override wins over the default; the
+/// jitter applies on top of either.
+#[derive(Debug, Clone, Copy)]
+pub struct PollConfig {
+    pub default_interval: Duration,
+    pub jitter_fraction: f64,
+}
+
+impl SyncWorker {
+    /// Claim one due repo and compare its default-branch head against the
+    /// synced position with a single cheap conditional request (`git
+    /// ls-remote`). A moved head enqueues a fetch — which re-syncs and
+    /// re-indexes the repo — while an unchanged head costs only that one
+    /// request, transferring no objects (RFC 0001 §3, issue #9). Returns
+    /// whether a repo was due.
+    ///
+    /// The conditional request is spent only within the forge's rate
+    /// budget: a claimed repo that would put the forge over budget (or
+    /// whose forge is cooling down from a rate-limit signal) is
+    /// rescheduled for when a request frees up, its head left unchecked
+    /// this cycle.
+    ///
+    /// Best-effort like the fetch loop: a failed conditional request is
+    /// logged and the repo polls again later, rather than returned as an
+    /// error — `Err` means the control plane itself is unreachable.
+    ///
+    /// Returns whether the loop should keep claiming immediately: `true`
+    /// when a head was actually checked, `false` when nothing was due or
+    /// the only outcome was deferring an over-budget / cooling-down forge.
+    /// Returning `false` on a pure defer is what stops the loop from
+    /// hot-spinning through claim+defer for every due repo when a forge is
+    /// over budget — the caller sleeps, and the bucket refills meanwhile.
+    pub async fn poll_once(&self, cfg: &PollConfig) -> anyhow::Result<bool> {
+        let Some(due) = self
+            .control
+            .claim_due_poll(cfg.default_interval, cfg.jitter_fraction)
+            .await?
+        else {
+            return Ok(false);
+        };
+        // Spend a rate-budget token; over budget, reschedule the repo for
+        // when one frees up and back off (no head check this cycle).
+        if let Err(retry) = self.take_poll_token(due.forge_id, due.rate_budget) {
+            self.control.defer_poll(due.repo_id, retry).await?;
+            return Ok(false);
+        }
+        let clone_url = join_clone_url(&due.base_url, &due.slug);
+        let token = forge_token(due.token_env.as_deref(), &clone_url);
+        match remote_head_commit(&clone_url, token.as_deref()).await {
+            Ok(Some(head)) if head != due.synced_commit => {
+                if self.control.request_fetch(due.repo_id).await? {
+                    tracing::info!(slug = %due.slug, %head, "head moved; fetch queued");
+                }
+            }
+            // Unchanged, or an unborn/hidden head: nothing to fetch.
+            Ok(_) => {}
+            Err(e) => {
+                let detail = format!("{e:#}");
+                if is_rate_limit_error(&detail) {
+                    // The forge is pushing back: cool the whole forge down,
+                    // retry this repo past the cooldown, and back off.
+                    let retry = self.cool_forge_down(due.forge_id, due.rate_budget);
+                    self.control.defer_poll(due.repo_id, retry).await?;
+                    tracing::warn!(slug = %due.slug, "forge rate-limited the poll; backing the forge off");
+                    return Ok(false);
+                }
+                tracing::warn!(slug = %due.slug, error = detail, "poll failed; will retry next interval");
+            }
+        }
+        Ok(true)
+    }
+
+    /// Spend one of this forge's rate-budget tokens. `Err(retry_after)`
+    /// when none is available — the forge is over budget or cooling down
+    /// — so the caller can reschedule the repo for `retry_after` out.
+    fn take_poll_token(&self, forge_id: i64, rate_budget: i32) -> Result<(), Duration> {
+        let now = Instant::now();
+        let mut buckets = self.poll_buckets.lock().expect("poll bucket map poisoned");
+        let bucket = buckets
+            .entry(forge_id)
+            .or_insert_with(|| TokenBucket::per_minute(rate_budget, now));
+        if bucket.try_take(now) {
+            Ok(())
+        } else {
+            Err(bucket.retry_after(now))
+        }
+    }
+
+    /// Cool a forge down after it signalled a rate limit, returning when
+    /// its next poll should be attempted (past the cooldown).
+    fn cool_forge_down(&self, forge_id: i64, rate_budget: i32) -> Duration {
+        let now = Instant::now();
+        let mut buckets = self.poll_buckets.lock().expect("poll bucket map poisoned");
+        let bucket = buckets
+            .entry(forge_id)
+            .or_insert_with(|| TokenBucket::per_minute(rate_budget, now));
+        bucket.cooldown(now + RATE_LIMIT_COOLDOWN);
+        bucket.retry_after(now)
+    }
+}
+
+/// The commit a remote's default branch (HEAD) points at, read with a
+/// single `git ls-remote` — the cheap conditional request the poll loop
+/// spends to detect a moved head without transferring objects. `None`
+/// when the remote advertises no HEAD commit (an empty repo, an unborn
+/// default branch).
+pub async fn remote_head_commit(
+    clone_url: &str,
+    token: Option<&str>,
+) -> anyhow::Result<Option<String>> {
+    let out = run_git(None, &["ls-remote", clone_url, "HEAD"], token)
+        .await
+        .with_context(|| format!("polling {clone_url} for its head"))?;
+    // ls-remote (no --symref) prints one line, `<sha>\tHEAD`; take the sha.
+    let head = out.lines().find_map(|line| {
+        let (oid, name) = line.split_once('\t')?;
+        (name == "HEAD" && oid.len() >= 40 && oid.bytes().all(|b| b.is_ascii_hexdigit()))
+            .then(|| oid.to_string())
+    });
+    Ok(head)
+}
+
+/// How long a forge stays cooled down after it signals a rate limit or
+/// abuse detection: no poll spends a request against it until this
+/// passes (the bucket withholds tokens), and the repo that tripped it is
+/// rescheduled past the cooldown. Generous — a forge that is pushing
+/// back wants real breathing room, and poll is best-effort.
+const RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(5 * 60);
+
+/// A per-forge token bucket bounding how often the poll loop spends a
+/// conditional request against one forge (RFC 0001 §2–3 rate budget).
+/// Tokens refill continuously at the forge's configured rate and a poll
+/// takes one; a rate-limit or abuse signal drops the forge into a
+/// cooldown that withholds tokens until it passes. Driven by an explicit
+/// monotonic clock so the schedule is testable without real time.
+struct TokenBucket {
+    /// Maximum tokens held — one minute's budget, the opening burst.
+    capacity: f64,
+    /// Tokens regained per second (the per-minute budget over 60).
+    refill_per_sec: f64,
+    /// Tokens available as of `last`.
+    tokens: f64,
+    /// When `tokens` was last reconciled against the clock.
+    last: Instant,
+    /// While set and still in the future, no token is granted however
+    /// full the bucket — the forge asked us to back off.
+    cooldown_until: Option<Instant>,
+}
+
+impl TokenBucket {
+    /// A bucket for `rate_per_minute` conditional requests a minute,
+    /// starting full so a freshly seen forge polls immediately.
+    fn per_minute(rate_per_minute: i32, now: Instant) -> Self {
+        let capacity = rate_per_minute.max(1) as f64;
+        Self {
+            capacity,
+            refill_per_sec: capacity / 60.0,
+            tokens: capacity,
+            last: now,
+            cooldown_until: None,
+        }
+    }
+
+    /// Reconcile `tokens` with the clock: add what has refilled since
+    /// `last`, capped at capacity.
+    fn refill(&mut self, now: Instant) {
+        let elapsed = now.saturating_duration_since(self.last).as_secs_f64();
+        self.tokens = (self.tokens + elapsed * self.refill_per_sec).min(self.capacity);
+        self.last = now;
+    }
+
+    /// Spend one token if one is available and the forge is not cooling
+    /// down. Returns whether the poll may proceed.
+    fn try_take(&mut self, now: Instant) -> bool {
+        self.refill(now);
+        if self.cooling_down(now) {
+            return false;
+        }
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Back the forge off until at least `until` (extending, never
+    /// shortening, an existing cooldown).
+    fn cooldown(&mut self, until: Instant) {
+        self.cooldown_until = Some(match self.cooldown_until {
+            Some(existing) if existing > until => existing,
+            _ => until,
+        });
+    }
+
+    fn cooling_down(&self, now: Instant) -> bool {
+        self.cooldown_until.is_some_and(|until| now < until)
+    }
+
+    /// How long until this bucket would next grant a token: the longer of
+    /// the remaining cooldown and the time to refill one token. The repo
+    /// that was denied is rescheduled by this, so it retries no sooner.
+    fn retry_after(&self, now: Instant) -> Duration {
+        let refill_wait = if self.tokens >= 1.0 {
+            0.0
+        } else {
+            (1.0 - self.tokens) / self.refill_per_sec
+        };
+        let cooldown_wait = self
+            .cooldown_until
+            .map(|until| until.saturating_duration_since(now).as_secs_f64())
+            .unwrap_or(0.0);
+        Duration::from_secs_f64(refill_wait.max(cooldown_wait))
+    }
+}
+
+/// Whether a git failure is the forge pushing back on request volume — a
+/// 429, a secondary-rate-limit notice, or an abuse-detection trip —
+/// rather than an ordinary error (missing repo, auth, DNS). Matched on
+/// the message because git surfaces the forge's HTTP status as prose;
+/// judged case-insensitively across the phrasings forges use.
+///
+/// The needles are deliberately multi-word or punctuated phrases, never
+/// bare `429`/`abuse`: the message this is fed includes the clone URL
+/// (the `polling {clone_url} …` context plus git's own output), so a repo
+/// slug like `acme/abuse-tracker` or `org/sloc-429` must not be mistaken
+/// for the forge rate-limiting us — that would cool the whole forge down.
+/// URL path segments can't contain spaces, so spaced phrases are safe.
+fn is_rate_limit_error(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    [
+        "too many requests",
+        "rate limit",
+        "abuse detection",
+        "error: 429",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
 }
 
 /// Resolve the Forge token for a clone: read the env var the control
@@ -747,6 +999,93 @@ mod tests {
 
     fn parsed(url: &str) -> RepoLocator {
         RepoLocator::parse(url).expect(url)
+    }
+
+    #[test]
+    fn token_bucket_grants_a_full_burst_then_refills_over_time() {
+        let t0 = Instant::now();
+        // 60 requests/min: a 60-token burst, refilling one token per second.
+        let mut bucket = TokenBucket::per_minute(60, t0);
+        for i in 0..60 {
+            assert!(bucket.try_take(t0), "take {i} is within the opening burst");
+        }
+        assert!(
+            !bucket.try_take(t0),
+            "the bucket is empty once the burst is spent"
+        );
+
+        // A second later, exactly one token has refilled.
+        let t1 = t0 + Duration::from_secs(1);
+        assert!(bucket.try_take(t1), "one token refills after a second");
+        assert!(!bucket.try_take(t1), "but only one");
+    }
+
+    #[test]
+    fn token_bucket_never_exceeds_its_capacity() {
+        let t0 = Instant::now();
+        let mut bucket = TokenBucket::per_minute(60, t0);
+        // Idle for an hour: refill is capped at capacity, not unbounded.
+        let later = t0 + Duration::from_secs(3600);
+        for i in 0..60 {
+            assert!(bucket.try_take(later), "take {i} from a capped-full bucket");
+        }
+        assert!(
+            !bucket.try_take(later),
+            "a long idle must not bank more than one burst's worth of tokens"
+        );
+    }
+
+    #[test]
+    fn token_bucket_withholds_tokens_during_a_cooldown() {
+        let t0 = Instant::now();
+        let mut bucket = TokenBucket::per_minute(60, t0);
+        assert!(bucket.try_take(t0), "a fresh bucket grants");
+
+        // A rate-limit/abuse signal cools the whole forge down for 30s —
+        // no token is granted meanwhile, however full the bucket.
+        bucket.cooldown(t0 + Duration::from_secs(30));
+        assert!(
+            !bucket.try_take(t0 + Duration::from_secs(10)),
+            "no token is granted mid-cooldown"
+        );
+        assert!(
+            bucket.retry_after(t0 + Duration::from_secs(10)) >= Duration::from_secs(19),
+            "retry_after reflects the remaining cooldown"
+        );
+        assert!(
+            bucket.try_take(t0 + Duration::from_secs(31)),
+            "tokens flow again once the cooldown passes"
+        );
+    }
+
+    #[test]
+    fn rate_limit_errors_are_recognized_across_a_forges_phrasings() {
+        for message in [
+            "fatal: unable to access: The requested URL returned error: 429",
+            "You have exceeded a secondary rate limit",
+            "remote: Too Many Requests",
+            "error: RPC failed; abuse detection mechanism triggered",
+        ] {
+            assert!(is_rate_limit_error(message), "must flag: {message:?}");
+        }
+        for message in [
+            "fatal: repository not found",
+            "fatal: could not read Username",
+            "error: unable to resolve host",
+            // The message includes the clone URL (the `polling {url}`
+            // context + git's output), so an ordinary failure on a repo
+            // whose slug merely contains "abuse" or "429" must NOT be
+            // mistaken for the forge rate-limiting us.
+            "polling https://github.com/acme/abuse-tracker for its head: \
+             fatal: unable to access: The requested URL returned error: 404",
+            "polling https://github.com/org/sloc-429-counter for its head: \
+             fatal: repository not found",
+        ] {
+            assert!(
+                !is_rate_limit_error(message),
+                "must not flag an ordinary failure: {message:?}"
+            );
+        }
     }
 
     #[test]

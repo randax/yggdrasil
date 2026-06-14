@@ -29,6 +29,8 @@ pub struct AddRepo<'a> {
     pub slug: &'a str,
     /// Shallow-clone override; `None` fetches full history (the default).
     pub fetch_depth: Option<i32>,
+    /// Per-repo poll interval in seconds; `None` uses the server default.
+    pub poll_interval_seconds: Option<i32>,
 }
 
 pub struct AddRepoOutcome {
@@ -152,6 +154,41 @@ pub struct IndexedRepo {
     pub revision: String,
 }
 
+/// A repo the poll loop has claimed for a default-branch head check
+/// (RFC 0001 §3): everything needed to make the cheap conditional request
+/// and, on a moved head, enqueue a fetch. Claiming advances the repo's
+/// `next_poll_at` by one jittered interval, so two Sync workers never
+/// poll the same repo in one cycle.
+#[derive(Debug, sqlx::FromRow)]
+pub struct DuePoll {
+    pub repo_id: i64,
+    pub slug: String,
+    /// The forge row, keying the per-forge rate budget.
+    pub forge_id: i64,
+    /// Forge root; the clone URL is `{base_url}/{slug}`.
+    pub base_url: String,
+    /// Env var holding the Forge token, if the forge has one.
+    pub token_env: Option<String>,
+    /// Shallow-clone override; `None` = full history.
+    pub fetch_depth: Option<i32>,
+    /// The repo's sync position — the commit a moved head is compared
+    /// against. Never NULL: the claim gates on it.
+    pub synced_commit: String,
+    /// Conditional requests per minute allowed against this forge.
+    pub rate_budget: i32,
+}
+
+/// A superseded Shard the GC sweep may reclaim: no repo points at it and
+/// its grace window has elapsed. Carries what object storage needs to
+/// delete the Shard's segments — its repo and revision name the
+/// `shards/<repo>/<revision>/` prefix — plus the row id to drop.
+#[derive(Debug, sqlx::FromRow)]
+pub struct SupersededShard {
+    pub shard_id: i64,
+    pub repo_id: i64,
+    pub revision: String,
+}
+
 /// One repo's row in `yg admin status`.
 #[derive(sqlx::FromRow)]
 pub struct RepoSyncStatus {
@@ -220,14 +257,18 @@ impl ControlPlane {
         // it means the same qualifier arrived via a different forge row.
         let qualifier = repo_qualifier(repo.base_url, repo.slug);
         let inserted: Result<(i64, bool), sqlx::Error> = sqlx::query_as(
-            "INSERT INTO repos (forge_id, slug, fetch_depth, qualifier) VALUES ($1, $2, $3, $4)
-             ON CONFLICT (forge_id, slug) DO UPDATE SET fetch_depth = excluded.fetch_depth
+            "INSERT INTO repos (forge_id, slug, fetch_depth, qualifier, poll_interval_seconds)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (forge_id, slug) DO UPDATE
+             SET fetch_depth = excluded.fetch_depth,
+                 poll_interval_seconds = excluded.poll_interval_seconds
              RETURNING id, (xmax = 0)",
         )
         .bind(forge_id)
         .bind(repo.slug)
         .bind(repo.fetch_depth)
         .bind(&qualifier)
+        .bind(repo.poll_interval_seconds)
         .fetch_one(&mut *tx)
         .await;
         let (repo_id, created) = match inserted {
@@ -349,6 +390,74 @@ impl ControlPlane {
             .await
     }
 
+    /// Claim the most-overdue repo for a poll, advancing its `next_poll_at`
+    /// by one jittered interval — in `[interval, interval·(1 + jitter)]`,
+    /// the spread keeping a forge's repos off lockstep. `FOR UPDATE SKIP
+    /// LOCKED` lets parallel Sync workers each claim a different repo;
+    /// advancing the schedule at claim time is the claim, so a crashed
+    /// poll just costs one skipped cycle. Only synced repos are eligible
+    /// — a repo's first fetch is queued at registration, so there is
+    /// nothing to compare a head against before it lands. The per-repo
+    /// `poll_interval_seconds` overrides the default. Returns `None` when
+    /// nothing is due.
+    pub async fn claim_due_poll(
+        &self,
+        default_interval: std::time::Duration,
+        jitter_fraction: f64,
+    ) -> anyhow::Result<Option<DuePoll>> {
+        let row = sqlx::query_as(
+            "WITH due AS (
+                 SELECT r.id FROM repos r
+                 WHERE r.last_synced_commit IS NOT NULL AND r.next_poll_at <= now()
+                 ORDER BY r.next_poll_at
+                 FOR UPDATE SKIP LOCKED
+                 LIMIT 1
+             )
+             UPDATE repos r
+             SET next_poll_at = now()
+                 + make_interval(secs => coalesce(r.poll_interval_seconds, $1)
+                                         * (1 + $2 * random()))
+             FROM due, forges f
+             WHERE r.id = due.id AND f.id = r.forge_id
+             RETURNING r.id AS repo_id, r.slug, f.id AS forge_id,
+                       f.base_url, f.token_env, r.fetch_depth,
+                       r.last_synced_commit AS synced_commit, f.rate_budget",
+        )
+        .bind(default_interval.as_secs_f64())
+        .bind(jitter_fraction)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    /// Reschedule a repo's next poll `delay` from now, overriding the
+    /// interval the claim set. The poll loop calls this when it must skip
+    /// a due repo it has already claimed — the forge is over its rate
+    /// budget or cooling down — so the repo retries when a request is
+    /// available again rather than waiting a full interval.
+    pub async fn defer_poll(&self, repo_id: i64, delay: std::time::Duration) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE repos SET next_poll_at = now() + make_interval(secs => $2) WHERE id = $1",
+        )
+        .bind(repo_id)
+        .bind(delay.as_secs_f64())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Enqueue a fetch for a repo whose default branch the poll loop saw
+    /// move, unless one of its fetches is already in flight (a queued or
+    /// leased fetch already covers the change). The fetch then re-syncs
+    /// the repo and the existing pipeline re-indexes it. Returns whether
+    /// a new job was queued.
+    pub async fn request_fetch(&self, repo_id: i64) -> anyhow::Result<bool> {
+        let mut tx = self.pool.begin().await?;
+        let queued = enqueue_job_unless_in_flight(&mut tx, "fetch", repo_id).await?;
+        tx.commit().await?;
+        Ok(queued)
+    }
+
     /// Claim the next due index job under a lease, same protocol as
     /// [`Self::claim_due_fetch`]. Only repos with a synced commit are
     /// claimable — there is nothing to index before the first fetch lands.
@@ -389,11 +498,12 @@ impl ControlPlane {
         // Lock the repo row before reading its sync position so a
         // concurrent complete_fetch can't advance it between this check
         // and commit (its own repos UPDATE serializes behind this lock).
-        let (current_commit,): (Option<String>,) =
-            sqlx::query_as("SELECT last_synced_commit FROM repos WHERE id = $1 FOR UPDATE")
-                .bind(job.repo_id)
-                .fetch_one(&mut *tx)
-                .await?;
+        let (current_commit, old_shard_id): (Option<String>, Option<i64>) = sqlx::query_as(
+            "SELECT last_synced_commit, current_shard_id FROM repos WHERE id = $1 FOR UPDATE",
+        )
+        .bind(job.repo_id)
+        .fetch_one(&mut *tx)
+        .await?;
         let up_to_date = current_commit.as_deref() == Some(job.commit.as_str());
         if !settle_leased_job(&mut tx, job.job_id, &job.lease_token, up_to_date).await? {
             return Ok(false);
@@ -403,12 +513,18 @@ impl ControlPlane {
         // that's already recorded: reuse the row instead of failing.
         // DO UPDATE (with values identical by construction) rather than
         // DO NOTHING so RETURNING yields the id on conflict too.
+        // `published_at` is refreshed too: republishing a revision (a
+        // force-push back to its commit, churn) re-publishes the Shard, so
+        // its GC grace window must restart from now — otherwise a revision
+        // resurrected long after its first publish, but left non-current,
+        // would carry a stale publish time and be eligible for GC with no
+        // grace (its anchor is `published_at` until it is superseded).
         let (shard_id,): (i64,) = sqlx::query_as(
             "INSERT INTO shards (repo_id, revision, manifest_key, commit_sha,
                                  provenance_level, node_count, edge_count)
              VALUES ($1, $2, $3, $4, $5, $6, $7)
              ON CONFLICT (repo_id, revision) DO UPDATE
-             SET manifest_key = excluded.manifest_key
+             SET manifest_key = excluded.manifest_key, published_at = now()
              RETURNING id",
         )
         .bind(job.repo_id)
@@ -432,19 +548,38 @@ impl ControlPlane {
         // shards in either direction. Accepted for now under the same
         // pre-production stance as migration 0005; ordering would need
         // the shards row to carry its schema version.
-        sqlx::query(
+        let swapped: Option<(i64,)> = sqlx::query_as(
             "UPDATE repos SET current_shard_id = $1
              WHERE id = $2
                AND ($3 OR current_shard_id IS NULL OR NOT EXISTS (
                        SELECT 1 FROM shards s
                        WHERE s.id = repos.current_shard_id
-                         AND s.commit_sha = repos.last_synced_commit))",
+                         AND s.commit_sha = repos.last_synced_commit))
+             RETURNING current_shard_id",
         )
         .bind(shard_id)
         .bind(job.repo_id)
         .bind(up_to_date)
-        .execute(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await?;
+        // The pointer moved: the Shard it left is now superseded — stamp
+        // when, so GC's grace window runs from supersession, not
+        // publication. The Shard it landed on is current, so clear any
+        // stamp it carried (a revision re-published after being
+        // superseded becomes current again). No move (an exactly-current
+        // pointer held its ground) supersedes nothing.
+        if swapped.is_some() {
+            sqlx::query("UPDATE shards SET superseded_at = NULL WHERE id = $1")
+                .bind(shard_id)
+                .execute(&mut *tx)
+                .await?;
+            if let Some(old) = old_shard_id.filter(|old| *old != shard_id) {
+                sqlx::query("UPDATE shards SET superseded_at = now() WHERE id = $1")
+                    .bind(old)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+        }
         tx.commit().await?;
         Ok(true)
     }
@@ -478,6 +613,51 @@ impl ControlPlane {
         }
         tx.commit().await?;
         Ok(queued)
+    }
+
+    /// Every Shard the GC sweep may reclaim: one no repo points at,
+    /// superseded (or, for a result that never became current, published)
+    /// longer ago than `grace`. The grace window runs from supersession,
+    /// not publication, so a query that resolved the old pointer just
+    /// before a swap keeps its Shard while it reads. Ordered by id for a
+    /// stable, resumable sweep.
+    pub async fn superseded_shards_past_grace(
+        &self,
+        grace: std::time::Duration,
+    ) -> anyhow::Result<Vec<SupersededShard>> {
+        let rows = sqlx::query_as(
+            "SELECT s.id AS shard_id, s.repo_id, s.revision FROM shards s
+             WHERE NOT EXISTS (SELECT 1 FROM repos r WHERE r.current_shard_id = s.id)
+               AND coalesce(s.superseded_at, s.published_at) < now() - make_interval(secs => $1)
+             ORDER BY s.id",
+        )
+        .bind(grace.as_secs_f64())
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Claim a superseded Shard's row for reclamation — delete it, but
+    /// only while no repo points at it. Revisions are deterministic per
+    /// `(commit, pass, schema)`, so a force-push back to a Shard's commit
+    /// can republish that exact revision and re-point a repo at this very
+    /// row between the GC sweep's eligibility scan and this delete; the
+    /// `NOT EXISTS` guard makes that case a no-op instead of a foreign-key
+    /// error (which would wedge the sweep, retrying forever). Returns
+    /// whether the row was deleted — `false` means it became current
+    /// again and its object-storage segments must be left alone.
+    pub async fn delete_superseded_shard(&self, shard_id: i64) -> anyhow::Result<bool> {
+        let deleted = sqlx::query(
+            "DELETE FROM shards s
+             WHERE s.id = $1
+               AND NOT EXISTS (SELECT 1 FROM repos r WHERE r.current_shard_id = s.id)",
+        )
+        .bind(shard_id)
+        .execute(&self.pool)
+        .await?
+        .rows_affected()
+            == 1;
+        Ok(deleted)
     }
 
     /// Record a failed index run: back the job off and keep the error

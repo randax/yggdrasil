@@ -129,6 +129,10 @@ enum RepoCommand {
         /// (default: full history)
         #[arg(long, value_parser = clap::value_parser!(i32).range(1..))]
         depth: Option<i32>,
+        /// Poll this repo for changes every N seconds (default: the
+        /// server's poll interval)
+        #[arg(long, value_parser = clap::value_parser!(i32).range(1..))]
+        poll_interval: Option<i32>,
     },
 }
 
@@ -164,8 +168,13 @@ async fn main() -> anyhow::Result<()> {
         } => history(id, since, limit, cursor, json).await,
         Command::Admin { command } => match command {
             AdminCommand::Repo {
-                command: RepoCommand::Add { url, depth },
-            } => admin_repo_add(url, depth).await,
+                command:
+                    RepoCommand::Add {
+                        url,
+                        depth,
+                        poll_interval,
+                    },
+            } => admin_repo_add(url, depth, poll_interval).await,
             AdminCommand::Status { json } => admin_status(json).await,
         },
     }
@@ -459,11 +468,15 @@ async fn history(
     Ok(())
 }
 
-async fn admin_repo_add(url: String, depth: Option<i32>) -> anyhow::Result<()> {
+async fn admin_repo_add(
+    url: String,
+    depth: Option<i32>,
+    poll_interval: Option<i32>,
+) -> anyhow::Result<()> {
     let body = server_json(
         reqwest::Method::POST,
         "/v1/admin/repos",
-        Some(serde_json::json!({"url": url, "depth": depth})),
+        Some(serde_json::json!({"url": url, "depth": depth, "poll_interval": poll_interval})),
     )
     .await?;
     let slug = body["slug"].as_str().unwrap_or("?");
@@ -604,14 +617,27 @@ async fn run_workers(
             "could not queue re-index of outdated Shards"
         );
     }
+    // Continuous Sync (RFC 0001 §3, issue #9): the poll loop watches
+    // indexed repos for pushed changes and the GC loop reclaims
+    // superseded Shards after their grace window, both beside the queue
+    // drains. Each loop on its own task so a slow job of one kind never
+    // stalls another; an error from any of them ends the process.
+    let poll = poll_config_from_env();
+    let gc_grace = env_duration_secs("YG_GC_GRACE", DEFAULT_GC_GRACE_SECS);
+    let gc_interval = env_duration_secs("YG_GC_INTERVAL", DEFAULT_GC_INTERVAL_SECS);
     tokio::try_join!(
         drain_queue(|| sync.run_once()),
         drain_queue(|| index.run_once()),
+        drain_queue(|| sync.poll_once(&poll)),
+        gc_loop(&index, gc_grace, gc_interval),
     )?;
     Ok(())
 }
 
 /// Run one queue's claim loop forever, sleeping briefly when it's empty.
+/// Drives the poll loop too: `poll_once` returns `true` while repos are
+/// due (claiming one per call) and `false` when none is, so the same
+/// work-or-sleep shape applies.
 async fn drain_queue<F, Fut>(run_once: F) -> anyhow::Result<()>
 where
     F: Fn() -> Fut,
@@ -621,6 +647,71 @@ where
         if !run_once().await? {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         }
+    }
+}
+
+/// Default poll interval per repo when `YG_POLL_INTERVAL` is unset.
+const DEFAULT_POLL_INTERVAL_SECS: u64 = 5 * 60;
+/// Default grace window before a superseded Shard is reclaimed
+/// (`YG_GC_GRACE`).
+const DEFAULT_GC_GRACE_SECS: u64 = 60 * 60;
+/// Default cadence of the GC sweep (`YG_GC_INTERVAL`).
+const DEFAULT_GC_INTERVAL_SECS: u64 = 10 * 60;
+/// Fraction of the interval added as random jitter so a forge's repos
+/// don't poll in lockstep.
+const POLL_JITTER_FRACTION: f64 = 0.2;
+/// Ceiling on an env-configured duration. A poll/GC cadence is fed to
+/// Postgres `make_interval`, which errors (out of range) on absurd
+/// values — and that error propagates out of the poll loop and kills the
+/// worker. Clamp to ten years: far beyond any sane cadence, far inside
+/// `make_interval`'s range, so a typo degrades to "very slow" not "crash".
+const MAX_DURATION_SECS: u64 = 10 * 365 * 24 * 3600;
+
+fn poll_config_from_env() -> yg_sync::PollConfig {
+    yg_sync::PollConfig {
+        default_interval: env_duration_secs("YG_POLL_INTERVAL", DEFAULT_POLL_INTERVAL_SECS),
+        jitter_fraction: POLL_JITTER_FRACTION,
+    }
+}
+
+/// A positive-integer-seconds duration from `var`, falling back to
+/// `default_secs` when the variable is unset or not a positive integer.
+fn env_duration_secs(var: &str, default_secs: u64) -> std::time::Duration {
+    let secs = match std::env::var(var) {
+        Ok(value) => match value.trim().parse::<u64>() {
+            Ok(secs) if secs >= 1 => secs.min(MAX_DURATION_SECS),
+            _ => {
+                tracing::warn!(
+                    var,
+                    value,
+                    "ignoring {var} (want a positive integer of seconds); using the default"
+                );
+                default_secs
+            }
+        },
+        Err(_) => default_secs,
+    };
+    std::time::Duration::from_secs(secs)
+}
+
+/// Reclaim superseded Shards on a fixed cadence. Unlike a queue drain
+/// there is no per-item "work or not": the sweep runs every `interval`,
+/// reclaiming whatever has aged past `grace`. A sweep that fails (a
+/// control-plane or object-storage blip) is logged and retried next
+/// interval rather than ending the process — GC is best-effort.
+async fn gc_loop(
+    index: &yg_index::IndexWorker,
+    grace: std::time::Duration,
+    interval: std::time::Duration,
+) -> anyhow::Result<()> {
+    loop {
+        if let Err(e) = index.gc_once(grace).await {
+            tracing::warn!(
+                error = format!("{e:#}"),
+                "shard GC sweep failed; retrying next interval"
+            );
+        }
+        tokio::time::sleep(interval).await;
     }
 }
 

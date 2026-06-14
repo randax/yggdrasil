@@ -72,6 +72,58 @@ impl IndexWorker {
         Ok(queued)
     }
 
+    /// Reclaim object storage from superseded Shards (issue #9): for every
+    /// Shard no repo points at that has been superseded longer than
+    /// `grace`, drop its control-plane row and delete its object-storage
+    /// segments. A Shard that became current again between the scan and
+    /// the delete is skipped; one that fails to delete is logged and left
+    /// for the next sweep rather than blocking the rest. Returns how many
+    /// Shards were collected.
+    pub async fn gc_once(&self, grace: Duration) -> anyhow::Result<u64> {
+        let stale = self.control.superseded_shards_past_grace(grace).await?;
+        let mut collected = 0;
+        for shard in &stale {
+            match self.collect_shard(shard).await {
+                Ok(true) => collected += 1,
+                // Became current again between the scan and now — left be.
+                Ok(false) => {}
+                Err(e) => tracing::warn!(
+                    repo_id = shard.repo_id,
+                    revision = %shard.revision,
+                    error = format!("{e:#}"),
+                    "could not garbage-collect a superseded Shard; leaving it for the next sweep"
+                ),
+            }
+        }
+        if collected > 0 {
+            tracing::info!(shards = collected, "garbage-collected superseded Shards");
+        }
+        Ok(collected)
+    }
+
+    /// Reclaim one superseded Shard. The row goes first, under a guard
+    /// that deletes it only while no repo points at it: revisions are
+    /// deterministic, so a force-push back to this Shard's commit can
+    /// republish its exact revision — reusing this very row — and make it
+    /// current again between the sweep's scan and now. Deleting the row
+    /// first proves the Shard is not current at delete time; a re-index
+    /// would have to fully complete (fetch, checkout, parse, swap) within
+    /// the few milliseconds before the object delete to resurrect it,
+    /// which it cannot. So the live current Shard's segments are never
+    /// deleted. The cost is that a crash between the two orphans the
+    /// segments — a bounded, rare storage leak, traded for never deleting
+    /// a current Shard's data. Returns whether the Shard was collected
+    /// (`false` = it became current again and was skipped).
+    async fn collect_shard(&self, shard: &yg_control::SupersededShard) -> anyhow::Result<bool> {
+        if !self.control.delete_superseded_shard(shard.shard_id).await? {
+            return Ok(false);
+        }
+        yg_shard::delete_shard(self.store.as_ref(), shard.repo_id, &shard.revision)
+            .await
+            .context("deleting the Shard's object-storage segments")?;
+        Ok(true)
+    }
+
     /// Claim and run one due index job. Returns whether there was work.
     /// A failed run is recorded (with backoff) rather than returned as an
     /// error — `Err` means the control plane itself is unreachable.

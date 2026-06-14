@@ -237,6 +237,7 @@ async fn re_adding_heals_a_forge_row_missing_its_token_env() {
             token_env: Some("YG_GITHUB_TOKEN"),
             slug: "acme/widgets",
             fetch_depth: None,
+            poll_interval_seconds: None,
         })
     };
     add().await.unwrap();
@@ -312,6 +313,7 @@ async fn a_fetch_job_outlives_its_crashed_worker_via_lease_expiry() {
             token_env: Some("YG_GITHUB_TOKEN"),
             slug: "acme/widgets",
             fetch_depth: None,
+            poll_interval_seconds: None,
         })
         .await
         .unwrap();
@@ -354,6 +356,7 @@ async fn a_worker_that_outlived_its_lease_cannot_clobber_the_new_claim() {
             token_env: Some("YG_GITHUB_TOKEN"),
             slug: "acme/widgets",
             fetch_depth: None,
+            poll_interval_seconds: None,
         })
         .await
         .unwrap();
@@ -737,6 +740,7 @@ async fn yg_serve_role_worker_drains_the_queue_without_serving_http() {
             token_env: None,
             slug: &format!("acme/{slug}"),
             fetch_depth: None,
+            poll_interval_seconds: None,
         })
         .await
         .unwrap();

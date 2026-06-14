@@ -49,6 +49,9 @@ which is required:
 | `YG_S3_REGION` | `us-east-1` | Object storage region |
 | `YG_GIT_CACHE` | `./data/git` | Worker-local cache of bare clones |
 | `YG_GITHUB_TOKEN` | — (optional) | Forge token for `github.com` Sync |
+| `YG_POLL_INTERVAL` | `300` | Seconds between a repo's default-branch head checks (per-repo override: `repo add --poll-interval`) |
+| `YG_GC_GRACE` | `3600` | Seconds a superseded Shard is kept before it is garbage-collected |
+| `YG_GC_INTERVAL` | `600` | Seconds between Shard garbage-collection sweeps |
 
 `yg serve --role=api|worker|all` picks what the process runs: `api` serves
 HTTP only, `worker` drains the Sync and indexing queues only (it needs the
