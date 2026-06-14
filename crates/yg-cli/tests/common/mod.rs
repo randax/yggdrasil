@@ -228,6 +228,68 @@ pub fn git(dir: &std::path::Path, args: &[&str]) -> String {
     String::from_utf8(out.stdout).unwrap().trim().to_string()
 }
 
+/// Like [`git`], but with extra environment — the author/committer
+/// identity and dates a history fixture needs so its commits have
+/// deterministic, machine-independent timestamps.
+pub fn git_env(dir: &std::path::Path, envs: &[(&str, &str)], args: &[&str]) -> String {
+    let mut cmd = std::process::Command::new("git");
+    cmd.arg("-C").arg(dir).args(args);
+    for (key, value) in envs {
+        cmd.env(key, value);
+    }
+    let out = cmd
+        .output()
+        .expect("git must be installed to run the history tests");
+    assert!(
+        out.status.success(),
+        "git {args:?} failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
+}
+
+/// One commit in a history fixture: who wrote it, when (unix seconds), its
+/// message, and the files it writes.
+pub struct FixtureCommit<'a> {
+    pub author: &'a str,
+    pub email: &'a str,
+    pub when: i64,
+    pub message: &'a str,
+    pub files: &'a [(&'a str, &'a str)],
+}
+
+/// A fixture repo with an explicit commit history, applied in order (so
+/// the last entry is newest). Each commit's author and timestamp are
+/// fixed, giving history tests a deterministic newest-first order and
+/// stable authorship. Returns (fixture root guard, repo dir, URL).
+pub fn history_fixture(
+    commits: &[FixtureCommit<'_>],
+) -> (tempfile::TempDir, std::path::PathBuf, String) {
+    let (root, repo, url) = empty_fixture_repo();
+    for commit in commits {
+        for (path, contents) in commit.files {
+            let full = repo.join(path);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(full, contents).unwrap();
+        }
+        git(&repo, &["add", "."]);
+        let date = format!("{} +0000", commit.when);
+        git_env(
+            &repo,
+            &[
+                ("GIT_AUTHOR_NAME", commit.author),
+                ("GIT_AUTHOR_EMAIL", commit.email),
+                ("GIT_AUTHOR_DATE", &date),
+                ("GIT_COMMITTER_NAME", commit.author),
+                ("GIT_COMMITTER_EMAIL", commit.email),
+                ("GIT_COMMITTER_DATE", &date),
+            ],
+            &["commit", "-m", commit.message],
+        );
+    }
+    (root, repo, url)
+}
+
 /// A Go repo fixture standing in for a Forge-hosted one: two functions in
 /// main.go plus a README, giving the graph File and Symbol nodes joined
 /// by DEFINES edges.

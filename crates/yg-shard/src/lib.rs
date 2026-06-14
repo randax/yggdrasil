@@ -36,12 +36,16 @@ pub use fts::{
 /// (RFC 0001 §5: "locations where applicable").
 /// v4: a Shard carries a full-text segment ([`FTS_SEGMENT_FILE`]) beside
 /// the graph — the tantivy index the lexical `search` Verb reads.
+/// v5: the git-history layer — Commit and Contributor node kinds, TOUCHES
+/// (Commit→File) and AUTHORED (Contributor→Commit) edges, and a nullable
+/// `committed_at` on nodes (set on Commits, for the `history` Verb's
+/// newest-first ordering and `since` filter).
 ///
 /// Bumping this changes every revision id (see
 /// [`syntactic_revision_suffix`]): readers refuse artifacts from other
 /// schema versions ([`SchemaOutdated`]), and worker boot queues a
 /// re-index for every repo still pointing at an outdated revision.
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// Name of the M0 indexing pass, as recorded in revision ids, manifests,
 /// and the control plane's `provenance_level`. The precise pass (M1)
@@ -81,6 +85,14 @@ pub enum NodeKind {
     /// target IMPORTS edges point at whether or not the package's source
     /// is in this repo.
     Package,
+    /// A commit on the default branch (RFC 0001 §5), keyed by its sha;
+    /// carries the commit subject and committer date. TOUCHES edges fan
+    /// out to the Files it changed.
+    Commit,
+    /// A person appearing in the repo's history (CONTEXT.md), keyed by
+    /// email within this repo's Shard — cross-Forge identity merge is M2.
+    /// AUTHORED edges point at the Commits they wrote.
+    Contributor,
 }
 
 /// Compile-time backstop for `NodeKind::ALL`: a new variant makes this
@@ -96,23 +108,33 @@ const _: () = {
             NodeKind::File => 1,
             NodeKind::Symbol => 1,
             NodeKind::Package => 1,
+            NodeKind::Commit => 1,
+            NodeKind::Contributor => 1,
         }
     }
     let _ = count;
-    assert!(NodeKind::ALL.len() == 3);
+    assert!(NodeKind::ALL.len() == 5);
 };
 
 impl NodeKind {
     /// Every node kind, for exhaustive checks (a cross-crate test holds
     /// the id grammar in yg-verbs to this list; the `const _` block
     /// above pins its length, the yg-api drift test its contents).
-    pub const ALL: &'static [NodeKind] = &[NodeKind::File, NodeKind::Symbol, NodeKind::Package];
+    pub const ALL: &'static [NodeKind] = &[
+        NodeKind::File,
+        NodeKind::Symbol,
+        NodeKind::Package,
+        NodeKind::Commit,
+        NodeKind::Contributor,
+    ];
 
     pub fn as_str(self) -> &'static str {
         match self {
             NodeKind::File => "File",
             NodeKind::Symbol => "Symbol",
             NodeKind::Package => "Package",
+            NodeKind::Commit => "Commit",
+            NodeKind::Contributor => "Contributor",
         }
     }
 
@@ -130,6 +152,8 @@ impl NodeKind {
             NodeKind::File => "file",
             NodeKind::Symbol => "sym",
             NodeKind::Package => "pkg",
+            NodeKind::Commit => "commit",
+            NodeKind::Contributor => "contributor",
         }
     }
 }
@@ -141,6 +165,10 @@ pub enum EdgeKind {
     Imports,
     Extends,
     Implements,
+    /// Commit → File: the commit changed this file (RFC 0001 §5).
+    Touches,
+    /// Contributor → Commit: this contributor authored the commit.
+    Authored,
 }
 
 /// Compile-time backstop for `EdgeKind::ALL` — see the guard above
@@ -153,10 +181,12 @@ const _: () = {
             EdgeKind::Imports => 1,
             EdgeKind::Extends => 1,
             EdgeKind::Implements => 1,
+            EdgeKind::Touches => 1,
+            EdgeKind::Authored => 1,
         }
     }
     let _ = count;
-    assert!(EdgeKind::ALL.len() == 5);
+    assert!(EdgeKind::ALL.len() == 7);
 };
 
 impl EdgeKind {
@@ -170,6 +200,8 @@ impl EdgeKind {
         EdgeKind::Imports,
         EdgeKind::Extends,
         EdgeKind::Implements,
+        EdgeKind::Touches,
+        EdgeKind::Authored,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -179,6 +211,8 @@ impl EdgeKind {
             EdgeKind::Imports => "IMPORTS",
             EdgeKind::Extends => "EXTENDS",
             EdgeKind::Implements => "IMPLEMENTS",
+            EdgeKind::Touches => "TOUCHES",
+            EdgeKind::Authored => "AUTHORED",
         }
     }
 }
@@ -190,10 +224,16 @@ impl EdgeKind {
 pub struct Node {
     pub id: String,
     pub kind: NodeKind,
-    /// Human name (Symbols); None for nodes whose id says it all.
+    /// Human name: a Symbol's name, a Package's import path, a Commit's
+    /// subject line, a Contributor's display name. None for nodes whose
+    /// id says it all (Files).
     pub name: Option<String>,
-    /// Repo-relative path for file-anchored nodes.
+    /// Repo-relative path for file-anchored nodes (File, Symbol).
     pub path: Option<String>,
+    /// Committer date in unix seconds — set on Commit nodes, the key the
+    /// `history` Verb orders by and filters `since` against. None for
+    /// every other kind.
+    pub committed_at: Option<i64>,
 }
 
 impl Node {
@@ -204,6 +244,7 @@ impl Node {
             kind: NodeKind::File,
             name: None,
             path: Some(path.to_string()),
+            committed_at: None,
         }
     }
 
@@ -214,6 +255,32 @@ impl Node {
             kind: NodeKind::Package,
             name: Some(import_path.to_string()),
             path: None,
+            committed_at: None,
+        }
+    }
+
+    /// The Commit node for a commit sha: id `commit:<sha>`, name the
+    /// commit subject (first line of the message), `committed_at` the
+    /// committer date in unix seconds.
+    pub fn commit(sha: &str, subject: &str, committed_at: i64) -> Self {
+        Self {
+            id: format!("{}:{sha}", NodeKind::Commit.id_prefix()),
+            kind: NodeKind::Commit,
+            name: Some(subject.to_string()),
+            path: None,
+            committed_at: Some(committed_at),
+        }
+    }
+
+    /// The Contributor node for an email: id `contributor:<email>` (the
+    /// dedup key within this repo's Shard), name the display name.
+    pub fn contributor(email: &str, name: &str) -> Self {
+        Self {
+            id: format!("{}:{email}", NodeKind::Contributor.id_prefix()),
+            kind: NodeKind::Contributor,
+            name: Some(name.to_string()),
+            path: None,
+            committed_at: None,
         }
     }
 
@@ -232,6 +299,7 @@ impl Node {
             kind: NodeKind::Symbol,
             name: Some(name.to_string()),
             path: Some(path.to_string()),
+            committed_at: None,
         }
     }
 }
@@ -1066,10 +1134,11 @@ fn build_graph_sqlite(graph: &Graph) -> anyhow::Result<Vec<u8>> {
     conn.execute_batch(
         "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
          CREATE TABLE nodes (
-             id   TEXT PRIMARY KEY,
-             kind TEXT NOT NULL,
-             name TEXT,
-             path TEXT
+             id           TEXT PRIMARY KEY,
+             kind         TEXT NOT NULL,
+             name         TEXT,
+             path         TEXT,
+             committed_at INTEGER
          );
          CREATE TABLE edges (
              src        TEXT NOT NULL,
@@ -1093,14 +1162,17 @@ fn build_graph_sqlite(graph: &Graph) -> anyhow::Result<Vec<u8>> {
     {
         let tx = conn.unchecked_transaction()?;
         {
-            let mut insert_node =
-                tx.prepare("INSERT INTO nodes (id, kind, name, path) VALUES (?1, ?2, ?3, ?4)")?;
+            let mut insert_node = tx.prepare(
+                "INSERT INTO nodes (id, kind, name, path, committed_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+            )?;
             for node in &graph.nodes {
                 insert_node.execute(rusqlite::params![
                     node.id,
                     node.kind.as_str(),
                     node.name,
-                    node.path
+                    node.path,
+                    node.committed_at
                 ])?;
             }
             let mut insert_edge = tx.prepare(

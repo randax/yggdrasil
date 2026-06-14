@@ -18,3 +18,7 @@ tree-sitter-go = "0.25.0"
 yg-control = { version = "0.1.0", path = "../yg-control" }
 yg-shard = { version = "0.1.0", path = "../yg-shard" }
 yg-sync = { version = "0.1.0", path = "../yg-sync" }
+
+[dev-dependencies]
+# `#[tokio::test]` for the async history-extraction tests.
+tokio = { version = "1.52.3", features = ["macros", "rt"] }

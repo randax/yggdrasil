@@ -80,6 +80,23 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Show the commits that touched a file (or a symbol's file), newest first
+    History {
+        #[arg(help = "Node id, e.g. file:github.com/acme/widgets:main.go")]
+        id: String,
+        /// Only commits at or after this date (RFC3339 or YYYY-MM-DD)
+        #[arg(long)]
+        since: Option<String>,
+        /// Commits per page (1-1000)
+        #[arg(long)]
+        limit: Option<u32>,
+        /// Resume where the previous page's next_cursor left off
+        #[arg(long)]
+        cursor: Option<String>,
+        /// Emit the raw JSON response instead of the human report
+        #[arg(long)]
+        json: bool,
+    },
     /// Administer the Index Server (Admin token required)
     Admin {
         #[command(subcommand)]
@@ -138,6 +155,13 @@ async fn main() -> anyhow::Result<()> {
             cursor,
             json,
         } => search(query, kinds, repos, limit, cursor, json).await,
+        Command::History {
+            id,
+            since,
+            limit,
+            cursor,
+            json,
+        } => history(id, since, limit, cursor, json).await,
         Command::Admin { command } => match command {
             AdminCommand::Repo {
                 command: RepoCommand::Add { url, depth },
@@ -386,6 +410,53 @@ fn plain_snippet(html: &str) -> String {
         // &amp; last, so an escaped entity in the source text isn't
         // double-unescaped.
         .replace("&amp;", "&")
+}
+
+async fn history(
+    id: String,
+    since: Option<String>,
+    limit: Option<u32>,
+    cursor: Option<String>,
+    json: bool,
+) -> anyhow::Result<()> {
+    let mut req = serde_json::json!({ "id": id });
+    if let Some(since) = since {
+        req["since"] = since.into();
+    }
+    if let Some(limit) = limit {
+        req["limit"] = limit.into();
+    }
+    if let Some(cursor) = cursor {
+        req["cursor"] = cursor.into();
+    }
+    let body = post_verb("history", req).await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&body)?);
+        return Ok(());
+    }
+    let commits = body["commits"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+    if commits.is_empty() {
+        println!("no history");
+        return Ok(());
+    }
+    for commit in commits {
+        let sha = commit["sha"].as_str().unwrap_or("?");
+        // Short sha: .get so an odd server value never splits a UTF-8 boundary.
+        let short = sha.get(..12).unwrap_or(sha);
+        let date = commit["date"].as_str().unwrap_or("?");
+        // The author's name, falling back to their email, then to a
+        // placeholder for an unattributable commit.
+        let who = commit["author"]["name"]
+            .as_str()
+            .or_else(|| commit["author"]["email"].as_str())
+            .unwrap_or("(unknown)");
+        let subject = commit["subject"].as_str().unwrap_or("");
+        println!("{short}  {date}  {who}  {subject}");
+    }
+    if let Some(cursor) = body["next_cursor"].as_str() {
+        println!("more: pass --cursor {cursor}");
+    }
+    Ok(())
 }
 
 async fn admin_repo_add(url: String, depth: Option<i32>) -> anyhow::Result<()> {

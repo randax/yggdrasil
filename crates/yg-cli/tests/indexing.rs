@@ -73,10 +73,13 @@ async fn indexing_a_synced_go_repo_publishes_a_shard_with_symbols_and_counts() {
         shard["revision"].as_str().is_some_and(|r| !r.is_empty()),
         "an indexed repo must show its Shard revision, got: {shard}"
     );
-    // main.go and README.md are File nodes; Hello and main are Symbols,
-    // each defined by main.go — plus the CALLS edge main → Hello.
-    assert_eq!(shard["nodes"], 4, "got: {shard}");
-    assert_eq!(shard["edges"], 3, "got: {shard}");
+    // Code: main.go and README.md are File nodes; Hello and main are
+    // Symbols, each defined by main.go — plus the CALLS edge main → Hello
+    // (4 nodes, 3 edges). History adds the lone commit and its author
+    // (Commit + Contributor nodes), the AUTHORED edge, and a TOUCHES edge
+    // to each of the two files (2 nodes, 3 edges).
+    assert_eq!(shard["nodes"], 6, "got: {shard}");
+    assert_eq!(shard["edges"], 6, "got: {shard}");
 
     assert!(
         !h.indexer.run_once().await.unwrap(),
@@ -167,8 +170,13 @@ async fn a_new_commit_publishes_a_new_revision_and_never_mutates_the_old_shard()
         second["revision"], first["revision"],
         "a new commit must publish a new Shard revision"
     );
-    assert_eq!(second["nodes"], 5, "the new Shard sees Bye, got: {second}");
-    assert_eq!(second["edges"], 4, "got: {second}");
+    // Code grows by one Symbol (Bye) and its DEFINES edge: 5 nodes, 4
+    // edges. History now spans two commits by the one author (2 Commit +
+    // 1 Contributor nodes; 2 AUTHORED edges) with TOUCHES to main.go and
+    // README.md from the first commit and main.go from the second (3
+    // TOUCHES) — 3 nodes, 5 edges.
+    assert_eq!(second["nodes"], 8, "the new Shard sees Bye, got: {second}");
+    assert_eq!(second["edges"], 9, "got: {second}");
 
     // Both revisions are recorded; the old Shard's objects are untouched.
     let (revisions,): (i64,) = sqlx::query_as("SELECT count(*) FROM shards")
@@ -272,10 +280,13 @@ async fn every_edge_row_carries_provenance_and_confidence() {
         .unwrap();
     assert!(!edges.is_empty(), "the Go fixture must yield edges");
     for (src, dst, provenance, confidence) in edges {
-        assert_eq!(
-            provenance,
-            yg_shard::SYNTACTIC_PASS,
-            "M0 edges all come from the syntactic pass ({src} → {dst})"
+        // M0 edges are either syntactic (the tree-sitter code graph) or
+        // extracted (the git-history TOUCHES/AUTHORED edges, deterministi-
+        // cally derived) — never inferred or precise yet.
+        assert!(
+            provenance == yg_shard::SYNTACTIC_PASS || provenance == "extracted",
+            "M0 edge provenance must be syntactic or extracted, \
+             got {provenance:?} on {src} → {dst}"
         );
         assert!(
             confidence > 0.0 && confidence <= 1.0,
@@ -455,7 +466,9 @@ async fn an_index_worker_without_the_mirror_fetches_it_itself() {
         body["repos"][0]["index"]["state"], "indexed",
         "a worker without the mirror must fetch it and index, got: {body}"
     );
-    assert_eq!(body["repos"][0]["shard"]["nodes"], 4, "got: {body}");
+    // 4 code nodes (2 Files, 2 Symbols) + 2 history nodes (Commit,
+    // Contributor).
+    assert_eq!(body["repos"][0]["shard"]["nodes"], 6, "got: {body}");
 }
 
 #[tokio::test]
@@ -703,7 +716,7 @@ async fn yg_admin_status_shows_the_shard_revision_and_counts() {
         "the human report must show the Shard revision, got:\n{stdout}"
     );
     assert!(
-        stdout.contains("4 nodes") && stdout.contains("3 edges"),
+        stdout.contains("6 nodes") && stdout.contains("6 edges"),
         "the human report must show the graph counts, got:\n{stdout}"
     );
 }
@@ -729,8 +742,10 @@ async fn yg_serve_role_all_indexes_an_added_repo_end_to_end() {
         let body = admin_status_body(&url).await;
         let shard = &body["repos"][0]["shard"];
         if shard["revision"].as_str().is_some() {
-            assert_eq!(shard["nodes"], 4, "got: {body}");
-            assert_eq!(shard["edges"], 3, "got: {body}");
+            // 4 code nodes + 2 history (Commit, Contributor); 3 code edges
+            // + AUTHORED + 2 TOUCHES.
+            assert_eq!(shard["nodes"], 6, "got: {body}");
+            assert_eq!(shard["edges"], 6, "got: {body}");
             break;
         }
         assert!(
