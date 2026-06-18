@@ -1412,13 +1412,20 @@ async fn admin_forge_add(
         Ok(base_url) => base_url,
         Err(message) => return error_json(StatusCode::BAD_REQUEST, message),
     };
+    let token_env = req.token_env.as_deref().or_else(|| {
+        if kind == "github" {
+            Some("YG_GITHUB_TOKEN")
+        } else {
+            None
+        }
+    });
     let outcome = state
         .control
         .connect_forge_org(yg_control::ConnectForgeOrg {
             forge_kind: kind,
             base_url: &base_url,
             org_slug: &org,
-            token_env: req.token_env.as_deref(),
+            token_env,
         })
         .await;
     match outcome {
@@ -1468,6 +1475,7 @@ fn github_base_url(base_url: Option<&str>) -> Result<String, &'static str> {
         .unwrap_or("https://github.com")
         .trim()
         .trim_end_matches('/');
+    let base_url = base_url.to_ascii_lowercase();
     let Some(rest) = base_url.strip_prefix("https://") else {
         return Err("github forge base_url must start with https://");
     };
@@ -1480,7 +1488,7 @@ fn github_base_url(base_url: Option<&str>) -> Result<String, &'static str> {
     {
         return Err("github forge base_url must be a clone root like https://github.com");
     }
-    Ok(base_url.to_ascii_lowercase())
+    Ok(base_url)
 }
 
 #[derive(Deserialize)]

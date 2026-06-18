@@ -416,7 +416,7 @@ impl ControlPlane {
             "INSERT INTO forges (kind, base_url, token_env) VALUES ($1, $2, $3)
              ON CONFLICT (base_url) DO UPDATE
              SET kind = excluded.kind,
-                 token_env = coalesce(forges.token_env, excluded.token_env)
+                 token_env = coalesce(excluded.token_env, forges.token_env)
              RETURNING id",
         )
         .bind(org.forge_kind)
@@ -487,7 +487,7 @@ impl ControlPlane {
             "SELECT f.id, f.base_url
              FROM forge_orgs o JOIN forges f ON f.id = o.forge_id
              WHERE o.id = $1
-             FOR UPDATE OF o",
+             FOR UPDATE",
         )
         .bind(org_id)
         .fetch_one(&mut *tx)
@@ -525,10 +525,11 @@ impl ControlPlane {
                     (repo_id, previous_state == "included")
                 }
                 None => {
-                    let inserted: Result<(i64,), sqlx::Error> = sqlx::query_as(
+                    let inserted: Option<(i64,)> = sqlx::query_as(
                         "INSERT INTO repos
                             (forge_id, slug, visibility, discovery_state, fetch_depth, qualifier)
                          VALUES ($1, $2, $3, $4, $5, $6)
+                         ON CONFLICT (forge_id, slug) DO NOTHING
                          RETURNING id",
                     )
                     .bind(forge_id)
@@ -537,18 +538,43 @@ impl ControlPlane {
                     .bind(state)
                     .bind(repo.fetch_depth)
                     .bind(&qualifier)
-                    .fetch_one(&mut *tx)
-                    .await;
-                    let (repo_id,) = match inserted {
-                        Ok(row) => row,
-                        Err(sqlx::Error::Database(e))
-                            if e.constraint() == Some("repos_qualifier") =>
-                        {
-                            return Err(anyhow::Error::new(QualifierConflict { qualifier }));
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|e| match e {
+                        sqlx::Error::Database(db) if db.constraint() == Some("repos_qualifier") => {
+                            anyhow::Error::new(QualifierConflict { qualifier })
                         }
-                        Err(e) => return Err(e.into()),
-                    };
-                    (repo_id, false)
+                        other => other.into(),
+                    })?;
+                    match inserted {
+                        Some((repo_id,)) => (repo_id, false),
+                        None => {
+                            let (repo_id, previous_state): (i64, String) = sqlx::query_as(
+                                "SELECT id, discovery_state
+                                 FROM repos
+                                 WHERE forge_id = $1 AND slug = $2
+                                 FOR UPDATE",
+                            )
+                            .bind(forge_id)
+                            .bind(repo.slug)
+                            .fetch_one(&mut *tx)
+                            .await?;
+                            sqlx::query(
+                                "UPDATE repos
+                                 SET visibility = $2,
+                                     discovery_state = $3,
+                                     fetch_depth = coalesce($4, fetch_depth)
+                                 WHERE id = $1",
+                            )
+                            .bind(repo_id)
+                            .bind(repo.visibility.as_str())
+                            .bind(state)
+                            .bind(repo.fetch_depth)
+                            .execute(&mut *tx)
+                            .await?;
+                            (repo_id, previous_state == "included")
+                        }
+                    }
                 }
             };
             if state == "included"
@@ -573,6 +599,7 @@ impl ControlPlane {
     /// discovery-state evaluator and documented in the ADR/RFC docs.
     pub async fn add_rule(&self, rule: AddRule<'_>) -> anyhow::Result<AddRuleOutcome> {
         let mut tx = self.pool.begin().await?;
+        lock_forge_for_update(&mut tx, rule.forge_id).await?;
         let created = put_rule_newest(
             &mut tx,
             rule.forge_id,
@@ -1187,6 +1214,20 @@ async fn rules_for_forge(
     .fetch_all(&mut **tx)
     .await?;
     Ok(rules)
+}
+
+async fn lock_forge_for_update(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    forge_id: i64,
+) -> anyhow::Result<()> {
+    let locked: Option<(i64,)> = sqlx::query_as("SELECT id FROM forges WHERE id = $1 FOR UPDATE")
+        .bind(forge_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+    if locked.is_none() {
+        anyhow::bail!("forge {forge_id} does not exist");
+    }
+    Ok(())
 }
 
 async fn put_rule_newest(

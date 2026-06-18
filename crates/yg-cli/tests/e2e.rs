@@ -390,6 +390,70 @@ async fn admin_forge_add_connects_a_github_org() {
 }
 
 #[tokio::test]
+async fn admin_forge_add_normalizes_base_url_and_defaults_the_github_token_env() {
+    let db_name = create_test_db().await;
+    let server = serve(test_config(&db_name)).await.unwrap();
+    let base = format!("http://{}", server.local_addr());
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/admin/forges"))
+        .bearer_auth(TEST_TOKEN)
+        .json(&serde_json::json!({
+            "kind": "GitHub",
+            "org": "acme",
+            "base_url": "HTTPS://GitHub.COM/",
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 201);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["kind"], "github");
+    assert_eq!(body["base_url"], "https://github.com");
+
+    let control = control_plane(&db_name).await;
+    let due = control
+        .claim_due_discovery(std::time::Duration::from_secs(3600))
+        .await
+        .unwrap()
+        .expect("connected forge org must be due for discovery");
+    assert_eq!(due.base_url, "https://github.com");
+    assert_eq!(due.token_env.as_deref(), Some("YG_GITHUB_TOKEN"));
+}
+
+#[tokio::test]
+async fn reconnecting_a_forge_org_refreshes_the_token_env() {
+    let db_name = create_test_db().await;
+    let control = control_plane(&db_name).await;
+    control
+        .connect_forge_org(yg_control::ConnectForgeOrg {
+            forge_kind: "github",
+            base_url: "https://github.com",
+            org_slug: "acme",
+            token_env: Some("YG_OLD_TOKEN"),
+        })
+        .await
+        .unwrap();
+    control
+        .connect_forge_org(yg_control::ConnectForgeOrg {
+            forge_kind: "github",
+            base_url: "https://github.com",
+            org_slug: "acme",
+            token_env: Some("YG_NEW_TOKEN"),
+        })
+        .await
+        .unwrap();
+
+    let due = control
+        .claim_due_discovery(std::time::Duration::from_secs(3600))
+        .await
+        .unwrap()
+        .expect("connected forge org must be due for discovery");
+    assert_eq!(due.token_env.as_deref(), Some("YG_NEW_TOKEN"));
+}
+
+#[tokio::test]
 async fn admin_forge_add_rejects_malformed_orgs_and_base_urls() {
     let server = boot_test_server().await;
     let base = format!("http://{}", server.local_addr());

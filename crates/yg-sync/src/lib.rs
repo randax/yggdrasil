@@ -25,6 +25,7 @@ const GITHUB_PAGE_SIZE: usize = 100;
 pub struct SyncWorker {
     control: ControlPlane,
     fetcher: GitFetcher,
+    discovery_client: reqwest::Client,
     /// Per-forge rate budgets, keyed by forge id. Created on first poll
     /// of a forge and kept for the worker's life; the poll loop spends a
     /// token per conditional request and backs the forge off on a
@@ -38,6 +39,7 @@ impl SyncWorker {
         Self {
             control,
             fetcher: GitFetcher::new(git_cache),
+            discovery_client: github_discovery_client(),
             poll_buckets: Mutex::new(HashMap::new()),
         }
     }
@@ -123,18 +125,24 @@ impl SyncWorker {
                 .map(|token| token.trim().to_string())
                 .filter(|token| !token.is_empty())
         });
-        let repos =
-            match list_github_org_repos(&due.base_url, &due.org_slug, token.as_deref()).await {
-                Ok(repos) => repos,
-                Err(e) => {
-                    tracing::warn!(
-                        org = %due.org_slug,
-                        error = format!("{e:#}"),
-                        "forge discovery failed; will retry on the next discovery interval"
-                    );
-                    return Ok(true);
-                }
-            };
+        let repos = match list_github_org_repos(
+            &self.discovery_client,
+            &due.base_url,
+            &due.org_slug,
+            token.as_deref(),
+        )
+        .await
+        {
+            Ok(repos) => repos,
+            Err(e) => {
+                tracing::warn!(
+                    org = %due.org_slug,
+                    error = format!("{e:#}"),
+                    "forge discovery failed; will retry on the next discovery interval"
+                );
+                return Ok(true);
+            }
+        };
         let discovered: Vec<_> = repos
             .iter()
             .map(|repo| yg_control::DiscoveredRepo {
@@ -331,14 +339,11 @@ impl GitHubRepo {
 }
 
 async fn list_github_org_repos(
+    client: &reqwest::Client,
     base_url: &str,
     org: &str,
     token: Option<&str>,
 ) -> anyhow::Result<Vec<ListedRepo>> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(60))
-        .build()
-        .context("building the GitHub discovery client")?;
     let api_root = github_api_root(base_url);
     let mut next = Some(format!(
         "{}/orgs/{org}/repos?per_page={GITHUB_PAGE_SIZE}&type=all",
@@ -374,6 +379,13 @@ async fn list_github_org_repos(
         next = link.as_deref().and_then(next_link);
     }
     Ok(repos)
+}
+
+fn github_discovery_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()
+        .expect("building the GitHub discovery client")
 }
 
 fn github_api_root(base_url: &str) -> String {
@@ -1415,7 +1427,8 @@ mod tests {
             socket.try_write(response.as_bytes()).unwrap();
         });
 
-        let repos = list_github_org_repos(&format!("http://{addr}"), "acme", None)
+        let client = github_discovery_client();
+        let repos = list_github_org_repos(&client, &format!("http://{addr}"), "acme", None)
             .await
             .unwrap();
         server.await.unwrap();
