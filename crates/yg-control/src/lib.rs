@@ -42,6 +42,95 @@ pub struct AddRepoOutcome {
     pub fetch_queued: bool,
 }
 
+/// A forge org/group connection that discovery should keep reconciling.
+pub struct ConnectForgeOrg<'a> {
+    /// Forge kind: `github` for issue #10.
+    pub forge_kind: &'a str,
+    /// Forge root, unique per forge, e.g. `https://github.com`.
+    pub base_url: &'a str,
+    /// Org or group slug on the forge.
+    pub org_slug: &'a str,
+    /// Env var the Forge token is read from.
+    pub token_env: Option<&'a str>,
+}
+
+pub struct ConnectForgeOrgOutcome {
+    pub forge_id: i64,
+    pub org_id: i64,
+    pub created: bool,
+}
+
+/// One connected org due for repository discovery.
+#[derive(Debug, sqlx::FromRow)]
+pub struct DueDiscovery {
+    pub org_id: i64,
+    pub forge_id: i64,
+    pub forge_kind: String,
+    pub base_url: String,
+    pub org_slug: String,
+    pub token_env: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type)]
+#[sqlx(type_name = "text", rename_all = "lowercase")]
+pub enum RepoVisibility {
+    Public,
+    Internal,
+    Private,
+}
+
+impl RepoVisibility {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Public => "public",
+            Self::Internal => "internal",
+            Self::Private => "private",
+        }
+    }
+}
+
+pub struct DiscoveredRepo<'a> {
+    pub slug: &'a str,
+    pub visibility: RepoVisibility,
+    pub fetch_depth: Option<i32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuleAction {
+    Include,
+    Exclude,
+}
+
+impl RuleAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Include => "include",
+            Self::Exclude => "exclude",
+        }
+    }
+}
+
+pub struct AddRule<'a> {
+    pub forge_id: i64,
+    pub pattern: &'a str,
+    pub action: RuleAction,
+    pub applies_to_private: bool,
+}
+
+pub struct AddRuleOutcome {
+    pub created: bool,
+    pub repos_reconsidered: u64,
+    pub fetches_queued: u64,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+pub struct DiscoveryRule {
+    pub forge: String,
+    pub pattern: String,
+    pub action: String,
+    pub applies_to_private: bool,
+}
+
 /// A fetch job a worker holds the lease on, with everything needed to
 /// run it: where to clone from and how.
 #[derive(sqlx::FromRow)]
@@ -197,6 +286,8 @@ pub struct RepoSyncStatus {
     pub slug: String,
     /// The forge's base URL.
     pub forge: String,
+    pub visibility: RepoVisibility,
+    pub discovery_state: String,
     pub last_synced_commit: Option<String>,
     /// State of the in-flight fetch job (`queued` | `leased`), if any.
     pub job_state: Option<String>,
@@ -210,6 +301,13 @@ pub struct RepoSyncStatus {
     pub shard_revision: Option<String>,
     pub shard_node_count: Option<i64>,
     pub shard_edge_count: Option<i64>,
+}
+
+#[derive(sqlx::FromRow)]
+struct RuleRow {
+    pattern: String,
+    action: String,
+    applies_to_private: bool,
 }
 
 impl ControlPlane {
@@ -253,6 +351,7 @@ impl ControlPlane {
         .bind(repo.token_env)
         .fetch_one(&mut *tx)
         .await?;
+        put_rule_newest(&mut tx, forge_id, repo.slug, RuleAction::Include, true).await?;
         // (xmax = 0) distinguishes a fresh insert from an upsert of an
         // existing row. The qualifier is deterministic from (base_url,
         // slug), so the upsert never changes it; a unique violation on
@@ -280,15 +379,23 @@ impl ControlPlane {
             }
             Err(e) => return Err(e.into()),
         };
-        sqlx::query(
-            "INSERT INTO rules (forge_id, pattern, action) VALUES ($1, $2, 'include')
-             ON CONFLICT (forge_id, pattern, action) DO NOTHING",
-        )
-        .bind(forge_id)
-        .bind(repo.slug)
-        .execute(&mut *tx)
-        .await?;
-        let fetch_queued = enqueue_job_unless_in_flight(&mut tx, "fetch", repo_id).await?;
+        let rules = rules_for_forge(&mut tx, forge_id).await?;
+        let (visibility,): (RepoVisibility,) =
+            sqlx::query_as("SELECT visibility FROM repos WHERE id = $1 FOR UPDATE")
+                .bind(repo_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        let discovery_state = discovery_state_for(repo.slug, visibility, &rules);
+        sqlx::query("UPDATE repos SET discovery_state = $2 WHERE id = $1")
+            .bind(repo_id)
+            .bind(discovery_state)
+            .execute(&mut *tx)
+            .await?;
+        let fetch_queued = if discovery_state == "included" {
+            enqueue_job_unless_in_flight(&mut tx, "fetch", repo_id).await?
+        } else {
+            false
+        };
         tx.commit().await?;
         Ok(AddRepoOutcome {
             repo_id,
@@ -297,13 +404,264 @@ impl ControlPlane {
         })
     }
 
+    /// Connect a Forge org/group for recurring discovery. Idempotent:
+    /// reconnecting the same org refreshes the token env without
+    /// duplicating the connection.
+    pub async fn connect_forge_org(
+        &self,
+        org: ConnectForgeOrg<'_>,
+    ) -> anyhow::Result<ConnectForgeOrgOutcome> {
+        let mut tx = self.pool.begin().await?;
+        let (forge_id,): (i64,) = sqlx::query_as(
+            "INSERT INTO forges (kind, base_url, token_env) VALUES ($1, $2, $3)
+             ON CONFLICT (base_url) DO UPDATE
+             SET kind = excluded.kind,
+                 token_env = coalesce(forges.token_env, excluded.token_env)
+             RETURNING id",
+        )
+        .bind(org.forge_kind)
+        .bind(org.base_url)
+        .bind(org.token_env)
+        .fetch_one(&mut *tx)
+        .await?;
+        let (org_id, created): (i64, bool) = sqlx::query_as(
+            "INSERT INTO forge_orgs (forge_id, org_slug, token_env) VALUES ($1, $2, $3)
+             ON CONFLICT (forge_id, org_slug) DO UPDATE
+             SET token_env = coalesce(excluded.token_env, forge_orgs.token_env)
+             RETURNING id, (xmax = 0)",
+        )
+        .bind(forge_id)
+        .bind(org.org_slug)
+        .bind(org.token_env)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(ConnectForgeOrgOutcome {
+            forge_id,
+            org_id,
+            created,
+        })
+    }
+
+    /// Claim one org whose discovery schedule is due, advancing it by
+    /// `interval` before the caller lists the Forge. A crashed discovery
+    /// therefore costs at most one interval; manual/on-demand callers use
+    /// [`Self::discover_forge_repos`] directly.
+    pub async fn claim_due_discovery(
+        &self,
+        interval: std::time::Duration,
+    ) -> anyhow::Result<Option<DueDiscovery>> {
+        let row = sqlx::query_as(
+            "WITH due AS (
+                 SELECT id FROM forge_orgs
+                 WHERE next_discovery_at <= now()
+                 ORDER BY next_discovery_at
+                 FOR UPDATE SKIP LOCKED
+                 LIMIT 1
+             )
+             UPDATE forge_orgs o
+             SET next_discovery_at = now() + make_interval(secs => $1)
+             FROM due, forges f
+             WHERE o.id = due.id AND f.id = o.forge_id
+             RETURNING o.id AS org_id, f.id AS forge_id, f.kind AS forge_kind,
+                       f.base_url, o.org_slug,
+                       coalesce(o.token_env, f.token_env) AS token_env",
+        )
+        .bind(interval.as_secs_f64())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    /// Reconcile the repositories returned by one Forge org discovery.
+    /// Public/internal repos are included by default. Private repos stay
+    /// discovered-only unless the winning rule explicitly applies to
+    /// private repos and includes them.
+    pub async fn discover_forge_repos(
+        &self,
+        org_id: i64,
+        repos: &[DiscoveredRepo<'_>],
+    ) -> anyhow::Result<u64> {
+        let mut tx = self.pool.begin().await?;
+        let (forge_id, base_url): (i64, String) = sqlx::query_as(
+            "SELECT f.id, f.base_url
+             FROM forge_orgs o JOIN forges f ON f.id = o.forge_id
+             WHERE o.id = $1
+             FOR UPDATE OF o",
+        )
+        .bind(org_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let rules = rules_for_forge(&mut tx, forge_id).await?;
+        let mut fetches_queued = 0;
+        for repo in repos {
+            let state = discovery_state_for(repo.slug, repo.visibility, &rules);
+            let qualifier = repo_qualifier(&base_url, repo.slug);
+            let existing: Option<(i64, String)> = sqlx::query_as(
+                "SELECT id, discovery_state
+                 FROM repos
+                 WHERE forge_id = $1 AND slug = $2
+                 FOR UPDATE",
+            )
+            .bind(forge_id)
+            .bind(repo.slug)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let (repo_id, was_included) = match existing {
+                Some((repo_id, previous_state)) => {
+                    sqlx::query(
+                        "UPDATE repos
+                         SET visibility = $2,
+                             discovery_state = $3,
+                             fetch_depth = coalesce($4, fetch_depth)
+                         WHERE id = $1",
+                    )
+                    .bind(repo_id)
+                    .bind(repo.visibility.as_str())
+                    .bind(state)
+                    .bind(repo.fetch_depth)
+                    .execute(&mut *tx)
+                    .await?;
+                    (repo_id, previous_state == "included")
+                }
+                None => {
+                    let inserted: Result<(i64,), sqlx::Error> = sqlx::query_as(
+                        "INSERT INTO repos
+                            (forge_id, slug, visibility, discovery_state, fetch_depth, qualifier)
+                         VALUES ($1, $2, $3, $4, $5, $6)
+                         RETURNING id",
+                    )
+                    .bind(forge_id)
+                    .bind(repo.slug)
+                    .bind(repo.visibility.as_str())
+                    .bind(state)
+                    .bind(repo.fetch_depth)
+                    .bind(&qualifier)
+                    .fetch_one(&mut *tx)
+                    .await;
+                    let (repo_id,) = match inserted {
+                        Ok(row) => row,
+                        Err(sqlx::Error::Database(e))
+                            if e.constraint() == Some("repos_qualifier") =>
+                        {
+                            return Err(anyhow::Error::new(QualifierConflict { qualifier }));
+                        }
+                        Err(e) => return Err(e.into()),
+                    };
+                    (repo_id, false)
+                }
+            };
+            if state == "included"
+                && !was_included
+                && enqueue_job_unless_in_flight(&mut tx, "fetch", repo_id).await?
+            {
+                fetches_queued += 1;
+            } else if state != "included" && was_included {
+                remove_repo_from_indexing(&mut tx, repo_id).await?;
+            }
+        }
+        sqlx::query("UPDATE forge_orgs SET last_discovered_at = now() WHERE id = $1")
+            .bind(org_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(fetches_queued)
+    }
+
+    /// Add an include/exclude rule and immediately re-evaluate known
+    /// repos for that forge. Precedence is centralized in
+    /// [`discovery_state_for`] and documented in the ADR/RFC docs.
+    pub async fn add_rule(&self, rule: AddRule<'_>) -> anyhow::Result<AddRuleOutcome> {
+        let mut tx = self.pool.begin().await?;
+        let created = put_rule_newest(
+            &mut tx,
+            rule.forge_id,
+            rule.pattern,
+            rule.action,
+            rule.applies_to_private,
+        )
+        .await?;
+
+        let rules = rules_for_forge(&mut tx, rule.forge_id).await?;
+        let repos: Vec<(i64, String, RepoVisibility, String)> = sqlx::query_as(
+            "SELECT id, slug, visibility, discovery_state
+             FROM repos
+             WHERE forge_id = $1
+             ORDER BY id",
+        )
+        .bind(rule.forge_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut fetches_queued = 0;
+        for (repo_id, slug, visibility, previous_state) in &repos {
+            let was_included = previous_state == "included";
+            let state = discovery_state_for(slug, *visibility, &rules);
+            sqlx::query("UPDATE repos SET discovery_state = $2 WHERE id = $1")
+                .bind(repo_id)
+                .bind(state)
+                .execute(&mut *tx)
+                .await?;
+            if state == "included"
+                && !was_included
+                && enqueue_job_unless_in_flight(&mut tx, "fetch", *repo_id).await?
+            {
+                fetches_queued += 1;
+            } else if state != "included" && was_included {
+                remove_repo_from_indexing(&mut tx, *repo_id).await?;
+            }
+        }
+        let repos_reconsidered = repos.len() as u64;
+        tx.commit().await?;
+        Ok(AddRuleOutcome {
+            created,
+            repos_reconsidered,
+            fetches_queued,
+        })
+    }
+
+    pub async fn forge_id_by_base_url(&self, base_url: &str) -> anyhow::Result<Option<i64>> {
+        let row: Option<(i64,)> = sqlx::query_as("SELECT id FROM forges WHERE base_url = $1")
+            .bind(base_url)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|(id,)| id))
+    }
+
+    pub async fn request_discovery(&self, base_url: &str, org_slug: &str) -> anyhow::Result<bool> {
+        let updated = sqlx::query(
+            "UPDATE forge_orgs o
+             SET next_discovery_at = now()
+             FROM forges f
+             WHERE f.id = o.forge_id AND f.base_url = $1 AND o.org_slug = $2",
+        )
+        .bind(base_url)
+        .bind(org_slug)
+        .execute(&self.pool)
+        .await?
+        .rows_affected()
+            == 1;
+        Ok(updated)
+    }
+
+    pub async fn rules(&self) -> anyhow::Result<Vec<DiscoveryRule>> {
+        let rows = sqlx::query_as(
+            "SELECT f.base_url AS forge, r.pattern, r.action, r.applies_to_private
+             FROM rules r JOIN forges f ON f.id = r.forge_id
+             ORDER BY f.base_url, length(r.pattern) DESC, r.created_at DESC, r.id DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
     /// Every registered repo with its sync position: last synced commit,
     /// the in-flight fetch job, if any, and its current Shard, if any.
     pub async fn admin_status(&self) -> anyhow::Result<Vec<RepoSyncStatus>> {
         let rows = sqlx::query_as(
             // Plain joins suffice: jobs_one_in_flight_per_repo_kind
             // guarantees at most one non-done job per (repo, kind).
-            "SELECT r.slug, f.base_url AS forge, r.last_synced_commit,
+            "SELECT r.slug, f.base_url AS forge, r.visibility, r.discovery_state,
+                    r.last_synced_commit,
                     j.state AS job_state, coalesce(j.attempts, 0) AS attempts,
                     j.last_error,
                     i.state AS index_job_state,
@@ -359,10 +717,16 @@ impl ControlPlane {
         // touches both (add_repo, complete_index). Mixed orders here
         // deadlock — e.g. holding a jobs entry while waiting on a repo
         // row another completion took first.
-        sqlx::query("SELECT 1 FROM repos WHERE id = $1 FOR UPDATE")
-            .bind(job.repo_id)
-            .execute(&mut *tx)
-            .await?;
+        let (discovery_state,): (String,) =
+            sqlx::query_as("SELECT discovery_state FROM repos WHERE id = $1 FOR UPDATE")
+                .bind(job.repo_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        if discovery_state != "included" {
+            settle_leased_job(&mut tx, job.job_id, &job.lease_token, true).await?;
+            tx.commit().await?;
+            return Ok(false);
+        }
         if !settle_leased_job(&mut tx, job.job_id, &job.lease_token, true).await? {
             return Ok(false);
         }
@@ -410,7 +774,9 @@ impl ControlPlane {
         let row = sqlx::query_as(
             "WITH due AS (
                  SELECT r.id FROM repos r
-                 WHERE r.last_synced_commit IS NOT NULL AND r.next_poll_at <= now()
+                 WHERE r.discovery_state = 'included'
+                   AND r.last_synced_commit IS NOT NULL
+                   AND r.next_poll_at <= now()
                  ORDER BY r.next_poll_at
                  FOR UPDATE SKIP LOCKED
                  LIMIT 1
@@ -456,7 +822,17 @@ impl ControlPlane {
     /// a new job was queued.
     pub async fn request_fetch(&self, repo_id: i64) -> anyhow::Result<bool> {
         let mut tx = self.pool.begin().await?;
-        let queued = enqueue_job_unless_in_flight(&mut tx, "fetch", repo_id).await?;
+        let included: Option<(i64,)> = sqlx::query_as(
+            "SELECT id FROM repos WHERE id = $1 AND discovery_state = 'included' FOR UPDATE",
+        )
+        .bind(repo_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let queued = if included.is_some() {
+            enqueue_job_unless_in_flight(&mut tx, "fetch", repo_id).await?
+        } else {
+            false
+        };
         tx.commit().await?;
         Ok(queued)
     }
@@ -501,12 +877,21 @@ impl ControlPlane {
         // Lock the repo row before reading its sync position so a
         // concurrent complete_fetch can't advance it between this check
         // and commit (its own repos UPDATE serializes behind this lock).
-        let (current_commit, old_shard_id): (Option<String>, Option<i64>) = sqlx::query_as(
-            "SELECT last_synced_commit, current_shard_id FROM repos WHERE id = $1 FOR UPDATE",
-        )
-        .bind(job.repo_id)
-        .fetch_one(&mut *tx)
-        .await?;
+        let (current_commit, old_shard_id, discovery_state): (Option<String>, Option<i64>, String) =
+            sqlx::query_as(
+                "SELECT last_synced_commit, current_shard_id, discovery_state
+             FROM repos
+             WHERE id = $1
+             FOR UPDATE",
+            )
+            .bind(job.repo_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        if discovery_state != "included" {
+            settle_leased_job(&mut tx, job.job_id, &job.lease_token, true).await?;
+            tx.commit().await?;
+            return Ok(false);
+        }
         let up_to_date = current_commit.as_deref() == Some(job.commit.as_str());
         if !settle_leased_job(&mut tx, job.job_id, &job.lease_token, up_to_date).await? {
             return Ok(false);
@@ -601,7 +986,8 @@ impl ControlPlane {
         let outdated: Vec<(i64,)> = sqlx::query_as(
             "SELECT r.id FROM repos r
              JOIN shards s ON s.id = r.current_shard_id
-             WHERE r.last_synced_commit IS NOT NULL
+             WHERE r.discovery_state = 'included'
+               AND r.last_synced_commit IS NOT NULL
                AND right(s.revision, length($1)) <> $1
              ORDER BY r.id",
         )
@@ -703,10 +1089,12 @@ impl ControlPlane {
     /// How many repos are indexed into the Knowledge Graph: those whose
     /// current-Shard pointer is set.
     pub async fn indexed_repo_count(&self) -> anyhow::Result<i64> {
-        let (count,): (i64,) =
-            sqlx::query_as("SELECT count(*) FROM repos WHERE current_shard_id IS NOT NULL")
-                .fetch_one(&self.pool)
-                .await?;
+        let (count,): (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM repos
+             WHERE discovery_state = 'included' AND current_shard_id IS NOT NULL",
+        )
+        .fetch_one(&self.pool)
+        .await?;
         Ok(count)
     }
 
@@ -717,7 +1105,7 @@ impl ControlPlane {
         let target = sqlx::query_as(
             "SELECT r.id AS repo_id, s.revision FROM repos r
              LEFT JOIN shards s ON s.id = r.current_shard_id
-             WHERE r.qualifier = $1",
+             WHERE r.qualifier = $1 AND r.discovery_state = 'included'",
         )
         .bind(qualifier)
         .fetch_optional(&self.pool)
@@ -738,7 +1126,8 @@ impl ControlPlane {
         let repos = sqlx::query_as(
             "SELECT r.id AS repo_id, r.qualifier, s.revision FROM repos r
              JOIN shards s ON s.id = r.current_shard_id
-             WHERE right(s.revision, length($1)) = $1
+             WHERE r.discovery_state = 'included'
+               AND right(s.revision, length($1)) = $1
              ORDER BY r.qualifier",
         )
         .bind(revision_suffix)
@@ -768,6 +1157,7 @@ fn claim_due_sql(kind: &str, extra_due_predicate: &str, returning: &str) -> Stri
         "WITH due AS (
              SELECT j.id FROM jobs j JOIN repos r ON r.id = j.repo_id
              WHERE j.kind = '{kind}' AND j.state <> 'done' AND j.run_after <= now()
+               AND r.discovery_state = 'included'
                AND (j.state = 'queued' OR j.lease_until < now())
                {extra_due_predicate}
              ORDER BY j.priority DESC, j.run_after
@@ -781,6 +1171,126 @@ fn claim_due_sql(kind: &str, extra_due_predicate: &str, returning: &str) -> Stri
          RETURNING j.id AS job_id, j.repo_id, j.attempts, {returning},
                    j.lease_until::text AS lease_token"
     )
+}
+
+async fn rules_for_forge(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    forge_id: i64,
+) -> anyhow::Result<Vec<RuleRow>> {
+    let rules = sqlx::query_as(
+        "SELECT pattern, action, applies_to_private
+         FROM rules
+         WHERE forge_id = $1
+         ORDER BY length(pattern) DESC, created_at DESC, id DESC",
+    )
+    .bind(forge_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    Ok(rules)
+}
+
+async fn put_rule_newest(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    forge_id: i64,
+    pattern: &str,
+    action: RuleAction,
+    applies_to_private: bool,
+) -> anyhow::Result<bool> {
+    let (created,): (bool,) = sqlx::query_as(
+        "INSERT INTO rules (forge_id, pattern, action, applies_to_private)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (forge_id, pattern, action) DO UPDATE
+         SET applies_to_private = excluded.applies_to_private,
+             created_at = now()
+         RETURNING (xmax = 0)",
+    )
+    .bind(forge_id)
+    .bind(pattern)
+    .bind(action.as_str())
+    .bind(applies_to_private)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(created)
+}
+
+async fn remove_repo_from_indexing(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    repo_id: i64,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "UPDATE shards
+         SET superseded_at = now()
+         WHERE id = (SELECT current_shard_id FROM repos WHERE id = $1)",
+    )
+    .bind(repo_id)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query("UPDATE repos SET current_shard_id = NULL WHERE id = $1")
+        .bind(repo_id)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query(
+        "UPDATE jobs
+         SET state = 'done', lease_until = NULL
+         WHERE repo_id = $1 AND state <> 'done'",
+    )
+    .bind(repo_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Rule precedence is deterministic: the most specific matching glob
+/// (longest pattern) wins, and the newest rule wins ties. Private repos
+/// only consider rules with `applies_to_private`, making private indexing
+/// an explicit opt-in path per ADR 0001.
+fn discovery_state_for(slug: &str, visibility: RepoVisibility, rules: &[RuleRow]) -> &'static str {
+    for rule in rules {
+        if visibility == RepoVisibility::Private && !rule.applies_to_private {
+            continue;
+        }
+        if glob_matches(&rule.pattern, slug) {
+            return if rule.action == "include" {
+                "included"
+            } else {
+                "excluded"
+            };
+        }
+    }
+    match visibility {
+        RepoVisibility::Private => "discovered",
+        RepoVisibility::Public | RepoVisibility::Internal => "included",
+    }
+}
+
+fn glob_matches(pattern: &str, text: &str) -> bool {
+    let pattern = pattern.as_bytes();
+    let text = text.as_bytes();
+    let (mut p, mut t) = (0, 0);
+    let mut star = None;
+    let mut retry_text = 0;
+
+    while t < text.len() {
+        if p < pattern.len() && (pattern[p] == b'?' || pattern[p] == text[t]) {
+            p += 1;
+            t += 1;
+        } else if p < pattern.len() && pattern[p] == b'*' {
+            star = Some(p);
+            p += 1;
+            retry_text = t;
+        } else if let Some(star_at) = star {
+            p = star_at + 1;
+            retry_text += 1;
+            t = retry_text;
+        } else {
+            return false;
+        }
+    }
+
+    while p < pattern.len() && pattern[p] == b'*' {
+        p += 1;
+    }
+    p == pattern.len()
 }
 
 /// Queue a job for the repo unless one of its kind is already in flight
@@ -840,7 +1350,7 @@ async fn settle_leased_job(
 
 #[cfg(test)]
 mod tests {
-    use super::repo_qualifier;
+    use super::{RepoVisibility, RuleRow, discovery_state_for, glob_matches, repo_qualifier};
 
     #[test]
     fn qualifiers_join_the_schemeless_forge_root_with_the_slug() {
@@ -858,6 +1368,40 @@ mod tests {
         assert_eq!(
             repo_qualifier("file:///tmp/fixtures", "acme/widgets"),
             "/tmp/fixtures/acme/widgets"
+        );
+    }
+
+    #[test]
+    fn discovery_globs_match_without_recursive_backtracking() {
+        assert!(glob_matches("acme/*", "acme/widgets"));
+        assert!(glob_matches("acme/private-?", "acme/private-a"));
+        assert!(!glob_matches("acme/private-?", "acme/private-ab"));
+        assert!(!glob_matches("acme/*/api", "acme/widgets"));
+        assert!(glob_matches("********widgets", "acme/widgets"));
+    }
+
+    #[test]
+    fn longest_private_applicable_rule_wins_discovery_state() {
+        let rules = vec![
+            RuleRow {
+                pattern: "acme/*".into(),
+                action: "include".into(),
+                applies_to_private: false,
+            },
+            RuleRow {
+                pattern: "acme/private-*".into(),
+                action: "include".into(),
+                applies_to_private: true,
+            },
+        ];
+        assert_eq!(
+            discovery_state_for("acme/private-widgets", RepoVisibility::Private, &rules),
+            "included"
+        );
+        assert_eq!(
+            discovery_state_for("acme/secret", RepoVisibility::Private, &rules),
+            "discovered",
+            "private repos ignore rules not explicitly marked private"
         );
     }
 }

@@ -29,7 +29,7 @@ Job queue = `SELECT … FOR UPDATE SKIP LOCKED` with leases; priorities favor in
 
 ## 3. Sync protocol
 
-- **Discovery loop** (per Forge connection, ~hourly + on demand): list orgs/groups → upsert `repos` with `discovery_state`. Public/internal → `included` unless an exclude rule matches; private → `discovered` until an include rule with `applies_to_private` covers it (ADR 0001).
+- **Discovery loop** (per Forge connection, ~hourly + on demand): list orgs/groups → upsert `repos` with `discovery_state`. Public/internal → `included` unless an exclude rule matches; private → `discovered` until an include rule with `applies_to_private` covers it (ADR 0001). Rule precedence is longest matching glob first, then newest rule for equal-length matches.
 - **Poll loop** (default 5 min/repo, jittered, conditional requests): compare branch head via cheap API call; on change enqueue `fetch`. Rate budgeting per Forge token; backoff on 429/abuse signals.
 - **Webhook receiver** (optional accelerator): push/CR/issue events → enqueue the same jobs. Secrets per Forge; idempotent with poll (poll is truth, webhooks are latency).
 - **Fetch job**: bare clone/fetch into worker-local cache (full history default; `--depth` per-repo override). Forge Artifacts synced via API cursors (updated-since), normalized to common shapes (Change Request, Issue, Review).

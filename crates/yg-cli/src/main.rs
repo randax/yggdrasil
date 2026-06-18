@@ -111,12 +111,83 @@ enum AdminCommand {
         #[command(subcommand)]
         command: RepoCommand,
     },
+    /// Connect Forge orgs for repository discovery
+    Forge {
+        #[command(subcommand)]
+        command: ForgeCommand,
+    },
+    /// Manage repository discovery include/exclude rules
+    Rules {
+        #[command(subcommand)]
+        command: RulesCommand,
+    },
     /// Show every registered repo with its sync state
     Status {
         /// Emit the raw JSON response instead of the human report
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum ForgeCommand {
+    /// Connect a GitHub org for hourly discovery
+    Add {
+        #[arg(help = "Forge kind; currently only github")]
+        kind: String,
+        #[arg(help = "Organization slug, e.g. acme")]
+        org: String,
+        /// Forge root (default: https://github.com)
+        #[arg(long)]
+        base_url: Option<String>,
+        /// Env var holding the Forge token
+        #[arg(long)]
+        token_env: Option<String>,
+    },
+    /// Request discovery for a connected org now
+    Discover {
+        #[arg(help = "Forge kind; currently only github")]
+        kind: String,
+        #[arg(help = "Organization slug, e.g. acme")]
+        org: String,
+        /// Forge root (default: https://github.com)
+        #[arg(long)]
+        base_url: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum RulesCommand {
+    /// Add or update an include/exclude glob rule
+    Add {
+        #[arg(help = "Repo slug glob, e.g. acme/private-*")]
+        pattern: String,
+        #[arg(long, value_enum)]
+        action: RuleActionArg,
+        /// Forge root the rule belongs to
+        #[arg(long, default_value = "https://github.com")]
+        forge: String,
+        /// Let this rule apply to private repos
+        #[arg(long = "private")]
+        applies_to_private: bool,
+    },
+    /// List discovery rules in evaluation order
+    List,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum RuleActionArg {
+    Include,
+    Exclude,
+}
+
+impl RuleActionArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Include => "include",
+            Self::Exclude => "exclude",
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -175,6 +246,32 @@ async fn main() -> anyhow::Result<()> {
                         poll_interval,
                     },
             } => admin_repo_add(url, depth, poll_interval).await,
+            AdminCommand::Forge {
+                command:
+                    ForgeCommand::Add {
+                        kind,
+                        org,
+                        base_url,
+                        token_env,
+                    },
+            } => admin_forge_add(kind, org, base_url, token_env).await,
+            AdminCommand::Forge {
+                command:
+                    ForgeCommand::Discover {
+                        kind,
+                        org,
+                        base_url,
+                    },
+            } => admin_forge_discover(kind, org, base_url).await,
+            AdminCommand::Rules { command } => match command {
+                RulesCommand::Add {
+                    pattern,
+                    action,
+                    forge,
+                    applies_to_private,
+                } => admin_rules_add(pattern, action, forge, applies_to_private).await,
+                RulesCommand::List => admin_rules_list().await,
+            },
             AdminCommand::Status { json } => admin_status(json).await,
         },
     }
@@ -494,6 +591,113 @@ async fn admin_repo_add(
     Ok(())
 }
 
+async fn admin_forge_add(
+    kind: String,
+    org: String,
+    base_url: Option<String>,
+    token_env: Option<String>,
+) -> anyhow::Result<()> {
+    let body = server_json(
+        reqwest::Method::POST,
+        "/v1/admin/forges",
+        Some(serde_json::json!({
+            "kind": kind,
+            "org": org,
+            "base_url": base_url,
+            "token_env": token_env,
+        })),
+    )
+    .await?;
+    let kind = body["kind"].as_str().unwrap_or("?");
+    let org = body["org"].as_str().unwrap_or("?");
+    let base_url = body["base_url"].as_str().unwrap_or("?");
+    if body["created"] == true {
+        println!("connected {kind} org {org} ({base_url})");
+    } else {
+        println!("{kind} org {org} already connected ({base_url})");
+    }
+    Ok(())
+}
+
+async fn admin_forge_discover(
+    kind: String,
+    org: String,
+    base_url: Option<String>,
+) -> anyhow::Result<()> {
+    let body = server_json(
+        reqwest::Method::POST,
+        "/v1/admin/forges/discover",
+        Some(serde_json::json!({
+            "kind": kind,
+            "org": org,
+            "base_url": base_url,
+        })),
+    )
+    .await?;
+    println!(
+        "discovery requested for {} org {} ({})",
+        body["kind"].as_str().unwrap_or("?"),
+        body["org"].as_str().unwrap_or("?"),
+        body["base_url"].as_str().unwrap_or("?")
+    );
+    Ok(())
+}
+
+async fn admin_rules_add(
+    pattern: String,
+    action: RuleActionArg,
+    forge: String,
+    applies_to_private: bool,
+) -> anyhow::Result<()> {
+    let body = server_json(
+        reqwest::Method::POST,
+        "/v1/admin/rules",
+        Some(serde_json::json!({
+            "forge": forge,
+            "pattern": pattern,
+            "action": action.as_str(),
+            "private": applies_to_private,
+        })),
+    )
+    .await?;
+    let scope = if body["applies_to_private"] == true {
+        "private"
+    } else {
+        "public/internal"
+    };
+    println!(
+        "{} {} on {} ({scope}; {} fetches queued)",
+        body["action"].as_str().unwrap_or("?"),
+        body["pattern"].as_str().unwrap_or("?"),
+        body["forge"].as_str().unwrap_or("?"),
+        body["fetches_queued"].as_u64().unwrap_or(0)
+    );
+    Ok(())
+}
+
+async fn admin_rules_list() -> anyhow::Result<()> {
+    let body = server_json(reqwest::Method::GET, "/v1/admin/rules", None).await?;
+    let rules = body["rules"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+    if rules.is_empty() {
+        println!("no discovery rules");
+        return Ok(());
+    }
+    for rule in rules {
+        let private = if rule["applies_to_private"] == true {
+            "private"
+        } else {
+            "public/internal"
+        };
+        println!(
+            "{}  {}  {}  {private}",
+            rule["forge"].as_str().unwrap_or("?"),
+            rule["action"].as_str().unwrap_or("?"),
+            rule["pattern"].as_str().unwrap_or("?")
+        );
+    }
+    Ok(())
+}
+
 async fn admin_status(json: bool) -> anyhow::Result<()> {
     let body = server_json(reqwest::Method::GET, "/v1/admin/status", None).await?;
 
@@ -516,6 +720,11 @@ async fn admin_status(json: bool) -> anyhow::Result<()> {
             .map(|sha| sha.get(..12).unwrap_or(sha))
             .unwrap_or("-");
         print!("{slug}  {state}  {commit}");
+        let visibility = repo["visibility"].as_str().unwrap_or("public");
+        let discovery = repo["discovery_state"].as_str().unwrap_or("included");
+        if visibility != "public" || discovery != "included" {
+            print!("  ({visibility}, {discovery})");
+        }
         if let Some(error) = repo["sync"]["last_error"].as_str() {
             print!("  [attempt {}: {error}]", repo["sync"]["attempts"]);
         }
@@ -624,9 +833,11 @@ async fn run_workers(
     // never stalls another. Queue and poll control-plane errors end the
     // process; GC logs transient sweep failures and retries on its cadence.
     let poll = poll_config_from_env();
+    let discovery = discovery_config_from_env();
     let gc_grace = env_duration_secs("YG_GC_GRACE", DEFAULT_GC_GRACE_SECS);
     let gc_interval = env_duration_secs("YG_GC_INTERVAL", DEFAULT_GC_INTERVAL_SECS);
     tokio::try_join!(
+        drain_queue(|| sync.discover_once(&discovery)),
         drain_queue(|| sync.run_once()),
         drain_queue(|| index.run_once()),
         drain_queue(|| sync.poll_once(&poll)),
@@ -653,6 +864,8 @@ where
 
 /// Default poll interval per repo when `YG_POLL_INTERVAL` is unset.
 const DEFAULT_POLL_INTERVAL_SECS: u64 = 5 * 60;
+/// Default connected-forge discovery interval (`YG_DISCOVERY_INTERVAL`).
+const DEFAULT_DISCOVERY_INTERVAL_SECS: u64 = 60 * 60;
 /// Default grace window before a superseded Shard is reclaimed
 /// (`YG_GC_GRACE`).
 const DEFAULT_GC_GRACE_SECS: u64 = 60 * 60;
@@ -672,6 +885,12 @@ fn poll_config_from_env() -> yg_sync::PollConfig {
     yg_sync::PollConfig {
         default_interval: env_duration_secs("YG_POLL_INTERVAL", DEFAULT_POLL_INTERVAL_SECS),
         jitter_fraction: POLL_JITTER_FRACTION,
+    }
+}
+
+fn discovery_config_from_env() -> yg_sync::DiscoveryConfig {
+    yg_sync::DiscoveryConfig {
+        interval: env_duration_secs("YG_DISCOVERY_INTERVAL", DEFAULT_DISCOVERY_INTERVAL_SECS),
     }
 }
 

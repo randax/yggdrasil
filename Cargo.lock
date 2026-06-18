@@ -4043,6 +4043,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64",
+ "reqwest 0.13.4",
+ "serde",
  "tempfile",
  "tokio",
  "tracing",
