@@ -173,6 +173,7 @@ impl SyncWorker {
         let bucket = buckets
             .entry(forge_id)
             .or_insert_with(|| TokenBucket::per_minute(rate_budget, now));
+        bucket.update_rate(rate_budget, now);
         if bucket.try_take(now) {
             Ok(())
         } else {
@@ -188,6 +189,7 @@ impl SyncWorker {
         let bucket = buckets
             .entry(forge_id)
             .or_insert_with(|| TokenBucket::per_minute(rate_budget, now));
+        bucket.update_rate(rate_budget, now);
         bucket.cooldown(now + RATE_LIMIT_COOLDOWN);
         bucket.retry_after(now)
     }
@@ -271,6 +273,20 @@ impl TokenBucket {
         let elapsed = now.saturating_duration_since(self.last).as_secs_f64();
         self.tokens = (self.tokens + elapsed * self.refill_per_sec).min(self.capacity);
         self.last = now;
+    }
+
+    /// Apply a new per-minute rate from the control plane without
+    /// restarting the worker. Existing tokens are first reconciled under
+    /// the previous rate, then capped to the new capacity.
+    fn update_rate(&mut self, rate_per_minute: i32, now: Instant) {
+        let capacity = rate_per_minute.max(1) as f64;
+        if self.capacity == capacity {
+            return;
+        }
+        self.refill(now);
+        self.capacity = capacity;
+        self.refill_per_sec = capacity / 60.0;
+        self.tokens = self.tokens.min(capacity);
     }
 
     /// Spend one token if one is available and the forge is not cooling
@@ -1056,6 +1072,35 @@ mod tests {
         assert!(
             !bucket.try_take(later),
             "a long idle must not bank more than one burst's worth of tokens"
+        );
+    }
+
+    #[test]
+    fn token_bucket_applies_rate_budget_changes_without_restart() {
+        let t0 = Instant::now();
+        let mut bucket = TokenBucket::per_minute(60, t0);
+        for _ in 0..60 {
+            assert!(bucket.try_take(t0));
+        }
+        assert!(!bucket.try_take(t0), "the original budget is empty");
+
+        bucket.update_rate(120, t0 + Duration::from_secs(120));
+        for i in 0..60 {
+            assert!(
+                bucket.try_take(t0 + Duration::from_secs(120)),
+                "new capacity grants token {i}"
+            );
+        }
+        assert!(
+            !bucket.try_take(t0 + Duration::from_secs(120)),
+            "tokens are capped to the new capacity"
+        );
+
+        bucket.update_rate(1, t0 + Duration::from_secs(180));
+        assert!(bucket.try_take(t0 + Duration::from_secs(180)));
+        assert!(
+            !bucket.try_take(t0 + Duration::from_secs(180)),
+            "lowering the budget caps already-held tokens"
         );
     }
 

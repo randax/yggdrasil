@@ -419,24 +419,24 @@ pub async fn delete_shard(
     repo_id: i64,
     revision: &str,
 ) -> anyhow::Result<()> {
-    use futures::TryStreamExt;
+    use futures::{StreamExt, TryStreamExt};
     let prefix = object_store::path::Path::from(format!("shards/{repo_id}/{revision}/"));
-    let locations: Vec<object_store::path::Path> = store
+    let locations = store
         .list(Some(&prefix))
         .map_ok(|object| object.location)
-        .try_collect()
-        .await
-        .with_context(|| format!("listing Shard objects under {prefix}"))?;
-    for location in locations {
-        match store.delete(&location).await {
-            Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
-            Err(e) => {
-                return Err(
-                    anyhow::Error::new(e).context(format!("deleting Shard object {location}"))
-                );
+        .boxed();
+    store
+        .delete_stream(locations)
+        .filter_map(|deleted| async {
+            match deleted {
+                Ok(path) => Some(Ok(path)),
+                Err(object_store::Error::NotFound { .. }) => None,
+                Err(e) => Some(Err(e)),
             }
-        }
-    }
+        })
+        .try_collect::<Vec<_>>()
+        .await
+        .with_context(|| format!("deleting Shard objects under {prefix}"))?;
     Ok(())
 }
 

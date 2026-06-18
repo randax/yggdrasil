@@ -76,9 +76,9 @@ impl IndexWorker {
     /// Shard no repo points at that has been superseded longer than
     /// `grace`, drop its control-plane row and delete its object-storage
     /// segments. A Shard that became current again between the scan and
-    /// the delete is skipped; one that fails to delete is logged and left
-    /// for the next sweep rather than blocking the rest. Returns how many
-    /// Shards were collected.
+    /// the delete is skipped; one whose row is deleted but object cleanup
+    /// fails is logged as orphaned rather than blocking the rest. Returns
+    /// how many Shards were collected.
     pub async fn gc_once(&self, grace: Duration) -> anyhow::Result<u64> {
         let stale = self.control.superseded_shards_past_grace(grace).await?;
         let mut collected = 0;
@@ -91,7 +91,7 @@ impl IndexWorker {
                     repo_id = shard.repo_id,
                     revision = %shard.revision,
                     error = format!("{e:#}"),
-                    "could not garbage-collect a superseded Shard; leaving it for the next sweep"
+                    "could not delete object-storage segments for superseded Shard; these segments are now orphaned"
                 ),
             }
         }
