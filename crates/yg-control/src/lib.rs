@@ -171,6 +171,8 @@ pub struct DuePoll {
     pub token_env: Option<String>,
     /// Shallow-clone override; `None` = full history.
     pub fetch_depth: Option<i32>,
+    /// Per-repo polling interval override, if configured.
+    pub poll_interval_seconds: Option<i32>,
     /// The repo's sync position — the commit a moved head is compared
     /// against. Never NULL: the claim gates on it.
     pub synced_commit: String,
@@ -421,6 +423,7 @@ impl ControlPlane {
              WHERE r.id = due.id AND f.id = r.forge_id
              RETURNING r.id AS repo_id, r.slug, f.id AS forge_id,
                        f.base_url, f.token_env, r.fetch_depth,
+                       r.poll_interval_seconds,
                        r.last_synced_commit AS synced_commit, f.rate_budget",
         )
         .bind(default_interval.as_secs_f64())

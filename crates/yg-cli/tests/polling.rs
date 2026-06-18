@@ -170,6 +170,76 @@ async fn a_pushed_commit_becomes_queryable_after_a_poll() {
 }
 
 #[tokio::test]
+async fn a_poll_that_races_an_existing_fetch_retries_soon_if_that_fetch_was_stale() {
+    let h = Harness::boot().await;
+    h.add_repo().await;
+    h.sync_and_index().await;
+    let first_head = h
+        .synced_commit()
+        .await
+        .expect("the fixture has been synced");
+
+    // A manual re-add queues a fetch, and a worker claims it before the
+    // push below. This leased fetch stands in for one that already read
+    // the old remote head and will complete stale.
+    h.add_repo().await;
+    let control = control_plane(&h.db_name).await;
+    let stale_fetch = control
+        .claim_due_fetch(Duration::from_secs(60))
+        .await
+        .unwrap()
+        .expect("re-add queued a fetch");
+
+    h.push_commit(
+        "add Greet",
+        &[(
+            "extra.go",
+            "package main\n\nfunc Greet() string {\n\treturn \"hi\"\n}\n",
+        )],
+    );
+
+    assert!(
+        h.sync.poll_once(&poll_config()).await.unwrap(),
+        "the poll observes the moved head"
+    );
+    let retry = h.next_poll_in_secs().await;
+    assert!(
+        (-1.0..=35.0).contains(&retry),
+        "a moved head hidden behind an in-flight fetch must retry soon, not after the full interval; got {retry}s"
+    );
+
+    assert!(
+        control
+            .complete_fetch(&stale_fetch, &first_head)
+            .await
+            .unwrap(),
+        "the already-leased fetch completes with the old head"
+    );
+    assert!(
+        !h.symbol_is_queryable("Greet").await,
+        "the stale fetch must not have indexed the pushed symbol"
+    );
+
+    // Time-travel the near-term retry to avoid sleeping in the test. The
+    // second poll sees the head still moved, queues a fresh fetch, and the
+    // normal fetch+index pipeline catches up.
+    sqlx::query("UPDATE repos SET next_poll_at = now()")
+        .execute(&h.pool().await)
+        .await
+        .unwrap();
+    assert!(
+        h.sync.poll_once(&poll_config()).await.unwrap(),
+        "the retry poll queues the missing fetch"
+    );
+    assert!(h.sync.run_once().await.unwrap(), "fresh fetch runs");
+    assert!(h.indexer.run_once().await.unwrap(), "fresh index runs");
+    assert!(
+        h.symbol_is_queryable("Greet").await,
+        "the pushed symbol becomes queryable after the retry"
+    );
+}
+
+#[tokio::test]
 async fn an_unchanged_head_costs_only_a_conditional_request() {
     let h = Harness::boot().await;
     h.add_repo().await;

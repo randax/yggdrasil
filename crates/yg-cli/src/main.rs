@@ -620,8 +620,9 @@ async fn run_workers(
     // Continuous Sync (RFC 0001 §3, issue #9): the poll loop watches
     // indexed repos for pushed changes and the GC loop reclaims
     // superseded Shards after their grace window, both beside the queue
-    // drains. Each loop on its own task so a slow job of one kind never
-    // stalls another; an error from any of them ends the process.
+    // drains. Each loop runs on its own task so a slow job of one kind
+    // never stalls another. Queue and poll control-plane errors end the
+    // process; GC logs transient sweep failures and retries on its cadence.
     let poll = poll_config_from_env();
     let gc_grace = env_duration_secs("YG_GC_GRACE", DEFAULT_GC_GRACE_SECS);
     let gc_interval = env_duration_secs("YG_GC_INTERVAL", DEFAULT_GC_INTERVAL_SECS);

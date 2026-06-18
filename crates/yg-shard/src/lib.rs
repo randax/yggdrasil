@@ -420,7 +420,7 @@ pub async fn delete_shard(
     revision: &str,
 ) -> anyhow::Result<()> {
     use futures::TryStreamExt;
-    let prefix = object_store::path::Path::from(format!("shards/{repo_id}/{revision}"));
+    let prefix = object_store::path::Path::from(format!("shards/{repo_id}/{revision}/"));
     let locations: Vec<object_store::path::Path> = store
         .list(Some(&prefix))
         .map_ok(|object| object.location)

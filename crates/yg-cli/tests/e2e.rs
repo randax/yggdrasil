@@ -466,6 +466,63 @@ async fn admin_repo_add_rejects_non_positive_depth() {
 }
 
 #[tokio::test]
+async fn admin_repo_add_rejects_non_positive_poll_interval() {
+    let server = boot_test_server().await;
+    let base = format!("http://{}", server.local_addr());
+
+    for interval in [0, -3] {
+        let resp = post_repo(
+            &base,
+            serde_json::json!({
+                "url": "https://github.com/acme/widgets",
+                "poll_interval": interval
+            }),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            400,
+            "poll_interval {interval} must be rejected"
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("poll_interval")),
+            "the error must name poll_interval, got: {body}"
+        );
+    }
+
+    let body = admin_status_body(&base).await;
+    assert_eq!(
+        body["repos"].as_array().unwrap().len(),
+        0,
+        "a rejected poll_interval must not register the repo, got: {body}"
+    );
+
+    // The CLI rejects it before the request even leaves.
+    let cli = assert_cmd::Command::cargo_bin("yg")
+        .unwrap()
+        .env("YG_SERVER", &base)
+        .env("YG_TOKEN", TEST_TOKEN)
+        .args([
+            "admin",
+            "repo",
+            "add",
+            "https://github.com/acme/widgets",
+            "--poll-interval",
+            "0",
+        ])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8(cli.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("poll-interval") || stderr.contains("--poll-interval"),
+        "clap must reject poll interval 0, got:\n{stderr}"
+    );
+}
+
+#[tokio::test]
 async fn failing_fetches_surface_their_error_and_back_off_exponentially() {
     let fixture = tempfile::tempdir().unwrap();
     // Valid URL shape, but nothing lives there.

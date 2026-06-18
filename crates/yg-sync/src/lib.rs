@@ -12,6 +12,11 @@ use yg_control::ControlPlane;
 /// How long a worker may hold a fetch job before a crashed run becomes
 /// claimable again. Generous: a cold full-history clone of a large repo.
 const FETCH_LEASE: Duration = Duration::from_secs(15 * 60);
+/// When a poll observes a moved head but a fetch is already queued or
+/// leased, retry soon: that in-flight fetch may have read the previous
+/// head before this poll observed the push. Capped so large default poll
+/// intervals do not hide the detected move for minutes.
+const FETCH_IN_FLIGHT_REPOLL_MAX: Duration = Duration::from_secs(30);
 
 /// A Sync worker: drains the fetch queue, mirroring repos into the
 /// worker-local git cache and recording each repo's synced commit.
@@ -130,6 +135,15 @@ impl SyncWorker {
             Ok(Some(head)) if head != due.synced_commit => {
                 if self.control.request_fetch(due.repo_id).await? {
                     tracing::info!(slug = %due.slug, %head, "head moved; fetch queued");
+                } else {
+                    self.control
+                        .defer_poll(due.repo_id, in_flight_fetch_repoll(&due, cfg))
+                        .await?;
+                    tracing::info!(
+                        slug = %due.slug,
+                        %head,
+                        "head moved but fetch is already pending; poll retry scheduled"
+                    );
                 }
             }
             // Unchanged, or an unborn/hidden head: nothing to fetch.
@@ -177,6 +191,16 @@ impl SyncWorker {
         bucket.cooldown(now + RATE_LIMIT_COOLDOWN);
         bucket.retry_after(now)
     }
+}
+
+fn in_flight_fetch_repoll(due: &yg_control::DuePoll, cfg: &PollConfig) -> Duration {
+    let repo_interval = due
+        .poll_interval_seconds
+        .map(|secs| Duration::from_secs(secs as u64))
+        .unwrap_or(cfg.default_interval);
+    repo_interval
+        .min(FETCH_IN_FLIGHT_REPOLL_MAX)
+        .max(Duration::from_secs(1))
 }
 
 /// The commit a remote's default branch (HEAD) points at, read with a
