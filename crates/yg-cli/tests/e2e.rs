@@ -39,6 +39,526 @@ async fn admin_repo_add_registers_repo_and_admin_status_lists_it_queued() {
 }
 
 #[tokio::test]
+async fn discovery_keeps_private_repos_discovered_until_a_private_include_rule_matches() {
+    let db_name = create_test_db().await;
+    let control = control_plane(&db_name).await;
+
+    let forge = control
+        .connect_forge_org(yg_control::ConnectForgeOrg {
+            forge_kind: "github",
+            base_url: "https://github.com",
+            org_slug: "acme",
+            token_env: Some("YG_GITHUB_TOKEN"),
+        })
+        .await
+        .unwrap();
+
+    control
+        .discover_forge_repos(
+            forge.org_id,
+            &[yg_control::DiscoveredRepo {
+                slug: "acme/private-widgets",
+                visibility: yg_control::RepoVisibility::Private,
+                fetch_depth: None,
+            }],
+        )
+        .await
+        .unwrap();
+
+    let repos = control.admin_status().await.unwrap();
+    assert_eq!(repos[0].visibility, yg_control::RepoVisibility::Private);
+    assert_eq!(repos[0].discovery_state, "discovered");
+    assert!(
+        repos[0].job_state.is_none(),
+        "a private repo must not queue fetch before opt-in"
+    );
+
+    control
+        .add_rule(yg_control::AddRule {
+            forge_id: forge.forge_id,
+            pattern: "acme/private-*",
+            action: yg_control::RuleAction::Include,
+            applies_to_private: true,
+        })
+        .await
+        .unwrap();
+
+    let repos = control.admin_status().await.unwrap();
+    assert_eq!(repos[0].discovery_state, "included");
+    assert_eq!(
+        repos[0].job_state.as_deref(),
+        Some("queued"),
+        "explicit private opt-in must queue the first fetch"
+    );
+}
+
+#[tokio::test]
+async fn admin_repo_add_opts_in_a_previously_discovered_private_repo() {
+    let db_name = create_test_db().await;
+    let control = control_plane(&db_name).await;
+
+    let forge = control
+        .connect_forge_org(yg_control::ConnectForgeOrg {
+            forge_kind: "github",
+            base_url: "https://github.com",
+            org_slug: "acme",
+            token_env: None,
+        })
+        .await
+        .unwrap();
+    control
+        .discover_forge_repos(
+            forge.org_id,
+            &[yg_control::DiscoveredRepo {
+                slug: "acme/private-widgets",
+                visibility: yg_control::RepoVisibility::Private,
+                fetch_depth: None,
+            }],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        control.admin_status().await.unwrap()[0].discovery_state,
+        "discovered",
+        "private org discovery must not include the repo by itself"
+    );
+
+    let added = control
+        .add_repo(yg_control::AddRepo {
+            forge_kind: "github",
+            base_url: "https://github.com",
+            token_env: None,
+            slug: "acme/private-widgets",
+            fetch_depth: None,
+            poll_interval_seconds: None,
+        })
+        .await
+        .unwrap();
+
+    assert!(
+        added.fetch_queued,
+        "manual add is an explicit private opt-in"
+    );
+    let repos = control.admin_status().await.unwrap();
+    assert_eq!(repos[0].visibility, yg_control::RepoVisibility::Private);
+    assert_eq!(repos[0].discovery_state, "included");
+    assert!(
+        control
+            .claim_due_fetch(std::time::Duration::from_secs(60))
+            .await
+            .unwrap()
+            .is_some(),
+        "the explicit opt-in fetch must be claimable"
+    );
+}
+
+#[tokio::test]
+async fn rediscovery_does_not_requeue_repos_that_are_already_included() {
+    let db_name = create_test_db().await;
+    let control = control_plane(&db_name).await;
+    let forge = control
+        .connect_forge_org(yg_control::ConnectForgeOrg {
+            forge_kind: "github",
+            base_url: "https://github.com",
+            org_slug: "acme",
+            token_env: None,
+        })
+        .await
+        .unwrap();
+    let repos = [yg_control::DiscoveredRepo {
+        slug: "acme/widgets",
+        visibility: yg_control::RepoVisibility::Public,
+        fetch_depth: None,
+    }];
+
+    assert_eq!(
+        control
+            .discover_forge_repos(forge.org_id, &repos)
+            .await
+            .unwrap(),
+        1,
+        "first discovery queues the initial fetch"
+    );
+    let fetch = control
+        .claim_due_fetch(std::time::Duration::from_secs(60))
+        .await
+        .unwrap()
+        .expect("initial discovery queued a fetch");
+    assert!(
+        control
+            .complete_fetch(&fetch, "feedface0000000000000000000000000000feed")
+            .await
+            .unwrap(),
+        "initial fetch completion lands"
+    );
+
+    assert_eq!(
+        control
+            .discover_forge_repos(forge.org_id, &repos)
+            .await
+            .unwrap(),
+        0,
+        "rediscovery of an already-included repo must not queue another fetch"
+    );
+    assert!(
+        control
+            .claim_due_fetch(std::time::Duration::from_secs(60))
+            .await
+            .unwrap()
+            .is_none(),
+        "polling, not discovery, owns subsequent syncs for existing repos"
+    );
+}
+
+#[tokio::test]
+async fn exclude_rules_cancel_pending_fetches_for_included_repos() {
+    let db_name = create_test_db().await;
+    let control = control_plane(&db_name).await;
+    control
+        .add_repo(yg_control::AddRepo {
+            forge_kind: "github",
+            base_url: "https://github.com",
+            token_env: None,
+            slug: "acme/widgets",
+            fetch_depth: None,
+            poll_interval_seconds: None,
+        })
+        .await
+        .unwrap();
+    let forge_id = control
+        .forge_id_by_base_url("https://github.com")
+        .await
+        .unwrap()
+        .unwrap();
+
+    control
+        .add_rule(yg_control::AddRule {
+            forge_id,
+            pattern: "acme/widgets",
+            action: yg_control::RuleAction::Exclude,
+            applies_to_private: false,
+        })
+        .await
+        .unwrap();
+
+    assert!(
+        control
+            .claim_due_fetch(std::time::Duration::from_secs(60))
+            .await
+            .unwrap()
+            .is_none(),
+        "an excluded repo must not keep its queued fetch"
+    );
+    let repos = control.admin_status().await.unwrap();
+    assert_eq!(repos[0].discovery_state, "excluded");
+}
+
+#[tokio::test]
+async fn readding_a_repo_makes_its_exact_include_rule_newest_again() {
+    let db_name = create_test_db().await;
+    let control = control_plane(&db_name).await;
+    control
+        .add_repo(yg_control::AddRepo {
+            forge_kind: "github",
+            base_url: "https://github.com",
+            token_env: None,
+            slug: "acme/widgets",
+            fetch_depth: None,
+            poll_interval_seconds: None,
+        })
+        .await
+        .unwrap();
+    let forge_id = control
+        .forge_id_by_base_url("https://github.com")
+        .await
+        .unwrap()
+        .unwrap();
+    control
+        .add_rule(yg_control::AddRule {
+            forge_id,
+            pattern: "acme/widgets",
+            action: yg_control::RuleAction::Exclude,
+            applies_to_private: false,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        control.admin_status().await.unwrap()[0].discovery_state,
+        "excluded"
+    );
+
+    let added = control
+        .add_repo(yg_control::AddRepo {
+            forge_kind: "github",
+            base_url: "https://github.com",
+            token_env: None,
+            slug: "acme/widgets",
+            fetch_depth: None,
+            poll_interval_seconds: None,
+        })
+        .await
+        .unwrap();
+
+    assert!(added.fetch_queued);
+    assert_eq!(
+        control.admin_status().await.unwrap()[0].discovery_state,
+        "included",
+        "the latest equal-length rule must win the deterministic tie-break"
+    );
+}
+
+#[tokio::test]
+async fn exclude_rules_remove_indexed_repos_from_query_visibility() {
+    let h = Harness::boot().await;
+    h.add_repo().await;
+    h.sync_and_index().await;
+
+    let before = h
+        .verb_ok("search", serde_json::json!({"query": "Hello"}))
+        .await;
+    assert!(
+        before["hits"]
+            .as_array()
+            .is_some_and(|hits| !hits.is_empty()),
+        "the fixture is queryable before exclusion: {before}"
+    );
+
+    let locator = yg_sync::RepoLocator::parse(&h.fixture_url).unwrap();
+    let control = control_plane(&h.db_name).await;
+    let forge_id = control
+        .forge_id_by_base_url(&locator.base_url)
+        .await
+        .unwrap()
+        .unwrap();
+    control
+        .add_rule(yg_control::AddRule {
+            forge_id,
+            pattern: &locator.slug,
+            action: yg_control::RuleAction::Exclude,
+            applies_to_private: false,
+        })
+        .await
+        .unwrap();
+
+    let after = h
+        .verb_ok("search", serde_json::json!({"query": "Hello"}))
+        .await;
+    assert_eq!(
+        after["hits"].as_array().unwrap(),
+        &Vec::<serde_json::Value>::new(),
+        "excluded repos must leave org-wide search: {after}"
+    );
+    let status = admin_status_body(&h.base).await;
+    assert_eq!(status["repos"][0]["discovery_state"], "excluded");
+    assert_eq!(
+        status["repos"][0]["shard"],
+        serde_json::Value::Null,
+        "excluding a repo must clear its current Shard pointer"
+    );
+    let pool = sqlx::PgPool::connect(&format!("{DEV_POSTGRES}/{}", h.db_name))
+        .await
+        .unwrap();
+    let (superseded,): (bool,) = sqlx::query_as("SELECT superseded_at IS NOT NULL FROM shards")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(superseded, "the removed Shard keeps a GC grace anchor");
+}
+
+#[tokio::test]
+async fn admin_forge_add_connects_a_github_org() {
+    let server = boot_test_server().await;
+    let base = format!("http://{}", server.local_addr());
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/admin/forges"))
+        .bearer_auth(TEST_TOKEN)
+        .json(&serde_json::json!({
+            "kind": "github",
+            "org": "acme",
+            "token_env": "YG_GITHUB_TOKEN",
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 201);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["kind"], "github");
+    assert_eq!(body["org"], "acme");
+    assert_eq!(body["base_url"], "https://github.com");
+}
+
+#[tokio::test]
+async fn admin_forge_add_normalizes_base_url_and_defaults_the_github_token_env() {
+    let db_name = create_test_db().await;
+    let server = serve(test_config(&db_name)).await.unwrap();
+    let base = format!("http://{}", server.local_addr());
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/admin/forges"))
+        .bearer_auth(TEST_TOKEN)
+        .json(&serde_json::json!({
+            "kind": "GitHub",
+            "org": "acme",
+            "base_url": "HTTPS://GitHub.COM/",
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 201);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["kind"], "github");
+    assert_eq!(body["base_url"], "https://github.com");
+
+    let control = control_plane(&db_name).await;
+    let due = control
+        .claim_due_discovery(std::time::Duration::from_secs(3600))
+        .await
+        .unwrap()
+        .expect("connected forge org must be due for discovery");
+    assert_eq!(due.base_url, "https://github.com");
+    assert_eq!(due.token_env.as_deref(), Some("YG_GITHUB_TOKEN"));
+}
+
+#[tokio::test]
+async fn reconnecting_a_forge_org_refreshes_the_token_env() {
+    let db_name = create_test_db().await;
+    let control = control_plane(&db_name).await;
+    control
+        .connect_forge_org(yg_control::ConnectForgeOrg {
+            forge_kind: "github",
+            base_url: "https://github.com",
+            org_slug: "acme",
+            token_env: Some("YG_OLD_TOKEN"),
+        })
+        .await
+        .unwrap();
+    control
+        .connect_forge_org(yg_control::ConnectForgeOrg {
+            forge_kind: "github",
+            base_url: "https://github.com",
+            org_slug: "acme",
+            token_env: Some("YG_NEW_TOKEN"),
+        })
+        .await
+        .unwrap();
+
+    let due = control
+        .claim_due_discovery(std::time::Duration::from_secs(3600))
+        .await
+        .unwrap()
+        .expect("connected forge org must be due for discovery");
+    assert_eq!(due.token_env.as_deref(), Some("YG_NEW_TOKEN"));
+}
+
+#[tokio::test]
+async fn admin_forge_add_rejects_malformed_orgs_and_base_urls() {
+    let server = boot_test_server().await;
+    let base = format!("http://{}", server.local_addr());
+    let client = reqwest::Client::new();
+
+    for body in [
+        serde_json::json!({"kind": "github", "org": "bad/org"}),
+        serde_json::json!({"kind": "github", "org": "-bad"}),
+        serde_json::json!({"kind": "github", "org": "bad--org"}),
+        serde_json::json!({"kind": "github", "org": "acme", "base_url": "http://github.com"}),
+        serde_json::json!({"kind": "github", "org": "acme", "base_url": "https://token@github.com"}),
+        serde_json::json!({"kind": "github", "org": "acme", "base_url": "https://github.com/acme"}),
+    ] {
+        let resp = client
+            .post(format!("{base}/v1/admin/forges"))
+            .bearer_auth(TEST_TOKEN)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "body must be rejected: {body}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn yg_admin_forge_add_and_rules_manage_discovery_policy() {
+    let server = boot_test_server().await;
+    let base = format!("http://{}", server.local_addr());
+
+    let forge = assert_cmd::Command::cargo_bin("yg")
+        .unwrap()
+        .env("YG_SERVER", &base)
+        .env("YG_TOKEN", TEST_TOKEN)
+        .timeout(std::time::Duration::from_secs(10))
+        .args([
+            "admin",
+            "forge",
+            "add",
+            "github",
+            "acme",
+            "--token-env",
+            "YG_GITHUB_TOKEN",
+        ])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(forge.get_output().stdout.clone()).unwrap();
+    assert!(
+        stdout.contains("connected github org acme"),
+        "forge add output must name the connection, got:\n{stdout}"
+    );
+
+    let discover = assert_cmd::Command::cargo_bin("yg")
+        .unwrap()
+        .env("YG_SERVER", &base)
+        .env("YG_TOKEN", TEST_TOKEN)
+        .timeout(std::time::Duration::from_secs(10))
+        .args(["admin", "forge", "discover", "github", "acme"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(discover.get_output().stdout.clone()).unwrap();
+    assert!(
+        stdout.contains("discovery requested for github org acme"),
+        "forge discover output must name the on-demand request, got:\n{stdout}"
+    );
+
+    let rule = assert_cmd::Command::cargo_bin("yg")
+        .unwrap()
+        .env("YG_SERVER", &base)
+        .env("YG_TOKEN", TEST_TOKEN)
+        .timeout(std::time::Duration::from_secs(10))
+        .args([
+            "admin",
+            "rules",
+            "add",
+            "acme/private-*",
+            "--action",
+            "include",
+            "--forge",
+            "https://GITHUB.COM/",
+            "--private",
+        ])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(rule.get_output().stdout.clone()).unwrap();
+    assert!(
+        stdout.contains("include acme/private-*"),
+        "rule add output must name the deterministic policy, got:\n{stdout}"
+    );
+
+    let rules = assert_cmd::Command::cargo_bin("yg")
+        .unwrap()
+        .env("YG_SERVER", &base)
+        .env("YG_TOKEN", TEST_TOKEN)
+        .timeout(std::time::Duration::from_secs(10))
+        .args(["admin", "rules", "list"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(rules.get_output().stdout.clone()).unwrap();
+    assert!(
+        stdout.contains("https://github.com  include  acme/private-*  private"),
+        "rules list must expose the private opt-in rule, got:\n{stdout}"
+    );
+}
+
+#[tokio::test]
 async fn admin_repo_add_is_idempotent() {
     let server = boot_test_server().await;
     let base = format!("http://{}", server.local_addr());

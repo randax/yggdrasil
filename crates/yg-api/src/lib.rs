@@ -120,6 +120,9 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<RunningServer> {
                 .route("/verbs/history", post(verb_history))
                 .route("/verbs/search", post(verb_search))
                 .route("/admin/repos", post(admin_repo_add))
+                .route("/admin/forges", post(admin_forge_add))
+                .route("/admin/forges/discover", post(admin_forge_discover))
+                .route("/admin/rules", get(admin_rules_list).post(admin_rules_add))
                 .route("/admin/status", get(admin_status)),
         )
         .layer(middleware::from_fn_with_state(
@@ -1377,6 +1380,281 @@ struct AddRepoResponse {
     fetch_queued: bool,
 }
 
+#[derive(Deserialize)]
+struct AddForgeRequest {
+    kind: String,
+    org: String,
+    base_url: Option<String>,
+    token_env: Option<String>,
+}
+
+#[derive(Serialize)]
+struct AddForgeResponse {
+    kind: String,
+    org: String,
+    base_url: String,
+    created: bool,
+}
+
+async fn admin_forge_add(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<AddForgeRequest>,
+) -> Response {
+    let kind = match github_kind(&req.kind) {
+        Ok(kind) => kind,
+        Err(message) => return error_json(StatusCode::BAD_REQUEST, message),
+    };
+    let org = match github_org_slug(&req.org) {
+        Ok(org) => org,
+        Err(message) => return error_json(StatusCode::BAD_REQUEST, message),
+    };
+    let base_url = match github_base_url(req.base_url.as_deref()) {
+        Ok(base_url) => base_url,
+        Err(message) => return error_json(StatusCode::BAD_REQUEST, message),
+    };
+    let token_env = req.token_env.as_deref().or_else(|| {
+        if kind == "github" {
+            Some("YG_GITHUB_TOKEN")
+        } else {
+            None
+        }
+    });
+    let outcome = state
+        .control
+        .connect_forge_org(yg_control::ConnectForgeOrg {
+            forge_kind: kind,
+            base_url: &base_url,
+            org_slug: &org,
+            token_env,
+        })
+        .await;
+    match outcome {
+        Ok(outcome) => (
+            if outcome.created {
+                StatusCode::CREATED
+            } else {
+                StatusCode::OK
+            },
+            Json(AddForgeResponse {
+                kind: kind.to_string(),
+                org,
+                base_url,
+                created: outcome.created,
+            }),
+        )
+            .into_response(),
+        Err(e) => error_json(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+    }
+}
+
+fn github_kind(kind: &str) -> Result<&'static str, &'static str> {
+    if kind.trim().eq_ignore_ascii_case("github") {
+        Ok("github")
+    } else {
+        Err("only github forge discovery is supported in this release")
+    }
+}
+
+fn github_org_slug(org: &str) -> Result<String, &'static str> {
+    let org = org.trim();
+    let valid = !org.is_empty()
+        && org.len() <= 39
+        && !org.starts_with('-')
+        && !org.ends_with('-')
+        && !org.contains("--")
+        && org.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+    if valid {
+        Ok(org.to_string())
+    } else {
+        Err("org must be a GitHub organization slug (letters, numbers, single hyphens)")
+    }
+}
+
+fn github_base_url(base_url: Option<&str>) -> Result<String, &'static str> {
+    let base_url = base_url
+        .unwrap_or("https://github.com")
+        .trim()
+        .trim_end_matches('/');
+    let base_url = base_url.to_ascii_lowercase();
+    let Some(rest) = base_url.strip_prefix("https://") else {
+        return Err("github forge base_url must start with https://");
+    };
+    if rest.is_empty()
+        || rest.contains('/')
+        || rest.contains('@')
+        || rest.contains('?')
+        || rest.contains('#')
+        || rest.bytes().any(|b| b.is_ascii_whitespace())
+    {
+        return Err("github forge base_url must be a clone root like https://github.com");
+    }
+    Ok(base_url)
+}
+
+#[derive(Deserialize)]
+struct DiscoverForgeRequest {
+    kind: String,
+    org: String,
+    base_url: Option<String>,
+}
+
+#[derive(Serialize)]
+struct DiscoverForgeResponse {
+    kind: String,
+    org: String,
+    base_url: String,
+    queued: bool,
+}
+
+async fn admin_forge_discover(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<DiscoverForgeRequest>,
+) -> Response {
+    let kind = match github_kind(&req.kind) {
+        Ok(kind) => kind,
+        Err(message) => return error_json(StatusCode::BAD_REQUEST, message),
+    };
+    let org = match github_org_slug(&req.org) {
+        Ok(org) => org,
+        Err(message) => return error_json(StatusCode::BAD_REQUEST, message),
+    };
+    let base_url = match github_base_url(req.base_url.as_deref()) {
+        Ok(base_url) => base_url,
+        Err(message) => return error_json(StatusCode::BAD_REQUEST, message),
+    };
+    match state.control.request_discovery(&base_url, &org).await {
+        Ok(true) => Json(DiscoverForgeResponse {
+            kind: kind.to_string(),
+            org,
+            base_url,
+            queued: true,
+        })
+        .into_response(),
+        Ok(false) => error_json(
+            StatusCode::NOT_FOUND,
+            format!(
+                "{} org {} is not connected; run yg admin forge add first",
+                kind, org
+            ),
+        ),
+        Err(e) => error_json(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+    }
+}
+
+#[derive(Deserialize)]
+struct AddRuleRequest {
+    forge: Option<String>,
+    pattern: String,
+    action: String,
+    private: Option<bool>,
+}
+
+#[derive(Serialize)]
+struct AddRuleResponse {
+    forge: String,
+    pattern: String,
+    action: String,
+    applies_to_private: bool,
+    created: bool,
+    repos_reconsidered: u64,
+    fetches_queued: u64,
+}
+
+async fn admin_rules_add(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<AddRuleRequest>,
+) -> Response {
+    let action = match req.action.as_str() {
+        "include" => yg_control::RuleAction::Include,
+        "exclude" => yg_control::RuleAction::Exclude,
+        other => {
+            return error_json(
+                StatusCode::BAD_REQUEST,
+                format!("rule action must be include or exclude, got {other:?}"),
+            );
+        }
+    };
+    let pattern = req.pattern.trim();
+    if pattern.is_empty() {
+        return error_json(StatusCode::BAD_REQUEST, "rule pattern must not be empty");
+    }
+    let forge = match github_base_url(req.forge.as_deref()) {
+        Ok(forge) => forge,
+        Err(message) => return error_json(StatusCode::BAD_REQUEST, message),
+    };
+    let forge_id = match state.control.forge_id_by_base_url(&forge).await {
+        Ok(Some(id)) => id,
+        Ok(None) => {
+            return error_json(
+                StatusCode::NOT_FOUND,
+                format!("forge {forge} is not connected; run yg admin forge add first"),
+            );
+        }
+        Err(e) => return error_json(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+    };
+    let outcome = state
+        .control
+        .add_rule(yg_control::AddRule {
+            forge_id,
+            pattern,
+            action,
+            applies_to_private: req.private.unwrap_or(false),
+        })
+        .await;
+    match outcome {
+        Ok(outcome) => (
+            if outcome.created {
+                StatusCode::CREATED
+            } else {
+                StatusCode::OK
+            },
+            Json(AddRuleResponse {
+                forge,
+                pattern: pattern.to_string(),
+                action: req.action,
+                applies_to_private: req.private.unwrap_or(false),
+                created: outcome.created,
+                repos_reconsidered: outcome.repos_reconsidered,
+                fetches_queued: outcome.fetches_queued,
+            }),
+        )
+            .into_response(),
+        Err(e) => error_json(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+    }
+}
+
+#[derive(Serialize)]
+struct RulesResponse {
+    rules: Vec<RuleResponse>,
+}
+
+#[derive(Serialize)]
+struct RuleResponse {
+    forge: String,
+    pattern: String,
+    action: String,
+    applies_to_private: bool,
+}
+
+async fn admin_rules_list(State(state): State<Arc<AppState>>) -> Response {
+    let rules = match state.control.rules().await {
+        Ok(rules) => rules,
+        Err(e) => return error_json(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+    };
+    Json(RulesResponse {
+        rules: rules
+            .into_iter()
+            .map(|rule| RuleResponse {
+                forge: rule.forge,
+                pattern: rule.pattern,
+                action: rule.action,
+                applies_to_private: rule.applies_to_private,
+            })
+            .collect(),
+    })
+    .into_response()
+}
+
 async fn admin_repo_add(
     State(state): State<Arc<AppState>>,
     Json(req): Json<AddRepoRequest>,
@@ -1460,6 +1738,8 @@ struct AdminStatusResponse {
 struct AdminRepoStatus {
     slug: String,
     forge: String,
+    visibility: &'static str,
+    discovery_state: String,
     last_synced_commit: Option<String>,
     sync: JobStatus,
     index: JobStatus,
@@ -1527,6 +1807,12 @@ async fn admin_status(State(state): State<Arc<AppState>>) -> Response {
             }),
             slug: r.slug,
             forge: r.forge,
+            visibility: match r.visibility {
+                yg_control::RepoVisibility::Public => "public",
+                yg_control::RepoVisibility::Internal => "internal",
+                yg_control::RepoVisibility::Private => "private",
+            },
+            discovery_state: r.discovery_state,
             last_synced_commit: r.last_synced_commit,
         })
         .collect();
