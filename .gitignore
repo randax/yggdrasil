@@ -1,1 +1,6 @@
 /target
+
+# Local server state: the worker-local git cache (YG_GIT_CACHE defaults
+# to ./data/git) and the query-node shard cache. The spawned-server e2e
+# tests create it under the crate they run from.
+data/

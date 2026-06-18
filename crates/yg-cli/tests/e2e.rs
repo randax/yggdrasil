@@ -237,6 +237,7 @@ async fn re_adding_heals_a_forge_row_missing_its_token_env() {
             token_env: Some("YG_GITHUB_TOKEN"),
             slug: "acme/widgets",
             fetch_depth: None,
+            poll_interval_seconds: None,
         })
     };
     add().await.unwrap();
@@ -312,6 +313,7 @@ async fn a_fetch_job_outlives_its_crashed_worker_via_lease_expiry() {
             token_env: Some("YG_GITHUB_TOKEN"),
             slug: "acme/widgets",
             fetch_depth: None,
+            poll_interval_seconds: None,
         })
         .await
         .unwrap();
@@ -354,6 +356,7 @@ async fn a_worker_that_outlived_its_lease_cannot_clobber_the_new_claim() {
             token_env: Some("YG_GITHUB_TOKEN"),
             slug: "acme/widgets",
             fetch_depth: None,
+            poll_interval_seconds: None,
         })
         .await
         .unwrap();
@@ -459,6 +462,63 @@ async fn admin_repo_add_rejects_non_positive_depth() {
     assert!(
         stderr.contains("depth") || stderr.contains("--depth"),
         "clap must reject depth 0, got:\n{stderr}"
+    );
+}
+
+#[tokio::test]
+async fn admin_repo_add_rejects_non_positive_poll_interval() {
+    let server = boot_test_server().await;
+    let base = format!("http://{}", server.local_addr());
+
+    for interval in [0, -3] {
+        let resp = post_repo(
+            &base,
+            serde_json::json!({
+                "url": "https://github.com/acme/widgets",
+                "poll_interval": interval
+            }),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            400,
+            "poll_interval {interval} must be rejected"
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("poll_interval")),
+            "the error must name poll_interval, got: {body}"
+        );
+    }
+
+    let body = admin_status_body(&base).await;
+    assert_eq!(
+        body["repos"].as_array().unwrap().len(),
+        0,
+        "a rejected poll_interval must not register the repo, got: {body}"
+    );
+
+    // The CLI rejects it before the request even leaves.
+    let cli = assert_cmd::Command::cargo_bin("yg")
+        .unwrap()
+        .env("YG_SERVER", &base)
+        .env("YG_TOKEN", TEST_TOKEN)
+        .args([
+            "admin",
+            "repo",
+            "add",
+            "https://github.com/acme/widgets",
+            "--poll-interval",
+            "0",
+        ])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8(cli.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("poll-interval") || stderr.contains("--poll-interval"),
+        "clap must reject poll interval 0, got:\n{stderr}"
     );
 }
 
@@ -737,6 +797,7 @@ async fn yg_serve_role_worker_drains_the_queue_without_serving_http() {
             token_env: None,
             slug: &format!("acme/{slug}"),
             fetch_depth: None,
+            poll_interval_seconds: None,
         })
         .await
         .unwrap();

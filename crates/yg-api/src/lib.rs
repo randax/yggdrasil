@@ -1365,6 +1365,8 @@ struct AddRepoRequest {
     url: String,
     /// Shallow-clone override; omitted = full history.
     depth: Option<i32>,
+    /// Per-repo poll interval in seconds; omitted = the server default.
+    poll_interval: Option<i32>,
 }
 
 #[derive(Serialize)]
@@ -1385,6 +1387,14 @@ async fn admin_repo_add(
         return error_json(
             StatusCode::BAD_REQUEST,
             format!("depth must be a positive number of commits (got {depth})"),
+        );
+    }
+    if let Some(interval) = req.poll_interval
+        && interval < 1
+    {
+        return error_json(
+            StatusCode::BAD_REQUEST,
+            format!("poll_interval must be a positive number of seconds (got {interval})"),
         );
     }
     let locator = match RepoLocator::parse(&req.url) {
@@ -1415,6 +1425,7 @@ async fn admin_repo_add(
             token_env: locator.kind.token_env(),
             slug: &locator.slug,
             fetch_depth: req.depth,
+            poll_interval_seconds: req.poll_interval,
         })
         .await;
     match outcome {

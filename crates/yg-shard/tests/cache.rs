@@ -9,7 +9,7 @@ use object_store::memory::InMemory;
 use object_store::{GetOptions, GetResult, ObjectStore, PutOptions, PutPayload, PutResult};
 use yg_shard::{
     Edge, EdgeKind, Graph, Node, NodeKind, Provenance, SearchDoc, SearchParams, ShardCache,
-    write_shard,
+    delete_shard, write_shard,
 };
 
 /// An object store that counts reads, so tests can assert which queries
@@ -143,6 +143,51 @@ async fn publish_fixture_shard(store: &dyn ObjectStore, repo_id: i64, commit: &s
         .await
         .expect("publishing the fixture Shard")
         .revision
+}
+
+#[tokio::test]
+async fn delete_shard_only_deletes_the_exact_revision_directory() {
+    use object_store::ObjectStoreExt;
+    use object_store::path::Path;
+
+    let store = InMemory::new();
+    let doomed = "abc";
+    let neighbor = "abc-suffix";
+    for key in [
+        yg_shard::manifest_key(7, doomed),
+        yg_shard::graph_segment_key(7, doomed),
+        yg_shard::manifest_key(7, neighbor),
+        yg_shard::graph_segment_key(7, neighbor),
+    ] {
+        store
+            .put(&Path::from(key), "segment".to_string().into())
+            .await
+            .unwrap();
+    }
+
+    delete_shard(&store, 7, doomed).await.unwrap();
+
+    for key in [
+        yg_shard::manifest_key(7, doomed),
+        yg_shard::graph_segment_key(7, doomed),
+    ] {
+        assert!(
+            matches!(
+                store.get(&Path::from(key)).await,
+                Err(object_store::Error::NotFound { .. })
+            ),
+            "the reclaimed revision's object must be gone"
+        );
+    }
+    for key in [
+        yg_shard::manifest_key(7, neighbor),
+        yg_shard::graph_segment_key(7, neighbor),
+    ] {
+        store
+            .get(&Path::from(key))
+            .await
+            .unwrap_or_else(|e| panic!("neighbor revision object must survive: {e}"));
+    }
 }
 
 #[tokio::test]

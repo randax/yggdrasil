@@ -407,6 +407,39 @@ pub fn fts_segment_key(repo_id: i64, revision: &str) -> String {
     format!("shards/{repo_id}/{revision}/{FTS_SEGMENT_FILE}")
 }
 
+/// Delete every object of a superseded Shard revision — the whole
+/// `shards/<repo_id>/<revision>/` prefix (manifest + segments) — when the
+/// GC sweep reclaims it (issue #9). Prefix matching is path-segment
+/// aware, so one revision's directory never sweeps another's. Idempotent:
+/// an object already gone is success, so a sweep retried after a partial
+/// delete finishes cleanly. Listing surfaces no objects for a revision
+/// already fully deleted, which is also success.
+pub async fn delete_shard(
+    store: &dyn ObjectStore,
+    repo_id: i64,
+    revision: &str,
+) -> anyhow::Result<()> {
+    use futures::{StreamExt, TryStreamExt};
+    let prefix = object_store::path::Path::from(format!("shards/{repo_id}/{revision}/"));
+    let locations = store
+        .list(Some(&prefix))
+        .map_ok(|object| object.location)
+        .boxed();
+    store
+        .delete_stream(locations)
+        .filter_map(|deleted| async {
+            match deleted {
+                Ok(path) => Some(Ok(path)),
+                Err(object_store::Error::NotFound { .. }) => None,
+                Err(e) => Some(Err(e)),
+            }
+        })
+        .try_collect::<Vec<_>>()
+        .await
+        .with_context(|| format!("deleting Shard objects under {prefix}"))?;
+    Ok(())
+}
+
 /// S3-compatible object storage holding the Shards (ADR 0005).
 pub struct ObjectStoreConfig {
     pub endpoint: String,
