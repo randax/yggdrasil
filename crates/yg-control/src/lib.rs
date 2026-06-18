@@ -569,8 +569,8 @@ impl ControlPlane {
     }
 
     /// Add an include/exclude rule and immediately re-evaluate known
-    /// repos for that forge. Precedence is centralized in
-    /// [`discovery_state_for`] and documented in the ADR/RFC docs.
+    /// repos for that forge. Precedence is centralized in the
+    /// discovery-state evaluator and documented in the ADR/RFC docs.
     pub async fn add_rule(&self, rule: AddRule<'_>) -> anyhow::Result<AddRuleOutcome> {
         let mut tx = self.pool.begin().await?;
         let created = put_rule_newest(

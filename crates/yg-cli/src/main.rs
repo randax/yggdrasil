@@ -137,7 +137,7 @@ enum ForgeCommand {
         kind: String,
         #[arg(help = "Organization slug, e.g. acme")]
         org: String,
-        /// Forge root (default: https://github.com)
+        /// Forge root (default: <https://github.com>)
         #[arg(long)]
         base_url: Option<String>,
         /// Env var holding the Forge token
@@ -150,7 +150,7 @@ enum ForgeCommand {
         kind: String,
         #[arg(help = "Organization slug, e.g. acme")]
         org: String,
-        /// Forge root (default: https://github.com)
+        /// Forge root (default: <https://github.com>)
         #[arg(long)]
         base_url: Option<String>,
     },
