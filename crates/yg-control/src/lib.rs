@@ -123,6 +123,23 @@ pub struct AddRuleOutcome {
     pub fetches_queued: u64,
 }
 
+pub struct IssuedMemberToken {
+    pub id: String,
+    pub member: String,
+    /// The bearer token material. Returned only from issue time; only its
+    /// hash is persisted.
+    pub token: String,
+}
+
+/// Member token ids are URL path components and operator-facing handles,
+/// so keep their grammar narrow and stable.
+pub fn member_token_id_is_valid(id: &str) -> bool {
+    let Some(hex) = id.strip_prefix("mtok_") else {
+        return false;
+    };
+    hex.len() == 24 && hex.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 #[derive(Debug, sqlx::FromRow)]
 pub struct DiscoveryRule {
     pub forge: String,
@@ -681,6 +698,93 @@ impl ControlPlane {
         Ok(rows)
     }
 
+    /// Issue a bearer token for a human or agent Member. The plaintext
+    /// token is returned to the caller once; only its SHA-256 hash is
+    /// recorded.
+    pub async fn issue_member_token(&self, member: &str) -> anyhow::Result<IssuedMemberToken> {
+        let member = member.trim();
+        anyhow::ensure!(!member.is_empty(), "member must not be empty");
+
+        for _ in 0..3 {
+            let id = format!("mtok_{}", random_hex(12)?);
+            let token = format!("ygm_{}", random_hex(32)?);
+            debug_assert!(member_token_id_is_valid(&id));
+            let token_hash = hash_member_token(&token);
+            let inserted = sqlx::query(
+                "INSERT INTO member_tokens (id, member, token_hash)
+                 VALUES ($1, $2, $3)
+                 ON CONFLICT DO NOTHING",
+            )
+            .bind(&id)
+            .bind(member)
+            .bind(&token_hash)
+            .execute(&self.pool)
+            .await?
+            .rows_affected()
+                == 1;
+            if inserted {
+                return Ok(IssuedMemberToken {
+                    id,
+                    member: member.to_string(),
+                    token,
+                });
+            }
+        }
+
+        anyhow::bail!("could not allocate a unique member token id")
+    }
+
+    /// Revoke one member token by its stable id. Returns false when the
+    /// id is unknown or already revoked.
+    pub async fn revoke_member_token(&self, id: &str) -> anyhow::Result<bool> {
+        let revoked = sqlx::query(
+            "UPDATE member_tokens
+             SET revoked_at = now()
+             WHERE id = $1 AND revoked_at IS NULL",
+        )
+        .bind(id.trim())
+        .execute(&self.pool)
+        .await?
+        .rows_affected()
+            == 1;
+        Ok(revoked)
+    }
+
+    /// Validate a presented member bearer token. `last_used_at` is
+    /// stamped on first use and then at most once a minute, so hot Verb
+    /// traffic does not turn every read request into a write.
+    pub async fn authenticate_member_token(&self, token: &str) -> anyhow::Result<bool> {
+        let token_hash = hash_member_token(token);
+        let touched = sqlx::query(
+            "UPDATE member_tokens
+             SET last_used_at = now()
+             WHERE token_hash = $1
+               AND revoked_at IS NULL
+               AND (last_used_at IS NULL OR last_used_at < now() - make_interval(secs => 60))",
+        )
+        .bind(&token_hash)
+        .execute(&self.pool)
+        .await?
+        .rows_affected()
+            == 1;
+
+        let authenticated = if touched {
+            true
+        } else {
+            let (active,): (bool,) = sqlx::query_as(
+                "SELECT EXISTS (
+                     SELECT 1 FROM member_tokens
+                     WHERE token_hash = $1 AND revoked_at IS NULL
+                 )",
+            )
+            .bind(token_hash)
+            .fetch_one(&self.pool)
+            .await?;
+            active
+        };
+        Ok(authenticated)
+    }
+
     /// Every registered repo with its sync position: last synced commit,
     /// the in-flight fetch job, if any, and its current Shard, if any.
     pub async fn admin_status(&self) -> anyhow::Result<Vec<RepoSyncStatus>> {
@@ -1171,6 +1275,29 @@ impl ControlPlane {
     }
 }
 
+fn random_hex(bytes: usize) -> anyhow::Result<String> {
+    let mut buf = vec![0u8; bytes];
+    getrandom::fill(&mut buf)
+        .map_err(|e| anyhow::anyhow!("generating secure random bytes: {e}"))?;
+    Ok(hex_bytes(&buf))
+}
+
+fn hash_member_token(token: &str) -> String {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(token.as_bytes());
+    format!("sha256:{}", hex_bytes(&digest))
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
 /// The one lease-claim query, shared by every job kind so the claim
 /// protocol can't drift between kinds. `$1` is the lease in seconds.
 /// `state <> 'done'` looks implied by the queued-or-expired OR (done
@@ -1391,7 +1518,10 @@ async fn settle_leased_job(
 
 #[cfg(test)]
 mod tests {
-    use super::{RepoVisibility, RuleRow, discovery_state_for, glob_matches, repo_qualifier};
+    use super::{
+        RepoVisibility, RuleRow, discovery_state_for, glob_matches, member_token_id_is_valid,
+        repo_qualifier,
+    };
 
     #[test]
     fn qualifiers_join_the_schemeless_forge_root_with_the_slug() {
@@ -1419,6 +1549,21 @@ mod tests {
         assert!(!glob_matches("acme/private-?", "acme/private-ab"));
         assert!(!glob_matches("acme/*/api", "acme/widgets"));
         assert!(glob_matches("********widgets", "acme/widgets"));
+    }
+
+    #[test]
+    fn member_token_ids_are_strict_url_path_components() {
+        assert!(member_token_id_is_valid("mtok_0123456789abcdefABCDEF01"));
+        for id in [
+            "mtok_0123456789abcdefABCDEF0",
+            "mtok_0123456789abcdefABCDEF012",
+            "token_0123456789abcdefABCDEF01",
+            "mtok_0123456789abcdefABCDEG01",
+            "mtok_0123456789abcdefABCDE/01",
+            "mtok_0123456789abcdefABCDE?01",
+        ] {
+            assert!(!member_token_id_is_valid(id), "{id:?} must be rejected");
+        }
     }
 
     #[test]

@@ -121,6 +121,11 @@ enum AdminCommand {
         #[command(subcommand)]
         command: RulesCommand,
     },
+    /// Manage Member bearer tokens
+    Token {
+        #[command(subcommand)]
+        command: TokenCommand,
+    },
     /// Show every registered repo with its sync state
     Status {
         /// Emit the raw JSON response instead of the human report
@@ -173,6 +178,20 @@ enum RulesCommand {
     },
     /// List discovery rules in evaluation order
     List,
+}
+
+#[derive(Subcommand)]
+enum TokenCommand {
+    /// Issue a Member bearer token and print it once
+    Issue {
+        #[arg(help = "Member name for a human or agent")]
+        member: String,
+    },
+    /// Revoke an active Member bearer token by id
+    Revoke {
+        #[arg(help = "Token id shown by `yg admin token issue`")]
+        id: String,
+    },
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -272,6 +291,10 @@ async fn main() -> anyhow::Result<()> {
                 } => admin_rules_add(pattern, action, forge, applies_to_private).await,
                 RulesCommand::List => admin_rules_list().await,
             },
+            AdminCommand::Token { command } => match command {
+                TokenCommand::Issue { member } => admin_token_issue(member).await,
+                TokenCommand::Revoke { id } => admin_token_revoke(id).await,
+            },
             AdminCommand::Status { json } => admin_status(json).await,
         },
     }
@@ -282,8 +305,7 @@ async fn main() -> anyhow::Result<()> {
 fn client_env() -> anyhow::Result<(String, String)> {
     let server = std::env::var("YG_SERVER").unwrap_or_else(|_| "http://127.0.0.1:7311".into());
     let server = server.trim_end_matches('/').to_string();
-    let token = std::env::var("YG_TOKEN")
-        .context("YG_TOKEN must be set (the bootstrap Admin token for now)")?;
+    let token = std::env::var("YG_TOKEN").context("YG_TOKEN must be set")?;
     Ok((server, token))
 }
 
@@ -695,6 +717,34 @@ async fn admin_rules_list() -> anyhow::Result<()> {
             rule["pattern"].as_str().unwrap_or("?")
         );
     }
+    Ok(())
+}
+
+async fn admin_token_issue(member: String) -> anyhow::Result<()> {
+    let body = server_json(
+        reqwest::Method::POST,
+        "/v1/admin/tokens",
+        Some(serde_json::json!({ "member": member })),
+    )
+    .await?;
+    println!("id: {}", body["id"].as_str().unwrap_or("?"));
+    println!("member: {}", body["member"].as_str().unwrap_or("?"));
+    println!("token: {}", body["token"].as_str().unwrap_or("?"));
+    println!("save this token now; it will not be shown again");
+    Ok(())
+}
+
+async fn admin_token_revoke(id: String) -> anyhow::Result<()> {
+    if !yg_control::member_token_id_is_valid(&id) {
+        bail!("member token id must look like mtok_<24 hex characters>");
+    }
+    let body = server_json(
+        reqwest::Method::POST,
+        &format!("/v1/admin/tokens/{id}/revoke"),
+        None,
+    )
+    .await?;
+    println!("revoked {}", body["id"].as_str().unwrap_or(id.as_str()));
     Ok(())
 }
 

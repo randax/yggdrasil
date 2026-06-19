@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::Context;
-use axum::extract::{Request, State};
+use axum::extract::{Path, Request, State};
 use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -123,6 +123,8 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<RunningServer> {
                 .route("/admin/forges", post(admin_forge_add))
                 .route("/admin/forges/discover", post(admin_forge_discover))
                 .route("/admin/rules", get(admin_rules_list).post(admin_rules_add))
+                .route("/admin/tokens", post(admin_token_issue))
+                .route("/admin/tokens/{id}/revoke", post(admin_token_revoke))
                 .route("/admin/status", get(admin_status)),
         )
         .layer(middleware::from_fn_with_state(
@@ -146,8 +148,9 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<RunningServer> {
     Ok(RunningServer { local_addr, handle })
 }
 
-/// Every route — existing or not — requires the bootstrap Admin token;
-/// only the health endpoint is reachable without one.
+/// Every route — existing or not — requires a bearer token; only the
+/// health endpoint is reachable without one. The bootstrap token is
+/// Admin-scoped. Member tokens may call Verbs, but never admin routes.
 async fn require_bearer_token(
     State(state): State<Arc<AppState>>,
     req: Request,
@@ -155,11 +158,12 @@ async fn require_bearer_token(
 ) -> Response {
     use subtle::ConstantTimeEq;
 
-    if req.uri().path() == "/healthz" {
+    let path = req.uri().path();
+    if path == "/healthz" {
         return next.run(req).await;
     }
 
-    let authorized = req
+    let presented = req
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -167,18 +171,39 @@ async fn require_bearer_token(
         .and_then(|v| v.split_once(' '))
         .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
         // RFC 9110 allows 1*SP between scheme and credentials.
-        .is_some_and(|(_, presented)| {
-            presented
-                .trim_start_matches(' ')
-                .as_bytes()
-                .ct_eq(state.bootstrap_token.as_bytes())
-                .into()
-        });
-    if authorized {
-        next.run(req).await
-    } else {
-        error_json(StatusCode::UNAUTHORIZED, "missing or invalid bearer token")
+        .map(|(_, presented)| presented.trim_start_matches(' ').to_string());
+
+    let Some(presented) = presented else {
+        return error_json(StatusCode::UNAUTHORIZED, "missing or invalid bearer token");
+    };
+
+    let admin = presented
+        .as_bytes()
+        .ct_eq(state.bootstrap_token.as_bytes())
+        .into();
+    if admin {
+        return next.run(req).await;
     }
+
+    let member = match state.control.authenticate_member_token(&presented).await {
+        Ok(member) => member,
+        Err(e) => {
+            tracing::error!("auth lookup failed: {e:#}");
+            return error_json(StatusCode::INTERNAL_SERVER_ERROR, "internal server error");
+        }
+    };
+    if !member {
+        return error_json(StatusCode::UNAUTHORIZED, "missing or invalid bearer token");
+    }
+
+    if path.starts_with("/v1/verbs/") {
+        return next.run(req).await;
+    }
+
+    error_json(
+        StatusCode::FORBIDDEN,
+        "member tokens may call Verbs but not admin operations",
+    )
 }
 
 /// The one shape every error leaves this server in: `{"error": "…"}`.
@@ -1725,6 +1750,66 @@ async fn admin_repo_add(
         Err(e) if e.downcast_ref::<yg_control::QualifierConflict>().is_some() => {
             error_json(StatusCode::CONFLICT, format!("{e}"))
         }
+        Err(e) => error_json(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+    }
+}
+
+#[derive(Deserialize)]
+struct IssueTokenRequest {
+    member: String,
+}
+
+#[derive(Serialize)]
+struct IssueTokenResponse {
+    id: String,
+    member: String,
+    token: String,
+}
+
+async fn admin_token_issue(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<IssueTokenRequest>,
+) -> Response {
+    let member = req.member.trim();
+    if member.is_empty() {
+        return error_json(StatusCode::BAD_REQUEST, "member must not be empty");
+    }
+    match state.control.issue_member_token(member).await {
+        Ok(issued) => (
+            StatusCode::CREATED,
+            Json(IssueTokenResponse {
+                id: issued.id,
+                member: issued.member,
+                token: issued.token,
+            }),
+        )
+            .into_response(),
+        Err(e) => error_json(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+    }
+}
+
+#[derive(Serialize)]
+struct RevokeTokenResponse {
+    id: String,
+    revoked: bool,
+}
+
+async fn admin_token_revoke(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    if !yg_control::member_token_id_is_valid(&id) {
+        return error_json(
+            StatusCode::BAD_REQUEST,
+            "member token id must look like mtok_<24 hex characters>",
+        );
+    }
+    match state.control.revoke_member_token(&id).await {
+        Ok(true) => Json(RevokeTokenResponse { id, revoked: true }).into_response(),
+        Ok(false) => error_json(
+            StatusCode::NOT_FOUND,
+            format!("no active member token {id:?}"),
+        ),
         Err(e) => error_json(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
     }
 }
