@@ -24,6 +24,146 @@ use std::collections::BTreeMap;
 use anyhow::Context;
 use serde::Serialize;
 
+/// One shipped Verb's public tool metadata. The schema is stored with the
+/// Verb engine so REST, CLI, and MCP can point at the same Verb names and
+/// request shapes instead of maintaining separate tool inventories.
+pub struct VerbTool {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub input_schema: &'static str,
+}
+
+/// The shipped Verb catalog. Adding a Verb here makes it visible to MCP
+/// automatically; REST and CLI still own their transport-specific parsing
+/// and rendering around these shared request shapes.
+pub const VERB_TOOLS: &[VerbTool] = &[
+    VerbTool {
+        name: "node",
+        description: "Return one Knowledge Graph node with inbound and outbound edge summaries.",
+        input_schema: r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "id": {
+                    "type": "string",
+                    "description": "Node id, e.g. sym:github.com/acme/widgets:main.go#Hello"
+                }
+            },
+            "required": ["id"]
+        }"#,
+    },
+    VerbTool {
+        name: "neighbors",
+        description: "Return a node's neighboring subgraph with edge details and pagination.",
+        input_schema: r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "id": {
+                    "type": "string",
+                    "description": "Node id to traverse from"
+                },
+                "direction": {
+                    "type": "string",
+                    "enum": ["in", "out", "both"],
+                    "description": "Which edge direction to follow"
+                },
+                "edge_kinds": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Edge kinds to follow, e.g. DEFINES or CALLS"
+                },
+                "depth": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 3,
+                    "description": "Traversal depth"
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 1000,
+                    "description": "Nodes per page"
+                },
+                "cursor": {
+                    "type": "string",
+                    "description": "Opaque cursor returned by a previous neighbors call"
+                }
+            },
+            "required": ["id"]
+        }"#,
+    },
+    VerbTool {
+        name: "search",
+        description: "Search indexed repos for symbols, files, and docs with ranked node ids.",
+        input_schema: r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Search query"
+                },
+                "kinds": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Node kinds to search, e.g. Symbol or File"
+                },
+                "repos": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Repo qualifiers to search"
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["lexical", "semantic", "hybrid"],
+                    "description": "Search mode; lexical is available in this release"
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 100,
+                    "description": "Hits per page"
+                },
+                "cursor": {
+                    "type": "string",
+                    "description": "Opaque cursor returned by a previous search call"
+                }
+            },
+            "required": ["query"]
+        }"#,
+    },
+    VerbTool {
+        name: "history",
+        description: "Return commits touching a file node or a symbol's defining file.",
+        input_schema: r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "id": {
+                    "type": "string",
+                    "description": "File or Symbol node id"
+                },
+                "since": {
+                    "type": "string",
+                    "description": "RFC3339 timestamp or YYYY-MM-DD lower bound"
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 1000,
+                    "description": "Commits per page"
+                },
+                "cursor": {
+                    "type": "string",
+                    "description": "Opaque cursor returned by a previous history call"
+                }
+            },
+            "required": ["id"]
+        }"#,
+    },
+];
+
 /// Where a qualifier ends inside `rest`: at the first ':', except a
 /// colon introducing a port — digits then '/' — which is part of the
 /// authority (`git.corp.example:8443/acme/widgets`), pushing the

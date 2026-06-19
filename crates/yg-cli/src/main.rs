@@ -97,6 +97,8 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Proxy MCP stdio clients to the Index Server's Streamable HTTP endpoint
+    Mcp,
     /// Administer the Index Server (Admin token required)
     Admin {
         #[command(subcommand)]
@@ -256,6 +258,7 @@ async fn main() -> anyhow::Result<()> {
             cursor,
             json,
         } => history(id, since, limit, cursor, json).await,
+        Command::Mcp => mcp_proxy().await,
         Command::Admin { command } => match command {
             AdminCommand::Repo {
                 command:
@@ -303,10 +306,65 @@ async fn main() -> anyhow::Result<()> {
 /// Where the Index Server lives and how to authenticate, from the same
 /// env every client command reads.
 fn client_env() -> anyhow::Result<(String, String)> {
-    let server = std::env::var("YG_SERVER").unwrap_or_else(|_| "http://127.0.0.1:7311".into());
+    let config = read_client_config();
+    let server = std::env::var("YG_SERVER")
+        .ok()
+        .or(config.server)
+        .unwrap_or_else(|| "http://127.0.0.1:7311".into());
     let server = server.trim_end_matches('/').to_string();
-    let token = std::env::var("YG_TOKEN").context("YG_TOKEN must be set")?;
+    let token = std::env::var("YG_TOKEN")
+        .ok()
+        .or(config.token)
+        .context("YG_TOKEN must be set or token must be configured in ~/.config/yg/config.toml")?;
     Ok((server, token))
+}
+
+#[derive(Default)]
+struct ClientConfig {
+    server: Option<String>,
+    token: Option<String>,
+}
+
+fn read_client_config() -> ClientConfig {
+    let Some(path) = client_config_path() else {
+        return ClientConfig::default();
+    };
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return ClientConfig::default();
+    };
+    let mut config = ClientConfig::default();
+    for line in contents.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value
+            .trim()
+            .trim_matches('"')
+            .trim_matches('\'')
+            .to_string();
+        match key.trim() {
+            "server" => config.server = Some(value),
+            "token" => config.token = Some(value),
+            _ => {}
+        }
+    }
+    config
+}
+
+fn client_config_path() -> Option<std::path::PathBuf> {
+    if let Some(home) = std::env::var_os("XDG_CONFIG_HOME") {
+        return Some(std::path::PathBuf::from(home).join("yg/config.toml"));
+    }
+    std::env::var_os("HOME").map(|home| {
+        std::path::PathBuf::from(home)
+            .join(".config")
+            .join("yg")
+            .join("config.toml")
+    })
 }
 
 /// One HTTP exchange with the Index Server, shared by every subcommand:
@@ -353,6 +411,79 @@ async fn post_verb(verb: &str, body: serde_json::Value) -> anyhow::Result<serde_
         Some(body),
     )
     .await
+}
+
+async fn mcp_proxy() -> anyhow::Result<()> {
+    let (server, token) = client_env()?;
+    let endpoint = format!("{server}/v1/mcp");
+    let client = reqwest::Client::new();
+    let stdin = std::io::stdin();
+    let mut input = std::io::BufReader::new(stdin.lock());
+    let stdout = std::io::stdout();
+    let mut output = stdout.lock();
+    while let Some(body) = read_mcp_message(&mut input)? {
+        let id = serde_json::from_slice::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|body| body.get("id").cloned())
+            .unwrap_or(serde_json::Value::Null);
+        let resp = client
+            .post(&endpoint)
+            .bearer_auth(&token)
+            .header("accept", "application/json, text/event-stream")
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .with_context(|| format!("posting MCP request to {endpoint}"))?;
+        let status = resp.status();
+        let text = resp.text().await.context("reading MCP HTTP response")?;
+        let Some(payload) = (if status.is_success() {
+            if text.is_empty() { None } else { Some(text) }
+        } else {
+            let reason = serde_json::from_str::<serde_json::Value>(&text)
+                .ok()
+                .and_then(|body| body["error"].as_str().map(str::to_string))
+                .unwrap_or(text);
+            Some(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {
+                        "code": -32000,
+                        "message": format!("MCP HTTP endpoint answered {status}: {reason}")
+                    }
+                })
+                .to_string(),
+            )
+        }) else {
+            continue;
+        };
+        write_mcp_message(&mut output, payload.as_bytes())?;
+    }
+    Ok(())
+}
+
+fn read_mcp_message<R>(input: &mut R) -> anyhow::Result<Option<Vec<u8>>>
+where
+    R: std::io::BufRead,
+{
+    let mut line = String::new();
+    let read = input.read_line(&mut line)?;
+    if read == 0 {
+        return Ok(None);
+    }
+    let body = line.trim_end_matches(['\r', '\n']).as_bytes().to_vec();
+    Ok(Some(body))
+}
+
+fn write_mcp_message<W>(output: &mut W, body: &[u8]) -> anyhow::Result<()>
+where
+    W: std::io::Write,
+{
+    output.write_all(body)?;
+    output.write_all(b"\n")?;
+    output.flush()?;
+    Ok(())
 }
 
 async fn node(id: String, json: bool) -> anyhow::Result<()> {
