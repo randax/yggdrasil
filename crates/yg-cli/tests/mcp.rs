@@ -63,6 +63,21 @@ async fn streamable_http_lists_and_calls_verbs_with_bearer_auth() {
             .contains(&json!("id")),
         "node id comes from the shared Verb schema: {node}"
     );
+    let search = tools
+        .iter()
+        .find(|tool| tool["name"] == "search")
+        .expect("search tool");
+    assert!(
+        search["inputSchema"]["anyOf"]
+            .as_array()
+            .expect("search has fresh-or-resume schema")
+            .iter()
+            .any(|shape| shape["required"]
+                .as_array()
+                .expect("required list")
+                .contains(&json!("cursor"))),
+        "search schema allows cursor-only resume calls: {search}"
+    );
 
     let id = format!("sym:{}:main.go#Hello", h.qualifier());
     let (status, body) = mcp(

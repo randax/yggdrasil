@@ -334,18 +334,16 @@ fn read_client_config() -> ClientConfig {
     };
     let mut config = ClientConfig::default();
     for line in contents.lines() {
-        let line = line.split('#').next().unwrap_or("").trim();
-        if line.is_empty() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with('[') {
             continue;
         }
         let Some((key, value)) = line.split_once('=') else {
             continue;
         };
-        let value = value
-            .trim()
-            .trim_matches('"')
-            .trim_matches('\'')
-            .to_string();
+        let Some(value) = parse_config_value(value.trim()) else {
+            continue;
+        };
         match key.trim() {
             "server" => config.server = Some(value),
             "token" => config.token = Some(value),
@@ -353,6 +351,44 @@ fn read_client_config() -> ClientConfig {
         }
     }
     config
+}
+
+fn parse_config_value(raw: &str) -> Option<String> {
+    if raw.starts_with('"') {
+        return parse_double_quoted_config_value(raw);
+    }
+    if let Some(rest) = raw.strip_prefix('\'') {
+        return rest.split_once('\'').map(|(value, _)| value.to_string());
+    }
+    Some(raw.split('#').next().unwrap_or("").trim().to_string()).filter(|value| !value.is_empty())
+}
+
+fn parse_double_quoted_config_value(raw: &str) -> Option<String> {
+    let mut value = String::new();
+    let mut escaped = false;
+    for ch in raw[1..].chars() {
+        if escaped {
+            match ch {
+                'n' => value.push('\n'),
+                'r' => value.push('\r'),
+                't' => value.push('\t'),
+                '"' => value.push('"'),
+                '\\' => value.push('\\'),
+                other => {
+                    value.push('\\');
+                    value.push(other);
+                }
+            }
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            '"' => return Some(value),
+            other => value.push(other),
+        }
+    }
+    None
 }
 
 fn client_config_path() -> Option<std::path::PathBuf> {
@@ -1129,4 +1165,40 @@ async fn status(json: bool) -> anyhow::Result<()> {
         println!("repos indexed: {}", body["repos_indexed"]);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn config_values_preserve_hashes_inside_quoted_strings() {
+        assert_eq!(
+            super::parse_config_value(r#""https://example.test/mcp#fragment" # comment"#),
+            Some("https://example.test/mcp#fragment".to_string())
+        );
+        assert_eq!(
+            super::parse_config_value(r#""ygt_token#with-hash""#),
+            Some("ygt_token#with-hash".to_string())
+        );
+        assert_eq!(
+            super::parse_config_value("'literal#token' # comment"),
+            Some("literal#token".to_string())
+        );
+    }
+
+    #[test]
+    fn unquoted_config_values_still_treat_hash_as_comment() {
+        assert_eq!(
+            super::parse_config_value("http://127.0.0.1:7311 # local"),
+            Some("http://127.0.0.1:7311".to_string())
+        );
+        assert_eq!(super::parse_config_value("# comment"), None);
+    }
+
+    #[test]
+    fn double_quoted_config_values_decode_common_escapes() {
+        assert_eq!(
+            super::parse_config_value(r#""line\nnext\t\"quoted\"""#),
+            Some("line\nnext\t\"quoted\"".to_string())
+        );
+    }
 }

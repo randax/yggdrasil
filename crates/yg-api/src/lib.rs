@@ -213,6 +213,8 @@ fn error_json(status: StatusCode, message: impl Into<String>) -> Response {
     (status, Json(serde_json::json!({"error": message.into()}))).into_response()
 }
 
+const MCP_VERB_RESPONSE_LIMIT: usize = 50 * 1024 * 1024;
+
 async fn mcp(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -312,7 +314,10 @@ async fn handle_mcp_message(
             }),
         ),
         "notifications/initialized" => jsonrpc_success(id, serde_json::json!({})),
-        "tools/list" => jsonrpc_success(id, serde_json::json!({"tools": mcp_tools()})),
+        "tools/list" => match mcp_tools() {
+            Ok(tools) => jsonrpc_success(id, serde_json::json!({"tools": tools})),
+            Err((code, message)) => jsonrpc_error(id, code, message),
+        },
         "tools/call" => match mcp_call_tool(state, params).await {
             Ok(result) => jsonrpc_success(id, result),
             Err((code, message)) => jsonrpc_error(id, code, message),
@@ -338,16 +343,22 @@ fn jsonrpc_error(
     })
 }
 
-fn mcp_tools() -> Vec<serde_json::Value> {
+fn mcp_tools() -> Result<Vec<serde_json::Value>, (i64, String)> {
     yg_verbs::VERB_TOOLS
         .iter()
         .map(|tool| {
-            serde_json::json!({
+            let input_schema = serde_json::from_str::<serde_json::Value>(tool.input_schema)
+                .map_err(|e| {
+                    (
+                        -32603,
+                        format!("Verb tool schema {:?} is invalid: {e}", tool.name),
+                    )
+                })?;
+            Ok(serde_json::json!({
                 "name": tool.name,
                 "description": tool.description,
-                "inputSchema": serde_json::from_str::<serde_json::Value>(tool.input_schema)
-                    .expect("Verb tool schema is valid JSON")
-            })
+                "inputSchema": input_schema
+            }))
         })
         .collect()
 }
@@ -390,24 +401,25 @@ async fn call_verb_tool(
     name: &str,
     arguments: serde_json::Value,
 ) -> Result<Result<serde_json::Value, String>, (i64, String)> {
-    let response = match name {
-        "node" => {
+    let tool =
+        yg_verbs::verb_tool(name).ok_or_else(|| (-32602, format!("unknown Verb tool {name:?}")))?;
+    let response = match tool.verb {
+        yg_verbs::Verb::Node => {
             let req = decode_tool_args(arguments)?;
             verb_node(State(state), Json(req)).await
         }
-        "neighbors" => {
+        yg_verbs::Verb::Neighbors => {
             let req = decode_tool_args(arguments)?;
             verb_neighbors(State(state), Json(req)).await
         }
-        "search" => {
+        yg_verbs::Verb::Search => {
             let req = decode_tool_args(arguments)?;
             verb_search(State(state), Json(req)).await
         }
-        "history" => {
+        yg_verbs::Verb::History => {
             let req = decode_tool_args(arguments)?;
             verb_history(State(state), Json(req)).await
         }
-        other => return Err((-32602, format!("unknown Verb tool {other:?}"))),
     };
     verb_response_value(response).await
 }
@@ -423,7 +435,7 @@ async fn verb_response_value(
     response: Response,
 ) -> Result<Result<serde_json::Value, String>, (i64, String)> {
     let status = response.status();
-    let bytes = to_bytes(response.into_body(), usize::MAX)
+    let bytes = to_bytes(response.into_body(), MCP_VERB_RESPONSE_LIMIT)
         .await
         .map_err(|e| (-32603, format!("reading Verb response failed: {e}")))?;
     let body: serde_json::Value = serde_json::from_slice(&bytes)

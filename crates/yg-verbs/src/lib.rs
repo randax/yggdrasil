@@ -28,16 +28,39 @@ use serde::Serialize;
 /// Verb engine so REST, CLI, and MCP can point at the same Verb names and
 /// request shapes instead of maintaining separate tool inventories.
 pub struct VerbTool {
+    pub verb: Verb,
     pub name: &'static str,
     pub description: &'static str,
     pub input_schema: &'static str,
 }
 
-/// The shipped Verb catalog. Adding a Verb here makes it visible to MCP
-/// automatically; REST and CLI still own their transport-specific parsing
-/// and rendering around these shared request shapes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Verb {
+    Node,
+    Neighbors,
+    Search,
+    History,
+}
+
+impl Verb {
+    pub fn tool(self) -> &'static VerbTool {
+        VERB_TOOLS
+            .iter()
+            .find(|tool| tool.verb == self)
+            .expect("every Verb enum variant has tool metadata")
+    }
+}
+
+pub fn verb_tool(name: &str) -> Option<&'static VerbTool> {
+    VERB_TOOLS.iter().find(|tool| tool.name == name)
+}
+
+/// The shipped Verb catalog. MCP tool listing and calling both resolve
+/// through this catalog; REST and CLI still own their transport-specific
+/// parsing and rendering around these shared request shapes.
 pub const VERB_TOOLS: &[VerbTool] = &[
     VerbTool {
+        verb: Verb::Node,
         name: "node",
         description: "Return one Knowledge Graph node with inbound and outbound edge summaries.",
         input_schema: r#"{
@@ -53,6 +76,7 @@ pub const VERB_TOOLS: &[VerbTool] = &[
         }"#,
     },
     VerbTool {
+        verb: Verb::Neighbors,
         name: "neighbors",
         description: "Return a node's neighboring subgraph with edge details and pagination.",
         input_schema: r#"{
@@ -94,6 +118,7 @@ pub const VERB_TOOLS: &[VerbTool] = &[
         }"#,
     },
     VerbTool {
+        verb: Verb::Search,
         name: "search",
         description: "Search indexed repos for symbols, files, and docs with ranked node ids.",
         input_schema: r#"{
@@ -130,10 +155,14 @@ pub const VERB_TOOLS: &[VerbTool] = &[
                     "description": "Opaque cursor returned by a previous search call"
                 }
             },
-            "required": ["query"]
+            "anyOf": [
+                {"required": ["query"]},
+                {"required": ["cursor"]}
+            ]
         }"#,
     },
     VerbTool {
+        verb: Verb::History,
         name: "history",
         description: "Return commits touching a file node or a symbol's defining file.",
         input_schema: r#"{
