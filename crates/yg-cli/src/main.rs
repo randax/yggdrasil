@@ -99,11 +99,22 @@ enum Command {
     },
     /// Proxy MCP stdio clients to the Index Server's Streamable HTTP endpoint
     Mcp,
+    /// Install yggdrasil's navigation Skill for local agents
+    Skill {
+        #[command(subcommand)]
+        command: SkillCommand,
+    },
     /// Administer the Index Server (Admin token required)
     Admin {
         #[command(subcommand)]
         command: AdminCommand,
     },
+}
+
+#[derive(Subcommand)]
+enum SkillCommand {
+    /// Install or update the yggdrasil navigation Skill
+    Install,
 }
 
 #[derive(Subcommand)]
@@ -259,6 +270,9 @@ async fn main() -> anyhow::Result<()> {
             json,
         } => history(id, since, limit, cursor, json).await,
         Command::Mcp => mcp_proxy().await,
+        Command::Skill {
+            command: SkillCommand::Install,
+        } => skill_install(),
         Command::Admin { command } => match command {
             AdminCommand::Repo {
                 command:
@@ -301,6 +315,25 @@ async fn main() -> anyhow::Result<()> {
             AdminCommand::Status { json } => admin_status(json).await,
         },
     }
+}
+
+fn skill_install() -> anyhow::Result<()> {
+    const SKILL_NAME: &str = "yggdrasil-navigation";
+    const SKILL_DOCUMENT: &str = include_str!("../../../skills/yggdrasil-navigation/SKILL.md");
+
+    let home =
+        std::env::var_os("HOME").context("HOME must be set to install Claude Code skills")?;
+    let skill_dir = std::path::PathBuf::from(home)
+        .join(".claude")
+        .join("skills")
+        .join(SKILL_NAME);
+    std::fs::create_dir_all(&skill_dir)
+        .with_context(|| format!("creating {}", skill_dir.display()))?;
+    let skill_path = skill_dir.join("SKILL.md");
+    std::fs::write(&skill_path, SKILL_DOCUMENT)
+        .with_context(|| format!("writing {}", skill_path.display()))?;
+    println!("installed {SKILL_NAME} Skill at {}", skill_path.display());
+    Ok(())
 }
 
 /// Where the Index Server lives and how to authenticate, from the same
