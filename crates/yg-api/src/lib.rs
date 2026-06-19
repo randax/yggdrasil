@@ -573,8 +573,10 @@ async fn verb_neighbors(
     let options = yg_verbs::NeighborsOptions {
         direction,
         edge_kinds: shape.edge_kinds.clone(),
-        depth: shape.depth.unwrap_or(1),
-        limit: req.limit.unwrap_or(100) as usize,
+        depth: shape.depth.unwrap_or(yg_verbs::DEFAULT_NEIGHBORS_DEPTH),
+        limit: req
+            .limit
+            .unwrap_or(yg_verbs::DEFAULT_NEIGHBORS_LIMIT as u32) as usize,
         after: cursor.as_ref().map(|c| (c.after_depth, c.after.clone())),
     };
     if let Err(reason) = options.validate() {
@@ -627,10 +629,6 @@ struct NeighborsResponse {
     edges: Vec<yg_verbs::GraphEdge>,
     next_cursor: Option<String>,
 }
-
-/// Default and maximum page size for `history`, in commits.
-const DEFAULT_HISTORY_LIMIT: usize = 50;
-const MAX_HISTORY_LIMIT: usize = 1000;
 
 /// One commit on the wire: the Verb's commit plus a display-ready date —
 /// the server owns rendering (like search snippets), so clients print it
@@ -764,11 +762,17 @@ async fn verb_history(
         Ok(id) => id,
         Err(reason) => return error_json(StatusCode::BAD_REQUEST, reason),
     };
-    let limit = req.limit.map_or(DEFAULT_HISTORY_LIMIT, |l| l as usize);
-    if !(1..=MAX_HISTORY_LIMIT).contains(&limit) {
+    let limit = req
+        .limit
+        .map_or(yg_verbs::DEFAULT_HISTORY_LIMIT, |l| l as usize);
+    if !(yg_verbs::MIN_PAGE_LIMIT..=yg_verbs::MAX_HISTORY_LIMIT).contains(&limit) {
         return error_json(
             StatusCode::BAD_REQUEST,
-            format!("limit must be between 1 and {MAX_HISTORY_LIMIT}, got {limit}"),
+            format!(
+                "limit must be between {} and {}, got {limit}",
+                yg_verbs::MIN_PAGE_LIMIT,
+                yg_verbs::MAX_HISTORY_LIMIT
+            ),
         );
     }
     // A cursor pins the revision its history started on; fresh queries
@@ -818,13 +822,10 @@ async fn verb_history(
     .into_response()
 }
 
-/// Default and maximum page size for `search`, plus the deepest a cursor
-/// may page. The window also bounds the fan-out: each repo is asked for a
-/// constant top-[`MAX_SEARCH_WINDOW`] hits (the deepest reachable page),
-/// which both keeps the merged ranking stable across pages and caps the
-/// work an unbounded offset could demand.
-const DEFAULT_SEARCH_LIMIT: usize = 20;
-const MAX_SEARCH_LIMIT: usize = 100;
+/// The deepest a `search` cursor may page. The window also bounds the
+/// fan-out: each repo is asked for a constant top-[`MAX_SEARCH_WINDOW`]
+/// hits (the deepest reachable page), which both keeps the merged ranking
+/// stable across pages and caps the work an unbounded offset could demand.
 const MAX_SEARCH_WINDOW: usize = 1000;
 
 /// The most repositories one search may fan out over — the width bound a
@@ -945,11 +946,17 @@ async fn verb_search(
 
     // Page size may vary between pages; everything else is fixed at the
     // first page and carried by the cursor.
-    let limit = req.limit.map_or(DEFAULT_SEARCH_LIMIT, |l| l as usize);
-    if !(1..=MAX_SEARCH_LIMIT).contains(&limit) {
+    let limit = req
+        .limit
+        .map_or(yg_verbs::DEFAULT_SEARCH_LIMIT, |l| l as usize);
+    if !(yg_verbs::MIN_PAGE_LIMIT..=yg_verbs::MAX_SEARCH_LIMIT).contains(&limit) {
         return error_json(
             StatusCode::BAD_REQUEST,
-            format!("limit must be between 1 and {MAX_SEARCH_LIMIT}, got {limit}"),
+            format!(
+                "limit must be between {} and {}, got {limit}",
+                yg_verbs::MIN_PAGE_LIMIT,
+                yg_verbs::MAX_SEARCH_LIMIT
+            ),
         );
     }
 
