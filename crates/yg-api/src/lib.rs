@@ -344,16 +344,16 @@ fn jsonrpc_error(
 }
 
 fn mcp_tools() -> Result<Vec<serde_json::Value>, (i64, String)> {
-    yg_verbs::VERB_TOOLS
+    Ok(yg_verbs::VERB_TOOLS
         .iter()
         .map(|tool| {
-            Ok(serde_json::json!({
+            serde_json::json!({
                 "name": tool.name,
                 "description": tool.description,
                 "inputSchema": tool.input_schema()
-            }))
+            })
         })
-        .collect()
+        .collect())
 }
 
 async fn mcp_call_tool(

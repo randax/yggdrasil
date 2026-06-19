@@ -88,10 +88,13 @@ impl VerbTool {
                 let mut schema = closed_schema::<SearchRequest>();
                 enum_property(&mut schema, "mode", SEARCH_MODE_VALUES);
                 bounded_property(&mut schema, "limit", MIN_PAGE_LIMIT, MAX_SEARCH_LIMIT);
-                schema["anyOf"] = serde_json::json!([
-                    {"required": ["query"]},
-                    {"required": ["cursor"]}
-                ]);
+                insert_any_of(
+                    &mut schema,
+                    serde_json::json!([
+                        {"required": ["query"]},
+                        {"required": ["cursor"]}
+                    ]),
+                );
                 schema
             }
             Verb::History => {
@@ -104,31 +107,53 @@ impl VerbTool {
 }
 
 fn schema<T: JsonSchema>() -> Value {
-    serde_json::to_value(schemars::schema_for!(T)).expect("schema serializes")
+    match serde_json::to_value(schemars::schema_for!(T)) {
+        Ok(Value::Object(mut object)) => {
+            object.remove("$schema");
+            object.remove("title");
+            Value::Object(object)
+        }
+        Ok(value) => value,
+        Err(_) => serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "description": "Schema generation failed"
+        }),
+    }
 }
 
 fn closed_schema<T: JsonSchema>() -> Value {
     let mut schema = schema::<T>();
-    schema["additionalProperties"] = serde_json::json!(false);
+    if let Some(object) = schema.as_object_mut() {
+        object.insert("additionalProperties".to_string(), serde_json::json!(false));
+    }
     schema
 }
 
-fn property_schema_mut<'a>(schema: &'a mut Value, property: &str) -> &'a mut Value {
+fn property_schema_mut<'a>(schema: &'a mut Value, property: &str) -> Option<&'a mut Value> {
     schema
         .get_mut("properties")
         .and_then(Value::as_object_mut)
         .and_then(|properties| properties.get_mut(property))
-        .unwrap_or_else(|| panic!("schema has property {property:?}"))
 }
 
 fn enum_property(schema: &mut Value, property: &str, values: &[&str]) {
-    property_schema_mut(schema, property)["enum"] = serde_json::json!(values);
+    if let Some(property) = property_schema_mut(schema, property) {
+        property["enum"] = serde_json::json!(values);
+    }
 }
 
 fn bounded_property<T: Serialize>(schema: &mut Value, property: &str, minimum: T, maximum: T) {
-    let property = property_schema_mut(schema, property);
-    property["minimum"] = serde_json::json!(minimum);
-    property["maximum"] = serde_json::json!(maximum);
+    if let Some(property) = property_schema_mut(schema, property) {
+        property["minimum"] = serde_json::json!(minimum);
+        property["maximum"] = serde_json::json!(maximum);
+    }
+}
+
+fn insert_any_of(schema: &mut Value, value: Value) {
+    if let Some(object) = schema.as_object_mut() {
+        object.insert("anyOf".to_string(), value);
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -1246,6 +1271,8 @@ mod tests {
     #[test]
     fn verb_tool_schemas_preserve_wire_constraints() {
         let node = Verb::Node.tool().input_schema();
+        assert_eq!(node.get("$schema"), None);
+        assert_eq!(node.get("title"), None);
         assert_eq!(node["additionalProperties"], json!(false));
         assert_eq!(node["properties"]["id"]["type"], "string");
         assert!(
@@ -1257,6 +1284,8 @@ mod tests {
         );
 
         let neighbors = Verb::Neighbors.tool().input_schema();
+        assert_eq!(neighbors.get("$schema"), None);
+        assert_eq!(neighbors.get("title"), None);
         assert_eq!(neighbors["additionalProperties"], json!(false));
         assert_eq!(
             neighbors["properties"]["direction"]["enum"],
@@ -1280,6 +1309,8 @@ mod tests {
         );
 
         let search = Verb::Search.tool().input_schema();
+        assert_eq!(search.get("$schema"), None);
+        assert_eq!(search.get("title"), None);
         assert_eq!(search["additionalProperties"], json!(false));
         assert_eq!(
             search["properties"]["mode"]["enum"],
@@ -1311,6 +1342,8 @@ mod tests {
         );
 
         let history = Verb::History.tool().input_schema();
+        assert_eq!(history.get("$schema"), None);
+        assert_eq!(history.get("title"), None);
         assert_eq!(history["additionalProperties"], json!(false));
         assert_eq!(
             history["properties"]["limit"]["minimum"],
