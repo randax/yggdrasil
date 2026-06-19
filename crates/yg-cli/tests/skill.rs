@@ -10,11 +10,11 @@ fn skill_install_places_navigation_skill_for_claude_code() {
         .assert()
         .success();
 
-    let skill = std::fs::read_to_string(
-        home.path()
-            .join(".claude/skills/yggdrasil-navigation/SKILL.md"),
-    )
-    .unwrap();
+    let skill = installed_skill(home.path());
+    assert_eq!(
+        skill,
+        include_str!("../skills/yggdrasil-navigation/SKILL.md")
+    );
     assert!(skill.contains("name: yggdrasil-navigation"));
     assert!(skill.contains("Server/Verb version"));
     assert!(skill.contains("RFC 0001 §7"));
@@ -40,11 +40,48 @@ fn skill_install_falls_back_to_userprofile_when_home_is_empty() {
         .assert()
         .success();
 
-    assert!(
-        userprofile
-            .path()
-            .join(".claude/skills/yggdrasil-navigation/SKILL.md")
-            .is_file(),
+    assert_eq!(
+        installed_skill(userprofile.path()),
+        include_str!("../skills/yggdrasil-navigation/SKILL.md"),
         "empty HOME must be ignored in favor of USERPROFILE"
     );
+}
+
+#[test]
+fn skill_install_falls_back_to_userprofile_when_home_is_missing() {
+    let userprofile = tempfile::tempdir().unwrap();
+
+    assert_cmd::Command::cargo_bin("yg")
+        .unwrap()
+        .env_remove("HOME")
+        .env("USERPROFILE", userprofile.path())
+        .arg("skill")
+        .arg("install")
+        .assert()
+        .success();
+
+    assert_eq!(
+        installed_skill(userprofile.path()),
+        include_str!("../skills/yggdrasil-navigation/SKILL.md"),
+        "missing HOME must fall back to USERPROFILE"
+    );
+}
+
+#[test]
+fn skill_install_requires_a_home_directory() {
+    assert_cmd::Command::cargo_bin("yg")
+        .unwrap()
+        .env_remove("HOME")
+        .env_remove("USERPROFILE")
+        .arg("skill")
+        .arg("install")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "HOME or USERPROFILE must be set to install Claude Code skills",
+        ));
+}
+
+fn installed_skill(home: &std::path::Path) -> String {
+    std::fs::read_to_string(home.join(".claude/skills/yggdrasil-navigation/SKILL.md")).unwrap()
 }
