@@ -344,23 +344,16 @@ fn jsonrpc_error(
 }
 
 fn mcp_tools() -> Result<Vec<serde_json::Value>, (i64, String)> {
-    yg_verbs::VERB_TOOLS
+    Ok(yg_verbs::VERB_TOOLS
         .iter()
         .map(|tool| {
-            let input_schema = serde_json::from_str::<serde_json::Value>(tool.input_schema)
-                .map_err(|e| {
-                    (
-                        -32603,
-                        format!("Verb tool schema {:?} is invalid: {e}", tool.name),
-                    )
-                })?;
-            Ok(serde_json::json!({
+            serde_json::json!({
                 "name": tool.name,
                 "description": tool.description,
-                "inputSchema": input_schema
-            }))
+                "inputSchema": tool.input_schema()
+            })
         })
-        .collect()
+        .collect())
 }
 
 async fn mcp_call_tool(
@@ -452,13 +445,11 @@ async fn verb_response_value(
     }
 }
 
-#[derive(Deserialize)]
-struct NodeRequest {
-    id: String,
-}
-
 /// `POST /v1/verbs/node` (RFC 0001 §7): full node + edge summary.
-async fn verb_node(State(state): State<Arc<AppState>>, Json(req): Json<NodeRequest>) -> Response {
+async fn verb_node(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<yg_verbs::NodeRequest>,
+) -> Response {
     let id = match yg_verbs::VerbId::parse(&req.id) {
         Ok(id) => id,
         Err(reason) => return error_json(StatusCode::BAD_REQUEST, reason),
@@ -471,33 +462,6 @@ async fn verb_node(State(state): State<Arc<AppState>>, Json(req): Json<NodeReque
         Ok(response) => Json(response).into_response(),
         Err(response) => response,
     }
-}
-
-#[derive(Deserialize)]
-struct NeighborsRequest {
-    #[serde(flatten)]
-    shape: TraversalShape,
-    /// Page size in nodes: 1 to 1000, default 100. Deliberately not
-    /// part of the shape: pages of one traversal may vary in size.
-    limit: Option<u32>,
-    /// Resume an earlier traversal where its last page ended.
-    cursor: Option<String>,
-}
-
-/// The traversal-defining half of a `neighbors` request: origin and
-/// filters, exactly as the client spelled them. One definition, two
-/// homes — the request and the cursor — so "the cursor remembers what
-/// was asked" is a move, not a field-by-field copy that can drift.
-#[derive(Serialize, Deserialize, Clone)]
-struct TraversalShape {
-    id: String,
-    /// `"in"` | `"out"` | `"both"` (the default). A plain string so a
-    /// typo gets this server's error envelope, not a serde rejection.
-    direction: Option<String>,
-    /// Only follow edges of these kinds; omitted follows every kind.
-    edge_kinds: Option<Vec<String>>,
-    /// Hops to traverse: 1 (default) to 3 (RFC 0001 §7).
-    depth: Option<u32>,
 }
 
 /// What a `next_cursor` opaquely carries: the traversal position, the
@@ -514,7 +478,7 @@ struct TraversalShape {
 struct NeighborsCursor {
     rev: String,
     #[serde(flatten)]
-    shape: TraversalShape,
+    shape: yg_verbs::TraversalShape,
     after_depth: u32,
     after: String,
 }
@@ -543,7 +507,7 @@ impl NeighborsCursor {
     /// them, nothing else. Spellings are compared normalized: an
     /// omitted direction and an explicit `"both"` mean the same
     /// traversal, and edge-kind order carries no meaning.
-    fn agrees_with(&self, req: &TraversalShape) -> Result<(), String> {
+    fn agrees_with(&self, req: &yg_verbs::TraversalShape) -> Result<(), String> {
         fn direction(spelled: &Option<String>) -> Result<yg_verbs::Direction, String> {
             spelled.as_deref().map_or(
                 Ok(yg_verbs::Direction::default()),
@@ -581,7 +545,7 @@ impl NeighborsCursor {
 /// subgraph.
 async fn verb_neighbors(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<NeighborsRequest>,
+    Json(req): Json<yg_verbs::NeighborsRequest>,
 ) -> Response {
     let cursor = match req.cursor.as_deref().map(NeighborsCursor::decode) {
         Some(Ok(cursor)) => Some(cursor),
@@ -609,8 +573,10 @@ async fn verb_neighbors(
     let options = yg_verbs::NeighborsOptions {
         direction,
         edge_kinds: shape.edge_kinds.clone(),
-        depth: shape.depth.unwrap_or(1),
-        limit: req.limit.unwrap_or(100) as usize,
+        depth: shape.depth.unwrap_or(yg_verbs::DEFAULT_NEIGHBORS_DEPTH),
+        limit: req
+            .limit
+            .unwrap_or(yg_verbs::DEFAULT_NEIGHBORS_LIMIT as u32) as usize,
         after: cursor.as_ref().map(|c| (c.after_depth, c.after.clone())),
     };
     if let Err(reason) = options.validate() {
@@ -662,25 +628,6 @@ struct NeighborsResponse {
     nodes: Vec<yg_verbs::NodeView>,
     edges: Vec<yg_verbs::GraphEdge>,
     next_cursor: Option<String>,
-}
-
-/// Default and maximum page size for `history`, in commits.
-const DEFAULT_HISTORY_LIMIT: usize = 50;
-const MAX_HISTORY_LIMIT: usize = 1000;
-
-#[derive(Deserialize)]
-struct HistoryRequest {
-    /// The node whose history to take. Always present, even on a resume —
-    /// the cursor must agree with it.
-    id: String,
-    /// Only commits at or after this date: RFC3339 (`2024-01-01T00:00:00Z`)
-    /// or a plain `YYYY-MM-DD` (midnight UTC). Omitted imposes no floor.
-    since: Option<String>,
-    /// Page size in commits: 1 to [`MAX_HISTORY_LIMIT`], default
-    /// [`DEFAULT_HISTORY_LIMIT`]. May vary between pages of one history.
-    limit: Option<u32>,
-    /// Resume an earlier history where its last page ended.
-    cursor: Option<String>,
 }
 
 /// One commit on the wire: the Verb's commit plus a display-ready date —
@@ -787,7 +734,7 @@ fn parse_since(raw: &str) -> Result<i64, String> {
 /// pagination.
 async fn verb_history(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<HistoryRequest>,
+    Json(req): Json<yg_verbs::HistoryRequest>,
 ) -> Response {
     let cursor = match req.cursor.as_deref().map(HistoryCursor::decode) {
         Some(Ok(cursor)) => Some(cursor),
@@ -815,11 +762,17 @@ async fn verb_history(
         Ok(id) => id,
         Err(reason) => return error_json(StatusCode::BAD_REQUEST, reason),
     };
-    let limit = req.limit.map_or(DEFAULT_HISTORY_LIMIT, |l| l as usize);
-    if !(1..=MAX_HISTORY_LIMIT).contains(&limit) {
+    let limit = req
+        .limit
+        .map_or(yg_verbs::DEFAULT_HISTORY_LIMIT, |l| l as usize);
+    if !(yg_verbs::MIN_PAGE_LIMIT..=yg_verbs::MAX_HISTORY_LIMIT).contains(&limit) {
         return error_json(
             StatusCode::BAD_REQUEST,
-            format!("limit must be between 1 and {MAX_HISTORY_LIMIT}, got {limit}"),
+            format!(
+                "limit must be between {} and {}, got {limit}",
+                yg_verbs::MIN_PAGE_LIMIT,
+                yg_verbs::MAX_HISTORY_LIMIT
+            ),
         );
     }
     // A cursor pins the revision its history started on; fresh queries
@@ -869,13 +822,10 @@ async fn verb_history(
     .into_response()
 }
 
-/// Default and maximum page size for `search`, plus the deepest a cursor
-/// may page. The window also bounds the fan-out: each repo is asked for a
-/// constant top-[`MAX_SEARCH_WINDOW`] hits (the deepest reachable page),
-/// which both keeps the merged ranking stable across pages and caps the
-/// work an unbounded offset could demand.
-const DEFAULT_SEARCH_LIMIT: usize = 20;
-const MAX_SEARCH_LIMIT: usize = 100;
+/// The deepest a `search` cursor may page. The window also bounds the
+/// fan-out: each repo is asked for a constant top-[`MAX_SEARCH_WINDOW`]
+/// hits (the deepest reachable page), which both keeps the merged ranking
+/// stable across pages and caps the work an unbounded offset could demand.
 const MAX_SEARCH_WINDOW: usize = 1000;
 
 /// The most repositories one search may fan out over — the width bound a
@@ -884,27 +834,6 @@ const MAX_SEARCH_WINDOW: usize = 1000;
 /// Generous for M0; org-wide fan-out beyond this is the tiering work
 /// deferred to M3 (RFC 0001 §11 Q5).
 const MAX_SEARCH_TARGETS: usize = 1000;
-
-#[derive(Deserialize)]
-struct SearchRequest {
-    /// The query — required on a fresh search; a resume carries it in the
-    /// cursor instead (and a query passed alongside a cursor must match).
-    query: Option<String>,
-    /// Restrict hits to these node kinds (`Symbol`, `File`); omitted
-    /// searches every kind.
-    kinds: Option<Vec<String>>,
-    /// Restrict the fan-out to these repo qualifiers; omitted searches
-    /// every indexed repo (RFC 0001 §7).
-    repos: Option<Vec<String>>,
-    /// `lexical` (the only M0 mode, and the default); `semantic`/`hybrid`
-    /// arrive with embeddings (M3).
-    mode: Option<String>,
-    /// Page size in hits: 1 to [`MAX_SEARCH_LIMIT`], default
-    /// [`DEFAULT_SEARCH_LIMIT`]. May vary between pages of one search.
-    limit: Option<u32>,
-    /// Resume an earlier search where its last page ended.
-    cursor: Option<String>,
-}
 
 /// One repo in a search's pinned fan-out set: queried at this exact
 /// immutable revision, so every page of one search sees the same corpus
@@ -1007,7 +936,7 @@ fn merge_paginate(mut all: Vec<SearchHit>, offset: usize, limit: usize) -> (Vec<
 /// the indexed repos, returning one ranked page with snippets and node ids.
 async fn verb_search(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<SearchRequest>,
+    Json(req): Json<yg_verbs::SearchRequest>,
 ) -> Response {
     let cursor = match req.cursor.as_deref().map(SearchCursor::decode) {
         Some(Ok(cursor)) => Some(cursor),
@@ -1017,11 +946,17 @@ async fn verb_search(
 
     // Page size may vary between pages; everything else is fixed at the
     // first page and carried by the cursor.
-    let limit = req.limit.map_or(DEFAULT_SEARCH_LIMIT, |l| l as usize);
-    if !(1..=MAX_SEARCH_LIMIT).contains(&limit) {
+    let limit = req
+        .limit
+        .map_or(yg_verbs::DEFAULT_SEARCH_LIMIT, |l| l as usize);
+    if !(yg_verbs::MIN_PAGE_LIMIT..=yg_verbs::MAX_SEARCH_LIMIT).contains(&limit) {
         return error_json(
             StatusCode::BAD_REQUEST,
-            format!("limit must be between 1 and {MAX_SEARCH_LIMIT}, got {limit}"),
+            format!(
+                "limit must be between {} and {}, got {limit}",
+                yg_verbs::MIN_PAGE_LIMIT,
+                yg_verbs::MAX_SEARCH_LIMIT
+            ),
         );
     }
 

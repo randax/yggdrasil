@@ -22,16 +22,29 @@
 use std::collections::BTreeMap;
 
 use anyhow::Context;
-use serde::Serialize;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
-/// One shipped Verb's public tool metadata. The schema is stored with the
-/// Verb engine so REST, CLI, and MCP can point at the same Verb names and
-/// request shapes instead of maintaining separate tool inventories.
+pub const DEFAULT_NEIGHBORS_DEPTH: u32 = 1;
+pub const MIN_NEIGHBORS_DEPTH: u32 = 1;
+pub const MAX_NEIGHBORS_DEPTH: u32 = 3;
+pub const DEFAULT_NEIGHBORS_LIMIT: usize = 100;
+pub const MIN_PAGE_LIMIT: usize = 1;
+pub const MAX_NEIGHBORS_LIMIT: usize = 1000;
+pub const DEFAULT_SEARCH_LIMIT: usize = 20;
+pub const MAX_SEARCH_LIMIT: usize = 100;
+pub const DEFAULT_HISTORY_LIMIT: usize = 50;
+pub const MAX_HISTORY_LIMIT: usize = 1000;
+pub const SEARCH_MODE_VALUES: &[&str] = &["lexical", "semantic", "hybrid"];
+
+/// One shipped Verb's public tool metadata. The schema is derived from
+/// the same request type REST deserializes and CLI serializes, so the
+/// transports cannot maintain separate tool inventories.
 pub struct VerbTool {
     pub verb: Verb,
     pub name: &'static str,
     pub description: &'static str,
-    pub input_schema: &'static str,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,141 +68,189 @@ pub fn verb_tool(name: &str) -> Option<&'static VerbTool> {
     VERB_TOOLS.iter().find(|tool| tool.name == name)
 }
 
+impl VerbTool {
+    pub fn input_schema(&self) -> Value {
+        match self.verb {
+            Verb::Node => closed_schema::<NodeRequest>(),
+            Verb::Neighbors => {
+                let mut schema = closed_schema::<NeighborsRequest>();
+                enum_property(&mut schema, "direction", Direction::WIRE_VALUES);
+                bounded_property(
+                    &mut schema,
+                    "depth",
+                    MIN_NEIGHBORS_DEPTH,
+                    MAX_NEIGHBORS_DEPTH,
+                );
+                bounded_property(&mut schema, "limit", MIN_PAGE_LIMIT, MAX_NEIGHBORS_LIMIT);
+                schema
+            }
+            Verb::Search => {
+                let mut schema = closed_schema::<SearchRequest>();
+                enum_property(&mut schema, "mode", SEARCH_MODE_VALUES);
+                bounded_property(&mut schema, "limit", MIN_PAGE_LIMIT, MAX_SEARCH_LIMIT);
+                insert_any_of(
+                    &mut schema,
+                    serde_json::json!([
+                        {"required": ["query"]},
+                        {"required": ["cursor"]}
+                    ]),
+                );
+                schema
+            }
+            Verb::History => {
+                let mut schema = closed_schema::<HistoryRequest>();
+                bounded_property(&mut schema, "limit", MIN_PAGE_LIMIT, MAX_HISTORY_LIMIT);
+                schema
+            }
+        }
+    }
+}
+
+fn schema<T: JsonSchema>() -> Value {
+    match serde_json::to_value(schemars::schema_for!(T)) {
+        Ok(Value::Object(mut object)) => {
+            object.remove("$schema");
+            object.remove("title");
+            Value::Object(object)
+        }
+        Ok(value) => value,
+        Err(_) => serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "description": "Schema generation failed"
+        }),
+    }
+}
+
+fn closed_schema<T: JsonSchema>() -> Value {
+    let mut schema = schema::<T>();
+    if let Some(object) = schema.as_object_mut() {
+        object.insert("additionalProperties".to_string(), serde_json::json!(false));
+    }
+    schema
+}
+
+fn property_schema_mut<'a>(schema: &'a mut Value, property: &str) -> Option<&'a mut Value> {
+    schema
+        .get_mut("properties")
+        .and_then(Value::as_object_mut)
+        .and_then(|properties| properties.get_mut(property))
+}
+
+fn enum_property(schema: &mut Value, property: &str, values: &[&str]) {
+    if let Some(property) = property_schema_mut(schema, property) {
+        property["enum"] = serde_json::json!(values);
+    }
+}
+
+fn bounded_property<T: Serialize>(schema: &mut Value, property: &str, minimum: T, maximum: T) {
+    if let Some(property) = property_schema_mut(schema, property) {
+        property["minimum"] = serde_json::json!(minimum);
+        property["maximum"] = serde_json::json!(maximum);
+    }
+}
+
+fn insert_any_of(schema: &mut Value, value: Value) {
+    if let Some(object) = schema.as_object_mut() {
+        object.insert("anyOf".to_string(), value);
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct NodeRequest {
+    /// Node id, e.g. sym:github.com/acme/widgets:main.go#Hello.
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct NeighborsRequest {
+    #[serde(flatten)]
+    pub shape: TraversalShape,
+    /// Page size in nodes: 1 to 1000, default 100.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    /// Resume where the previous page's next_cursor left off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+}
+
+/// The traversal-defining half of a `neighbors` request: origin and
+/// filters, exactly as the client spelled them.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct TraversalShape {
+    /// Node id to traverse from.
+    pub id: String,
+    /// Which edge direction to follow: in, out, or both.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub direction: Option<String>,
+    /// Edge kinds to follow, e.g. DEFINES or CALLS.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub edge_kinds: Option<Vec<String>>,
+    /// Traversal depth.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub depth: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SearchRequest {
+    /// Search query; required on a fresh search, replaced by cursor on resume.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+    /// Node kinds to search, e.g. Symbol or File.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kinds: Option<Vec<String>>,
+    /// Repo qualifiers to search.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repos: Option<Vec<String>>,
+    /// Search mode; lexical is available in this release.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// Hits per page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    /// Resume where the previous page's next_cursor left off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct HistoryRequest {
+    /// File or Symbol node id.
+    pub id: String,
+    /// RFC3339 timestamp or YYYY-MM-DD lower bound.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub since: Option<String>,
+    /// Commits per page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    /// Resume where the previous page's next_cursor left off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+}
+
 /// The shipped Verb catalog. MCP tool listing and calling both resolve
-/// through this catalog; REST and CLI still own their transport-specific
-/// parsing and rendering around these shared request shapes.
+/// through this catalog, and each tool schema is generated from the
+/// shared request type for that Verb.
 pub const VERB_TOOLS: &[VerbTool] = &[
     VerbTool {
         verb: Verb::Node,
         name: "node",
         description: "Return one Knowledge Graph node with inbound and outbound edge summaries.",
-        input_schema: r#"{
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-                "id": {
-                    "type": "string",
-                    "description": "Node id, e.g. sym:github.com/acme/widgets:main.go#Hello"
-                }
-            },
-            "required": ["id"]
-        }"#,
     },
     VerbTool {
         verb: Verb::Neighbors,
         name: "neighbors",
         description: "Return a node's neighboring subgraph with edge details and pagination.",
-        input_schema: r#"{
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-                "id": {
-                    "type": "string",
-                    "description": "Node id to traverse from"
-                },
-                "direction": {
-                    "type": "string",
-                    "enum": ["in", "out", "both"],
-                    "description": "Which edge direction to follow"
-                },
-                "edge_kinds": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Edge kinds to follow, e.g. DEFINES or CALLS"
-                },
-                "depth": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": 3,
-                    "description": "Traversal depth"
-                },
-                "limit": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": 1000,
-                    "description": "Nodes per page"
-                },
-                "cursor": {
-                    "type": "string",
-                    "description": "Opaque cursor returned by a previous neighbors call"
-                }
-            },
-            "required": ["id"]
-        }"#,
     },
     VerbTool {
         verb: Verb::Search,
         name: "search",
         description: "Search indexed repos for symbols, files, and docs with ranked node ids.",
-        input_schema: r#"{
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Search query"
-                },
-                "kinds": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Node kinds to search, e.g. Symbol or File"
-                },
-                "repos": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Repo qualifiers to search"
-                },
-                "mode": {
-                    "type": "string",
-                    "enum": ["lexical", "semantic", "hybrid"],
-                    "description": "Search mode; lexical is available in this release"
-                },
-                "limit": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": 100,
-                    "description": "Hits per page"
-                },
-                "cursor": {
-                    "type": "string",
-                    "description": "Opaque cursor returned by a previous search call"
-                }
-            },
-            "anyOf": [
-                {"required": ["query"]},
-                {"required": ["cursor"]}
-            ]
-        }"#,
     },
     VerbTool {
         verb: Verb::History,
         name: "history",
         description: "Return commits touching a file node or a symbol's defining file.",
-        input_schema: r#"{
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-                "id": {
-                    "type": "string",
-                    "description": "File or Symbol node id"
-                },
-                "since": {
-                    "type": "string",
-                    "description": "RFC3339 timestamp or YYYY-MM-DD lower bound"
-                },
-                "limit": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": 1000,
-                    "description": "Commits per page"
-                },
-                "cursor": {
-                    "type": "string",
-                    "description": "Opaque cursor returned by a previous history call"
-                }
-            },
-            "required": ["id"]
-        }"#,
     },
 ];
 
@@ -432,6 +493,8 @@ pub enum Direction {
 }
 
 impl Direction {
+    pub const WIRE_VALUES: &'static [&'static str] = &["in", "out", "both"];
+
     /// Parse the wire form. The error is client-facing.
     pub fn parse(direction: &str) -> Result<Self, String> {
         match direction {
@@ -482,8 +545,8 @@ impl Default for NeighborsOptions {
         Self {
             direction: Direction::default(),
             edge_kinds: None,
-            depth: 1,
-            limit: 100,
+            depth: DEFAULT_NEIGHBORS_DEPTH,
+            limit: DEFAULT_NEIGHBORS_LIMIT,
             after: None,
         }
     }
@@ -495,12 +558,15 @@ impl NeighborsOptions {
     /// check lives with the options, not in any one transport). Errors
     /// are client-facing.
     pub fn validate(&self) -> Result<(), String> {
-        if !(1..=3).contains(&self.depth) {
-            return Err(format!("depth must be between 1 and 3, got {}", self.depth));
-        }
-        if !(1..=1000).contains(&self.limit) {
+        if !(MIN_NEIGHBORS_DEPTH..=MAX_NEIGHBORS_DEPTH).contains(&self.depth) {
             return Err(format!(
-                "limit must be between 1 and 1000, got {}",
+                "depth must be between {MIN_NEIGHBORS_DEPTH} and {MAX_NEIGHBORS_DEPTH}, got {}",
+                self.depth
+            ));
+        }
+        if !(MIN_PAGE_LIMIT..=MAX_NEIGHBORS_LIMIT).contains(&self.limit) {
+            return Err(format!(
+                "limit must be between {MIN_PAGE_LIMIT} and {MAX_NEIGHBORS_LIMIT}, got {}",
                 self.limit
             ));
         }
@@ -1079,6 +1145,7 @@ fn history_commit(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn ids_with_port_bearing_qualifiers_round_trip() {
@@ -1199,5 +1266,92 @@ mod tests {
             ..NeighborsOptions::default()
         };
         assert!(options.validate().is_ok(), "known kinds pass");
+    }
+
+    #[test]
+    fn verb_tool_schemas_preserve_wire_constraints() {
+        let node = Verb::Node.tool().input_schema();
+        assert_eq!(node.get("$schema"), None);
+        assert_eq!(node.get("title"), None);
+        assert_eq!(node["additionalProperties"], json!(false));
+        assert_eq!(node["properties"]["id"]["type"], "string");
+        assert!(
+            node["required"]
+                .as_array()
+                .expect("node required list")
+                .contains(&json!("id")),
+            "node id remains required: {node}"
+        );
+
+        let neighbors = Verb::Neighbors.tool().input_schema();
+        assert_eq!(neighbors.get("$schema"), None);
+        assert_eq!(neighbors.get("title"), None);
+        assert_eq!(neighbors["additionalProperties"], json!(false));
+        assert_eq!(
+            neighbors["properties"]["direction"]["enum"],
+            json!(Direction::WIRE_VALUES)
+        );
+        assert_eq!(
+            neighbors["properties"]["depth"]["minimum"],
+            json!(MIN_NEIGHBORS_DEPTH)
+        );
+        assert_eq!(
+            neighbors["properties"]["depth"]["maximum"],
+            json!(MAX_NEIGHBORS_DEPTH)
+        );
+        assert_eq!(
+            neighbors["properties"]["limit"]["minimum"],
+            json!(MIN_PAGE_LIMIT)
+        );
+        assert_eq!(
+            neighbors["properties"]["limit"]["maximum"],
+            json!(MAX_NEIGHBORS_LIMIT)
+        );
+
+        let search = Verb::Search.tool().input_schema();
+        assert_eq!(search.get("$schema"), None);
+        assert_eq!(search.get("title"), None);
+        assert_eq!(search["additionalProperties"], json!(false));
+        assert_eq!(
+            search["properties"]["mode"]["enum"],
+            json!(SEARCH_MODE_VALUES)
+        );
+        assert_eq!(
+            search["properties"]["limit"]["minimum"],
+            json!(MIN_PAGE_LIMIT)
+        );
+        assert_eq!(
+            search["properties"]["limit"]["maximum"],
+            json!(MAX_SEARCH_LIMIT)
+        );
+        assert!(
+            search["anyOf"]
+                .as_array()
+                .expect("search anyOf")
+                .iter()
+                .any(|shape| shape["required"] == json!(["query"])),
+            "fresh search still requires query: {search}"
+        );
+        assert!(
+            search["anyOf"]
+                .as_array()
+                .expect("search anyOf")
+                .iter()
+                .any(|shape| shape["required"] == json!(["cursor"])),
+            "resume search still allows cursor-only calls: {search}"
+        );
+
+        let history = Verb::History.tool().input_schema();
+        assert_eq!(history.get("$schema"), None);
+        assert_eq!(history.get("title"), None);
+        assert_eq!(history["additionalProperties"], json!(false));
+        assert_eq!(
+            history["properties"]["limit"]["minimum"],
+            json!(MIN_PAGE_LIMIT)
+        );
+        assert_eq!(
+            history["properties"]["limit"]["maximum"],
+            json!(MAX_HISTORY_LIMIT)
+        );
     }
 }

@@ -523,7 +523,7 @@ where
 }
 
 async fn node(id: String, json: bool) -> anyhow::Result<()> {
-    let body = post_verb("node", serde_json::json!({"id": id})).await?;
+    let body = post_verb("node", serde_json::to_value(yg_verbs::NodeRequest { id })?).await?;
     if json {
         println!("{}", serde_json::to_string_pretty(&body)?);
         return Ok(());
@@ -580,23 +580,20 @@ async fn neighbors(
     cursor: Option<String>,
     json: bool,
 ) -> anyhow::Result<()> {
-    let mut req = serde_json::json!({"id": id});
-    if let Some(direction) = direction {
-        req["direction"] = direction.into();
-    }
-    if !kinds.is_empty() {
-        req["edge_kinds"] = kinds.into();
-    }
-    if let Some(depth) = depth {
-        req["depth"] = depth.into();
-    }
-    if let Some(limit) = limit {
-        req["limit"] = limit.into();
-    }
-    if let Some(cursor) = cursor {
-        req["cursor"] = cursor.into();
-    }
-    let body = post_verb("neighbors", req).await?;
+    let body = post_verb(
+        "neighbors",
+        serde_json::to_value(yg_verbs::NeighborsRequest {
+            shape: yg_verbs::TraversalShape {
+                id,
+                direction,
+                edge_kinds: (!kinds.is_empty()).then_some(kinds),
+                depth,
+            },
+            limit,
+            cursor,
+        })?,
+    )
+    .await?;
     if json {
         println!("{}", serde_json::to_string_pretty(&body)?);
         return Ok(());
@@ -648,20 +645,18 @@ async fn search(
     cursor: Option<String>,
     json: bool,
 ) -> anyhow::Result<()> {
-    let mut req = serde_json::json!({"query": query});
-    if !kinds.is_empty() {
-        req["kinds"] = kinds.into();
-    }
-    if !repos.is_empty() {
-        req["repos"] = repos.into();
-    }
-    if let Some(limit) = limit {
-        req["limit"] = limit.into();
-    }
-    if let Some(cursor) = cursor {
-        req["cursor"] = cursor.into();
-    }
-    let body = post_verb("search", req).await?;
+    let body = post_verb(
+        "search",
+        serde_json::to_value(yg_verbs::SearchRequest {
+            query: Some(query),
+            kinds: (!kinds.is_empty()).then_some(kinds),
+            repos: (!repos.is_empty()).then_some(repos),
+            mode: None,
+            limit,
+            cursor,
+        })?,
+    )
+    .await?;
     if json {
         println!("{}", serde_json::to_string_pretty(&body)?);
         return Ok(());
@@ -714,17 +709,16 @@ async fn history(
     cursor: Option<String>,
     json: bool,
 ) -> anyhow::Result<()> {
-    let mut req = serde_json::json!({ "id": id });
-    if let Some(since) = since {
-        req["since"] = since.into();
-    }
-    if let Some(limit) = limit {
-        req["limit"] = limit.into();
-    }
-    if let Some(cursor) = cursor {
-        req["cursor"] = cursor.into();
-    }
-    let body = post_verb("history", req).await?;
+    let body = post_verb(
+        "history",
+        serde_json::to_value(yg_verbs::HistoryRequest {
+            id,
+            since,
+            limit,
+            cursor,
+        })?,
+    )
+    .await?;
     if json {
         println!("{}", serde_json::to_string_pretty(&body)?);
         return Ok(());
