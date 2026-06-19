@@ -22,16 +22,16 @@
 use std::collections::BTreeMap;
 
 use anyhow::Context;
-use serde::Serialize;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 
-/// One shipped Verb's public tool metadata. The schema is stored with the
-/// Verb engine so REST, CLI, and MCP can point at the same Verb names and
-/// request shapes instead of maintaining separate tool inventories.
+/// One shipped Verb's public tool metadata. The schema is derived from
+/// the same request type REST deserializes and CLI serializes, so the
+/// transports cannot maintain separate tool inventories.
 pub struct VerbTool {
     pub verb: Verb,
     pub name: &'static str,
     pub description: &'static str,
-    pub input_schema: &'static str,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,141 +55,123 @@ pub fn verb_tool(name: &str) -> Option<&'static VerbTool> {
     VERB_TOOLS.iter().find(|tool| tool.name == name)
 }
 
+impl VerbTool {
+    pub fn input_schema(&self) -> serde_json::Value {
+        match self.verb {
+            Verb::Node => schema::<NodeRequest>(),
+            Verb::Neighbors => schema::<NeighborsRequest>(),
+            Verb::Search => {
+                let mut schema = schema::<SearchRequest>();
+                schema["anyOf"] = serde_json::json!([
+                    {"required": ["query"]},
+                    {"required": ["cursor"]}
+                ]);
+                schema
+            }
+            Verb::History => schema::<HistoryRequest>(),
+        }
+    }
+}
+
+fn schema<T: JsonSchema>() -> serde_json::Value {
+    serde_json::to_value(schemars::schema_for!(T)).expect("schema serializes")
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct NodeRequest {
+    /// Node id, e.g. sym:github.com/acme/widgets:main.go#Hello.
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct NeighborsRequest {
+    #[serde(flatten)]
+    pub shape: TraversalShape,
+    /// Page size in nodes: 1 to 1000, default 100.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    /// Resume where the previous page's next_cursor left off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+}
+
+/// The traversal-defining half of a `neighbors` request: origin and
+/// filters, exactly as the client spelled them.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct TraversalShape {
+    /// Node id to traverse from.
+    pub id: String,
+    /// Which edge direction to follow: in, out, or both.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub direction: Option<String>,
+    /// Edge kinds to follow, e.g. DEFINES or CALLS.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub edge_kinds: Option<Vec<String>>,
+    /// Traversal depth.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub depth: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SearchRequest {
+    /// Search query; required on a fresh search, replaced by cursor on resume.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+    /// Node kinds to search, e.g. Symbol or File.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kinds: Option<Vec<String>>,
+    /// Repo qualifiers to search.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repos: Option<Vec<String>>,
+    /// Search mode; lexical is available in this release.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// Hits per page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    /// Resume where the previous page's next_cursor left off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct HistoryRequest {
+    /// File or Symbol node id.
+    pub id: String,
+    /// RFC3339 timestamp or YYYY-MM-DD lower bound.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub since: Option<String>,
+    /// Commits per page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    /// Resume where the previous page's next_cursor left off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+}
+
 /// The shipped Verb catalog. MCP tool listing and calling both resolve
-/// through this catalog; REST and CLI still own their transport-specific
-/// parsing and rendering around these shared request shapes.
+/// through this catalog, and each tool schema is generated from the
+/// shared request type for that Verb.
 pub const VERB_TOOLS: &[VerbTool] = &[
     VerbTool {
         verb: Verb::Node,
         name: "node",
         description: "Return one Knowledge Graph node with inbound and outbound edge summaries.",
-        input_schema: r#"{
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-                "id": {
-                    "type": "string",
-                    "description": "Node id, e.g. sym:github.com/acme/widgets:main.go#Hello"
-                }
-            },
-            "required": ["id"]
-        }"#,
     },
     VerbTool {
         verb: Verb::Neighbors,
         name: "neighbors",
         description: "Return a node's neighboring subgraph with edge details and pagination.",
-        input_schema: r#"{
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-                "id": {
-                    "type": "string",
-                    "description": "Node id to traverse from"
-                },
-                "direction": {
-                    "type": "string",
-                    "enum": ["in", "out", "both"],
-                    "description": "Which edge direction to follow"
-                },
-                "edge_kinds": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Edge kinds to follow, e.g. DEFINES or CALLS"
-                },
-                "depth": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": 3,
-                    "description": "Traversal depth"
-                },
-                "limit": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": 1000,
-                    "description": "Nodes per page"
-                },
-                "cursor": {
-                    "type": "string",
-                    "description": "Opaque cursor returned by a previous neighbors call"
-                }
-            },
-            "required": ["id"]
-        }"#,
     },
     VerbTool {
         verb: Verb::Search,
         name: "search",
         description: "Search indexed repos for symbols, files, and docs with ranked node ids.",
-        input_schema: r#"{
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Search query"
-                },
-                "kinds": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Node kinds to search, e.g. Symbol or File"
-                },
-                "repos": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Repo qualifiers to search"
-                },
-                "mode": {
-                    "type": "string",
-                    "enum": ["lexical", "semantic", "hybrid"],
-                    "description": "Search mode; lexical is available in this release"
-                },
-                "limit": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": 100,
-                    "description": "Hits per page"
-                },
-                "cursor": {
-                    "type": "string",
-                    "description": "Opaque cursor returned by a previous search call"
-                }
-            },
-            "anyOf": [
-                {"required": ["query"]},
-                {"required": ["cursor"]}
-            ]
-        }"#,
     },
     VerbTool {
         verb: Verb::History,
         name: "history",
         description: "Return commits touching a file node or a symbol's defining file.",
-        input_schema: r#"{
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-                "id": {
-                    "type": "string",
-                    "description": "File or Symbol node id"
-                },
-                "since": {
-                    "type": "string",
-                    "description": "RFC3339 timestamp or YYYY-MM-DD lower bound"
-                },
-                "limit": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": 1000,
-                    "description": "Commits per page"
-                },
-                "cursor": {
-                    "type": "string",
-                    "description": "Opaque cursor returned by a previous history call"
-                }
-            },
-            "required": ["id"]
-        }"#,
     },
 ];
 

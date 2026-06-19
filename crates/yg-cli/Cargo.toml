@@ -23,6 +23,7 @@ yg-api = { version = "0.1.0", path = "../yg-api" }
 yg-control = { version = "0.1.0", path = "../yg-control" }
 yg-index = { version = "0.1.0", path = "../yg-index" }
 yg-sync = { version = "0.1.0", path = "../yg-sync" }
+yg-verbs = { version = "0.1.0", path = "../yg-verbs" }
 
 [dev-dependencies]
 assert_cmd = "2.2.2"
