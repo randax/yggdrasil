@@ -319,11 +319,9 @@ async fn main() -> anyhow::Result<()> {
 
 fn skill_install() -> anyhow::Result<()> {
     const SKILL_NAME: &str = "yggdrasil-navigation";
-    const SKILL_DOCUMENT: &str = include_str!("../../../skills/yggdrasil-navigation/SKILL.md");
+    const SKILL_DOCUMENT: &str = include_str!("../skills/yggdrasil-navigation/SKILL.md");
 
-    let home =
-        std::env::var_os("HOME").context("HOME must be set to install Claude Code skills")?;
-    let skill_dir = std::path::PathBuf::from(home)
+    let skill_dir = skill_home_dir()?
         .join(".claude")
         .join("skills")
         .join(SKILL_NAME);
@@ -334,6 +332,14 @@ fn skill_install() -> anyhow::Result<()> {
         .with_context(|| format!("writing {}", skill_path.display()))?;
     println!("installed {SKILL_NAME} Skill at {}", skill_path.display());
     Ok(())
+}
+
+fn skill_home_dir() -> anyhow::Result<std::path::PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|value| !value.as_os_str().is_empty())
+        .or_else(|| std::env::var_os("USERPROFILE").filter(|value| !value.as_os_str().is_empty()))
+        .map(std::path::PathBuf::from)
+        .context("HOME or USERPROFILE must be set to install Claude Code skills")
 }
 
 /// Where the Index Server lives and how to authenticate, from the same

@@ -26,3 +26,25 @@ fn skill_install_places_navigation_skill_for_claude_code() {
     assert!(skill.contains("Verb cookbook"));
     assert!(skill.contains("Failure etiquette"));
 }
+
+#[test]
+fn skill_install_falls_back_to_userprofile_when_home_is_empty() {
+    let userprofile = tempfile::tempdir().unwrap();
+
+    assert_cmd::Command::cargo_bin("yg")
+        .unwrap()
+        .env("HOME", "")
+        .env("USERPROFILE", userprofile.path())
+        .arg("skill")
+        .arg("install")
+        .assert()
+        .success();
+
+    assert!(
+        userprofile
+            .path()
+            .join(".claude/skills/yggdrasil-navigation/SKILL.md")
+            .is_file(),
+        "empty HOME must be ignored in favor of USERPROFILE"
+    );
+}

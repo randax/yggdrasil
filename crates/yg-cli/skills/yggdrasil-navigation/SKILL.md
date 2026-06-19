@@ -19,7 +19,7 @@ Expected in M1: `map`, `callers`, `callees`, and `impact`.
 
 ## Knowledge Graph vs reading files
 
-Use the Knowledge Graph first for organization-truth:
+Use the Knowledge Graph first for org-truth:
 
 - finding Symbols, Doc Sections, and files across synced repositories
 - following edges between Symbols, files, Dependencies, Contributors, and docs
