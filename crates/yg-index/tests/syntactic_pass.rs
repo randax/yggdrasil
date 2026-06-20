@@ -492,6 +492,34 @@ fn python_qualified_external_calls_do_not_resolve_to_same_named_local_methods() 
 }
 
 #[test]
+fn python_nested_self_attributes_do_not_resolve_as_direct_method_calls() {
+    let graph = pass_over(&[(
+        "pkg/widget.py",
+        r#"class Widget:
+    def info(self):
+        pass
+
+    def render(self):
+        return self.logger.info("widget")
+"#,
+    )]);
+
+    assert!(
+        graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Calls)
+            .all(|e| e.dst != "sym:pkg/widget.py#Widget.info"),
+        "a nested self attribute call must not resolve to the same-named local method: {:?}",
+        graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Calls)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn rust_declarations_imports_and_calls_become_graph_facts() {
     let graph = pass_over(&[(
         "src/lib.rs",
@@ -580,6 +608,32 @@ impl Widget {
 }
 
 #[test]
+fn rust_impl_methods_on_primitive_types_become_symbols() {
+    let graph = pass_over(&[(
+        "src/lib.rs",
+        r#"trait Renderable {
+    fn render(&self) -> String;
+}
+
+impl Renderable for str {
+    fn render(&self) -> String {
+        String::new()
+    }
+}
+"#,
+    )]);
+
+    assert!(
+        graph
+            .nodes
+            .iter()
+            .any(|n| n.id == "sym:src/lib.rs#str.render"),
+        "Rust impl methods on primitive receivers must yield receiver-qualified Symbols: {:?}",
+        symbol_names(&graph)
+    );
+}
+
+#[test]
 fn rust_internal_use_paths_do_not_become_package_imports() {
     let graph = pass_over(&[(
         "src/lib.rs",
@@ -640,6 +694,49 @@ class Widget:
             .edges
             .iter()
             .filter(|e| e.kind == EdgeKind::Imports)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn java_this_and_super_method_calls_resolve_to_repo_methods() {
+    let graph = pass_over(&[(
+        "src/Widget.java",
+        r#"class Base {
+    void inherited() {}
+}
+
+class Widget extends Base {
+    void helper() {}
+
+    void buildWidget() {
+        this.helper();
+        super.inherited();
+    }
+}
+"#,
+    )]);
+
+    assert!(
+        graph.edges.iter().any(|e| e.kind == EdgeKind::Calls
+            && e.src == "sym:src/Widget.java#Widget.buildWidget"
+            && e.dst == "sym:src/Widget.java#Widget.helper"),
+        "this-qualified Java method calls must resolve to repo methods: {:?}",
+        graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Calls)
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        graph.edges.iter().any(|e| e.kind == EdgeKind::Calls
+            && e.src == "sym:src/Widget.java#Widget.buildWidget"
+            && e.dst == "sym:src/Widget.java#Base.inherited"),
+        "super-qualified Java method calls must resolve to repo methods: {:?}",
+        graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Calls)
             .collect::<Vec<_>>()
     );
 }

@@ -1961,9 +1961,11 @@ fn collect_rust_impl_item(
 
 fn rust_type_name<'a>(node: tree_sitter::Node<'_>, source: &'a [u8]) -> Option<&'a str> {
     match node.kind() {
-        "type_identifier" => node.utf8_text(source).ok(),
+        "type_identifier" | "primitive_type" => node.utf8_text(source).ok(),
         "generic_type" => field_text(node, "type", source),
-        _ => first_of_kind(node, "type_identifier").and_then(|n| n.utf8_text(source).ok()),
+        _ => first_of_kind(node, "type_identifier")
+            .or_else(|| first_of_kind(node, "primitive_type"))
+            .and_then(|n| n.utf8_text(source).ok()),
     }
 }
 
@@ -2188,8 +2190,11 @@ fn collect_java_calls(
     calls: &mut Vec<SimpleCall>,
 ) {
     for call in descendants_of_kind(declaration, "method_invocation") {
-        if call.child_by_field_name("object").is_some() {
-            continue;
+        if let Some(object) = call.child_by_field_name("object") {
+            let object = object.utf8_text(source).ok();
+            if !matches!(object, Some("this" | "super")) {
+                continue;
+            }
         }
         let Some(callee) = field_text(call, "name", source) else {
             continue;
@@ -2400,10 +2405,7 @@ fn python_callee_name<'a>(expression: tree_sitter::Node<'_>, source: &'a [u8]) -
             let object = expression
                 .child_by_field_name("object")
                 .and_then(|node| node.utf8_text(source).ok());
-            let full = expression.utf8_text(source).ok();
-            if matches!(object, Some("self" | "cls"))
-                || full.is_some_and(|text| text.starts_with("self.") || text.starts_with("cls."))
-            {
+            if matches!(object, Some("self" | "cls")) {
                 field_text(expression, "attribute", source)
             } else {
                 None
