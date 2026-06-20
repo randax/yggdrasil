@@ -40,12 +40,14 @@ pub use fts::{
 /// (Commit→File) and AUTHORED (Contributor→Commit) edges, and a nullable
 /// `committed_at` on nodes (set on Commits, for the `history` Verb's
 /// newest-first ordering and `since` filter).
+/// v6: the syntactic grammar pack adds TypeScript, JavaScript, Python,
+/// Rust, and Java Symbols plus DEFINES/IMPORTS/CALLS facts.
 ///
 /// Bumping this changes every revision id (see
 /// [`syntactic_revision_suffix`]): readers refuse artifacts from other
 /// schema versions ([`SchemaOutdated`]), and worker boot queues a
 /// re-index for every repo still pointing at an outdated revision.
-pub const SCHEMA_VERSION: u32 = 5;
+pub const SCHEMA_VERSION: u32 = 6;
 
 /// Name of the M0 indexing pass, as recorded in revision ids, manifests,
 /// and the control plane's `provenance_level`. The precise pass (M1)

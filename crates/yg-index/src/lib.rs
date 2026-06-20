@@ -2065,38 +2065,58 @@ fn extract_java_facts(
         declarations: Vec::new(),
     };
     let mut id_uses: HashMap<String, u32> = HashMap::new();
-    for kind in [
-        "class_declaration",
-        "enum_declaration",
-        "interface_declaration",
-        "record_declaration",
-        "annotation_type_declaration",
-        "field_declaration",
-        "method_declaration",
-    ] {
-        for declaration in descendants_of_kind(root, kind) {
-            collect_java_declaration(
-                declaration,
-                source,
-                path,
-                file_id,
-                graph,
-                &mut id_uses,
-                &mut facts,
-            );
+    let mut ctx = SimpleExtractionCtx {
+        source,
+        path,
+        file_id,
+        graph,
+        id_uses: &mut id_uses,
+        facts: &mut facts,
+    };
+    collect_java_declarations(root, &mut ctx);
+    Some(facts)
+}
+
+fn collect_java_declarations(root: tree_sitter::Node<'_>, ctx: &mut SimpleExtractionCtx<'_, '_>) {
+    let mut cursor = root.walk();
+    if !cursor.goto_first_child() {
+        return;
+    }
+    loop {
+        let declaration = cursor.node();
+        if is_java_declaration_kind(declaration.kind()) {
+            collect_java_declaration(declaration, ctx);
+        }
+        if cursor.goto_first_child() {
+            continue;
+        }
+        loop {
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() || cursor.node() == root {
+                return;
+            }
         }
     }
-    Some(facts)
+}
+
+fn is_java_declaration_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "class_declaration"
+            | "enum_declaration"
+            | "interface_declaration"
+            | "record_declaration"
+            | "annotation_type_declaration"
+            | "field_declaration"
+            | "method_declaration"
+    )
 }
 
 fn collect_java_declaration(
     declaration: tree_sitter::Node<'_>,
-    source: &[u8],
-    path: &str,
-    file_id: &str,
-    graph: &mut Graph,
-    id_uses: &mut HashMap<String, u32>,
-    facts: &mut SimpleFileFacts,
+    ctx: &mut SimpleExtractionCtx<'_, '_>,
 ) {
     match declaration.kind() {
         "class_declaration"
@@ -2104,31 +2124,33 @@ fn collect_java_declaration(
         | "interface_declaration"
         | "record_declaration"
         | "annotation_type_declaration" => {
-            let Some(name) = field_text(declaration, "name", source) else {
+            let Some(name) = field_text(declaration, "name", ctx.source) else {
                 return;
             };
-            let id = mint_simple_symbol(path, file_id, name, id_uses, graph);
-            facts.declarations.push((name.to_string(), id));
+            let id = mint_simple_symbol(ctx.path, ctx.file_id, name, ctx.id_uses, ctx.graph);
+            ctx.facts.declarations.push((name.to_string(), id));
         }
         "method_declaration" => {
-            let Some(name) = field_text(declaration, "name", source) else {
+            let Some(name) = field_text(declaration, "name", ctx.source) else {
                 return;
             };
-            let symbol_name = java_member_symbol_name(declaration, source, name);
-            let id = mint_simple_symbol(path, file_id, &symbol_name, id_uses, graph);
-            facts.declarations.push((name.to_string(), id.clone()));
-            collect_java_calls(declaration, source, &id, path, &mut facts.calls);
+            let symbol_name = java_member_symbol_name(declaration, ctx.source, name);
+            let id =
+                mint_simple_symbol(ctx.path, ctx.file_id, &symbol_name, ctx.id_uses, ctx.graph);
+            ctx.facts.declarations.push((name.to_string(), id.clone()));
+            collect_java_calls(declaration, ctx.source, &id, ctx.path, &mut ctx.facts.calls);
         }
         "field_declaration" => {
             let mut cursor = declaration.walk();
             for declarator in declaration.children_by_field_name("declarator", &mut cursor) {
-                let Some(name) = field_text(declarator, "name", source) else {
+                let Some(name) = field_text(declarator, "name", ctx.source) else {
                     continue;
                 };
-                let symbol_name = java_member_symbol_name(declaration, source, name);
-                let id = mint_simple_symbol(path, file_id, &symbol_name, id_uses, graph);
-                facts.declarations.push((name.to_string(), id.clone()));
-                collect_java_calls(declarator, source, &id, path, &mut facts.calls);
+                let symbol_name = java_member_symbol_name(declaration, ctx.source, name);
+                let id =
+                    mint_simple_symbol(ctx.path, ctx.file_id, &symbol_name, ctx.id_uses, ctx.graph);
+                ctx.facts.declarations.push((name.to_string(), id.clone()));
+                collect_java_calls(declarator, ctx.source, &id, ctx.path, &mut ctx.facts.calls);
             }
         }
         _ => {}
