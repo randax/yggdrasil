@@ -339,6 +339,43 @@ async fn yg_search_reports_hits_humanly_and_as_raw_json() {
 }
 
 #[tokio::test]
+async fn yg_search_and_neighbors_work_on_an_indexed_typescript_repo() {
+    let h = Harness::boot_with(&[(
+        "src/widget.ts",
+        r#"import { format } from "@acme/format";
+
+export class Widget {
+	render(): string {
+		return format("widget");
+	}
+}
+
+export function buildWidget(): Widget {
+	return new Widget();
+}
+"#,
+    )])
+    .await;
+    h.add_repo().await;
+    h.sync_and_index().await;
+
+    let search = h.yg_ok(&["search", "build widget"]).await;
+    assert!(
+        search.contains("buildWidget") && search.contains("Symbol"),
+        "yg search finds the TypeScript Symbol:\n{search}"
+    );
+
+    let widget = format!("sym:{}:src/widget.ts#Widget", h.qualifier());
+    let neighbors = h
+        .yg_ok(&["neighbors", &widget, "--edge-kinds", "CALLS"])
+        .await;
+    assert!(
+        neighbors.contains("buildWidget") && neighbors.contains("CALLS"),
+        "yg neighbors follows TypeScript CALLS edges:\n{neighbors}"
+    );
+}
+
+#[tokio::test]
 async fn paging_with_the_cursor_unions_to_the_whole_result_set() {
     let h = Harness::boot_with(RATE_LIMIT_FIXTURE).await;
     h.add_repo().await;

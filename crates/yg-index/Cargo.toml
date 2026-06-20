@@ -15,6 +15,11 @@ tokio = { version = "1.52.3", features = ["rt", "process"] }
 tracing = "0.1.44"
 tree-sitter = "0.26.9"
 tree-sitter-go = "0.25.0"
+tree-sitter-java = "0.23.5"
+tree-sitter-javascript = "0.25.0"
+tree-sitter-python = "0.25.0"
+tree-sitter-rust = "0.24.2"
+tree-sitter-typescript = "0.23.2"
 yg-control = { version = "0.1.0", path = "../yg-control" }
 yg-shard = { version = "0.1.0", path = "../yg-shard" }
 yg-sync = { version = "0.1.0", path = "../yg-sync" }

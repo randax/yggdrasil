@@ -144,6 +144,633 @@ func (g Gadget) Render() string { return "g" }
 }
 
 #[test]
+fn typescript_exports_imports_and_calls_become_graph_facts() {
+    let graph = pass_over(&[(
+        "src/widget.ts",
+        r#"import { format } from "@acme/format";
+
+export const MAX_WIDGETS = 12;
+
+export interface Renderable {
+	render(): string;
+}
+
+export type WidgetId = string;
+
+export enum WidgetState {
+	Ready,
+}
+
+export class Widget implements Renderable {
+	render(): string {
+		return format("widget");
+	}
+}
+
+export function buildWidget(): Widget {
+	return new Widget();
+}
+"#,
+    )]);
+
+    assert_eq!(
+        symbol_names(&graph),
+        BTreeSet::from([
+            "MAX_WIDGETS",
+            "Renderable",
+            "Renderable.render",
+            "Widget",
+            "WidgetId",
+            "Widget.render",
+            "WidgetState",
+            "buildWidget"
+        ]),
+        "TypeScript declarations must yield Symbols"
+    );
+
+    for node in graph.nodes.iter().filter(|n| n.kind == NodeKind::Symbol) {
+        assert!(
+            graph.edges.iter().any(|e| e.kind == EdgeKind::Defines
+                && e.src == "file:src/widget.ts"
+                && e.dst == node.id),
+            "{} must be DEFINES-linked to src/widget.ts",
+            node.id
+        );
+    }
+
+    assert!(
+        graph
+            .nodes
+            .iter()
+            .any(|n| n.kind == NodeKind::Package && n.id == "pkg:@acme/format"),
+        "the import source must become a Package node"
+    );
+    assert!(
+        graph.edges.iter().any(|e| e.kind == EdgeKind::Imports
+            && e.src == "file:src/widget.ts"
+            && e.dst == "pkg:@acme/format"),
+        "the import statement must become an IMPORTS edge"
+    );
+    assert!(
+        graph.edges.iter().any(|e| e.kind == EdgeKind::Calls
+            && e.src == "sym:src/widget.ts#buildWidget"
+            && e.dst == "sym:src/widget.ts#Widget"),
+        "a call/constructor use of a repo-declared symbol must become a CALLS edge"
+    );
+}
+
+#[test]
+fn javascript_exports_imports_and_calls_become_graph_facts() {
+    let graph = pass_over(&[(
+        "src/widget.js",
+        r#"import format from "@acme/format";
+
+export const MAX_WIDGETS = 12;
+
+export class Widget {}
+
+export function buildWidget() {
+	format(new Widget());
+}
+"#,
+    )]);
+
+    assert_eq!(
+        symbol_names(&graph),
+        BTreeSet::from(["MAX_WIDGETS", "Widget", "buildWidget"]),
+        "JavaScript declarations must yield Symbols"
+    );
+    assert!(
+        graph.edges.iter().any(|e| e.kind == EdgeKind::Imports
+            && e.src == "file:src/widget.js"
+            && e.dst == "pkg:@acme/format"),
+        "the import statement must become an IMPORTS edge"
+    );
+    assert!(
+        graph.edges.iter().any(|e| e.kind == EdgeKind::Calls
+            && e.src == "sym:src/widget.js#buildWidget"
+            && e.dst == "sym:src/widget.js#Widget"),
+        "constructor use of a repo-declared class must become a CALLS edge"
+    );
+}
+
+#[test]
+fn javascript_class_methods_become_symbols_and_callers() {
+    let graph = pass_over(&[(
+        "src/widget.js",
+        r#"export class Widget {
+	helper() {
+		return new Widget();
+	}
+
+	buildWidget() {
+		return this.helper();
+	}
+}
+"#,
+    )]);
+
+    assert_eq!(
+        symbol_names(&graph),
+        BTreeSet::from(["Widget", "Widget.helper", "Widget.buildWidget"]),
+        "JavaScript class methods must yield class-qualified Symbols"
+    );
+    assert!(
+        graph.edges.iter().any(|e| e.kind == EdgeKind::Calls
+            && e.src == "sym:src/widget.js#Widget.buildWidget"
+            && e.dst == "sym:src/widget.js#Widget.helper"),
+        "a JavaScript method call of a repo-declared method must become a CALLS edge"
+    );
+    assert!(
+        graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Calls)
+            .all(|e| e.src != "sym:src/widget.js#Widget"),
+        "the containing class must not be treated as the caller: {:?}",
+        graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Calls)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn javascript_relative_imports_do_not_become_package_imports() {
+    let graph = pass_over(&[(
+        "src/widget.js",
+        r#"import { helper } from "./helper.js";
+
+export function buildWidget() {
+	helper();
+}
+"#,
+    )]);
+
+    assert!(
+        !graph.nodes.iter().any(|n| n.id == "pkg:./helper.js"),
+        "relative imports are internal paths, not Package nodes"
+    );
+    assert!(
+        graph.edges.iter().all(|e| e.dst != "pkg:./helper.js"),
+        "relative imports must not produce Package IMPORTS edges: {:?}",
+        graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Imports)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn javascript_and_typescript_module_extensions_are_indexed() {
+    let graph = pass_over(&[
+        (
+            "src/widget.mjs",
+            r#"export function buildWidget() {
+	return new Widget();
+}
+"#,
+        ),
+        (
+            "src/widget.cjs",
+            r#"function loadWidget() {
+	return buildWidget();
+}
+"#,
+        ),
+        (
+            "src/widget.mts",
+            r#"export class Widget {}
+"#,
+        ),
+        (
+            "src/widget.cts",
+            r#"export type WidgetId = string;
+"#,
+        ),
+    ]);
+
+    assert_eq!(
+        symbol_names(&graph),
+        BTreeSet::from(["Widget", "WidgetId", "buildWidget", "loadWidget"]),
+        "common JavaScript and TypeScript module extensions must be covered"
+    );
+}
+
+#[test]
+fn javascript_qualified_external_calls_do_not_resolve_to_same_named_local_methods() {
+    let graph = pass_over(&[(
+        "src/widget.js",
+        r#"export class Widget {
+	render() {
+		return Format.render("widget");
+	}
+}
+"#,
+    )]);
+
+    assert!(
+        graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Calls)
+            .all(|e| e.dst != "sym:src/widget.js#Widget.render"),
+        "a qualified external call must not resolve to the same-named local method: {:?}",
+        graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Calls)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn python_declarations_imports_and_calls_become_graph_facts() {
+    let graph = pass_over(&[(
+        "pkg/widget.py",
+        r#"from acme.format import format_widget
+
+MAX_WIDGETS = 12
+
+class Widget:
+    def render(self):
+        return format_widget("widget")
+
+def build_widget():
+    return Widget()
+"#,
+    )]);
+
+    assert_eq!(
+        symbol_names(&graph),
+        BTreeSet::from(["MAX_WIDGETS", "Widget", "Widget.render", "build_widget"]),
+        "Python declarations must yield Symbols"
+    );
+    assert!(
+        graph.edges.iter().any(|e| e.kind == EdgeKind::Imports
+            && e.src == "file:pkg/widget.py"
+            && e.dst == "pkg:acme.format"),
+        "the import statement must become an IMPORTS edge"
+    );
+    assert!(
+        graph.edges.iter().any(|e| e.kind == EdgeKind::Calls
+            && e.src == "sym:pkg/widget.py#build_widget"
+            && e.dst == "sym:pkg/widget.py#Widget"),
+        "constructor use of a repo-declared class must become a CALLS edge"
+    );
+}
+
+#[test]
+fn python_class_methods_become_symbols_and_callers() {
+    let graph = pass_over(&[(
+        "pkg/widget.py",
+        r#"class Widget:
+    def helper(self):
+        return Widget()
+
+    def build_widget(self):
+        return self.helper()
+"#,
+    )]);
+
+    assert_eq!(
+        symbol_names(&graph),
+        BTreeSet::from(["Widget", "Widget.helper", "Widget.build_widget"]),
+        "Python class methods must yield class-qualified Symbols"
+    );
+    assert!(
+        graph.edges.iter().any(|e| e.kind == EdgeKind::Calls
+            && e.src == "sym:pkg/widget.py#Widget.build_widget"
+            && e.dst == "sym:pkg/widget.py#Widget.helper"),
+        "a Python method call of a repo-declared method must become a CALLS edge: {:?}",
+        graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Calls)
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Calls)
+            .all(|e| e.src != "sym:pkg/widget.py#Widget"),
+        "the containing class must not be treated as the caller: {:?}",
+        graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Calls)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn python_qualified_external_calls_do_not_resolve_to_same_named_local_methods() {
+    let graph = pass_over(&[(
+        "pkg/widget.py",
+        r#"class Widget:
+    def render(self):
+        return formatter.render("widget")
+"#,
+    )]);
+
+    assert!(
+        graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Calls)
+            .all(|e| e.dst != "sym:pkg/widget.py#Widget.render"),
+        "a qualified external call must not resolve to the same-named local method: {:?}",
+        graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Calls)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn rust_declarations_imports_and_calls_become_graph_facts() {
+    let graph = pass_over(&[(
+        "src/lib.rs",
+        r#"use serde::Serialize;
+
+const MAX_WIDGETS: usize = 12;
+
+type WidgetId = usize;
+
+trait Renderable {
+    fn render(&self) -> String;
+}
+
+struct Widget;
+
+fn helper() -> Widget {
+    Widget
+}
+
+fn build_widget() -> Widget {
+    helper()
+}
+"#,
+    )]);
+
+    assert_eq!(
+        symbol_names(&graph),
+        BTreeSet::from([
+            "MAX_WIDGETS",
+            "Renderable",
+            "Widget",
+            "WidgetId",
+            "helper",
+            "build_widget"
+        ]),
+        "Rust declarations must yield Symbols"
+    );
+    assert!(
+        graph.edges.iter().any(|e| e.kind == EdgeKind::Imports
+            && e.src == "file:src/lib.rs"
+            && e.dst == "pkg:serde"),
+        "the use declaration must become an IMPORTS edge"
+    );
+    assert!(
+        graph.edges.iter().any(|e| e.kind == EdgeKind::Calls
+            && e.src == "sym:src/lib.rs#build_widget"
+            && e.dst == "sym:src/lib.rs#helper"),
+        "a call of a repo-declared function must become a CALLS edge"
+    );
+}
+
+#[test]
+fn rust_impl_methods_become_symbols_and_callers() {
+    let graph = pass_over(&[(
+        "src/lib.rs",
+        r#"struct Widget;
+
+impl Widget {
+    fn helper() -> Widget {
+        Widget
+    }
+
+    fn build_widget() -> Widget {
+        Widget::helper()
+    }
+}
+"#,
+    )]);
+
+    assert_eq!(
+        symbol_names(&graph),
+        BTreeSet::from(["Widget", "Widget.helper", "Widget.build_widget"]),
+        "Rust impl methods must yield receiver-qualified Symbols"
+    );
+    assert!(
+        graph.edges.iter().any(|e| e.kind == EdgeKind::Calls
+            && e.src == "sym:src/lib.rs#Widget.build_widget"
+            && e.dst == "sym:src/lib.rs#Widget.helper"),
+        "an impl method call of a repo-declared method must become a CALLS edge: {:?}",
+        graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Calls)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn rust_internal_use_paths_do_not_become_package_imports() {
+    let graph = pass_over(&[(
+        "src/lib.rs",
+        r#"use crate::internal::Widget;
+use self::local::Thing;
+use super::parent::Other;
+use crate::{grouped::Thing, nested::Other};
+
+struct Widget;
+"#,
+    )]);
+
+    assert!(
+        !graph.nodes.iter().any(|n| n.kind == NodeKind::Package),
+        "internal Rust module paths are not external packages: {:?}",
+        graph
+            .nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Package)
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        graph.edges.iter().all(|e| e.kind != EdgeKind::Imports),
+        "internal Rust module paths must not produce IMPORTS edges: {:?}",
+        graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Imports)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn python_relative_from_imports_do_not_become_package_imports() {
+    let graph = pass_over(&[(
+        "pkg/widget.py",
+        r#"from .format import format_widget
+from ..shared import build_widget
+
+class Widget:
+    pass
+"#,
+    )]);
+
+    assert!(
+        !graph.nodes.iter().any(|n| n.kind == NodeKind::Package),
+        "relative Python imports are internal paths, not Package nodes: {:?}",
+        graph
+            .nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Package)
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        graph.edges.iter().all(|e| e.kind != EdgeKind::Imports),
+        "relative Python imports must not produce Package IMPORTS edges: {:?}",
+        graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Imports)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn java_declarations_imports_and_calls_become_graph_facts() {
+    let graph = pass_over(&[(
+        "src/main/java/Widget.java",
+        r#"import com.acme.Format;
+
+interface Renderable {
+    String render();
+}
+
+enum WidgetState {
+    READY
+}
+
+class Widget implements Renderable {
+    static final int MAX_WIDGETS = 12;
+
+    static Widget helper() {
+        return new Widget();
+    }
+
+    static Widget buildWidget() {
+        return helper();
+    }
+
+    public String render() {
+        return Format.render("widget");
+    }
+}
+"#,
+    )]);
+
+    assert_eq!(
+        symbol_names(&graph),
+        BTreeSet::from([
+            "Renderable",
+            "Renderable.render",
+            "WidgetState",
+            "Widget",
+            "Widget.MAX_WIDGETS",
+            "Widget.helper",
+            "Widget.buildWidget",
+            "Widget.render"
+        ]),
+        "Java declarations must yield Symbols"
+    );
+    assert!(
+        graph.edges.iter().any(|e| e.kind == EdgeKind::Imports
+            && e.src == "file:src/main/java/Widget.java"
+            && e.dst == "pkg:com.acme.Format"),
+        "the import declaration must become an IMPORTS edge"
+    );
+    assert!(
+        graph.edges.iter().any(|e| e.kind == EdgeKind::Calls
+            && e.src == "sym:src/main/java/Widget.java#Widget.buildWidget"
+            && e.dst == "sym:src/main/java/Widget.java#Widget.helper"),
+        "a method call of a repo-declared method must become a CALLS edge"
+    );
+}
+
+#[test]
+fn java_class_symbols_do_not_claim_calls_from_their_methods() {
+    let graph = pass_over(&[(
+        "src/Widget.java",
+        r#"class Widget {
+    static Widget helper() {
+        return new Widget();
+    }
+
+    static Widget buildWidget() {
+        return helper();
+    }
+}
+"#,
+    )]);
+
+    assert!(
+        graph.edges.iter().any(|e| e.kind == EdgeKind::Calls
+            && e.src == "sym:src/Widget.java#Widget.buildWidget"
+            && e.dst == "sym:src/Widget.java#Widget.helper"),
+        "the method-level CALLS edge must exist"
+    );
+    assert!(
+        graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Calls)
+            .all(|e| e.src != "sym:src/Widget.java#Widget"),
+        "the containing class must not be treated as the caller: {:?}",
+        graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Calls)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn java_qualified_external_calls_do_not_resolve_to_same_named_local_methods() {
+    let graph = pass_over(&[(
+        "src/Widget.java",
+        r#"import com.acme.Format;
+
+class Widget {
+    String render() {
+        return Format.render("widget");
+    }
+}
+"#,
+    )]);
+
+    assert!(
+        graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Calls)
+            .all(|e| e.dst != "sym:src/Widget.java#Widget.render"),
+        "a qualified external call must not resolve to the same-named local method: {:?}",
+        graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Calls)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn duplicate_declarations_keep_distinct_node_ids() {
     // Multiple `func init()` per file is legal Go; their node ids must
     // not collide (the graph segment's id column is a primary key).
@@ -237,7 +864,7 @@ fn symlinks_become_file_nodes_but_are_never_read_through() {
 }
 
 #[test]
-fn non_go_files_become_file_nodes_without_symbols() {
+fn unmapped_files_become_file_nodes_without_symbols() {
     let graph = pass_over(&[
         (
             "docs/guide.md",
@@ -260,6 +887,6 @@ fn non_go_files_become_file_nodes_without_symbols() {
     assert_eq!(
         symbol_names(&graph),
         BTreeSet::new(),
-        "nothing outside the Go grammar may produce Symbols in M0"
+        "unmapped files degrade gracefully to File nodes"
     );
 }

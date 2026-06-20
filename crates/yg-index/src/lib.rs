@@ -592,7 +592,32 @@ pub fn syntactic_pass(root: &Path) -> anyhow::Result<(Graph, Vec<SearchDoc>)> {
     parser
         .set_language(&tree_sitter_go::LANGUAGE.into())
         .context("loading the Go grammar")?;
+    let mut typescript_parser = tree_sitter::Parser::new();
+    typescript_parser
+        .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+        .context("loading the TypeScript grammar")?;
+    let mut tsx_parser = tree_sitter::Parser::new();
+    tsx_parser
+        .set_language(&tree_sitter_typescript::LANGUAGE_TSX.into())
+        .context("loading the TSX grammar")?;
+    let mut javascript_parser = tree_sitter::Parser::new();
+    javascript_parser
+        .set_language(&tree_sitter_javascript::LANGUAGE.into())
+        .context("loading the JavaScript grammar")?;
+    let mut python_parser = tree_sitter::Parser::new();
+    python_parser
+        .set_language(&tree_sitter_python::LANGUAGE.into())
+        .context("loading the Python grammar")?;
+    let mut rust_parser = tree_sitter::Parser::new();
+    rust_parser
+        .set_language(&tree_sitter_rust::LANGUAGE.into())
+        .context("loading the Rust grammar")?;
+    let mut java_parser = tree_sitter::Parser::new();
+    java_parser
+        .set_language(&tree_sitter_java::LANGUAGE.into())
+        .context("loading the Java grammar")?;
     let mut files = Vec::new();
+    let mut simple_files = Vec::new();
     let mut modules = Vec::new();
     // The text of each file, for the full-text segment — valid UTF-8 only
     // (a binary blob is searchable by name alone), keyed by repo-relative
@@ -617,6 +642,50 @@ pub fn syntactic_pass(root: &Path) -> anyhow::Result<(Graph, Vec<SearchDoc>)> {
             if let Some(facts) = extract_go_facts(&mut parser, &path, &file_id, &bytes, &mut graph)
             {
                 files.push(facts);
+            }
+        } else if path.ends_with(".ts") || path.ends_with(".mts") || path.ends_with(".cts") {
+            if let Some(facts) = extract_ecmascript_facts(
+                &mut typescript_parser,
+                &path,
+                &file_id,
+                &bytes,
+                &mut graph,
+            ) {
+                simple_files.push(facts);
+            }
+        } else if path.ends_with(".tsx") || path.ends_with(".jsx") {
+            if let Some(facts) =
+                extract_ecmascript_facts(&mut tsx_parser, &path, &file_id, &bytes, &mut graph)
+            {
+                simple_files.push(facts);
+            }
+        } else if path.ends_with(".js") || path.ends_with(".mjs") || path.ends_with(".cjs") {
+            if let Some(facts) = extract_ecmascript_facts(
+                &mut javascript_parser,
+                &path,
+                &file_id,
+                &bytes,
+                &mut graph,
+            ) {
+                simple_files.push(facts);
+            }
+        } else if path.ends_with(".py") {
+            if let Some(facts) =
+                extract_python_facts(&mut python_parser, &path, &file_id, &bytes, &mut graph)
+            {
+                simple_files.push(facts);
+            }
+        } else if path.ends_with(".rs") {
+            if let Some(facts) =
+                extract_rust_facts(&mut rust_parser, &path, &file_id, &bytes, &mut graph)
+            {
+                simple_files.push(facts);
+            }
+        } else if path.ends_with(".java") {
+            if let Some(facts) =
+                extract_java_facts(&mut java_parser, &path, &file_id, &bytes, &mut graph)
+            {
+                simple_files.push(facts);
             }
         } else if path == "go.mod" || path.ends_with("/go.mod") {
             // Lossy, never fail: synced repos are arbitrary, and a junk
@@ -646,6 +715,11 @@ pub fn syntactic_pass(root: &Path) -> anyhow::Result<(Graph, Vec<SearchDoc>)> {
         emit_extends_edges(file, &index, &mut graph);
     }
     emit_implements_edges(&files, &mut graph);
+    let simple_index = SimpleSymbolIndex::build(&simple_files);
+    for file in &simple_files {
+        emit_simple_import_edges(file, &mut imported, &mut graph);
+        emit_simple_call_edges(file, &simple_index, &mut graph);
+    }
     let search_docs = build_search_docs(&graph, &file_text);
     Ok((graph, search_docs))
 }
@@ -828,6 +902,35 @@ struct GoType {
     interface: Option<InterfaceShape>,
 }
 
+/// Minimal facts for syntactic language packs whose M0 contract is
+/// Symbols, DEFINES, package IMPORTS, and name-based CALLS.
+struct SimpleFileFacts {
+    file_id: String,
+    imports: Vec<SimpleImport>,
+    calls: Vec<SimpleCall>,
+    declarations: Vec<(String, String)>,
+}
+
+struct SimpleImport {
+    path: String,
+    location: String,
+}
+
+struct SimpleCall {
+    caller_id: String,
+    callee: String,
+    location: String,
+}
+
+struct SimpleExtractionCtx<'a, 'b> {
+    source: &'a [u8],
+    path: &'a str,
+    file_id: &'a str,
+    graph: &'b mut Graph,
+    id_uses: &'b mut HashMap<String, u32>,
+    facts: &'b mut SimpleFileFacts,
+}
+
 /// An interface declaration's shape, for IMPLEMENTS matching.
 struct InterfaceShape {
     /// Method names declared directly in the interface body.
@@ -866,6 +969,37 @@ struct SymbolIndex {
     /// Repo directories per import path, resolved through go.mod module
     /// paths once per distinct path — phase 2 asks per call site.
     import_dirs: HashMap<String, Vec<String>>,
+}
+
+#[derive(Default)]
+struct SimpleSymbolIndex {
+    symbols: HashMap<String, Vec<String>>,
+}
+
+impl SimpleSymbolIndex {
+    fn build(files: &[SimpleFileFacts]) -> Self {
+        let mut index = Self::default();
+        for file in files {
+            for (name, id) in &file.declarations {
+                index
+                    .symbols
+                    .entry(name.clone())
+                    .or_default()
+                    .push(id.clone());
+            }
+        }
+        index
+    }
+
+    fn resolve(&self, name: &str) -> Vec<&str> {
+        self.symbols
+            .get(name)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+            .iter()
+            .map(String::as_str)
+            .collect()
+    }
 }
 
 impl SymbolIndex {
@@ -1294,6 +1428,41 @@ fn emit_implements_edges(files: &[GoFileFacts], graph: &mut Graph) {
     }
 }
 
+fn emit_simple_import_edges(
+    file: &SimpleFileFacts,
+    imported: &mut HashSet<String>,
+    graph: &mut Graph,
+) {
+    for import in &file.imports {
+        let package = Node::package(&import.path);
+        let package_id = package.id.clone();
+        if imported.insert(package_id.clone()) {
+            graph.nodes.push(package);
+        }
+        graph.edges.push(Edge {
+            src: file.file_id.clone(),
+            dst: package_id,
+            kind: EdgeKind::Imports,
+            provenance: Provenance::Syntactic,
+            confidence: 1.0,
+            location: Some(import.location.clone()),
+        });
+    }
+}
+
+fn emit_simple_call_edges(file: &SimpleFileFacts, index: &SimpleSymbolIndex, graph: &mut Graph) {
+    for call in &file.calls {
+        let candidates = index.resolve(&call.callee);
+        push_candidate_edges(
+            graph,
+            &call.caller_id,
+            &candidates,
+            EdgeKind::Calls,
+            &call.location,
+        );
+    }
+}
+
 /// Phase 1 for one Go file: parse, mint its Symbols and DEFINES edges,
 /// and distill the tree into [`GoFileFacts`]. Returns None when
 /// tree-sitter produces no tree (it only gives up on
@@ -1427,6 +1596,821 @@ fn extract_go_facts(
         }
     }
     Some(facts)
+}
+
+fn extract_ecmascript_facts(
+    parser: &mut tree_sitter::Parser,
+    path: &str,
+    file_id: &str,
+    source: &[u8],
+    graph: &mut Graph,
+) -> Option<SimpleFileFacts> {
+    let Some(tree) = parser.parse(source, None) else {
+        tracing::warn!(path, "tree-sitter produced no tree; skipping symbols");
+        return None;
+    };
+    let root = tree.root_node();
+    let mut facts = SimpleFileFacts {
+        file_id: file_id.to_string(),
+        imports: extract_ecmascript_imports(root, path, source),
+        calls: Vec::new(),
+        declarations: Vec::new(),
+    };
+    let mut id_uses: HashMap<String, u32> = HashMap::new();
+    let mut cursor = root.walk();
+    for declaration in root.children(&mut cursor) {
+        collect_ecmascript_top_level_declaration(
+            declaration,
+            source,
+            path,
+            file_id,
+            graph,
+            &mut id_uses,
+            &mut facts,
+        );
+    }
+    Some(facts)
+}
+
+fn collect_ecmascript_top_level_declaration(
+    declaration: tree_sitter::Node<'_>,
+    source: &[u8],
+    path: &str,
+    file_id: &str,
+    graph: &mut Graph,
+    id_uses: &mut HashMap<String, u32>,
+    facts: &mut SimpleFileFacts,
+) {
+    if declaration.kind() == "export_statement" {
+        let mut cursor = declaration.walk();
+        for child in declaration.children(&mut cursor) {
+            collect_ecmascript_top_level_declaration(
+                child, source, path, file_id, graph, id_uses, facts,
+            );
+        }
+        return;
+    }
+    match declaration.kind() {
+        "function_declaration"
+        | "generator_function_declaration"
+        | "type_alias_declaration"
+        | "enum_declaration" => {
+            let Some(name) = field_text(declaration, "name", source) else {
+                return;
+            };
+            let id = mint_simple_symbol(path, file_id, name, id_uses, graph);
+            facts.declarations.push((name.to_string(), id.clone()));
+            collect_ecmascript_calls(declaration, source, &id, path, &mut facts.calls);
+        }
+        "interface_declaration" => {
+            let Some(name) = field_text(declaration, "name", source) else {
+                return;
+            };
+            let id = mint_simple_symbol(path, file_id, name, id_uses, graph);
+            facts.declarations.push((name.to_string(), id));
+            let mut ctx = SimpleExtractionCtx {
+                source,
+                path,
+                file_id,
+                graph,
+                id_uses,
+                facts,
+            };
+            collect_ecmascript_interface_methods(declaration, name, &mut ctx);
+        }
+        "class_declaration" | "abstract_class_declaration" => {
+            let Some(name) = field_text(declaration, "name", source) else {
+                return;
+            };
+            let id = mint_simple_symbol(path, file_id, name, id_uses, graph);
+            facts.declarations.push((name.to_string(), id));
+            let mut ctx = SimpleExtractionCtx {
+                source,
+                path,
+                file_id,
+                graph,
+                id_uses,
+                facts,
+            };
+            collect_ecmascript_class_methods(declaration, name, &mut ctx);
+        }
+        "lexical_declaration" | "variable_declaration" => {
+            for declarator in descendants_of_kind(declaration, "variable_declarator") {
+                let Some(name_node) = declarator
+                    .child_by_field_name("name")
+                    .filter(|n| n.kind() == "identifier")
+                else {
+                    continue;
+                };
+                let Some(name) = name_node.utf8_text(source).ok() else {
+                    continue;
+                };
+                let id = mint_simple_symbol(path, file_id, name, id_uses, graph);
+                facts.declarations.push((name.to_string(), id.clone()));
+                collect_ecmascript_calls(declarator, source, &id, path, &mut facts.calls);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_ecmascript_class_methods(
+    class_declaration: tree_sitter::Node<'_>,
+    class_name: &str,
+    ctx: &mut SimpleExtractionCtx<'_, '_>,
+) {
+    let Some(body) = class_declaration.child_by_field_name("body") else {
+        return;
+    };
+    let mut cursor = body.walk();
+    for item in body.children(&mut cursor) {
+        if item.kind() != "method_definition" {
+            continue;
+        }
+        let Some(name) = field_text(item, "name", ctx.source).map(clean_property_name) else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+        let qualified = format!("{class_name}.{name}");
+        let id = mint_simple_symbol(ctx.path, ctx.file_id, &qualified, ctx.id_uses, ctx.graph);
+        ctx.facts.declarations.push((name.to_string(), id.clone()));
+        collect_ecmascript_calls(item, ctx.source, &id, ctx.path, &mut ctx.facts.calls);
+    }
+}
+
+fn collect_ecmascript_interface_methods(
+    interface_declaration: tree_sitter::Node<'_>,
+    interface_name: &str,
+    ctx: &mut SimpleExtractionCtx<'_, '_>,
+) {
+    let Some(body) = interface_declaration.child_by_field_name("body") else {
+        return;
+    };
+    let mut cursor = body.walk();
+    for item in body.children(&mut cursor) {
+        if item.kind() != "method_signature" {
+            continue;
+        }
+        let Some(name) = field_text(item, "name", ctx.source).map(clean_property_name) else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+        let qualified = format!("{interface_name}.{name}");
+        let id = mint_simple_symbol(ctx.path, ctx.file_id, &qualified, ctx.id_uses, ctx.graph);
+        ctx.facts.declarations.push((name.to_string(), id));
+    }
+}
+
+fn clean_property_name(name: &str) -> &str {
+    name.trim_matches(['"', '\''])
+}
+
+fn mint_simple_symbol(
+    path: &str,
+    file_id: &str,
+    name: &str,
+    id_uses: &mut HashMap<String, u32>,
+    graph: &mut Graph,
+) -> String {
+    let uses = id_uses.entry(name.to_string()).or_insert(0);
+    *uses += 1;
+    let symbol = Node::symbol(path, name, *uses);
+    let symbol_id = symbol.id.clone();
+    graph.nodes.push(symbol);
+    graph.edges.push(Edge {
+        src: file_id.to_string(),
+        dst: symbol_id.clone(),
+        kind: EdgeKind::Defines,
+        provenance: Provenance::Syntactic,
+        confidence: 1.0,
+        location: None,
+    });
+    symbol_id
+}
+
+fn extract_ecmascript_imports(
+    root: tree_sitter::Node<'_>,
+    path: &str,
+    source: &[u8],
+) -> Vec<SimpleImport> {
+    descendants_of_kind(root, "import_statement")
+        .into_iter()
+        .filter_map(|statement| {
+            let import_path = field_text(statement, "source", source)?
+                .trim_matches(['"', '\''])
+                .to_string();
+            if import_path.is_empty() || import_path.starts_with('.') {
+                return None;
+            }
+            Some(SimpleImport {
+                path: import_path,
+                location: site(path, statement),
+            })
+        })
+        .collect()
+}
+
+fn collect_ecmascript_calls(
+    declaration: tree_sitter::Node<'_>,
+    source: &[u8],
+    caller_id: &str,
+    path: &str,
+    calls: &mut Vec<SimpleCall>,
+) {
+    for call in descendants_of_kind(declaration, "call_expression") {
+        let Some(function) = call.child_by_field_name("function") else {
+            continue;
+        };
+        let Some(callee) = ecmascript_callee_name(function, source) else {
+            continue;
+        };
+        calls.push(SimpleCall {
+            caller_id: caller_id.to_string(),
+            callee: callee.to_string(),
+            location: site(path, call),
+        });
+    }
+    for call in descendants_of_kind(declaration, "new_expression") {
+        let Some(constructor) = call.child_by_field_name("constructor") else {
+            continue;
+        };
+        let Some(callee) = simple_expression_name(constructor, source) else {
+            continue;
+        };
+        calls.push(SimpleCall {
+            caller_id: caller_id.to_string(),
+            callee: callee.to_string(),
+            location: site(path, call),
+        });
+    }
+}
+
+fn simple_expression_name<'a>(
+    expression: tree_sitter::Node<'_>,
+    source: &'a [u8],
+) -> Option<&'a str> {
+    match expression.kind() {
+        "identifier" | "type_identifier" => expression.utf8_text(source).ok(),
+        "scoped_identifier" => field_text(expression, "name", source),
+        _ => None,
+    }
+}
+
+fn ecmascript_callee_name<'a>(
+    expression: tree_sitter::Node<'_>,
+    source: &'a [u8],
+) -> Option<&'a str> {
+    match expression.kind() {
+        "identifier" => expression.utf8_text(source).ok(),
+        "member_expression" => {
+            let object = expression
+                .child_by_field_name("object")
+                .and_then(|node| node.utf8_text(source).ok());
+            if object == Some("this") {
+                field_text(expression, "property", source)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn extract_rust_facts(
+    parser: &mut tree_sitter::Parser,
+    path: &str,
+    file_id: &str,
+    source: &[u8],
+    graph: &mut Graph,
+) -> Option<SimpleFileFacts> {
+    let Some(tree) = parser.parse(source, None) else {
+        tracing::warn!(path, "tree-sitter produced no tree; skipping symbols");
+        return None;
+    };
+    let root = tree.root_node();
+    let mut facts = SimpleFileFacts {
+        file_id: file_id.to_string(),
+        imports: extract_rust_imports(root, path, source),
+        calls: Vec::new(),
+        declarations: Vec::new(),
+    };
+    let mut id_uses: HashMap<String, u32> = HashMap::new();
+    let mut cursor = root.walk();
+    for declaration in root.children(&mut cursor) {
+        match declaration.kind() {
+            "function_item" | "struct_item" | "enum_item" | "trait_item" | "const_item"
+            | "static_item" | "type_item" => {
+                let Some(name) = field_text(declaration, "name", source) else {
+                    continue;
+                };
+                let id = mint_simple_symbol(path, file_id, name, &mut id_uses, graph);
+                facts.declarations.push((name.to_string(), id.clone()));
+                collect_rust_calls(declaration, source, &id, path, &mut facts.calls);
+            }
+            "impl_item" => collect_rust_impl_item(
+                declaration,
+                source,
+                path,
+                file_id,
+                graph,
+                &mut id_uses,
+                &mut facts,
+            ),
+            _ => {}
+        }
+    }
+    Some(facts)
+}
+
+fn collect_rust_impl_item(
+    impl_item: tree_sitter::Node<'_>,
+    source: &[u8],
+    path: &str,
+    file_id: &str,
+    graph: &mut Graph,
+    id_uses: &mut HashMap<String, u32>,
+    facts: &mut SimpleFileFacts,
+) {
+    let Some(receiver) = impl_item
+        .child_by_field_name("type")
+        .and_then(|node| rust_type_name(node, source))
+    else {
+        return;
+    };
+    let Some(body) = impl_item.child_by_field_name("body") else {
+        return;
+    };
+    let mut cursor = body.walk();
+    for item in body.children(&mut cursor) {
+        if item.kind() != "function_item" {
+            continue;
+        }
+        let Some(name) = field_text(item, "name", source) else {
+            continue;
+        };
+        let qualified = format!("{receiver}.{name}");
+        let id = mint_simple_symbol(path, file_id, &qualified, id_uses, graph);
+        facts.declarations.push((name.to_string(), id.clone()));
+        collect_rust_calls(item, source, &id, path, &mut facts.calls);
+    }
+}
+
+fn rust_type_name<'a>(node: tree_sitter::Node<'_>, source: &'a [u8]) -> Option<&'a str> {
+    match node.kind() {
+        "type_identifier" => node.utf8_text(source).ok(),
+        "generic_type" => field_text(node, "type", source),
+        _ => first_of_kind(node, "type_identifier").and_then(|n| n.utf8_text(source).ok()),
+    }
+}
+
+fn extract_rust_imports(
+    root: tree_sitter::Node<'_>,
+    path: &str,
+    source: &[u8],
+) -> Vec<SimpleImport> {
+    descendants_of_kind(root, "use_declaration")
+        .into_iter()
+        .filter_map(|declaration| {
+            let argument = declaration.child_by_field_name("argument")?;
+            if argument
+                .utf8_text(source)
+                .ok()
+                .is_some_and(is_rust_internal_use_path)
+            {
+                return None;
+            }
+            let package = rust_use_root(argument, source)?;
+            Some(SimpleImport {
+                path: package.to_string(),
+                location: site(path, declaration),
+            })
+        })
+        .collect()
+}
+
+fn is_rust_internal_use_path(path: &str) -> bool {
+    matches!(path, "crate" | "self" | "super")
+        || path.starts_with("crate::")
+        || path.starts_with("self::")
+        || path.starts_with("super::")
+}
+
+fn rust_use_root<'a>(node: tree_sitter::Node<'_>, source: &'a [u8]) -> Option<&'a str> {
+    match node.kind() {
+        "identifier" => node.utf8_text(source).ok(),
+        "scoped_identifier" => node
+            .child_by_field_name("path")
+            .and_then(|path| rust_use_root(path, source)),
+        "use_as_clause" | "scoped_use_list" => first_of_kind(node, "identifier")
+            .and_then(|identifier| identifier.utf8_text(source).ok()),
+        _ => None,
+    }
+}
+
+fn collect_rust_calls(
+    declaration: tree_sitter::Node<'_>,
+    source: &[u8],
+    caller_id: &str,
+    path: &str,
+    calls: &mut Vec<SimpleCall>,
+) {
+    for call in descendants_of_kind(declaration, "call_expression") {
+        let Some(function) = call.child_by_field_name("function") else {
+            continue;
+        };
+        let Some(callee) = rust_callee_name(function, source) else {
+            continue;
+        };
+        calls.push(SimpleCall {
+            caller_id: caller_id.to_string(),
+            callee: callee.to_string(),
+            location: site(path, call),
+        });
+    }
+}
+
+fn rust_callee_name<'a>(expression: tree_sitter::Node<'_>, source: &'a [u8]) -> Option<&'a str> {
+    simple_expression_name(expression, source).or_else(|| last_identifier_name(expression, source))
+}
+
+fn last_identifier_name<'a>(node: tree_sitter::Node<'_>, source: &'a [u8]) -> Option<&'a str> {
+    descendants_of_kind(node, "identifier")
+        .into_iter()
+        .last()
+        .and_then(|identifier| identifier.utf8_text(source).ok())
+}
+
+fn extract_java_facts(
+    parser: &mut tree_sitter::Parser,
+    path: &str,
+    file_id: &str,
+    source: &[u8],
+    graph: &mut Graph,
+) -> Option<SimpleFileFacts> {
+    let Some(tree) = parser.parse(source, None) else {
+        tracing::warn!(path, "tree-sitter produced no tree; skipping symbols");
+        return None;
+    };
+    let root = tree.root_node();
+    let mut facts = SimpleFileFacts {
+        file_id: file_id.to_string(),
+        imports: extract_java_imports(root, path, source),
+        calls: Vec::new(),
+        declarations: Vec::new(),
+    };
+    let mut id_uses: HashMap<String, u32> = HashMap::new();
+    for kind in [
+        "class_declaration",
+        "enum_declaration",
+        "interface_declaration",
+        "record_declaration",
+        "annotation_type_declaration",
+        "field_declaration",
+        "method_declaration",
+    ] {
+        for declaration in descendants_of_kind(root, kind) {
+            collect_java_declaration(
+                declaration,
+                source,
+                path,
+                file_id,
+                graph,
+                &mut id_uses,
+                &mut facts,
+            );
+        }
+    }
+    Some(facts)
+}
+
+fn collect_java_declaration(
+    declaration: tree_sitter::Node<'_>,
+    source: &[u8],
+    path: &str,
+    file_id: &str,
+    graph: &mut Graph,
+    id_uses: &mut HashMap<String, u32>,
+    facts: &mut SimpleFileFacts,
+) {
+    match declaration.kind() {
+        "class_declaration"
+        | "enum_declaration"
+        | "interface_declaration"
+        | "record_declaration"
+        | "annotation_type_declaration" => {
+            let Some(name) = field_text(declaration, "name", source) else {
+                return;
+            };
+            let id = mint_simple_symbol(path, file_id, name, id_uses, graph);
+            facts.declarations.push((name.to_string(), id));
+        }
+        "method_declaration" => {
+            let Some(name) = field_text(declaration, "name", source) else {
+                return;
+            };
+            let symbol_name = java_member_symbol_name(declaration, source, name);
+            let id = mint_simple_symbol(path, file_id, &symbol_name, id_uses, graph);
+            facts.declarations.push((name.to_string(), id.clone()));
+            collect_java_calls(declaration, source, &id, path, &mut facts.calls);
+        }
+        "field_declaration" => {
+            let mut cursor = declaration.walk();
+            for declarator in declaration.children_by_field_name("declarator", &mut cursor) {
+                let Some(name) = field_text(declarator, "name", source) else {
+                    continue;
+                };
+                let symbol_name = java_member_symbol_name(declaration, source, name);
+                let id = mint_simple_symbol(path, file_id, &symbol_name, id_uses, graph);
+                facts.declarations.push((name.to_string(), id.clone()));
+                collect_java_calls(declarator, source, &id, path, &mut facts.calls);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn java_member_symbol_name(member: tree_sitter::Node<'_>, source: &[u8], name: &str) -> String {
+    match java_containing_type_name(member, source) {
+        Some(container) => format!("{container}.{name}"),
+        None => name.to_string(),
+    }
+}
+
+fn java_containing_type_name<'a>(node: tree_sitter::Node<'_>, source: &'a [u8]) -> Option<&'a str> {
+    let mut current = node.parent();
+    while let Some(node) = current {
+        if matches!(
+            node.kind(),
+            "class_declaration"
+                | "enum_declaration"
+                | "interface_declaration"
+                | "record_declaration"
+                | "annotation_type_declaration"
+        ) {
+            return field_text(node, "name", source);
+        }
+        current = node.parent();
+    }
+    None
+}
+
+fn extract_java_imports(
+    root: tree_sitter::Node<'_>,
+    path: &str,
+    source: &[u8],
+) -> Vec<SimpleImport> {
+    descendants_of_kind(root, "import_declaration")
+        .into_iter()
+        .filter_map(|declaration| {
+            let mut cursor = declaration.walk();
+            let imported = declaration
+                .named_children(&mut cursor)
+                .find(|child| matches!(child.kind(), "identifier" | "scoped_identifier"))?
+                .utf8_text(source)
+                .ok()?;
+            Some(SimpleImport {
+                path: imported.to_string(),
+                location: site(path, declaration),
+            })
+        })
+        .collect()
+}
+
+fn collect_java_calls(
+    declaration: tree_sitter::Node<'_>,
+    source: &[u8],
+    caller_id: &str,
+    path: &str,
+    calls: &mut Vec<SimpleCall>,
+) {
+    for call in descendants_of_kind(declaration, "method_invocation") {
+        if call.child_by_field_name("object").is_some() {
+            continue;
+        }
+        let Some(callee) = field_text(call, "name", source) else {
+            continue;
+        };
+        calls.push(SimpleCall {
+            caller_id: caller_id.to_string(),
+            callee: callee.to_string(),
+            location: site(path, call),
+        });
+    }
+    for call in descendants_of_kind(declaration, "object_creation_expression") {
+        let Some(created_type) = call.child_by_field_name("type") else {
+            continue;
+        };
+        let Some(callee) = simple_expression_name(created_type, source) else {
+            continue;
+        };
+        calls.push(SimpleCall {
+            caller_id: caller_id.to_string(),
+            callee: callee.to_string(),
+            location: site(path, call),
+        });
+    }
+}
+
+fn extract_python_facts(
+    parser: &mut tree_sitter::Parser,
+    path: &str,
+    file_id: &str,
+    source: &[u8],
+    graph: &mut Graph,
+) -> Option<SimpleFileFacts> {
+    let Some(tree) = parser.parse(source, None) else {
+        tracing::warn!(path, "tree-sitter produced no tree; skipping symbols");
+        return None;
+    };
+    let root = tree.root_node();
+    let mut facts = SimpleFileFacts {
+        file_id: file_id.to_string(),
+        imports: extract_python_imports(root, path, source),
+        calls: Vec::new(),
+        declarations: Vec::new(),
+    };
+    let mut id_uses: HashMap<String, u32> = HashMap::new();
+    let mut cursor = root.walk();
+    for declaration in root.children(&mut cursor) {
+        collect_python_top_level_declaration(
+            declaration,
+            source,
+            path,
+            file_id,
+            graph,
+            &mut id_uses,
+            &mut facts,
+        );
+    }
+    Some(facts)
+}
+
+fn collect_python_top_level_declaration(
+    declaration: tree_sitter::Node<'_>,
+    source: &[u8],
+    path: &str,
+    file_id: &str,
+    graph: &mut Graph,
+    id_uses: &mut HashMap<String, u32>,
+    facts: &mut SimpleFileFacts,
+) {
+    if declaration.kind() == "expression_statement" {
+        let mut cursor = declaration.walk();
+        for child in declaration.children(&mut cursor) {
+            collect_python_top_level_declaration(
+                child, source, path, file_id, graph, id_uses, facts,
+            );
+        }
+        return;
+    }
+    match declaration.kind() {
+        "class_definition" => {
+            let Some(name) = field_text(declaration, "name", source) else {
+                return;
+            };
+            let id = mint_simple_symbol(path, file_id, name, id_uses, graph);
+            facts.declarations.push((name.to_string(), id));
+            let mut ctx = SimpleExtractionCtx {
+                source,
+                path,
+                file_id,
+                graph,
+                id_uses,
+                facts,
+            };
+            collect_python_class_methods(declaration, name, &mut ctx);
+        }
+        "function_definition" => {
+            let Some(name) = field_text(declaration, "name", source) else {
+                return;
+            };
+            let id = mint_simple_symbol(path, file_id, name, id_uses, graph);
+            facts.declarations.push((name.to_string(), id.clone()));
+            collect_python_calls(declaration, source, &id, path, &mut facts.calls);
+        }
+        "assignment" => {
+            let Some(left) = declaration
+                .child_by_field_name("left")
+                .filter(|n| n.kind() == "identifier")
+            else {
+                return;
+            };
+            let Some(name) = left.utf8_text(source).ok() else {
+                return;
+            };
+            let id = mint_simple_symbol(path, file_id, name, id_uses, graph);
+            facts.declarations.push((name.to_string(), id.clone()));
+            collect_python_calls(declaration, source, &id, path, &mut facts.calls);
+        }
+        _ => {}
+    }
+}
+
+fn collect_python_class_methods(
+    class_definition: tree_sitter::Node<'_>,
+    class_name: &str,
+    ctx: &mut SimpleExtractionCtx<'_, '_>,
+) {
+    let Some(body) = class_definition.child_by_field_name("body") else {
+        return;
+    };
+    let mut cursor = body.walk();
+    for item in body.children(&mut cursor) {
+        if item.kind() != "function_definition" {
+            continue;
+        }
+        let Some(name) = field_text(item, "name", ctx.source) else {
+            continue;
+        };
+        let qualified = format!("{class_name}.{name}");
+        let id = mint_simple_symbol(ctx.path, ctx.file_id, &qualified, ctx.id_uses, ctx.graph);
+        ctx.facts.declarations.push((name.to_string(), id.clone()));
+        collect_python_calls(item, ctx.source, &id, ctx.path, &mut ctx.facts.calls);
+    }
+}
+
+fn extract_python_imports(
+    root: tree_sitter::Node<'_>,
+    path: &str,
+    source: &[u8],
+) -> Vec<SimpleImport> {
+    let mut imports = Vec::new();
+    for statement in descendants_of_kind(root, "import_from_statement") {
+        if let Some(module) =
+            field_text(statement, "module_name", source).filter(|module| !module.starts_with('.'))
+        {
+            imports.push(SimpleImport {
+                path: module.to_string(),
+                location: site(path, statement),
+            });
+        }
+    }
+    for statement in descendants_of_kind(root, "import_statement") {
+        let mut cursor = statement.walk();
+        for name in statement.children_by_field_name("name", &mut cursor) {
+            let package = match name.kind() {
+                "dotted_name" | "identifier" => name.utf8_text(source).ok(),
+                "aliased_import" => first_of_kind(name, "dotted_name")
+                    .or_else(|| first_of_kind(name, "identifier"))
+                    .and_then(|n| n.utf8_text(source).ok()),
+                _ => None,
+            };
+            let Some(package) = package.filter(|package| !package.is_empty()) else {
+                continue;
+            };
+            imports.push(SimpleImport {
+                path: package.to_string(),
+                location: site(path, statement),
+            });
+        }
+    }
+    imports
+}
+
+fn collect_python_calls(
+    declaration: tree_sitter::Node<'_>,
+    source: &[u8],
+    caller_id: &str,
+    path: &str,
+    calls: &mut Vec<SimpleCall>,
+) {
+    for call in descendants_of_kind(declaration, "call") {
+        let Some(function) = call.child_by_field_name("function") else {
+            continue;
+        };
+        let Some(callee) = python_callee_name(function, source) else {
+            continue;
+        };
+        calls.push(SimpleCall {
+            caller_id: caller_id.to_string(),
+            callee: callee.to_string(),
+            location: site(path, call),
+        });
+    }
+}
+
+fn python_callee_name<'a>(expression: tree_sitter::Node<'_>, source: &'a [u8]) -> Option<&'a str> {
+    match expression.kind() {
+        "identifier" => expression.utf8_text(source).ok(),
+        "attribute" => {
+            let object = expression
+                .child_by_field_name("object")
+                .and_then(|node| node.utf8_text(source).ok());
+            let full = expression.utf8_text(source).ok();
+            if matches!(object, Some("self" | "cls"))
+                || full.is_some_and(|text| text.starts_with("self.") || text.starts_with("cls."))
+            {
+                field_text(expression, "attribute", source)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
 }
 
 /// Every call site inside one declaration's subtree, attributed to that
