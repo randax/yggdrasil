@@ -123,7 +123,10 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<RunningServer> {
         // A catch-all so the scope gate covers the whole /admin subtree:
         // a Member probing an unknown admin path gets the same 403 as a
         // real one, never a 404 that maps the admin surface.
-        .route("/{*rest}", axum::routing::any(async || StatusCode::NOT_FOUND))
+        .route(
+            "/{*rest}",
+            axum::routing::any(async || StatusCode::NOT_FOUND),
+        )
         .route_layer(middleware::from_fn(require_admin));
     let member_routes = Router::new()
         .route("/status", get(status))
@@ -479,7 +482,9 @@ async fn call_verb_tool(
         }
         yg_verbs::Verb::Neighbors => {
             let req = decode_tool_args(arguments)?;
-            verb_neighbors(State(state), Json(req)).await.into_response()
+            verb_neighbors(State(state), Json(req))
+                .await
+                .into_response()
         }
         yg_verbs::Verb::Search => {
             let req = decode_tool_args(arguments)?;
@@ -630,7 +635,9 @@ async fn verb_neighbors(
         .transpose()
         .map_err(ApiError::bad_request)?;
     if let Some(cursor) = &cursor {
-        cursor.agrees_with(&req.shape).map_err(ApiError::bad_request)?;
+        cursor
+            .agrees_with(&req.shape)
+            .map_err(ApiError::bad_request)?;
     }
     // The shape in force: the cursor's where present (it remembers the
     // original request, and agrees_with just ruled out contradiction),
@@ -1337,15 +1344,9 @@ async fn resolve_search_targets(
                 if !seen.insert(qualifier.as_str()) {
                     continue;
                 }
-                let target = state
-                    .control
-                    .verb_target(qualifier)
-                    .await?
-                    .ok_or_else(|| {
-                        ApiError::not_found(format!(
-                            "no indexed repository matches {qualifier:?}"
-                        ))
-                    })?;
+                let target = state.control.verb_target(qualifier).await?.ok_or_else(|| {
+                    ApiError::not_found(format!("no indexed repository matches {qualifier:?}"))
+                })?;
                 let Some(revision) = target.revision else {
                     return Err(ApiError::not_found(format!(
                         "{qualifier} is registered but not yet indexed; try again shortly"
@@ -1490,13 +1491,9 @@ async fn resolve_shard(
     qualifier: &str,
     pinned: Option<String>,
 ) -> Result<(std::path::PathBuf, String), ApiError> {
-    let target = state
-        .control
-        .verb_target(qualifier)
-        .await?
-        .ok_or_else(|| {
-            ApiError::not_found(format!("no indexed repository matches {qualifier:?}"))
-        })?;
+    let target = state.control.verb_target(qualifier).await?.ok_or_else(|| {
+        ApiError::not_found(format!("no indexed repository matches {qualifier:?}"))
+    })?;
     let from_cursor = pinned.is_some();
     let Some(revision) = pinned.or(target.revision) else {
         return Err(ApiError::not_found(format!(
