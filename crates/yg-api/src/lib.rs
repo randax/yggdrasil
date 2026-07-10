@@ -120,6 +120,10 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<RunningServer> {
         .route("/tokens", post(admin_token_issue))
         .route("/tokens/{id}/revoke", post(admin_token_revoke))
         .route("/status", get(admin_status))
+        // A catch-all so the scope gate covers the whole /admin subtree:
+        // a Member probing an unknown admin path gets the same 403 as a
+        // real one, never a 404 that maps the admin surface.
+        .route("/{*rest}", axum::routing::any(async || StatusCode::NOT_FOUND))
         .route_layer(middleware::from_fn(require_admin));
     let member_routes = Router::new()
         .route("/status", get(status))
@@ -496,15 +500,23 @@ where
     serde_json::from_value(value).map_err(|e| (-32602, format!("invalid tool arguments: {e}")))
 }
 
+/// A server fault inside the MCP tool-call plumbing: like
+/// [`ApiError::internal`], the detail goes to the log and the JSON-RPC
+/// client gets a generic message.
+fn mcp_internal_error(context: &str, e: &dyn std::fmt::Display) -> (i64, String) {
+    tracing::error!("{context}: {e}");
+    (-32603, "internal server error".to_string())
+}
+
 async fn verb_response_value(
     response: Response,
 ) -> Result<Result<serde_json::Value, String>, (i64, String)> {
     let status = response.status();
     let bytes = to_bytes(response.into_body(), MCP_VERB_RESPONSE_LIMIT)
         .await
-        .map_err(|e| (-32603, format!("reading Verb response failed: {e}")))?;
+        .map_err(|e| mcp_internal_error("reading Verb response failed", &e))?;
     let body: serde_json::Value = serde_json::from_slice(&bytes)
-        .map_err(|e| (-32603, format!("Verb returned invalid JSON: {e}")))?;
+        .map_err(|e| mcp_internal_error("Verb returned invalid JSON", &e))?;
     if status.is_success() {
         Ok(Ok(body))
     } else {

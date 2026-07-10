@@ -61,6 +61,11 @@ async fn member_token_can_call_verbs_but_not_admin_and_revocation_is_immediate()
         "the 403 must accurately describe member scope: {body}"
     );
 
+    // The whole /admin subtree is gated, existing route or not — a Member
+    // must not be able to map the admin surface by probing for 404s.
+    let (status, body) = get_with_token(&h.base, "/v1/admin/nonexistent", &token).await;
+    assert_eq!(status, 403, "unknown admin paths are gated too: {body}");
+
     let revoked = h.yg_ok(&["admin", "token", "revoke", &token_id]).await;
     assert!(
         revoked.contains(&token_id),
