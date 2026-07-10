@@ -1,17 +1,18 @@
-name: CI
+# Depot CI Migration
+# Source: .github/workflows/ci.yml
+#
+# No changes were necessary.
 
+name: CI
 on:
   pull_request:
   push:
     branches: [main]
-
 # fmt/clippy/test only read the checkout; nothing needs a writable token.
 permissions:
   contents: read
-
 env:
   CARGO_TERM_COLOR: always
-
 jobs:
   ci:
     name: fmt + clippy + test
