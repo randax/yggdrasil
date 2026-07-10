@@ -85,8 +85,11 @@ cargo run -p yg-cli -- admin repo add https://github.com/octocat/Hello-World
 cargo run -p yg-cli -- admin status   # synced commit, then Shard revision + counts once indexed
 ```
 
-`GET /healthz` (no token) reports per-dependency readiness; every `/v1`
-route requires `Authorization: Bearer $YG_TOKEN`.
+`GET /healthz` (no token) reports per-dependency readiness as bare
+`ok`/`error` verdicts (failure detail goes to the server log, never to
+anonymous callers); every `/v1` route requires
+`Authorization: Bearer $YG_TOKEN`. Member tokens reach the Verbs, MCP, and
+the read-only `/v1/status`; `/v1/admin/*` requires the Admin token.
 
 ## Checks
 

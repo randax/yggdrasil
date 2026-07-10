@@ -46,8 +46,20 @@ async fn member_token_can_call_verbs_but_not_admin_and_revocation_is_immediate()
         "successful member auth tracks last use"
     );
 
+    let (status, body) = get_with_token(&h.base, "/v1/status", &token).await;
+    assert_eq!(status, 200, "member token may read status: {body}");
+    assert!(
+        body["repos_indexed"].is_i64() || body["repos_indexed"].is_u64(),
+        "status must be the real report: {body}"
+    );
+
     let (status, body) = get_with_token(&h.base, "/v1/admin/status", &token).await;
     assert_eq!(status, 403, "member token must not call admin: {body}");
+    let message = body["error"].as_str().unwrap_or_default().to_lowercase();
+    assert!(
+        message.contains("admin"),
+        "the 403 must accurately describe member scope: {body}"
+    );
 
     let revoked = h.yg_ok(&["admin", "token", "revoke", &token_id]).await;
     assert!(
