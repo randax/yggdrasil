@@ -1,21 +1,22 @@
-name: CI
+# Depot CI Migration
+# Source: .github/workflows/ci.yml
+#
+# No changes were necessary.
 
+name: CI
 on:
   pull_request:
   push:
     branches: [main]
-
 # fmt/clippy/test only read the checkout; nothing needs a writable token.
 permissions:
   contents: read
-
 env:
   CARGO_TERM_COLOR: always
-
 jobs:
   ci:
     name: fmt + clippy + test
-    runs-on: ubuntu-latest
+    runs-on: depot-ubuntu-24.04
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       # Reads rust-toolchain.toml (pinned version + components) and caches.
