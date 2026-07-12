@@ -54,7 +54,10 @@ pub(crate) async fn admin_forge_add(
     let forge = discovery_capable_forge(&req.kind).map_err(ApiError::bad_request)?;
     let org = github_org_slug(&req.org).map_err(ApiError::bad_request)?;
     let base_url = github_base_url(req.base_url.as_deref()).map_err(ApiError::bad_request)?;
-    let token_env = req.token_env.as_deref().or_else(|| forge.default_token_env());
+    let token_env = req
+        .token_env
+        .as_deref()
+        .or_else(|| forge.default_token_env());
     let outcome = state
         .control
         .connect_forge_org(yg_control::ConnectForgeOrg {
