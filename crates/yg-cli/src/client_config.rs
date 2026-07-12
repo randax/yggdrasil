@@ -18,9 +18,12 @@ pub struct ClientConfig {
 /// offending source line — an unquoted token would land in stderr, CI
 /// logs, and shell transcripts.
 #[derive(Debug, thiserror::Error)]
-#[error("invalid TOML at line {line}: {message}")]
+#[error(
+    "invalid TOML{}: {message}",
+    .line.map(|line| format!(" at line {line}")).unwrap_or_default()
+)]
 pub struct ClientConfigError {
-    line: usize,
+    line: Option<usize>,
     message: String,
 }
 
@@ -29,10 +32,12 @@ pub struct ClientConfigError {
 /// sections — is ignored.
 pub fn parse_client_config(contents: &str) -> Result<ClientConfig, ClientConfigError> {
     toml::from_str(contents).map_err(|e| ClientConfigError {
-        line: e
-            .span()
-            .map(|span| contents[..span.start].lines().count().max(1))
-            .unwrap_or(0),
+        line: e.span().map(|span| {
+            1 + contents[..span.start]
+                .bytes()
+                .filter(|&b| b == b'\n')
+                .count()
+        }),
         message: drop_backtick_quoted(e.message()),
     })
 }
@@ -145,5 +150,14 @@ token = "not-my-credential"
             );
             assert!(message.contains("line"), "error should locate the problem");
         }
+    }
+
+    #[test]
+    fn parse_errors_report_the_one_based_line_of_the_problem() {
+        // The error span starts at the first character of line 2.
+        let message = parse_client_config("token = \"ok\"\n= bad\n")
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("line 2"), "{message}");
     }
 }
