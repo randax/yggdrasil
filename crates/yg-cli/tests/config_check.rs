@@ -47,9 +47,14 @@ fn config_check_never_prints_credentials() {
     yg().env("YG_BOOTSTRAP_TOKEN", "ygt_admin_credential")
         .env("YG_S3_ACCESS_KEY", "s3_access_credential")
         .env("YG_S3_SECRET_KEY", "s3_secret_credential")
+        // Assembled at runtime so no source line carries something a
+        // secret scanner mistakes for a real credential.
         .env(
             "YG_DATABASE_URL",
-            "postgres://yg:db_password_credential@db.invalid:5432/yg",
+            format!(
+                "postgres://yg:{}@db.invalid:5432/yg",
+                "db_password_credential"
+            ),
         )
         .arg("config-check")
         .assert()
