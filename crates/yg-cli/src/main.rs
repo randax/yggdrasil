@@ -1,5 +1,7 @@
 //! yg binary: subcommands, serve roles, MCP proxy.
 
+mod client_config;
+
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 
@@ -345,7 +347,7 @@ fn skill_home_dir() -> anyhow::Result<std::path::PathBuf> {
 /// Where the Index Server lives and how to authenticate, from the same
 /// env every client command reads.
 fn client_env() -> anyhow::Result<(String, String)> {
-    let config = read_client_config();
+    let config = read_client_config()?;
     let server = std::env::var("YG_SERVER")
         .ok()
         .or(config.server)
@@ -358,76 +360,23 @@ fn client_env() -> anyhow::Result<(String, String)> {
     Ok((server, token))
 }
 
-#[derive(Default)]
-struct ClientConfig {
-    server: Option<String>,
-    token: Option<String>,
-}
-
-fn read_client_config() -> ClientConfig {
+/// The client config file's settings, if the file exists. A file that
+/// exists but does not read or parse is an error — silently ignoring a
+/// credential file would fall back to the env and fail with a message
+/// pointing away from the real problem.
+fn read_client_config() -> anyhow::Result<client_config::ClientConfig> {
     let Some(path) = client_config_path() else {
-        return ClientConfig::default();
+        return Ok(client_config::ClientConfig::default());
     };
-    let Ok(contents) = std::fs::read_to_string(path) else {
-        return ClientConfig::default();
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(client_config::ClientConfig::default());
+        }
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     };
-    let mut config = ClientConfig::default();
-    for line in contents.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') || line.starts_with('[') {
-            continue;
-        }
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        let Some(value) = parse_config_value(value.trim()) else {
-            continue;
-        };
-        match key.trim() {
-            "server" => config.server = Some(value),
-            "token" => config.token = Some(value),
-            _ => {}
-        }
-    }
-    config
-}
-
-fn parse_config_value(raw: &str) -> Option<String> {
-    if raw.starts_with('"') {
-        return parse_double_quoted_config_value(raw);
-    }
-    if let Some(rest) = raw.strip_prefix('\'') {
-        return rest.split_once('\'').map(|(value, _)| value.to_string());
-    }
-    Some(raw.split('#').next().unwrap_or("").trim().to_string()).filter(|value| !value.is_empty())
-}
-
-fn parse_double_quoted_config_value(raw: &str) -> Option<String> {
-    let mut value = String::new();
-    let mut escaped = false;
-    for ch in raw[1..].chars() {
-        if escaped {
-            match ch {
-                'n' => value.push('\n'),
-                'r' => value.push('\r'),
-                't' => value.push('\t'),
-                '"' => value.push('"'),
-                '\\' => value.push('\\'),
-                other => {
-                    value.push('\\');
-                    value.push(other);
-                }
-            }
-            escaped = false;
-            continue;
-        }
-        match ch {
-            '\\' => escaped = true,
-            '"' => return Some(value),
-            other => value.push(other),
-        }
-    }
-    None
+    client_config::parse_client_config(&contents)
+        .with_context(|| format!("parsing {}", path.display()))
 }
 
 fn client_config_path() -> Option<std::path::PathBuf> {
@@ -1200,38 +1149,3 @@ async fn status(json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn config_values_preserve_hashes_inside_quoted_strings() {
-        assert_eq!(
-            super::parse_config_value(r#""https://example.test/mcp#fragment" # comment"#),
-            Some("https://example.test/mcp#fragment".to_string())
-        );
-        assert_eq!(
-            super::parse_config_value(r#""ygt_token#with-hash""#),
-            Some("ygt_token#with-hash".to_string())
-        );
-        assert_eq!(
-            super::parse_config_value("'literal#token' # comment"),
-            Some("literal#token".to_string())
-        );
-    }
-
-    #[test]
-    fn unquoted_config_values_still_treat_hash_as_comment() {
-        assert_eq!(
-            super::parse_config_value("http://127.0.0.1:7311 # local"),
-            Some("http://127.0.0.1:7311".to_string())
-        );
-        assert_eq!(super::parse_config_value("# comment"), None);
-    }
-
-    #[test]
-    fn double_quoted_config_values_decode_common_escapes() {
-        assert_eq!(
-            super::parse_config_value(r#""line\nnext\t\"quoted\"""#),
-            Some("line\nnext\t\"quoted\"".to_string())
-        );
-    }
-}
