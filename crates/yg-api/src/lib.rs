@@ -108,31 +108,54 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<RunningServer> {
         bootstrap_token: config.bootstrap_token,
         started: std::time::Instant::now(),
     });
-    // The auth layer wraps the whole app — including fallbacks, so even
-    // nonexistent paths answer 401 to unauthenticated callers.
-    let app = Router::new()
-        .route("/healthz", get(healthz))
-        .nest(
-            "/v1",
-            Router::new()
-                .route("/status", get(status))
-                .route("/verbs/node", post(verb_node))
-                .route("/verbs/neighbors", post(verb_neighbors))
-                .route("/verbs/history", post(verb_history))
-                .route("/verbs/search", post(verb_search))
-                .route("/mcp", post(mcp))
-                .route("/admin/repos", post(admin_repo_add))
-                .route("/admin/forges", post(admin_forge_add))
-                .route("/admin/forges/discover", post(admin_forge_discover))
-                .route("/admin/rules", get(admin_rules_list).post(admin_rules_add))
-                .route("/admin/tokens", post(admin_token_issue))
-                .route("/admin/tokens/{id}/revoke", post(admin_token_revoke))
-                .route("/admin/status", get(admin_status)),
+    // The route table is the authorization policy (issue #38): everything
+    // in `member_routes` is reachable with any valid token, everything
+    // nested under `/admin` additionally passes `require_admin`. Adding a
+    // route to a router grants its scope — no path allowlists anywhere.
+    let admin_routes = Router::new()
+        .route("/repos", post(admin_repo_add))
+        .route("/forges", post(admin_forge_add))
+        .route("/forges/discover", post(admin_forge_discover))
+        .route("/rules", get(admin_rules_list).post(admin_rules_add))
+        .route("/tokens", post(admin_token_issue))
+        .route("/tokens/{id}/revoke", post(admin_token_revoke))
+        .route("/status", get(admin_status))
+        // Catch-alls so the scope gate covers the whole /admin subtree,
+        // including its bare root (`{*rest}` cannot match an empty
+        // remainder): a Member probing any admin path gets the same 403
+        // as a real one, never a 404 that maps the admin surface. The
+        // one exception is the trailing-slash root `/admin/`, which
+        // matchit cannot route here; it falls through to the outer
+        // fallback and answers exactly like every other unknown `/v1`
+        // path, so it is non-differential too.
+        .route(
+            "/",
+            axum::routing::any(async || ApiError::not_found("not found")),
         )
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            require_bearer_token,
-        ))
+        .route(
+            "/{*rest}",
+            axum::routing::any(async || ApiError::not_found("not found")),
+        )
+        .route_layer(middleware::from_fn(require_admin));
+    let member_routes = Router::new()
+        .route("/status", get(status))
+        .route("/verbs/node", post(verb_node))
+        .route("/verbs/neighbors", post(verb_neighbors))
+        .route("/verbs/history", post(verb_history))
+        .route("/verbs/search", post(verb_search))
+        .route("/mcp", post(mcp));
+    // The auth layer wraps everything routed so far — including the
+    // fallback, so even nonexistent paths answer 401 to unauthenticated
+    // callers. `/healthz` is added *after* the layer: its exemption is
+    // structural, not a path comparison inside the middleware.
+    let app = Router::new()
+        .nest("/v1", member_routes.nest("/admin", admin_routes))
+        // Unknown paths leave in the same `{"error": …}` shape as every
+        // other error, and — being registered before the auth layer —
+        // still answer 401 to unauthenticated callers.
+        .fallback(async || ApiError::not_found("not found"))
+        .layer(middleware::from_fn_with_state(state.clone(), authenticate))
+        .route("/healthz", get(healthz))
         .with_state(state);
 
     let listener = TcpListener::bind(config.listen)
@@ -150,20 +173,25 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<RunningServer> {
     Ok(RunningServer { local_addr, handle })
 }
 
-/// Every route — existing or not — requires a bearer token; only the
-/// health endpoint is reachable without one. The bootstrap token is
-/// Admin-scoped. Member tokens may call Verbs, but never admin routes.
-async fn require_bearer_token(
+/// What a bearer token is scoped to, decided once by [`authenticate`] and
+/// carried in request extensions. Authorization itself lives in the route
+/// table: admin routes check for [`TokenScope::Admin`] via [`require_admin`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TokenScope {
+    Admin,
+    Member,
+}
+
+/// Every route behind the auth layer requires a bearer token. The
+/// bootstrap token is Admin-scoped; a stored member token is
+/// Member-scoped. This middleware only authenticates and records the
+/// scope — which routes a scope may reach is the router's shape.
+async fn authenticate(
     State(state): State<Arc<AppState>>,
-    req: Request,
+    mut req: Request,
     next: Next,
 ) -> Response {
     use subtle::ConstantTimeEq;
-
-    let path = req.uri().path();
-    if path == "/healthz" {
-        return next.run(req).await;
-    }
 
     let presented = req
         .headers()
@@ -179,38 +207,102 @@ async fn require_bearer_token(
         return error_json(StatusCode::UNAUTHORIZED, "missing or invalid bearer token");
     };
 
-    let admin = presented
+    let admin: bool = presented
         .as_bytes()
         .ct_eq(state.bootstrap_token.as_bytes())
         .into();
-    if admin {
-        return next.run(req).await;
-    }
-
-    let member = match state.control.authenticate_member_token(&presented).await {
-        Ok(member) => member,
-        Err(e) => {
-            tracing::error!("auth lookup failed: {e:#}");
-            return error_json(StatusCode::INTERNAL_SERVER_ERROR, "internal server error");
+    let scope = if admin {
+        TokenScope::Admin
+    } else {
+        match state.control.authenticate_member_token(&presented).await {
+            Ok(true) => TokenScope::Member,
+            Ok(false) => {
+                return error_json(StatusCode::UNAUTHORIZED, "missing or invalid bearer token");
+            }
+            Err(e) => return ApiError::internal(e.context("auth lookup failed")).into_response(),
         }
     };
-    if !member {
-        return error_json(StatusCode::UNAUTHORIZED, "missing or invalid bearer token");
-    }
+    req.extensions_mut().insert(scope);
+    next.run(req).await
+}
 
-    if path.starts_with("/v1/verbs/") || path == "/v1/mcp" {
-        return next.run(req).await;
+/// The admin router's gate: any authenticated caller reaches it, only an
+/// Admin token passes.
+async fn require_admin(req: Request, next: Next) -> Response {
+    match req.extensions().get::<TokenScope>() {
+        Some(TokenScope::Admin) => next.run(req).await,
+        _ => error_json(
+            StatusCode::FORBIDDEN,
+            "this operation requires an Admin token; member tokens may call \
+             Verbs and the read-only status route",
+        ),
     }
-
-    error_json(
-        StatusCode::FORBIDDEN,
-        "member tokens may call Verbs but not admin operations",
-    )
 }
 
 /// The one shape every error leaves this server in: `{"error": "…"}`.
 fn error_json(status: StatusCode, message: impl Into<String>) -> Response {
     (status, Json(serde_json::json!({"error": message.into()}))).into_response()
+}
+
+/// The one error type handlers leave the API through: a client status
+/// plus a client-safe message. Internal faults log the full chain
+/// server-side and cross the wire as a generic 500 — error-chain content
+/// (database errors, filesystem paths, store addresses) never reaches a
+/// response body.
+#[derive(Debug)]
+struct ApiError {
+    status: StatusCode,
+    message: String,
+}
+
+impl ApiError {
+    fn new(status: StatusCode, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            message: message.into(),
+        }
+    }
+
+    fn bad_request(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, message)
+    }
+
+    fn not_found(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::NOT_FOUND, message)
+    }
+
+    fn conflict(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::CONFLICT, message)
+    }
+
+    fn gone(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::GONE, message)
+    }
+
+    fn unavailable(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::SERVICE_UNAVAILABLE, message)
+    }
+
+    /// An internal fault: the full chain goes to the server log, the
+    /// client gets a generic body.
+    fn internal(source: anyhow::Error) -> Self {
+        tracing::error!("internal error: {source:#}");
+        Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal server error")
+    }
+}
+
+/// `?` on an `anyhow::Result` in a handler is an internal fault: logged
+/// in full, sanitized on the wire.
+impl From<anyhow::Error> for ApiError {
+    fn from(source: anyhow::Error) -> Self {
+        Self::internal(source)
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        error_json(self.status, self.message)
+    }
 }
 
 const MCP_VERB_RESPONSE_LIMIT: usize = 50 * 1024 * 1024;
@@ -399,19 +491,21 @@ async fn call_verb_tool(
     let response = match tool.verb {
         yg_verbs::Verb::Node => {
             let req = decode_tool_args(arguments)?;
-            verb_node(State(state), Json(req)).await
+            verb_node(State(state), Json(req)).await.into_response()
         }
         yg_verbs::Verb::Neighbors => {
             let req = decode_tool_args(arguments)?;
-            verb_neighbors(State(state), Json(req)).await
+            verb_neighbors(State(state), Json(req))
+                .await
+                .into_response()
         }
         yg_verbs::Verb::Search => {
             let req = decode_tool_args(arguments)?;
-            verb_search(State(state), Json(req)).await
+            verb_search(State(state), Json(req)).await.into_response()
         }
         yg_verbs::Verb::History => {
             let req = decode_tool_args(arguments)?;
-            verb_history(State(state), Json(req)).await
+            verb_history(State(state), Json(req)).await.into_response()
         }
     };
     verb_response_value(response).await
@@ -424,15 +518,23 @@ where
     serde_json::from_value(value).map_err(|e| (-32602, format!("invalid tool arguments: {e}")))
 }
 
+/// A server fault inside the MCP tool-call plumbing: like
+/// [`ApiError::internal`], the detail goes to the log and the JSON-RPC
+/// client gets a generic message.
+fn mcp_internal_error(context: &str, e: &dyn std::fmt::Display) -> (i64, String) {
+    tracing::error!("{context}: {e}");
+    (-32603, "internal server error".to_string())
+}
+
 async fn verb_response_value(
     response: Response,
 ) -> Result<Result<serde_json::Value, String>, (i64, String)> {
     let status = response.status();
     let bytes = to_bytes(response.into_body(), MCP_VERB_RESPONSE_LIMIT)
         .await
-        .map_err(|e| (-32603, format!("reading Verb response failed: {e}")))?;
+        .map_err(|e| mcp_internal_error("reading Verb response failed", &e))?;
     let body: serde_json::Value = serde_json::from_slice(&bytes)
-        .map_err(|e| (-32603, format!("Verb returned invalid JSON: {e}")))?;
+        .map_err(|e| mcp_internal_error("Verb returned invalid JSON", &e))?;
     if status.is_success() {
         Ok(Ok(body))
     } else {
@@ -449,19 +551,11 @@ async fn verb_response_value(
 async fn verb_node(
     State(state): State<Arc<AppState>>,
     Json(req): Json<yg_verbs::NodeRequest>,
-) -> Response {
-    let id = match yg_verbs::VerbId::parse(&req.id) {
-        Ok(id) => id,
-        Err(reason) => return error_json(StatusCode::BAD_REQUEST, reason),
-    };
-    let (path, _) = match resolve_shard(&state, &id.repo, None).await {
-        Ok(resolved) => resolved,
-        Err(response) => return response,
-    };
-    match run_verb(path, id, yg_verbs::node).await {
-        Ok(response) => Json(response).into_response(),
-        Err(response) => response,
-    }
+) -> Result<Response, ApiError> {
+    let id = yg_verbs::VerbId::parse(&req.id).map_err(ApiError::bad_request)?;
+    let (path, _) = resolve_shard(&state, &id.repo, None).await?;
+    let response = run_verb(path, id, yg_verbs::node).await?;
+    Ok(Json(response).into_response())
 }
 
 /// What a `next_cursor` opaquely carries: the traversal position, the
@@ -546,16 +640,17 @@ impl NeighborsCursor {
 async fn verb_neighbors(
     State(state): State<Arc<AppState>>,
     Json(req): Json<yg_verbs::NeighborsRequest>,
-) -> Response {
-    let cursor = match req.cursor.as_deref().map(NeighborsCursor::decode) {
-        Some(Ok(cursor)) => Some(cursor),
-        Some(Err(reason)) => return error_json(StatusCode::BAD_REQUEST, reason),
-        None => None,
-    };
-    if let Some(cursor) = &cursor
-        && let Err(reason) = cursor.agrees_with(&req.shape)
-    {
-        return error_json(StatusCode::BAD_REQUEST, reason);
+) -> Result<Response, ApiError> {
+    let cursor = req
+        .cursor
+        .as_deref()
+        .map(NeighborsCursor::decode)
+        .transpose()
+        .map_err(ApiError::bad_request)?;
+    if let Some(cursor) = &cursor {
+        cursor
+            .agrees_with(&req.shape)
+            .map_err(ApiError::bad_request)?;
     }
     // The shape in force: the cursor's where present (it remembers the
     // original request, and agrees_with just ruled out contradiction),
@@ -565,11 +660,13 @@ async fn verb_neighbors(
         Some(cursor) => cursor.shape.clone(),
         None => req.shape,
     };
-    let direction = match shape.direction.as_deref().map(yg_verbs::Direction::parse) {
-        Some(Ok(direction)) => direction,
-        Some(Err(reason)) => return error_json(StatusCode::BAD_REQUEST, reason),
-        None => yg_verbs::Direction::default(),
-    };
+    let direction = shape
+        .direction
+        .as_deref()
+        .map(yg_verbs::Direction::parse)
+        .transpose()
+        .map_err(ApiError::bad_request)?
+        .unwrap_or_default();
     let options = yg_verbs::NeighborsOptions {
         direction,
         edge_kinds: shape.edge_kinds.clone(),
@@ -579,31 +676,19 @@ async fn verb_neighbors(
             .unwrap_or(yg_verbs::DEFAULT_NEIGHBORS_LIMIT as u32) as usize,
         after: cursor.as_ref().map(|c| (c.after_depth, c.after.clone())),
     };
-    if let Err(reason) = options.validate() {
-        return error_json(StatusCode::BAD_REQUEST, reason);
-    }
+    options.validate().map_err(ApiError::bad_request)?;
 
-    let id = match yg_verbs::VerbId::parse(&shape.id) {
-        Ok(id) => id,
-        Err(reason) => return error_json(StatusCode::BAD_REQUEST, reason),
-    };
+    let id = yg_verbs::VerbId::parse(&shape.id).map_err(ApiError::bad_request)?;
     // A cursor pins the revision its traversal started on; fresh
     // queries resolve the current pointer.
     let pinned = cursor.as_ref().map(|c| c.rev.clone());
-    let (path, revision) = match resolve_shard(&state, &id.repo, pinned).await {
-        Ok(resolved) => resolved,
-        Err(response) => return response,
-    };
+    let (path, revision) = resolve_shard(&state, &id.repo, pinned).await?;
 
     let verb_options = options.clone();
-    let page = match run_verb(path, id, move |conn, id| {
+    let page = run_verb(path, id, move |conn, id| {
         yg_verbs::neighbors(conn, id, &verb_options)
     })
-    .await
-    {
-        Ok(page) => page,
-        Err(response) => return response,
-    };
+    .await?;
 
     let next_cursor = page.next.as_ref().map(|(after_depth, after)| {
         NeighborsCursor {
@@ -614,12 +699,12 @@ async fn verb_neighbors(
         }
         .encode()
     });
-    Json(NeighborsResponse {
+    Ok(Json(NeighborsResponse {
         nodes: page.nodes,
         edges: page.edges,
         next_cursor,
     })
-    .into_response()
+    .into_response())
 }
 
 /// The `neighbors` wire response: one page plus the opaque cursor.
@@ -735,21 +820,23 @@ fn parse_since(raw: &str) -> Result<i64, String> {
 async fn verb_history(
     State(state): State<Arc<AppState>>,
     Json(req): Json<yg_verbs::HistoryRequest>,
-) -> Response {
-    let cursor = match req.cursor.as_deref().map(HistoryCursor::decode) {
-        Some(Ok(cursor)) => Some(cursor),
-        Some(Err(reason)) => return error_json(StatusCode::BAD_REQUEST, reason),
-        None => None,
-    };
-    let req_since = match req.since.as_deref().map(parse_since) {
-        Some(Ok(since)) => Some(since),
-        Some(Err(reason)) => return error_json(StatusCode::BAD_REQUEST, reason),
-        None => None,
-    };
-    if let Some(cursor) = &cursor
-        && let Err(reason) = cursor.agrees_with(&req.id, req_since)
-    {
-        return error_json(StatusCode::BAD_REQUEST, reason);
+) -> Result<Response, ApiError> {
+    let cursor = req
+        .cursor
+        .as_deref()
+        .map(HistoryCursor::decode)
+        .transpose()
+        .map_err(ApiError::bad_request)?;
+    let req_since = req
+        .since
+        .as_deref()
+        .map(parse_since)
+        .transpose()
+        .map_err(ApiError::bad_request)?;
+    if let Some(cursor) = &cursor {
+        cursor
+            .agrees_with(&req.id, req_since)
+            .map_err(ApiError::bad_request)?;
     }
     // The id + since in force: the cursor's where resuming (it remembers
     // the original, and agrees_with ruled out contradiction), the
@@ -758,30 +845,21 @@ async fn verb_history(
         Some(cursor) => (cursor.id.clone(), cursor.since),
         None => (req.id.clone(), req_since),
     };
-    let id = match yg_verbs::VerbId::parse(&id_str) {
-        Ok(id) => id,
-        Err(reason) => return error_json(StatusCode::BAD_REQUEST, reason),
-    };
+    let id = yg_verbs::VerbId::parse(&id_str).map_err(ApiError::bad_request)?;
     let limit = req
         .limit
         .map_or(yg_verbs::DEFAULT_HISTORY_LIMIT, |l| l as usize);
     if !(yg_verbs::MIN_PAGE_LIMIT..=yg_verbs::MAX_HISTORY_LIMIT).contains(&limit) {
-        return error_json(
-            StatusCode::BAD_REQUEST,
-            format!(
-                "limit must be between {} and {}, got {limit}",
-                yg_verbs::MIN_PAGE_LIMIT,
-                yg_verbs::MAX_HISTORY_LIMIT
-            ),
-        );
+        return Err(ApiError::bad_request(format!(
+            "limit must be between {} and {}, got {limit}",
+            yg_verbs::MIN_PAGE_LIMIT,
+            yg_verbs::MAX_HISTORY_LIMIT
+        )));
     }
     // A cursor pins the revision its history started on; fresh queries
     // resolve the current pointer.
     let pinned = cursor.as_ref().map(|c| c.rev.clone());
-    let (path, revision) = match resolve_shard(&state, &id.repo, pinned).await {
-        Ok(resolved) => resolved,
-        Err(response) => return response,
-    };
+    let (path, revision) = resolve_shard(&state, &id.repo, pinned).await?;
     let options = yg_verbs::HistoryOptions {
         limit,
         since,
@@ -789,14 +867,10 @@ async fn verb_history(
             .as_ref()
             .map(|c| (c.after_committed_at, c.after_sha.clone())),
     };
-    let page = match run_verb(path, id, move |conn, id| {
+    let page = run_verb(path, id, move |conn, id| {
         yg_verbs::history(conn, id, &options)
     })
-    .await
-    {
-        Ok(page) => page,
-        Err(response) => return response,
-    };
+    .await?;
     let next_cursor = page.next.as_ref().map(|(at, sha)| {
         HistoryCursor {
             rev: revision.clone(),
@@ -815,11 +889,11 @@ async fn verb_history(
             commit,
         })
         .collect();
-    Json(HistoryResponse {
+    Ok(Json(HistoryResponse {
         commits,
         next_cursor,
     })
-    .into_response()
+    .into_response())
 }
 
 /// The deepest a `search` cursor may page. The window also bounds the
@@ -937,12 +1011,13 @@ fn merge_paginate(mut all: Vec<SearchHit>, offset: usize, limit: usize) -> (Vec<
 async fn verb_search(
     State(state): State<Arc<AppState>>,
     Json(req): Json<yg_verbs::SearchRequest>,
-) -> Response {
-    let cursor = match req.cursor.as_deref().map(SearchCursor::decode) {
-        Some(Ok(cursor)) => Some(cursor),
-        Some(Err(reason)) => return error_json(StatusCode::BAD_REQUEST, reason),
-        None => None,
-    };
+) -> Result<Response, ApiError> {
+    let cursor = req
+        .cursor
+        .as_deref()
+        .map(SearchCursor::decode)
+        .transpose()
+        .map_err(ApiError::bad_request)?;
 
     // Page size may vary between pages; everything else is fixed at the
     // first page and carried by the cursor.
@@ -950,14 +1025,11 @@ async fn verb_search(
         .limit
         .map_or(yg_verbs::DEFAULT_SEARCH_LIMIT, |l| l as usize);
     if !(yg_verbs::MIN_PAGE_LIMIT..=yg_verbs::MAX_SEARCH_LIMIT).contains(&limit) {
-        return error_json(
-            StatusCode::BAD_REQUEST,
-            format!(
-                "limit must be between {} and {}, got {limit}",
-                yg_verbs::MIN_PAGE_LIMIT,
-                yg_verbs::MAX_SEARCH_LIMIT
-            ),
-        );
+        return Err(ApiError::bad_request(format!(
+            "limit must be between {} and {}, got {limit}",
+            yg_verbs::MIN_PAGE_LIMIT,
+            yg_verbs::MAX_SEARCH_LIMIT
+        )));
     }
 
     // The query state in force: the cursor's where present, the request's
@@ -974,32 +1046,26 @@ async fn verb_search(
             if let Some(q) = req.query.as_deref()
                 && q.trim() != cursor.query
             {
-                return error_json(
-                    StatusCode::BAD_REQUEST,
+                return Err(ApiError::bad_request(
                     "this cursor belongs to a different query; start a fresh search or \
-                     pass the cursor without a query"
-                        .to_string(),
-                );
+                     pass the cursor without a query",
+                ));
             }
             if let Some(mode) = &req.mode
                 && mode != &cursor.mode
             {
-                return error_json(
-                    StatusCode::BAD_REQUEST,
+                return Err(ApiError::bad_request(
                     "this cursor belongs to a different search mode; page it without a \
-                     mode, or start a fresh search"
-                        .to_string(),
-                );
+                     mode, or start a fresh search",
+                ));
             }
             if let Some(kinds) = &req.kinds
                 && str_set(kinds) != str_set(cursor.kinds.as_deref().unwrap_or_default())
             {
-                return error_json(
-                    StatusCode::BAD_REQUEST,
+                return Err(ApiError::bad_request(
                     "this cursor belongs to a different kinds filter; page it without \
-                     kinds, or start a fresh search"
-                        .to_string(),
-                );
+                     kinds, or start a fresh search",
+                ));
             }
             if let Some(repos) = &req.repos
                 && str_set(repos)
@@ -1009,22 +1075,19 @@ async fn verb_search(
                         .map(|t| t.qualifier.as_str())
                         .collect()
             {
-                return error_json(
-                    StatusCode::BAD_REQUEST,
+                return Err(ApiError::bad_request(
                     "this cursor belongs to a different repos filter; page it without \
-                     repos, or start a fresh search"
-                        .to_string(),
-                );
+                     repos, or start a fresh search",
+                ));
             }
             // The cursor is unsigned, so its target list is untrusted: a
             // tampered cursor could repeat or pad it to fan a single
             // request out across an unbounded number of segment opens. Cap
             // and dedup it, mirroring the fresh path's `resolve_search_targets`.
             if cursor.targets.len() > MAX_SEARCH_TARGETS {
-                return error_json(
-                    StatusCode::BAD_REQUEST,
-                    "invalid cursor: it names too many repositories".to_string(),
-                );
+                return Err(ApiError::bad_request(
+                    "invalid cursor: it names too many repositories",
+                ));
             }
             (
                 cursor.query,
@@ -1037,18 +1100,10 @@ async fn verb_search(
         None => {
             let query = match req.query.as_deref().map(str::trim) {
                 Some(q) if !q.is_empty() => q.to_string(),
-                _ => {
-                    return error_json(
-                        StatusCode::BAD_REQUEST,
-                        "search needs a non-empty query".to_string(),
-                    );
-                }
+                _ => return Err(ApiError::bad_request("search needs a non-empty query")),
             };
             let mode = req.mode.unwrap_or_else(|| "lexical".to_string());
-            let targets = match resolve_search_targets(&state, req.repos.as_deref()).await {
-                Ok(targets) => targets,
-                Err(response) => return response,
-            };
+            let targets = resolve_search_targets(&state, req.repos.as_deref()).await?;
             (query, req.kinds, mode, targets, 0)
         }
     };
@@ -1056,23 +1111,19 @@ async fn verb_search(
     // The mode gate runs on the in-force value, so a forged or stale cursor
     // can't smuggle an unsupported mode past the fresh-search check.
     if mode != "lexical" {
-        return error_json(
-            StatusCode::BAD_REQUEST,
-            format!(
-                "search mode {mode:?} is not available; only \"lexical\" is supported \
-                 (semantic and hybrid arrive with embeddings)"
-            ),
-        );
+        return Err(ApiError::bad_request(format!(
+            "search mode {mode:?} is not available; only \"lexical\" is supported \
+             (semantic and hybrid arrive with embeddings)"
+        )));
     }
 
     // A cursor's offset is client-supplied (the cursor is unsigned), so
     // bound it before any arithmetic: past the window there is nothing to
     // serve, and an unbounded offset would overflow `offset + …` below.
     if offset >= MAX_SEARCH_WINDOW {
-        return error_json(
-            StatusCode::BAD_REQUEST,
-            format!("cannot page beyond {MAX_SEARCH_WINDOW} results"),
-        );
+        return Err(ApiError::bad_request(format!(
+            "cannot page beyond {MAX_SEARCH_WINDOW} results"
+        )));
     }
     // Clamp this page to the window: a requested limit that would run past
     // it serves a final short page rather than stranding reachable hits
@@ -1081,19 +1132,16 @@ async fn verb_search(
 
     // Validate (and parse) the kind filter against the node-kind
     // vocabulary, so a typo errors instead of silently matching nothing.
-    let kinds = match parse_search_kinds(kind_strings.as_deref()) {
-        Ok(kinds) => kinds,
-        Err(reason) => return error_json(StatusCode::BAD_REQUEST, reason),
-    };
+    let kinds = parse_search_kinds(kind_strings.as_deref()).map_err(ApiError::bad_request)?;
 
     // No indexed repos at all (a fresh org-wide search before anything is
     // indexed): an empty result, not an error.
     if targets.is_empty() {
-        return Json(SearchResponse {
+        return Ok(Json(SearchResponse {
             hits: vec![],
             next_cursor: None,
         })
-        .into_response();
+        .into_response());
     }
 
     // Each repo returns a *constant* top-K (the deepest reachable page),
@@ -1114,14 +1162,11 @@ async fn verb_search(
     let from_cursor = req.cursor.is_some();
     let mut all = Vec::new();
     for target in &targets {
-        let dir = match state
+        let dir = state
             .shards
             .fts_path(target.repo_id, &target.revision)
             .await
-        {
-            Ok(dir) => dir,
-            Err(e) => return map_search_shard_error(e, from_cursor),
-        };
+            .map_err(|e| map_search_shard_error(e, from_cursor))?;
         let query = query.clone();
         let kinds = kinds.clone();
         let qualifier = target.qualifier.clone();
@@ -1145,21 +1190,17 @@ async fn verb_search(
         .await;
         match hits {
             Ok(Ok(hits)) => all.extend(hits),
-            Ok(Err(e)) => return map_search_query_error(e),
+            Ok(Err(e)) => return Err(map_search_query_error(e)),
             Err(e) => {
-                return error_json(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("search task panicked: {e}"),
-                );
+                return Err(ApiError::internal(
+                    anyhow::Error::new(e).context("search task panicked"),
+                ));
             }
         }
     }
 
     let (mut page, has_more) = merge_paginate(all, offset, page_limit);
-    if let Err(response) = hydrate_snippets(&state, &targets, &query, from_cursor, &mut page).await
-    {
-        return response;
-    }
+    hydrate_snippets(&state, &targets, &query, from_cursor, &mut page).await?;
     // Offer a next page only while one is both available and reachable
     // (paging stops at the window).
     let next_cursor = (has_more && offset + page_limit < MAX_SEARCH_WINDOW).then(|| {
@@ -1172,11 +1213,11 @@ async fn verb_search(
         }
         .encode()
     });
-    Json(SearchResponse {
+    Ok(Json(SearchResponse {
         hits: page,
         next_cursor,
     })
-    .into_response()
+    .into_response())
 }
 
 /// Fill in the snippet of each hit on the final page, querying each repo's
@@ -1189,7 +1230,7 @@ async fn hydrate_snippets(
     query: &str,
     from_cursor: bool,
     page: &mut [SearchHit],
-) -> Result<(), Response> {
+) -> Result<(), ApiError> {
     use std::collections::HashMap;
     let target_by_qualifier: HashMap<&str, &SearchTarget> =
         targets.iter().map(|t| (t.qualifier.as_str(), t)).collect();
@@ -1203,14 +1244,11 @@ async fn hydrate_snippets(
         let Some(target) = target_by_qualifier.get(qualifier.as_str()) else {
             continue;
         };
-        let dir = match state
+        let dir = state
             .shards
             .fts_path(target.repo_id, &target.revision)
             .await
-        {
-            Ok(dir) => dir,
-            Err(e) => return Err(map_search_shard_error(e, from_cursor)),
-        };
+            .map_err(|e| map_search_shard_error(e, from_cursor))?;
         let local_ids: Vec<String> = indices.iter().map(|&i| page[i].local_id.clone()).collect();
         let query = query.to_string();
         let snippets = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
@@ -1300,17 +1338,15 @@ fn parse_search_kinds(kinds: Option<&[String]>) -> Result<Option<Vec<yg_shard::N
 async fn resolve_search_targets(
     state: &AppState,
     repos: Option<&[String]>,
-) -> Result<Vec<SearchTarget>, Response> {
+) -> Result<Vec<SearchTarget>, ApiError> {
     let targets = match repos {
         Some(repos) => {
             // An explicit empty list is ambiguous (no repos vs no filter)
             // and rejected, mirroring the empty-`kinds` rule; omit `repos`
             // to search every indexed repo.
             if repos.is_empty() {
-                return Err(error_json(
-                    StatusCode::BAD_REQUEST,
-                    "repos must name at least one repository; omit it to search every indexed repo"
-                        .to_string(),
+                return Err(ApiError::bad_request(
+                    "repos must name at least one repository; omit it to search every indexed repo",
                 ));
             }
             let mut targets = Vec::with_capacity(repos.len());
@@ -1321,26 +1357,13 @@ async fn resolve_search_targets(
                 if !seen.insert(qualifier.as_str()) {
                     continue;
                 }
-                let target = match state.control.verb_target(qualifier).await {
-                    Ok(Some(target)) => target,
-                    Ok(None) => {
-                        return Err(error_json(
-                            StatusCode::NOT_FOUND,
-                            format!("no indexed repository matches {qualifier:?}"),
-                        ));
-                    }
-                    Err(e) => {
-                        return Err(error_json(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("{e:#}"),
-                        ));
-                    }
-                };
+                let target = state.control.verb_target(qualifier).await?.ok_or_else(|| {
+                    ApiError::not_found(format!("no indexed repository matches {qualifier:?}"))
+                })?;
                 let Some(revision) = target.revision else {
-                    return Err(error_json(
-                        StatusCode::NOT_FOUND,
-                        format!("{qualifier} is registered but not yet indexed; try again shortly"),
-                    ));
+                    return Err(ApiError::not_found(format!(
+                        "{qualifier} is registered but not yet indexed; try again shortly"
+                    )));
                 };
                 targets.push(SearchTarget {
                     repo_id: target.repo_id,
@@ -1350,26 +1373,17 @@ async fn resolve_search_targets(
             }
             targets
         }
-        None => match state
+        None => state
             .control
             .indexed_repos(&yg_shard::syntactic_revision_suffix())
-            .await
-        {
-            Ok(repos) => repos
-                .into_iter()
-                .map(|r| SearchTarget {
-                    repo_id: r.repo_id,
-                    qualifier: r.qualifier,
-                    revision: r.revision,
-                })
-                .collect(),
-            Err(e) => {
-                return Err(error_json(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("{e:#}"),
-                ));
-            }
-        },
+            .await?
+            .into_iter()
+            .map(|r| SearchTarget {
+                repo_id: r.repo_id,
+                qualifier: r.qualifier,
+                revision: r.revision,
+            })
+            .collect(),
     };
 
     // The cursor that carries this fan-out is capped at MAX_SEARCH_TARGETS
@@ -1378,14 +1392,11 @@ async fn resolve_search_targets(
     // fan-out would be rejected on its next page. Beyond the cap, search
     // needs a `repos` filter — org-wide tiering is M3 (RFC 0001 §11).
     if targets.len() > MAX_SEARCH_TARGETS {
-        return Err(error_json(
-            StatusCode::BAD_REQUEST,
-            format!(
-                "the search spans {} repositories, more than the {MAX_SEARCH_TARGETS} one query \
-                 covers; narrow it with the repos filter",
-                targets.len()
-            ),
-        ));
+        return Err(ApiError::bad_request(format!(
+            "the search spans {} repositories, more than the {MAX_SEARCH_TARGETS} one query \
+             covers; narrow it with the repos filter",
+            targets.len()
+        )));
     }
     Ok(targets)
 }
@@ -1410,37 +1421,34 @@ fn dedup_targets(targets: Vec<SearchTarget>) -> Vec<SearchTarget> {
 
 /// Map a shard-resolution error from the search fan-out, the same way
 /// [`resolve_shard`] does for the node-addressed Verbs.
-fn map_search_shard_error(e: anyhow::Error, from_cursor: bool) -> Response {
+fn map_search_shard_error(e: anyhow::Error, from_cursor: bool) -> ApiError {
     if from_cursor && e.downcast_ref::<yg_shard::RevisionMissing>().is_some() {
-        return error_json(
-            StatusCode::GONE,
+        return ApiError::gone(
             "this cursor's Shard revision is no longer available; restart the search without a cursor",
         );
     }
     if e.downcast_ref::<yg_shard::SchemaOutdated>().is_some() {
         return if from_cursor {
-            error_json(
-                StatusCode::GONE,
+            ApiError::gone(
                 "this cursor's Shard revision predates the current index schema; \
                  restart the search without a cursor",
             )
         } else {
-            error_json(
-                StatusCode::SERVICE_UNAVAILABLE,
+            ApiError::unavailable(
                 "a repo's Shard predates the current index schema and is being re-indexed; \
                  try again shortly",
             )
         };
     }
-    error_json(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))
+    ApiError::internal(e)
 }
 
 /// Map a search-execution error: a query tantivy can't parse is the
 /// client's to fix (400); anything else is a 500.
-fn map_search_query_error(e: anyhow::Error) -> Response {
+fn map_search_query_error(e: anyhow::Error) -> ApiError {
     match e.downcast_ref::<yg_shard::QueryMalformed>() {
-        Some(malformed) => error_json(StatusCode::BAD_REQUEST, malformed.to_string()),
-        None => error_json(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+        Some(malformed) => ApiError::bad_request(malformed.to_string()),
+        None => ApiError::internal(e),
     }
 }
 
@@ -1453,7 +1461,7 @@ async fn run_verb<T, F>(
     path: std::path::PathBuf,
     id: yg_verbs::VerbId,
     verb: F,
-) -> Result<T, Response>
+) -> Result<T, ApiError>
 where
     T: Send + 'static,
     F: FnOnce(&rusqlite::Connection, &yg_verbs::VerbId) -> anyhow::Result<Option<T>>
@@ -1474,17 +1482,12 @@ where
         Ok(Ok(Some(response))) => Ok(response),
         // "this", not "the current": a pagination cursor may have
         // pinned an older revision than the pointer's.
-        Ok(Ok(None)) => Err(error_json(
-            StatusCode::NOT_FOUND,
-            format!("no node {external} in this repo's Shard"),
-        )),
-        Ok(Err(e)) => Err(error_json(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("{e:#}"),
-        )),
-        Err(e) => Err(error_json(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("verb task panicked: {e}"),
+        Ok(Ok(None)) => Err(ApiError::not_found(format!(
+            "no node {external} in this repo's Shard"
+        ))),
+        Ok(Err(e)) => Err(ApiError::internal(e)),
+        Err(e) => Err(ApiError::internal(
+            anyhow::Error::new(e).context("verb task panicked"),
         )),
     }
 }
@@ -1500,31 +1503,15 @@ async fn resolve_shard(
     state: &AppState,
     qualifier: &str,
     pinned: Option<String>,
-) -> Result<(std::path::PathBuf, String), Response> {
-    let target = match state.control.verb_target(qualifier).await {
-        Ok(target) => target,
-        Err(e) => {
-            return Err(error_json(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("{e:#}"),
-            ));
-        }
-    };
-    let Some(target) = target else {
-        return Err(error_json(
-            StatusCode::NOT_FOUND,
-            format!("no indexed repository matches {qualifier:?}"),
-        ));
-    };
+) -> Result<(std::path::PathBuf, String), ApiError> {
+    let target = state.control.verb_target(qualifier).await?.ok_or_else(|| {
+        ApiError::not_found(format!("no indexed repository matches {qualifier:?}"))
+    })?;
     let from_cursor = pinned.is_some();
-    let revision = match pinned.or(target.revision) {
-        Some(revision) => revision,
-        None => {
-            return Err(error_json(
-                StatusCode::NOT_FOUND,
-                format!("{qualifier} is registered but not yet indexed; try again shortly"),
-            ));
-        }
+    let Some(revision) = pinned.or(target.revision) else {
+        return Err(ApiError::not_found(format!(
+            "{qualifier} is registered but not yet indexed; try again shortly"
+        )));
     };
     match state.shards.graph_path(target.repo_id, &revision).await {
         Ok(path) => Ok((path, revision)),
@@ -1532,8 +1519,7 @@ async fn resolve_shard(
         // outliving its Shard (GC, a forged or mistyped cursor): the
         // client must restart the traversal, the server is fine.
         Err(e) if from_cursor && e.downcast_ref::<yg_shard::RevisionMissing>().is_some() => {
-            Err(error_json(
-                StatusCode::GONE,
+            Err(ApiError::gone(
                 "this cursor's Shard revision is no longer available; \
                  restart the traversal without a cursor",
             ))
@@ -1544,23 +1530,18 @@ async fn resolve_shard(
         // outdated Shard), so the client should retry, not despair.
         Err(e) if e.downcast_ref::<yg_shard::SchemaOutdated>().is_some() => {
             if from_cursor {
-                Err(error_json(
-                    StatusCode::GONE,
+                Err(ApiError::gone(
                     "this cursor's Shard revision predates the current index schema; \
                      restart the traversal without a cursor",
                 ))
             } else {
-                Err(error_json(
-                    StatusCode::SERVICE_UNAVAILABLE,
+                Err(ApiError::unavailable(
                     "this repo's Shard predates the current index schema and is being \
                      re-indexed; try again shortly",
                 ))
             }
         }
-        Err(e) => Err(error_json(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("{e:#}"),
-        )),
+        Err(e) => Err(ApiError::internal(e)),
     }
 }
 
@@ -1600,19 +1581,10 @@ struct AddForgeResponse {
 async fn admin_forge_add(
     State(state): State<Arc<AppState>>,
     Json(req): Json<AddForgeRequest>,
-) -> Response {
-    let kind = match github_kind(&req.kind) {
-        Ok(kind) => kind,
-        Err(message) => return error_json(StatusCode::BAD_REQUEST, message),
-    };
-    let org = match github_org_slug(&req.org) {
-        Ok(org) => org,
-        Err(message) => return error_json(StatusCode::BAD_REQUEST, message),
-    };
-    let base_url = match github_base_url(req.base_url.as_deref()) {
-        Ok(base_url) => base_url,
-        Err(message) => return error_json(StatusCode::BAD_REQUEST, message),
-    };
+) -> Result<Response, ApiError> {
+    let kind = github_kind(&req.kind).map_err(ApiError::bad_request)?;
+    let org = github_org_slug(&req.org).map_err(ApiError::bad_request)?;
+    let base_url = github_base_url(req.base_url.as_deref()).map_err(ApiError::bad_request)?;
     let token_env = req.token_env.as_deref().or_else(|| {
         if kind == "github" {
             Some("YG_GITHUB_TOKEN")
@@ -1628,24 +1600,21 @@ async fn admin_forge_add(
             org_slug: &org,
             token_env,
         })
-        .await;
-    match outcome {
-        Ok(outcome) => (
-            if outcome.created {
-                StatusCode::CREATED
-            } else {
-                StatusCode::OK
-            },
-            Json(AddForgeResponse {
-                kind: kind.to_string(),
-                org,
-                base_url,
-                created: outcome.created,
-            }),
-        )
-            .into_response(),
-        Err(e) => error_json(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
-    }
+        .await?;
+    Ok((
+        if outcome.created {
+            StatusCode::CREATED
+        } else {
+            StatusCode::OK
+        },
+        Json(AddForgeResponse {
+            kind: kind.to_string(),
+            org,
+            base_url,
+            created: outcome.created,
+        }),
+    )
+        .into_response())
 }
 
 fn github_kind(kind: &str) -> Result<&'static str, &'static str> {
@@ -1710,36 +1679,22 @@ struct DiscoverForgeResponse {
 async fn admin_forge_discover(
     State(state): State<Arc<AppState>>,
     Json(req): Json<DiscoverForgeRequest>,
-) -> Response {
-    let kind = match github_kind(&req.kind) {
-        Ok(kind) => kind,
-        Err(message) => return error_json(StatusCode::BAD_REQUEST, message),
-    };
-    let org = match github_org_slug(&req.org) {
-        Ok(org) => org,
-        Err(message) => return error_json(StatusCode::BAD_REQUEST, message),
-    };
-    let base_url = match github_base_url(req.base_url.as_deref()) {
-        Ok(base_url) => base_url,
-        Err(message) => return error_json(StatusCode::BAD_REQUEST, message),
-    };
-    match state.control.request_discovery(&base_url, &org).await {
-        Ok(true) => Json(DiscoverForgeResponse {
-            kind: kind.to_string(),
-            org,
-            base_url,
-            queued: true,
-        })
-        .into_response(),
-        Ok(false) => error_json(
-            StatusCode::NOT_FOUND,
-            format!(
-                "{} org {} is not connected; run yg admin forge add first",
-                kind, org
-            ),
-        ),
-        Err(e) => error_json(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+) -> Result<Response, ApiError> {
+    let kind = github_kind(&req.kind).map_err(ApiError::bad_request)?;
+    let org = github_org_slug(&req.org).map_err(ApiError::bad_request)?;
+    let base_url = github_base_url(req.base_url.as_deref()).map_err(ApiError::bad_request)?;
+    if !state.control.request_discovery(&base_url, &org).await? {
+        return Err(ApiError::not_found(format!(
+            "{kind} org {org} is not connected; run yg admin forge add first"
+        )));
     }
+    Ok(Json(DiscoverForgeResponse {
+        kind: kind.to_string(),
+        org,
+        base_url,
+        queued: true,
+    })
+    .into_response())
 }
 
 #[derive(Deserialize)]
@@ -1764,35 +1719,30 @@ struct AddRuleResponse {
 async fn admin_rules_add(
     State(state): State<Arc<AppState>>,
     Json(req): Json<AddRuleRequest>,
-) -> Response {
+) -> Result<Response, ApiError> {
     let action = match req.action.as_str() {
         "include" => yg_control::RuleAction::Include,
         "exclude" => yg_control::RuleAction::Exclude,
         other => {
-            return error_json(
-                StatusCode::BAD_REQUEST,
-                format!("rule action must be include or exclude, got {other:?}"),
-            );
+            return Err(ApiError::bad_request(format!(
+                "rule action must be include or exclude, got {other:?}"
+            )));
         }
     };
     let pattern = req.pattern.trim();
     if pattern.is_empty() {
-        return error_json(StatusCode::BAD_REQUEST, "rule pattern must not be empty");
+        return Err(ApiError::bad_request("rule pattern must not be empty"));
     }
-    let forge = match github_base_url(req.forge.as_deref()) {
-        Ok(forge) => forge,
-        Err(message) => return error_json(StatusCode::BAD_REQUEST, message),
-    };
-    let forge_id = match state.control.forge_id_by_base_url(&forge).await {
-        Ok(Some(id)) => id,
-        Ok(None) => {
-            return error_json(
-                StatusCode::NOT_FOUND,
-                format!("forge {forge} is not connected; run yg admin forge add first"),
-            );
-        }
-        Err(e) => return error_json(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
-    };
+    let forge = github_base_url(req.forge.as_deref()).map_err(ApiError::bad_request)?;
+    let forge_id = state
+        .control
+        .forge_id_by_base_url(&forge)
+        .await?
+        .ok_or_else(|| {
+            ApiError::not_found(format!(
+                "forge {forge} is not connected; run yg admin forge add first"
+            ))
+        })?;
     let outcome = state
         .control
         .add_rule(yg_control::AddRule {
@@ -1801,27 +1751,24 @@ async fn admin_rules_add(
             action,
             applies_to_private: req.private.unwrap_or(false),
         })
-        .await;
-    match outcome {
-        Ok(outcome) => (
-            if outcome.created {
-                StatusCode::CREATED
-            } else {
-                StatusCode::OK
-            },
-            Json(AddRuleResponse {
-                forge,
-                pattern: pattern.to_string(),
-                action: req.action,
-                applies_to_private: req.private.unwrap_or(false),
-                created: outcome.created,
-                repos_reconsidered: outcome.repos_reconsidered,
-                fetches_queued: outcome.fetches_queued,
-            }),
-        )
-            .into_response(),
-        Err(e) => error_json(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
-    }
+        .await?;
+    Ok((
+        if outcome.created {
+            StatusCode::CREATED
+        } else {
+            StatusCode::OK
+        },
+        Json(AddRuleResponse {
+            forge,
+            pattern: pattern.to_string(),
+            action: req.action,
+            applies_to_private: req.private.unwrap_or(false),
+            created: outcome.created,
+            repos_reconsidered: outcome.repos_reconsidered,
+            fetches_queued: outcome.fetches_queued,
+        }),
+    )
+        .into_response())
 }
 
 #[derive(Serialize)]
@@ -1837,12 +1784,9 @@ struct RuleResponse {
     applies_to_private: bool,
 }
 
-async fn admin_rules_list(State(state): State<Arc<AppState>>) -> Response {
-    let rules = match state.control.rules().await {
-        Ok(rules) => rules,
-        Err(e) => return error_json(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
-    };
-    Json(RulesResponse {
+async fn admin_rules_list(State(state): State<Arc<AppState>>) -> Result<Response, ApiError> {
+    let rules = state.control.rules().await?;
+    Ok(Json(RulesResponse {
         rules: rules
             .into_iter()
             .map(|rule| RuleResponse {
@@ -1853,48 +1797,40 @@ async fn admin_rules_list(State(state): State<Arc<AppState>>) -> Response {
             })
             .collect(),
     })
-    .into_response()
+    .into_response())
 }
 
 async fn admin_repo_add(
     State(state): State<Arc<AppState>>,
     Json(req): Json<AddRepoRequest>,
-) -> Response {
+) -> Result<Response, ApiError> {
     if let Some(depth) = req.depth
         && depth < 1
     {
-        return error_json(
-            StatusCode::BAD_REQUEST,
-            format!("depth must be a positive number of commits (got {depth})"),
-        );
+        return Err(ApiError::bad_request(format!(
+            "depth must be a positive number of commits (got {depth})"
+        )));
     }
     if let Some(interval) = req.poll_interval
         && interval < 1
     {
-        return error_json(
-            StatusCode::BAD_REQUEST,
-            format!("poll_interval must be a positive number of seconds (got {interval})"),
-        );
+        return Err(ApiError::bad_request(format!(
+            "poll_interval must be a positive number of seconds (got {interval})"
+        )));
     }
-    let locator = match RepoLocator::parse(&req.url) {
-        Ok(locator) => locator,
-        Err(reason) => return error_json(StatusCode::BAD_REQUEST, reason),
-    };
+    let locator = RepoLocator::parse(&req.url).map_err(ApiError::bad_request)?;
     // Every node id this repo will ever mint embeds its qualifier
     // (RFC 0001 §5); a qualifier the id grammar can't address — an
     // IPv6 host, a path with a stray colon — would index a repo no
     // query could reach. Refused here, with the reason, instead.
     let qualifier = yg_control::repo_qualifier(&locator.base_url, &locator.slug);
     if !yg_verbs::addressable_qualifier(&qualifier) {
-        return error_json(
-            StatusCode::BAD_REQUEST,
-            format!(
-                "{} maps to repo qualifier {qualifier:?}, which node ids cannot address \
-                 (it contains a colon outside a numeric port); \
-                 use a hostname-based URL without colons in its path",
-                req.url
-            ),
-        );
+        return Err(ApiError::bad_request(format!(
+            "{} maps to repo qualifier {qualifier:?}, which node ids cannot address \
+             (it contains a colon outside a numeric port); \
+             use a hostname-based URL without colons in its path",
+            req.url
+        )));
     }
     let outcome = state
         .control
@@ -1906,28 +1842,29 @@ async fn admin_repo_add(
             fetch_depth: req.depth,
             poll_interval_seconds: req.poll_interval,
         })
-        .await;
-    match outcome {
-        Ok(outcome) => (
-            if outcome.created {
-                StatusCode::CREATED
+        .await
+        .map_err(|e| {
+            // The same host/slug registered through a different forge URL
+            // (http vs https, say) is the caller's collision to resolve.
+            if e.downcast_ref::<yg_control::QualifierConflict>().is_some() {
+                ApiError::conflict(format!("{e}"))
             } else {
-                StatusCode::OK
-            },
-            Json(AddRepoResponse {
-                slug: locator.slug,
-                created: outcome.created,
-                fetch_queued: outcome.fetch_queued,
-            }),
-        )
-            .into_response(),
-        // The same host/slug registered through a different forge URL
-        // (http vs https, say) is the caller's collision to resolve.
-        Err(e) if e.downcast_ref::<yg_control::QualifierConflict>().is_some() => {
-            error_json(StatusCode::CONFLICT, format!("{e}"))
-        }
-        Err(e) => error_json(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
-    }
+                ApiError::internal(e)
+            }
+        })?;
+    Ok((
+        if outcome.created {
+            StatusCode::CREATED
+        } else {
+            StatusCode::OK
+        },
+        Json(AddRepoResponse {
+            slug: locator.slug,
+            created: outcome.created,
+            fetch_queued: outcome.fetch_queued,
+        }),
+    )
+        .into_response())
 }
 
 #[derive(Deserialize)]
@@ -1945,23 +1882,21 @@ struct IssueTokenResponse {
 async fn admin_token_issue(
     State(state): State<Arc<AppState>>,
     Json(req): Json<IssueTokenRequest>,
-) -> Response {
+) -> Result<Response, ApiError> {
     let member = req.member.trim();
     if member.is_empty() {
-        return error_json(StatusCode::BAD_REQUEST, "member must not be empty");
+        return Err(ApiError::bad_request("member must not be empty"));
     }
-    match state.control.issue_member_token(member).await {
-        Ok(issued) => (
-            StatusCode::CREATED,
-            Json(IssueTokenResponse {
-                id: issued.id,
-                member: issued.member,
-                token: issued.token,
-            }),
-        )
-            .into_response(),
-        Err(e) => error_json(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
-    }
+    let issued = state.control.issue_member_token(member).await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(IssueTokenResponse {
+            id: issued.id,
+            member: issued.member,
+            token: issued.token,
+        }),
+    )
+        .into_response())
 }
 
 #[derive(Serialize)]
@@ -1973,21 +1908,18 @@ struct RevokeTokenResponse {
 async fn admin_token_revoke(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-) -> Response {
+) -> Result<Response, ApiError> {
     if !yg_control::member_token_id_is_valid(&id) {
-        return error_json(
-            StatusCode::BAD_REQUEST,
+        return Err(ApiError::bad_request(
             "member token id must look like mtok_<24 hex characters>",
-        );
+        ));
     }
-    match state.control.revoke_member_token(&id).await {
-        Ok(true) => Json(RevokeTokenResponse { id, revoked: true }).into_response(),
-        Ok(false) => error_json(
-            StatusCode::NOT_FOUND,
-            format!("no active member token {id:?}"),
-        ),
-        Err(e) => error_json(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+    if !state.control.revoke_member_token(&id).await? {
+        return Err(ApiError::not_found(format!(
+            "no active member token {id:?}"
+        )));
     }
+    Ok(Json(RevokeTokenResponse { id, revoked: true }).into_response())
 }
 
 #[derive(Serialize)]
@@ -2024,11 +1956,8 @@ struct ShardStatus {
     edges: i64,
 }
 
-async fn admin_status(State(state): State<Arc<AppState>>) -> Response {
-    let repos = match state.control.admin_status().await {
-        Ok(repos) => repos,
-        Err(e) => return error_json(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
-    };
+async fn admin_status(State(state): State<Arc<AppState>>) -> Result<Response, ApiError> {
+    let repos = state.control.admin_status().await?;
     let repos = repos
         .into_iter()
         .map(|r| AdminRepoStatus {
@@ -2077,7 +2006,7 @@ async fn admin_status(State(state): State<Arc<AppState>>) -> Response {
             last_synced_commit: r.last_synced_commit,
         })
         .collect();
-    Json(AdminStatusResponse { repos }).into_response()
+    Ok(Json(AdminStatusResponse { repos }).into_response())
 }
 
 /// The stage-specific words [`job_state`] fills in: what to call a
@@ -2115,29 +2044,30 @@ struct StatusResponse {
     repos_indexed: i64,
 }
 
-async fn status(State(state): State<Arc<AppState>>) -> Response {
-    match state.control.indexed_repo_count().await {
-        Ok(repos_indexed) => Json(StatusResponse {
-            version: env!("CARGO_PKG_VERSION"),
-            uptime_seconds: state.started.elapsed().as_secs(),
-            repos_indexed,
-        })
-        .into_response(),
-        Err(e) => error_json(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
-    }
+async fn status(State(state): State<Arc<AppState>>) -> Result<Response, ApiError> {
+    let repos_indexed = state.control.indexed_repo_count().await?;
+    Ok(Json(StatusResponse {
+        version: env!("CARGO_PKG_VERSION"),
+        uptime_seconds: state.started.elapsed().as_secs(),
+        repos_indexed,
+    })
+    .into_response())
 }
 
+/// The unauthenticated readiness report: an overall verdict and a bare
+/// ok/error per dependency. Anonymous callers never see failure detail —
+/// connection errors carry hosts, ports, and bucket names — so the detail
+/// goes to the server log instead.
 #[derive(Serialize)]
 struct HealthResponse {
     status: &'static str,
-    version: &'static str,
     checks: HealthChecks,
 }
 
 #[derive(Serialize)]
 struct HealthChecks {
-    postgres: String,
-    object_store: String,
+    postgres: &'static str,
+    object_store: &'static str,
 }
 
 async fn healthz(State(state): State<Arc<AppState>>) -> (StatusCode, Json<HealthResponse>) {
@@ -2147,16 +2077,18 @@ async fn healthz(State(state): State<Arc<AppState>>) -> (StatusCode, Json<Health
     );
     let all_ok = postgres.is_ok() && object_store.is_ok();
 
-    let check = |r: &anyhow::Result<()>| match r {
-        Ok(()) => "ok".to_string(),
-        Err(e) => format!("error: {e:#}"),
+    let check = |name: &str, r: &anyhow::Result<()>| match r {
+        Ok(()) => "ok",
+        Err(e) => {
+            tracing::warn!("health check {name} failed: {e:#}");
+            "error"
+        }
     };
     let body = HealthResponse {
         status: if all_ok { "ok" } else { "degraded" },
-        version: env!("CARGO_PKG_VERSION"),
         checks: HealthChecks {
-            postgres: check(&postgres),
-            object_store: check(&object_store),
+            postgres: check("postgres", &postgres),
+            object_store: check("object_store", &object_store),
         },
     };
     let code = if all_ok {
@@ -2377,22 +2309,24 @@ mod tests {
             })
         };
         assert_eq!(
-            map_search_shard_error(missing(), true).status(),
+            map_search_shard_error(missing(), true).status,
             StatusCode::GONE
         );
         assert_eq!(
-            map_search_shard_error(outdated(), true).status(),
+            map_search_shard_error(outdated(), true).status,
             StatusCode::GONE
         );
         assert_eq!(
-            map_search_shard_error(outdated(), false).status(),
+            map_search_shard_error(outdated(), false).status,
             StatusCode::SERVICE_UNAVAILABLE
         );
         // A fresh search resolves a current pointer, so a missing revision
         // there is an unexpected server fault, not a client-expired cursor.
+        let internal = map_search_shard_error(missing(), false);
+        assert_eq!(internal.status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(
-            map_search_shard_error(missing(), false).status(),
-            StatusCode::INTERNAL_SERVER_ERROR
+            internal.message, "internal server error",
+            "500s carry no error-chain content"
         );
     }
 

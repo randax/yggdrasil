@@ -1522,6 +1522,73 @@ async fn yg_status_json_emits_machine_readable_output() {
     assert!(body["uptime_seconds"].is_u64());
 }
 
+/// An internal failure (the control plane severed under a live server)
+/// answers with a generic 500 body — no database errors, hosts, or paths —
+/// while the full error chain lands in the server's logs.
+#[tokio::test]
+async fn internal_failures_return_a_sanitized_500_and_log_the_full_chain() {
+    // Capture this process's tracing output: the in-process server logs
+    // the chain through the global subscriber.
+    #[derive(Clone, Default)]
+    struct Sink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let sink = Sink::default();
+    let writer = sink.clone();
+    tracing_subscriber::fmt()
+        .with_writer(move || writer.clone())
+        .try_init()
+        .expect("test requires setting the global tracing subscriber");
+
+    let db_name = create_test_db().await;
+    let server = serve(test_config(&db_name)).await.expect("boot");
+
+    // Sever the control plane out from under the running server, then
+    // drive a request whose handler must reach it.
+    let admin = admin_pool().await;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        r#"DROP DATABASE "{db_name}" WITH (FORCE)"#
+    )))
+    .execute(&admin)
+    .await
+    .unwrap();
+
+    let resp = reqwest::Client::new()
+        .get(format!("http://{}/v1/status", server.local_addr()))
+        .bearer_auth(TEST_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 500, "a severed dependency is a server fault");
+    let text = resp.text().await.unwrap();
+    let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(
+        body["error"], "internal server error",
+        "500 bodies carry no internal detail, got: {text}"
+    );
+    assert!(
+        !text.contains(&db_name) && !text.to_lowercase().contains("database"),
+        "500 bodies must not leak the error chain: {text}"
+    );
+
+    // The chain must appear on the sanitizer's own log line — the db name
+    // showing up in some other writer's output (e.g. sqlx statement
+    // logging) must not satisfy this.
+    let logs = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+    assert!(
+        logs.lines()
+            .any(|line| line.contains("internal error") && line.contains(&db_name)),
+        "the full error chain must appear on the internal-error log line, got:\n{logs}"
+    );
+}
+
 #[tokio::test]
 async fn health_degrades_to_503_when_a_dependency_dies() {
     let db_name = create_test_db().await;
@@ -1540,18 +1607,22 @@ async fn health_degrades_to_503_when_a_dependency_dies() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 503, "lost dependency must degrade health");
-    let body: serde_json::Value = resp.json().await.unwrap();
+    let text = resp.text().await.unwrap();
+    let body: serde_json::Value = serde_json::from_str(&text).unwrap();
     assert_eq!(body["status"], "degraded");
     assert_eq!(
         body["checks"]["object_store"], "ok",
         "storage is still fine"
     );
+    // Anonymous callers get a bare verdict — never the failure detail
+    // (hosts, ports, database names ride in connection errors).
+    assert_eq!(
+        body["checks"]["postgres"], "error",
+        "the check is a bare ok/error verdict, got: {body}"
+    );
     assert!(
-        body["checks"]["postgres"]
-            .as_str()
-            .unwrap()
-            .starts_with("error"),
-        "postgres check must carry the failure, got: {body}"
+        !text.contains(&db_name) && !text.contains("localhost") && !text.contains("5432"),
+        "health must not leak dependency details to anonymous callers: {text}"
     );
 }
 
@@ -1586,7 +1657,12 @@ async fn server_boots_and_health_reports_server_and_storage_readiness() {
     assert_eq!(resp.status(), 200);
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["status"], "ok");
-    assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(body["checks"]["postgres"], "ok");
     assert_eq!(body["checks"]["object_store"], "ok");
+    // Health is anonymous: it reports readiness verdicts and nothing else
+    // (no version, no dependency addresses).
+    assert!(
+        body.get("version").is_none(),
+        "health must not advertise the server version, got: {body}"
+    );
 }
