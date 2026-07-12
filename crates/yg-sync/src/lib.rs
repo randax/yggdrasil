@@ -118,24 +118,45 @@ pub async fn with_lease_heartbeat<T>(
     let mut work = std::pin::pin!(work);
     let mut held = true;
     loop {
+        // Between heartbeats there is nothing but the work to drive.
         tokio::select! {
             output = &mut work => return output,
-            _ = ticks.tick(), if held => match tokio::time::timeout(period, renew()).await {
-                Ok(Ok(true)) => {}
-                Ok(Ok(false)) => {
-                    held = false;
-                    tracing::warn!(
-                        "lease renewal fenced — the job was reclaimed; the fenced settle will discard this run"
-                    );
-                }
-                Ok(Err(e)) => {
-                    tracing::warn!(error = format!("{e:#}"), "lease renewal failed; retrying at the next heartbeat");
-                }
-                Err(_) => {
-                    tracing::warn!("lease renewal timed out; retrying at the next heartbeat");
-                }
-            },
+            _ = ticks.tick(), if held => {}
         }
+        // A heartbeat is due. The renewal runs concurrently with the
+        // work — an in-flight renewal must not stop the work being
+        // polled (async git IO stalls when its future sits unpolled) —
+        // and each attempt is bounded by the tick period, so a wedged
+        // control-plane connection surfaces as a retried timeout, never
+        // a stall.
+        let mut renewal = std::pin::pin!(tokio::time::timeout(period, renew()));
+        let output = tokio::select! {
+            output = &mut work => output,
+            outcome = &mut renewal => {
+                match outcome {
+                    Ok(Ok(true)) => {}
+                    Ok(Ok(false)) => {
+                        held = false;
+                        tracing::warn!(
+                            "lease renewal fenced — the job was reclaimed; the fenced settle will discard this run"
+                        );
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!(error = format!("{e:#}"), "lease renewal failed; retrying at the next heartbeat");
+                    }
+                    Err(_) => {
+                        tracing::warn!("lease renewal timed out; retrying at the next heartbeat");
+                    }
+                }
+                continue;
+            }
+        };
+        // The work landed mid-renewal. Drain the attempt (still bounded
+        // by its timeout) before returning: dropped here it could commit
+        // server-side after the settle reads the token, fencing this
+        // worker's own result.
+        let _ = renewal.await;
+        return output;
     }
 }
 
@@ -1370,6 +1391,32 @@ mod tests {
         .await;
         assert_eq!(out, "synced");
         assert!(renewals.load(std::sync::atomic::Ordering::SeqCst) >= 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn work_landing_mid_renewal_drains_the_attempt_before_settling() {
+        let completed = std::sync::atomic::AtomicUsize::new(0);
+        let lease = Duration::from_secs(60);
+        // The renewal is still in flight when the work finishes one
+        // second after the first tick. Dropped mid-flight it could
+        // commit after the settle reads the token and fence this
+        // worker's own result — so it must be driven to completion.
+        let renew = async || {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            completed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(true)
+        };
+        let out = with_lease_heartbeat(lease, renew, async {
+            tokio::time::sleep(Duration::from_secs(21)).await;
+            "synced"
+        })
+        .await;
+        assert_eq!(out, "synced");
+        assert_eq!(
+            completed.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the in-flight renewal must land before the caller settles"
+        );
     }
 
     #[tokio::test(start_paused = true)]
