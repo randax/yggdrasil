@@ -152,7 +152,7 @@ pub fn resolve(role: Role, lookup: impl Fn(&str) -> Option<String>) -> Resolutio
         object_store: ObjectStoreConfig {
             endpoint: r.string("YG_S3_ENDPOINT", "http://localhost:9000"),
             bucket: r.string("YG_S3_BUCKET", "yggdrasil"),
-            access_key: r.string("YG_S3_ACCESS_KEY", "yggdrasil"),
+            access_key: r.redacted_string("YG_S3_ACCESS_KEY", "yggdrasil"),
             secret_key: r.redacted_string("YG_S3_SECRET_KEY", "yggdrasil"),
             region: r.string("YG_S3_REGION", "us-east-1"),
             key_prefix: r.string("YG_S3_PREFIX", ""),
@@ -544,12 +544,14 @@ mod tests {
             Role::All,
             env(&[
                 ("YG_BOOTSTRAP_TOKEN", "ygt_admin_secret"),
+                ("YG_S3_ACCESS_KEY", "s3_access_value"),
                 ("YG_S3_SECRET_KEY", "s3_secret_value"),
             ]),
         );
         for setting in &resolution.settings {
             assert!(
                 !setting.shown.contains("ygt_admin_secret")
+                    && !setting.shown.contains("s3_access_value")
                     && !setting.shown.contains("s3_secret_value"),
                 "{}: {} leaks a credential",
                 setting.var,
@@ -565,6 +567,7 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(shown("YG_BOOTSTRAP_TOKEN"), REDACTED);
+        assert_eq!(shown("YG_S3_ACCESS_KEY"), REDACTED);
         assert_eq!(shown("YG_S3_SECRET_KEY"), REDACTED);
     }
 

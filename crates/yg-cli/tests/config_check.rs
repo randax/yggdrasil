@@ -45,6 +45,7 @@ fn config_check_reports_resolved_config_without_starting_the_server() {
 #[test]
 fn config_check_never_prints_credentials() {
     yg().env("YG_BOOTSTRAP_TOKEN", "ygt_admin_credential")
+        .env("YG_S3_ACCESS_KEY", "s3_access_credential")
         .env("YG_S3_SECRET_KEY", "s3_secret_credential")
         .env(
             "YG_DATABASE_URL",
@@ -56,6 +57,7 @@ fn config_check_never_prints_credentials() {
         .stdout(
             contains("ygt_admin_credential")
                 .not()
+                .and(contains("s3_access_credential").not())
                 .and(contains("s3_secret_credential").not())
                 .and(contains("db_password_credential").not())
                 .and(contains("YG_BOOTSTRAP_TOKEN"))
