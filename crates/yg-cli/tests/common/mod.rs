@@ -95,19 +95,34 @@ pub fn test_config(db_name: &str) -> ServerConfig {
     ServerConfig {
         listen: "127.0.0.1:0".parse().unwrap(),
         database_url: format!("{DEV_POSTGRES}/{db_name}"),
-        object_store: ObjectStoreConfig {
-            endpoint: "http://localhost:9000".into(),
-            bucket: "yggdrasil".into(),
-            access_key: "yggdrasil".into(),
-            secret_key: "yggdrasil".into(),
-            region: "us-east-1".into(),
-        },
+        // Every test database gets its own key namespace in the
+        // shared dev bucket, so identical fixture commits across
+        // parallel tests can never read each other's Shards.
+        object_store: dev_object_store_config(db_name),
         bootstrap_token: TEST_TOKEN.into(),
         // Per-test (db names are unique) so cache assertions never see
         // another test's segments; content-addressing would make sharing
         // safe, but isolation keeps the tests honest.
         shard_cache: std::env::temp_dir().join(format!("yg-shard-cache-{db_name}")),
     }
+}
+
+/// The dev compose stack's MinIO, keyed under `key_prefix` (empty
+/// means the bucket root).
+pub fn dev_object_store_config(key_prefix: &str) -> ObjectStoreConfig {
+    ObjectStoreConfig {
+        endpoint: "http://localhost:9000".into(),
+        bucket: "yggdrasil".into(),
+        access_key: "yggdrasil".into(),
+        secret_key: "yggdrasil".into(),
+        region: "us-east-1".into(),
+        key_prefix: key_prefix.into(),
+    }
+}
+
+/// [`dev_object_store_config`], connected.
+pub fn dev_object_store(key_prefix: &str) -> std::sync::Arc<dyn object_store::ObjectStore> {
+    dev_object_store_config(key_prefix).connect().unwrap()
 }
 
 /// The worker-side view of a test database.
@@ -145,6 +160,43 @@ pub async fn admin_status_body(base: &str) -> serde_json::Value {
     serde_json::from_str(&text).expect("admin status must be JSON")
 }
 
+/// The Symbol names the `search` Verb returns for `query`, against a
+/// server reached over HTTP (the spawned-process e2e demos).
+pub async fn search_hit_names(base: &str, query: &str) -> Vec<String> {
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/verbs/search"))
+        .bearer_auth(TEST_TOKEN)
+        .json(&serde_json::json!({"query": query}))
+        .send()
+        .await
+        .unwrap();
+    let body: serde_json::Value = resp.json().await.unwrap();
+    body["hits"]
+        .as_array()
+        .map(|hits| {
+            hits.iter()
+                .filter_map(|hit| hit["name"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Poll the running server until `name` is queryable, or fail at the
+/// deadline — the observable "the Knowledge Graph caught up" check.
+pub async fn await_symbol(base: &str, name: &str, within: std::time::Duration) {
+    let deadline = std::time::Instant::now() + within;
+    loop {
+        if search_hit_names(base, name).await.iter().any(|n| n == name) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "symbol {name:?} never became queryable within {within:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
 /// Kills a spawned server process even when the test panics.
 pub struct KillOnDrop(pub std::process::Child);
 impl Drop for KillOnDrop {
@@ -154,19 +206,27 @@ impl Drop for KillOnDrop {
     }
 }
 
-/// Spawn `yg serve --role=all` as a real process, wait for its address
-/// announcement, and return the kill guard plus base URL. `configure`
-/// adds the test's environment on top of `YG_LISTEN=127.0.0.1:0`. A
-/// server that dies before announcing panics with its stderr instead of
-/// an opaque unwrap; a live one has its stderr drained on a thread so a
-/// chatty run can never fill the pipe and block.
-pub fn spawn_yg_serve(configure: impl FnOnce(&mut std::process::Command)) -> (KillOnDrop, String) {
+/// Spawn `yg serve --role=<role>` as a real process wired to the test
+/// database (its Postgres URL and its object-store key prefix), wait
+/// for the readiness line on stdout, and return the kill guard plus
+/// that line. `configure` adds the test's environment on top of
+/// `YG_LISTEN=127.0.0.1:0`. A process that dies before announcing
+/// panics with its stderr instead of an opaque unwrap; a live one has
+/// its stderr drained on a thread so a chatty run can never fill the
+/// pipe and block.
+pub fn spawn_yg_role(
+    role: &str,
+    db_name: &str,
+    configure: impl FnOnce(&mut std::process::Command),
+) -> (KillOnDrop, String) {
     use std::io::{BufRead, Read};
     let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin("yg"));
-    cmd.env("YG_LISTEN", "127.0.0.1:0");
+    cmd.env("YG_LISTEN", "127.0.0.1:0")
+        .env("YG_DATABASE_URL", format!("{DEV_POSTGRES}/{db_name}"))
+        .env("YG_S3_PREFIX", db_name);
     configure(&mut cmd);
     let child = cmd
-        .args(["serve", "--role=all"])
+        .args(["serve", &format!("--role={role}")])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -184,14 +244,39 @@ pub fn spawn_yg_serve(configure: impl FnOnce(&mut std::process::Command)) -> (Ki
         None => {
             let _ = server.0.kill();
             let stderr = stderr_drain.join().unwrap_or_default();
-            panic!("yg serve exited without announcing its address; stderr:\n{stderr}");
+            panic!("yg serve --role={role} exited without announcing readiness; stderr:\n{stderr}");
         }
     };
-    let url = first_line
-        .strip_prefix("listening on ")
-        .unwrap_or_else(|| panic!("unexpected announcement: {first_line}"))
-        .to_string();
+    (server, first_line)
+}
+
+/// [`spawn_yg_role`] for the combined role, returning the announced
+/// base URL.
+pub fn spawn_yg_serve(
+    db_name: &str,
+    configure: impl FnOnce(&mut std::process::Command),
+) -> (KillOnDrop, String) {
+    let (server, first_line) = spawn_yg_role("all", db_name, configure);
+    let url = base_url(&first_line);
     (server, url)
+}
+
+/// [`spawn_yg_role`] for an HTTP-serving role, returning the announced
+/// base URL.
+pub fn spawn_yg_api(
+    db_name: &str,
+    configure: impl FnOnce(&mut std::process::Command),
+) -> (KillOnDrop, String) {
+    let (server, first_line) = spawn_yg_role("api", db_name, configure);
+    let url = base_url(&first_line);
+    (server, url)
+}
+
+fn base_url(announcement: &str) -> String {
+    announcement
+        .strip_prefix("listening on ")
+        .unwrap_or_else(|| panic!("unexpected announcement: {announcement}"))
+        .to_string()
 }
 
 /// The one repo mirror inside a worker's git cache. The cache root
@@ -448,12 +533,9 @@ pub fn fixture_repo(commits: usize) -> (tempfile::TempDir, std::path::PathBuf, S
 }
 
 /// Like [`fixture_repo`], but holding one commit of the given files.
-/// The commit message embeds the fixture's unique path so no two
-/// fixtures ever mint the same commit sha: Shard keys derive from
-/// (repo_id, commit), repo ids restart at 1 in every fresh test
-/// database, and all tests share the dev MinIO bucket — identical
-/// fixtures committed within the same second would otherwise read each
-/// other's Shards.
+/// Identical fixtures across tests mint identical commit shas, and
+/// that's fine: every test database keys the shared dev bucket under
+/// its own [`test_config`] prefix, so Shards can never collide.
 pub fn fixture_repo_with(
     files: &[(&str, &str)],
 ) -> (tempfile::TempDir, std::path::PathBuf, String) {
@@ -464,10 +546,7 @@ pub fn fixture_repo_with(
         std::fs::write(full, contents).unwrap();
     }
     git(&repo, &["add", "."]);
-    git(
-        &repo,
-        &["commit", "-m", &format!("initial ({})", repo.display())],
-    );
+    git(&repo, &["commit", "-m", "initial"]);
     (root, repo, url)
 }
 

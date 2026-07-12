@@ -727,9 +727,8 @@ async fn yg_admin_status_shows_the_shard_revision_and_counts() {
 async fn yg_serve_role_all_indexes_an_added_repo_end_to_end() {
     let (fixture, _repo_dir, fixture_url) = go_fixture_repo();
     let db_name = create_test_db().await;
-    let (_server, url) = spawn_yg_serve(|cmd| {
-        cmd.env("YG_DATABASE_URL", format!("{DEV_POSTGRES}/{db_name}"))
-            .env("YG_BOOTSTRAP_TOKEN", "ygt_test_token")
+    let (_server, url) = spawn_yg_serve(&db_name, |cmd| {
+        cmd.env("YG_BOOTSTRAP_TOKEN", "ygt_test_token")
             .env("YG_GIT_CACHE", fixture.path().join("git-cache"));
     });
 

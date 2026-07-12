@@ -5,7 +5,7 @@ on:
   push:
     branches: [main]
 
-# fmt/clippy/test only read the checkout; nothing needs a writable token.
+# All jobs only read the checkout; nothing needs a writable token.
 permissions:
   contents: read
 
@@ -13,8 +13,10 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  ci:
-    name: fmt + clippy + test
+  # Everything that needs no services: a formatting or lint failure
+  # fails here in minutes, without ever pulling the compose images.
+  checks:
+    name: fmt + clippy + doc + in-crate tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -29,9 +31,23 @@ jobs:
       - run: cargo doc --workspace --no-deps --locked
         env:
           RUSTDOCFLAGS: -D warnings
-      # The e2e tests exercise the server against real Postgres + MinIO.
+      # Every test outside the yg-cli e2e package runs without Postgres
+      # or MinIO; a service-needing test added to another crate breaks
+      # this job loudly instead of silently serializing CI again.
+      - run: cargo test --workspace --exclude yg-cli --locked
+
+  # The e2e suites exercise real server processes against the compose
+  # Postgres + MinIO stack.
+  e2e:
+    name: e2e
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+        with:
+          rustflags: ""
       # Two steps: older compose versions fail `up --wait` when the
       # one-shot minio-init service exits (even successfully).
       - run: docker compose up -d --wait postgres minio
       - run: docker compose run --rm minio-init
-      - run: cargo test --workspace --locked
+      - run: cargo test -p yg-cli --locked
