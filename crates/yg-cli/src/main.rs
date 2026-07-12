@@ -547,7 +547,7 @@ where
 async fn node(id: String, json: bool) -> anyhow::Result<()> {
     let body = post_verb("node", serde_json::to_value(yg_verbs::NodeRequest { id })?).await?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&body)?);
+        println!("{}", serde_json::to_string(&body)?);
         return Ok(());
     }
     let node = &body["node"];
@@ -617,7 +617,7 @@ async fn neighbors(
     )
     .await?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&body)?);
+        println!("{}", serde_json::to_string(&body)?);
         return Ok(());
     }
     let nodes = body["nodes"].as_array().map(Vec::as_slice).unwrap_or(&[]);
@@ -680,7 +680,7 @@ async fn search(
     )
     .await?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&body)?);
+        println!("{}", serde_json::to_string(&body)?);
         return Ok(());
     }
     let hits = body["hits"].as_array().map(Vec::as_slice).unwrap_or(&[]);
@@ -742,7 +742,7 @@ async fn history(
     )
     .await?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&body)?);
+        println!("{}", serde_json::to_string(&body)?);
         return Ok(());
     }
     let commits = body["commits"].as_array().map(Vec::as_slice).unwrap_or(&[]);
@@ -935,7 +935,7 @@ async fn admin_status(json: bool) -> anyhow::Result<()> {
     let body = server_json(reqwest::Method::GET, "/v1/admin/status", None).await?;
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&body)?);
+        println!("{}", serde_json::to_string(&body)?);
         return Ok(());
     }
     let repos = body["repos"].as_array().map(Vec::as_slice).unwrap_or(&[]);
@@ -1192,11 +1192,13 @@ async fn status(json: bool) -> anyhow::Result<()> {
 
     if json {
         // The server keeps volatile uptime out of the (cache-stable)
-        // body; fold it back in for machine consumers.
+        // body; fold it back in for machine consumers, keeping the
+        // body's key-sorted form.
         if let (Some(uptime), Some(map)) = (uptime_seconds, body.as_object_mut()) {
             map.insert("uptime_seconds".into(), uptime.into());
+            map.sort_keys();
         }
-        println!("{}", serde_json::to_string_pretty(&body)?);
+        println!("{}", serde_json::to_string(&body)?);
     } else {
         println!("yggdrasil Index Server at {server}");
         println!("version:       {}", body["version"].as_str().unwrap_or("?"));

@@ -99,6 +99,82 @@ async fn every_verb_serves_compact_key_sorted_byte_identical_bodies() {
              serve byte-identical bodies"
         );
     }
+
+    // Scores are f32s; canonicalization must not widen them into
+    // seventeen-digit f64 forms ("5.480152130126953") on the wire.
+    let search = raw_verb(&h.base, "search", &json!({"query": "Hello"})).await;
+    let search: serde_json::Value = serde_json::from_str(&search).unwrap();
+    for hit in search["hits"].as_array().expect("hits") {
+        let score = hit["score"].as_f64().expect("score");
+        let shortest: f64 = format!("{}", score as f32).parse().unwrap();
+        assert_eq!(
+            score, shortest,
+            "scores must keep their f32-shortest form on the wire"
+        );
+    }
+
+    // The Skill routes agents through `yg … --json`; the CLI must not
+    // undo the server's compaction at the last hop.
+    let node_id = format!("sym:{}:main.go#Hello", h.qualifier());
+    let out = h.yg_ok(&["node", &node_id, "--json"]).await;
+    assert_canonical("yg node --json output", out.trim_end());
+    let out = h.yg_ok(&["status", "--json"]).await;
+    assert_canonical("yg status --json output", out.trim_end());
+}
+
+#[tokio::test]
+async fn rejections_and_unroutable_requests_keep_the_canonical_error_shape() {
+    let server = boot_test_server().await;
+    let base = format!("http://{}", server.local_addr());
+    let client = reqwest::Client::new();
+
+    // Malformed JSON to a Verb: axum's default rejection would answer
+    // in text/plain, breaking the server's one error shape.
+    let resp = client
+        .post(format!("{base}/v1/verbs/node"))
+        .bearer_auth(TEST_TOKEN)
+        .header("content-type", "application/json")
+        .body("{not json")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 400);
+    let text = resp.text().await.unwrap();
+    assert_canonical("verb parse rejection", &text);
+    let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert!(body["error"].is_string(), "error shape: {body}");
+
+    // Malformed JSON to MCP: a canonical JSON-RPC parse error.
+    let resp = client
+        .post(format!("{base}/v1/mcp"))
+        .bearer_auth(TEST_TOKEN)
+        .header("content-type", "application/json")
+        .body("{not json")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 400);
+    let text = resp.text().await.unwrap();
+    assert_canonical("MCP parse rejection", &text);
+    let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(
+        body["error"]["code"], -32700,
+        "JSON-RPC parse error: {body}"
+    );
+
+    // A wrong method on a live route must not fall back to axum's
+    // empty-body 405.
+    let resp = client
+        .get(format!("{base}/v1/verbs/node"))
+        .bearer_auth(TEST_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 405);
+    let text = resp.text().await.unwrap();
+    assert_canonical("method-not-allowed response", &text);
+    let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert!(body["error"].is_string(), "error shape: {body}");
 }
 
 #[tokio::test]

@@ -17,7 +17,7 @@ use object_store::ObjectStore;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
-use wire::Wire;
+use wire::{Wire, WireJson};
 use yg_control::ControlPlane;
 // Server config embeds the object-store half owned by yg-shard; clients
 // of this crate keep addressing it as `yg_api::ObjectStoreConfig`.
@@ -115,7 +115,10 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<RunningServer> {
         .route("/verbs/neighbors", post(verb_neighbors))
         .route("/verbs/history", post(verb_history))
         .route("/verbs/search", post(verb_search))
-        .route("/mcp", post(mcp));
+        .route("/mcp", post(mcp))
+        // A wrong method on a live route keeps the one error shape
+        // instead of axum's empty-body 405.
+        .method_not_allowed_fallback(wire::method_not_allowed);
     // The auth layer wraps everything routed so far — including the
     // fallback, so even nonexistent paths answer 401 to unauthenticated
     // callers. `/healthz` is added *after* the layer: its exemption is
@@ -282,7 +285,7 @@ const MCP_VERB_RESPONSE_LIMIT: usize = 50 * 1024 * 1024;
 async fn mcp(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(input): Json<serde_json::Value>,
+    input: Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     if !mcp_origin_allowed(&headers) {
         return error_json(
@@ -290,6 +293,10 @@ async fn mcp(
             "MCP Origin header must match the request Host",
         );
     }
+    let input = match input {
+        Ok(Json(input)) => input,
+        Err(rejection) => return wire::jsonrpc_parse_error(&rejection),
+    };
     match input {
         serde_json::Value::Array(messages) => {
             if messages.is_empty() {
@@ -463,21 +470,25 @@ async fn call_verb_tool(
     let response = match tool.verb {
         yg_verbs::Verb::Node => {
             let req = decode_tool_args(arguments)?;
-            verb_node(State(state), Json(req)).await.into_response()
+            verb_node(State(state), WireJson(req)).await.into_response()
         }
         yg_verbs::Verb::Neighbors => {
             let req = decode_tool_args(arguments)?;
-            verb_neighbors(State(state), Json(req))
+            verb_neighbors(State(state), WireJson(req))
                 .await
                 .into_response()
         }
         yg_verbs::Verb::Search => {
             let req = decode_tool_args(arguments)?;
-            verb_search(State(state), Json(req)).await.into_response()
+            verb_search(State(state), WireJson(req))
+                .await
+                .into_response()
         }
         yg_verbs::Verb::History => {
             let req = decode_tool_args(arguments)?;
-            verb_history(State(state), Json(req)).await.into_response()
+            verb_history(State(state), WireJson(req))
+                .await
+                .into_response()
         }
     };
     verb_response_value(response).await
@@ -522,7 +533,7 @@ async fn verb_response_value(
 /// `POST /v1/verbs/node` (RFC 0001 §7): full node + edge summary.
 async fn verb_node(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<yg_verbs::NodeRequest>,
+    WireJson(req): WireJson<yg_verbs::NodeRequest>,
 ) -> Result<Response, ApiError> {
     let id = yg_verbs::VerbId::parse(&req.id).map_err(ApiError::bad_request)?;
     let (path, _) = resolve_shard(&state, &id.repo, None).await?;
@@ -611,7 +622,7 @@ impl NeighborsCursor {
 /// subgraph.
 async fn verb_neighbors(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<yg_verbs::NeighborsRequest>,
+    WireJson(req): WireJson<yg_verbs::NeighborsRequest>,
 ) -> Result<Response, ApiError> {
     let cursor = req
         .cursor
@@ -791,7 +802,7 @@ fn parse_since(raw: &str) -> Result<i64, String> {
 /// pagination.
 async fn verb_history(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<yg_verbs::HistoryRequest>,
+    WireJson(req): WireJson<yg_verbs::HistoryRequest>,
 ) -> Result<Response, ApiError> {
     let cursor = req
         .cursor
@@ -937,6 +948,7 @@ struct SearchHit {
     #[serde(skip_serializing_if = "Option::is_none")]
     path: Option<String>,
     repo: String,
+    #[serde(serialize_with = "wire::f32_shortest")]
     score: f32,
     #[serde(skip_serializing_if = "Option::is_none")]
     snippet: Option<String>,
@@ -982,7 +994,7 @@ fn merge_paginate(mut all: Vec<SearchHit>, offset: usize, limit: usize) -> (Vec<
 /// the indexed repos, returning one ranked page with snippets and node ids.
 async fn verb_search(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<yg_verbs::SearchRequest>,
+    WireJson(req): WireJson<yg_verbs::SearchRequest>,
 ) -> Result<Response, ApiError> {
     let cursor = req
         .cursor
@@ -1552,7 +1564,7 @@ struct AddForgeResponse {
 
 async fn admin_forge_add(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<AddForgeRequest>,
+    WireJson(req): WireJson<AddForgeRequest>,
 ) -> Result<Response, ApiError> {
     let kind = github_kind(&req.kind).map_err(ApiError::bad_request)?;
     let org = github_org_slug(&req.org).map_err(ApiError::bad_request)?;
@@ -1650,7 +1662,7 @@ struct DiscoverForgeResponse {
 
 async fn admin_forge_discover(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<DiscoverForgeRequest>,
+    WireJson(req): WireJson<DiscoverForgeRequest>,
 ) -> Result<Response, ApiError> {
     let kind = github_kind(&req.kind).map_err(ApiError::bad_request)?;
     let org = github_org_slug(&req.org).map_err(ApiError::bad_request)?;
@@ -1690,7 +1702,7 @@ struct AddRuleResponse {
 
 async fn admin_rules_add(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<AddRuleRequest>,
+    WireJson(req): WireJson<AddRuleRequest>,
 ) -> Result<Response, ApiError> {
     let action = match req.action.as_str() {
         "include" => yg_control::RuleAction::Include,
@@ -1774,7 +1786,7 @@ async fn admin_rules_list(State(state): State<Arc<AppState>>) -> Result<Response
 
 async fn admin_repo_add(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<AddRepoRequest>,
+    WireJson(req): WireJson<AddRepoRequest>,
 ) -> Result<Response, ApiError> {
     if let Some(depth) = req.depth
         && depth < 1
@@ -1853,7 +1865,7 @@ struct IssueTokenResponse {
 
 async fn admin_token_issue(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<IssueTokenRequest>,
+    WireJson(req): WireJson<IssueTokenRequest>,
 ) -> Result<Response, ApiError> {
     let member = req.member.trim();
     if member.is_empty() {

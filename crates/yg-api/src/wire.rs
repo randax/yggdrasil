@@ -4,9 +4,12 @@
 //! match, so identical data must always serialize to identical bytes —
 //! and pretty-printing is pure token overhead.
 
+use axum::extract::rejection::JsonRejection;
+use axum::extract::{FromRequest, Request};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 
 /// The canonical serialization of a body: compact separators, object
 /// keys sorted recursively.
@@ -14,6 +17,21 @@ pub(crate) fn canonical_string(body: &impl Serialize) -> serde_json::Result<Stri
     let mut value = serde_json::to_value(body)?;
     sort_keys(&mut value);
     serde_json::to_string(&value)
+}
+
+/// Serializes an `f32` as the `f64` its shortest decimal form denotes.
+/// [`canonical_string`]'s trip through `serde_json::to_value` widens
+/// floats with a bare cast, which would put "5.480152130126953" on the
+/// wire where the f32 wrote "5.480152".
+pub(crate) fn f32_shortest<S: serde::Serializer>(
+    value: &f32,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    let shortest: f64 = value
+        .to_string()
+        .parse()
+        .unwrap_or_else(|_| f64::from(*value));
+    serializer.serialize_f64(shortest)
 }
 
 fn sort_keys(value: &mut serde_json::Value) {
@@ -49,4 +67,43 @@ impl<T: Serialize> IntoResponse for Wire<T> {
             }
         }
     }
+}
+
+/// `Json` request extractor whose rejection keeps the server's one
+/// error shape — axum's default rejection answers in text/plain.
+pub(crate) struct WireJson<T>(pub T);
+
+impl<S, T> FromRequest<S> for WireJson<T>
+where
+    S: Send + Sync,
+    T: DeserializeOwned,
+{
+    type Rejection = Response;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        match axum::Json::<T>::from_request(req, state).await {
+            Ok(axum::Json(value)) => Ok(Self(value)),
+            Err(rejection) => Err(crate::error_json(rejection.status(), rejection.body_text())),
+        }
+    }
+}
+
+/// The canonical shape for requests the router never matched to a
+/// handler method.
+pub(crate) async fn method_not_allowed() -> Response {
+    crate::error_json(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
+}
+
+/// A body `/v1/mcp` could not parse at all: the JSON-RPC parse error,
+/// id null, per spec.
+pub(crate) fn jsonrpc_parse_error(rejection: &JsonRejection) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Wire(crate::jsonrpc_error(
+            serde_json::Value::Null,
+            -32700,
+            format!("parse error: {}", rejection.body_text()),
+        )),
+    )
+        .into_response()
 }
