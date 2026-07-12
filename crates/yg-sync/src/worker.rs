@@ -7,8 +7,7 @@ use std::time::{Duration, Instant};
 
 use yg_control::ControlPlane;
 
-use crate::forge::github::{github_discovery_client, list_github_org_repos};
-use crate::forge::is_rate_limit_error;
+use crate::forge::{Forge, ForgeRegistry, github::discovery_client};
 use crate::git::{GitFetcher, forge_token, lock_mirror, remote_head_commit};
 use crate::lease::with_lease_heartbeat;
 use crate::locator::join_clone_url;
@@ -28,6 +27,9 @@ const FETCH_IN_FLIGHT_REPOLL_MAX: Duration = Duration::from_secs(30);
 pub struct SyncWorker {
     control: ControlPlane,
     fetcher: GitFetcher,
+    /// The forge adapters this worker dispatches through — the built-ins
+    /// by default, injectable so tests register doubles.
+    registry: ForgeRegistry,
     discovery_client: reqwest::Client,
     /// Per-forge rate budgets, keyed by forge id. Created on first poll
     /// of a forge and kept for the worker's life; the poll loop spends a
@@ -39,10 +41,21 @@ pub struct SyncWorker {
 
 impl SyncWorker {
     pub fn new(control: ControlPlane, git_cache: impl Into<PathBuf>) -> Self {
+        Self::with_registry(control, git_cache, ForgeRegistry::builtin())
+    }
+
+    /// A worker dispatching through `registry` instead of the built-in
+    /// adapters — how a test registers a forge double.
+    pub fn with_registry(
+        control: ControlPlane,
+        git_cache: impl Into<PathBuf>,
+        registry: ForgeRegistry,
+    ) -> Self {
         Self {
             control,
             fetcher: GitFetcher::new(git_cache),
-            discovery_client: github_discovery_client(),
+            registry,
+            discovery_client: discovery_client(),
             poll_buckets: Mutex::new(HashMap::new()),
         }
     }
@@ -55,14 +68,15 @@ impl SyncWorker {
             return Ok(false);
         };
         let clone_url = join_clone_url(&job.base_url, &job.slug);
-        let token = forge_token(job.token_env.as_deref(), &clone_url);
+        let forge = self.registry.for_kind(&job.forge_kind);
+        let auth = forge_token(job.token_env.as_deref(), &clone_url).map(|t| forge.git_auth(t));
         // A lock failure (cache dir on a dead disk) is a failed fetch,
         // not a dead worker: record it and let backoff retry.
         let work = async {
             let _serialize_same_mirror =
                 lock_mirror(self.fetcher.cache_dir(), job.repo_id, FETCH_LEASE).await?;
             self.fetcher
-                .sync(job.repo_id, &clone_url, token.as_deref(), job.fetch_depth)
+                .sync(job.repo_id, &clone_url, auth.as_ref(), job.fetch_depth)
                 .await
         };
         // A cold clone of a large repo outlives the base lease; the
@@ -89,35 +103,48 @@ impl SyncWorker {
         Ok(true)
     }
 
-    /// Claim one due forge org and reconcile its repositories. GitHub is
-    /// the first implemented adapter; other forge kinds are skipped with
-    /// a warning until their adapters arrive. Returns whether there was a
-    /// due discovery claim.
+    /// Claim one due forge org and reconcile its repositories through
+    /// the forge's discovery adapter; forge kinds without one are
+    /// skipped with a warning until their adapters arrive. Returns
+    /// whether there was a due discovery claim.
     pub async fn discover_once(&self, cfg: &DiscoveryConfig) -> anyhow::Result<bool> {
         let Some(due) = self.control.claim_due_discovery(cfg.interval).await? else {
             return Ok(false);
         };
-        if due.forge_kind != "github" {
+        let discovery = self
+            .registry
+            .by_kind(&due.forge_kind)
+            .and_then(Forge::discovery);
+        let Some(discovery) = discovery else {
             tracing::warn!(
                 forge_kind = %due.forge_kind,
                 org = %due.org_slug,
                 "forge discovery adapter is not implemented"
             );
             return Ok(true);
-        }
+        };
+        let Some(api_root) = due.api_root.as_deref() else {
+            tracing::warn!(
+                forge_kind = %due.forge_kind,
+                org = %due.org_slug,
+                "the forge record has no API root; re-add the forge to backfill it"
+            );
+            return Ok(true);
+        };
         let token = due.token_env.as_deref().and_then(|var| {
             std::env::var(var)
                 .ok()
                 .map(|token| token.trim().to_string())
                 .filter(|token| !token.is_empty())
         });
-        let repos = match list_github_org_repos(
-            &self.discovery_client,
-            &due.base_url,
-            &due.org_slug,
-            token.as_deref(),
-        )
-        .await
+        let repos = match discovery
+            .list_org_repos(
+                &self.discovery_client,
+                api_root,
+                &due.org_slug,
+                token.as_deref(),
+            )
+            .await
         {
             Ok(repos) => repos,
             Err(e) => {
@@ -200,8 +227,9 @@ impl SyncWorker {
             return Ok(false);
         }
         let clone_url = join_clone_url(&due.base_url, &due.slug);
-        let token = forge_token(due.token_env.as_deref(), &clone_url);
-        match remote_head_commit(&clone_url, token.as_deref()).await {
+        let forge = self.registry.for_kind(&due.forge_kind);
+        let auth = forge_token(due.token_env.as_deref(), &clone_url).map(|t| forge.git_auth(t));
+        match remote_head_commit(&clone_url, auth.as_ref()).await {
             Ok(Some(head)) if head != due.synced_commit => {
                 if self.control.request_fetch(due.repo_id).await? {
                     tracing::info!(slug = %due.slug, %head, "head moved; fetch queued");
@@ -220,7 +248,7 @@ impl SyncWorker {
             Ok(_) => {}
             Err(e) => {
                 let detail = format!("{e:#}");
-                if is_rate_limit_error(&detail) {
+                if forge.is_rate_limit(&detail) {
                     // The forge is pushing back: cool the whole forge down,
                     // retry this repo past the cooldown, and back off.
                     let retry = self.cool_forge_down(due.forge_id, due.rate_budget);

@@ -259,9 +259,11 @@ impl IndexWorker {
         }
         let clone_url = yg_sync::join_clone_url(&job.base_url, &job.slug);
         tracing::info!(slug = %job.slug, "local mirror lacks the commit; fetching");
-        let token = yg_sync::forge_token(job.token_env.as_deref(), &clone_url);
+        let forge = yg_sync::forge::builtin().for_kind(&job.forge_kind);
+        let auth = yg_sync::forge_token(job.token_env.as_deref(), &clone_url)
+            .map(|token| forge.git_auth(token));
         yg_sync::GitFetcher::new(&self.git_cache)
-            .sync(job.repo_id, &clone_url, token.as_deref(), job.fetch_depth)
+            .sync(job.repo_id, &clone_url, auth.as_ref(), job.fetch_depth)
             .await
             .context("fetching the mirror for indexing")?;
         // A fetch brings the remote's *current* state, which is not

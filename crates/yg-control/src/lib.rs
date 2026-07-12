@@ -25,6 +25,9 @@ pub struct AddRepo<'a> {
     pub base_url: &'a str,
     /// Env var the Forge token is read from, if this forge has one.
     pub token_env: Option<&'a str>,
+    /// REST API root for the forge's discovery API, if it has one —
+    /// e.g. `https://api.github.com`.
+    pub api_root: Option<&'a str>,
     /// Repo path on the forge, e.g. `acme/widgets`.
     pub slug: &'a str,
     /// Shallow-clone override; `None` fetches full history (the default).
@@ -52,6 +55,9 @@ pub struct ConnectForgeOrg<'a> {
     pub org_slug: &'a str,
     /// Env var the Forge token is read from.
     pub token_env: Option<&'a str>,
+    /// REST API root the forge's discovery listing calls — e.g.
+    /// `https://api.github.com`, or a test fixture server.
+    pub api_root: Option<&'a str>,
 }
 
 pub struct ConnectForgeOrgOutcome {
@@ -67,6 +73,9 @@ pub struct DueDiscovery {
     pub forge_id: i64,
     pub forge_kind: String,
     pub base_url: String,
+    /// REST API root from the Forge record; `None` when the record
+    /// predates the field (re-adding the forge backfills it).
+    pub api_root: Option<String>,
     pub org_slug: String,
     pub token_env: Option<String>,
 }
@@ -182,6 +191,8 @@ pub struct LeasedFetch {
     pub slug: String,
     /// Shallow-clone override; `None` = full history.
     pub fetch_depth: Option<i32>,
+    /// Forge kind, e.g. `github` — selects the worker's forge adapter.
+    pub forge_kind: String,
     /// Forge root; the clone URL is `{base_url}/{slug}`.
     pub base_url: String,
     /// Env var holding the Forge token, if the forge has one.
@@ -229,6 +240,8 @@ pub struct LeasedIndex {
     pub slug: String,
     /// The commit to index — the repo's sync position at claim time.
     pub commit: String,
+    /// Forge kind, e.g. `github` — selects the worker's forge adapter.
+    pub forge_kind: String,
     /// Forge root; the clone URL is `{base_url}/{slug}`.
     pub base_url: String,
     /// Env var holding the Forge token, if the forge has one.
@@ -329,6 +342,8 @@ pub struct DuePoll {
     pub slug: String,
     /// The forge row, keying the per-forge rate budget.
     pub forge_id: i64,
+    /// Forge kind, e.g. `github` — selects the worker's forge adapter.
+    pub forge_kind: String,
     /// Forge root; the clone URL is `{base_url}/{slug}`.
     pub base_url: String,
     /// Env var holding the Forge token, if the forge has one.
@@ -415,15 +430,17 @@ impl ControlPlane {
         // value. token_env only backfills a missing value — an explicit
         // per-forge override is never clobbered by a re-add.
         let (forge_id,): (i64,) = sqlx::query_as(
-            "INSERT INTO forges (kind, base_url, token_env) VALUES ($1, $2, $3)
+            "INSERT INTO forges (kind, base_url, token_env, api_root) VALUES ($1, $2, $3, $4)
              ON CONFLICT (base_url) DO UPDATE
              SET kind = excluded.kind,
-                 token_env = coalesce(forges.token_env, excluded.token_env)
+                 token_env = coalesce(forges.token_env, excluded.token_env),
+                 api_root = coalesce(forges.api_root, excluded.api_root)
              RETURNING id",
         )
         .bind(repo.forge_kind)
         .bind(repo.base_url)
         .bind(repo.token_env)
+        .bind(repo.api_root)
         .fetch_one(&mut *tx)
         .await?;
         put_rule_newest(&mut tx, forge_id, repo.slug, RuleAction::Include, true).await?;
@@ -488,15 +505,17 @@ impl ControlPlane {
     ) -> anyhow::Result<ConnectForgeOrgOutcome> {
         let mut tx = self.pool.begin().await?;
         let (forge_id,): (i64,) = sqlx::query_as(
-            "INSERT INTO forges (kind, base_url, token_env) VALUES ($1, $2, $3)
+            "INSERT INTO forges (kind, base_url, token_env, api_root) VALUES ($1, $2, $3, $4)
              ON CONFLICT (base_url) DO UPDATE
              SET kind = excluded.kind,
-                 token_env = coalesce(excluded.token_env, forges.token_env)
+                 token_env = coalesce(excluded.token_env, forges.token_env),
+                 api_root = coalesce(excluded.api_root, forges.api_root)
              RETURNING id",
         )
         .bind(org.forge_kind)
         .bind(org.base_url)
         .bind(org.token_env)
+        .bind(org.api_root)
         .fetch_one(&mut *tx)
         .await?;
         let (org_id, created): (i64, bool) = sqlx::query_as(
@@ -539,7 +558,7 @@ impl ControlPlane {
              FROM due, forges f
              WHERE o.id = due.id AND f.id = o.forge_id
              RETURNING o.id AS org_id, f.id AS forge_id, f.kind AS forge_kind,
-                       f.base_url, o.org_slug,
+                       f.base_url, f.api_root, o.org_slug,
                        coalesce(o.token_env, f.token_env) AS token_env",
         )
         .bind(interval.as_secs_f64())
@@ -886,7 +905,7 @@ impl ControlPlane {
         let sql = sqlx::AssertSqlSafe(claim_due_sql(
             JobKind::Fetch,
             "",
-            "r.slug, r.fetch_depth, f.base_url, f.token_env",
+            "r.slug, r.fetch_depth, f.kind AS forge_kind, f.base_url, f.token_env",
         ));
         let row = sqlx::query_as(sql)
             .bind(lease.as_secs_f64())
@@ -1039,7 +1058,7 @@ impl ControlPlane {
              FROM due, forges f
              WHERE r.id = due.id AND f.id = r.forge_id
              RETURNING r.id AS repo_id, r.slug, f.id AS forge_id,
-                       f.base_url, f.token_env, r.fetch_depth,
+                       f.kind AS forge_kind, f.base_url, f.token_env, r.fetch_depth,
                        r.poll_interval_seconds,
                        r.last_synced_commit AS synced_commit, f.rate_budget",
         )
@@ -1101,7 +1120,7 @@ impl ControlPlane {
             JobKind::Index,
             "AND r.last_synced_commit IS NOT NULL",
             "r.slug, r.last_synced_commit AS commit,
-             f.base_url, f.token_env, r.fetch_depth",
+             f.kind AS forge_kind, f.base_url, f.token_env, r.fetch_depth",
         ));
         let row = sqlx::query_as(sql)
             .bind(lease.as_secs_f64())

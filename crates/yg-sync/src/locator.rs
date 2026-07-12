@@ -1,42 +1,20 @@
 //! Parsing repository URLs into a Forge root plus repo slug.
 
+use crate::forge::Forge;
+use crate::forge::git_generic::GitForge;
+
 /// Where a repository lives, split the way the control plane stores it:
 /// a Forge (`base_url`) plus a repo path on it (`slug`). The clone URL is
 /// re-derived as `{base_url}/{slug}`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoLocator {
-    pub kind: ForgeKind,
+    /// The forge adapter's kind string, e.g. `github`, or `git` for any
+    /// other remote — resolved by the [`crate::forge::ForgeRegistry`].
+    pub kind: &'static str,
     /// Forge root, e.g. `https://github.com` — unique key for the forge.
     pub base_url: String,
     /// Repo path on the forge, e.g. `acme/widgets`.
     pub slug: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ForgeKind {
-    Github,
-    /// Any other git remote (file:// fixtures, self-hosted mirrors).
-    Git,
-}
-
-impl ForgeKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ForgeKind::Github => "github",
-            ForgeKind::Git => "git",
-        }
-    }
-
-    /// Default environment variable this Forge kind's token is read
-    /// from. Only the default at registration: `forges.token_env` in the
-    /// control plane is what workers actually consult at fetch time, so
-    /// a per-forge override there wins.
-    pub fn token_env(self) -> Option<&'static str> {
-        match self {
-            ForgeKind::Github => Some("YG_GITHUB_TOKEN"),
-            ForgeKind::Git => None,
-        }
-    }
 }
 
 impl RepoLocator {
@@ -76,7 +54,7 @@ impl RepoLocator {
                 ));
             };
             return Ok(Self {
-                kind: ForgeKind::Git,
+                kind: GitForge.kind(),
                 base_url: format!("file:///{}", base_parts.join("/")),
                 slug: slug_parts.join("/"),
             });
@@ -110,31 +88,15 @@ impl RepoLocator {
                 "repository path must be at least owner/repo: {url}"
             ));
         }
-        let kind = if host == "github.com" {
-            ForgeKind::Github
-        } else {
-            ForgeKind::Git
-        };
-        // GitHub repos live at exactly owner/repo; a longer path is a
-        // pasted browser page (tree/…, issues/…), not a different repo —
-        // rejected rather than guessed at.
-        if kind == ForgeKind::Github && segments.len() > 2 {
-            return Err(format!(
-                "GitHub repositories are owner/repo — drop the trailing path \
-                 (got {} extra segment(s)): {url}",
-                segments.len() - 2
-            ));
-        }
-        // GitHub only speaks https; normalizing here keeps a worker from
-        // ever sending the Forge token over plaintext because of a URL
-        // spelling, and keeps http/https variants on one forge row.
-        let scheme = if kind == ForgeKind::Github {
-            "https".to_string()
-        } else {
-            scheme
-        };
+        // The forge claiming this host owns the rest of the rules: path
+        // shape (GitHub is exactly owner/repo) and canonical scheme
+        // (GitHub only speaks https, so a token never travels plaintext
+        // because of a URL spelling and http/https variants land on one
+        // forge row).
+        let forge = crate::forge::builtin().for_host(&host);
+        let scheme = forge.canonical_repo_url(&scheme, &segments, url)?;
         Ok(Self {
-            kind,
+            kind: forge.kind(),
             base_url: format!("{scheme}://{host}"),
             slug: segments.join("/"),
         })
@@ -179,7 +141,7 @@ mod tests {
     #[test]
     fn github_urls_split_into_forge_root_and_slug() {
         let locator = parsed("https://github.com/acme/widgets");
-        assert_eq!(locator.kind, ForgeKind::Github);
+        assert_eq!(locator.kind, "github");
         assert_eq!(locator.base_url, "https://github.com");
         assert_eq!(locator.slug, "acme/widgets");
         assert_eq!(locator.clone_url(), "https://github.com/acme/widgets");
@@ -227,7 +189,7 @@ mod tests {
         // The GitHub forge always speaks https; a worker must never send
         // its token over plaintext because of a URL spelling.
         let locator = parsed("http://github.com/acme/widgets");
-        assert_eq!(locator.kind, ForgeKind::Github);
+        assert_eq!(locator.kind, "github");
         assert_eq!(locator.base_url, "https://github.com");
         assert_eq!(
             locator.base_url,
@@ -239,7 +201,7 @@ mod tests {
     #[test]
     fn file_urls_use_the_last_two_segments_as_slug() {
         let locator = parsed("file:///tmp/fixtures/acme/widgets");
-        assert_eq!(locator.kind, ForgeKind::Git);
+        assert_eq!(locator.kind, "git");
         assert_eq!(locator.base_url, "file:///tmp/fixtures");
         assert_eq!(locator.slug, "acme/widgets");
         assert_eq!(locator.clone_url(), "file:///tmp/fixtures/acme/widgets");

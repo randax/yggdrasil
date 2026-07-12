@@ -6,6 +6,8 @@ use std::time::Duration;
 use anyhow::Context;
 use base64::Engine;
 
+use crate::forge::GitAuth;
+
 /// Resolve the Forge token for a clone: read the env var the control
 /// plane names, if any. Defense in depth: whatever the control plane
 /// says, a Forge token only ever travels over TLS.
@@ -24,9 +26,9 @@ pub fn forge_token(token_env: Option<&str>, clone_url: &str) -> Option<String> {
 /// default branch).
 pub async fn remote_head_commit(
     clone_url: &str,
-    token: Option<&str>,
+    auth: Option<&GitAuth>,
 ) -> anyhow::Result<Option<String>> {
-    let out = run_git(None, &["ls-remote", clone_url, "HEAD"], token)
+    let out = run_git(None, &["ls-remote", clone_url, "HEAD"], auth)
         .await
         .with_context(|| format!("polling {clone_url} for its head"))?;
     // ls-remote (no --symref) prints one line, `<sha>\tHEAD`; take the sha.
@@ -82,7 +84,7 @@ impl GitFetcher {
         &self,
         repo_id: i64,
         clone_url: &str,
-        token: Option<&str>,
+        auth: Option<&GitAuth>,
         depth: Option<i32>,
     ) -> anyhow::Result<String> {
         let local = mirror_path(&self.cache_dir, repo_id);
@@ -114,7 +116,7 @@ impl GitFetcher {
             // explicitly (refs/heads only — not refs/*, which on GitHub
             // would drag in every change request's head).
             args.extend(["origin", "+refs/heads/*:refs/heads/*"]);
-            run_git(Some(&local), &args, token)
+            run_git(Some(&local), &args, auth)
                 .await
                 .with_context(|| format!("fetching {clone_url}"))?;
             // git fetch never moves a bare mirror's HEAD — it stays
@@ -125,7 +127,7 @@ impl GitFetcher {
             // succeeded, and a HEAD left dangling fails the resolve
             // below loudly — a hiccup here must not fail a healthy
             // fetch.
-            match remote_head(clone_url, token).await {
+            match remote_head(clone_url, auth).await {
                 // Only re-point at a branch this fetch actually brought:
                 // one created-and-made-default after the fetch
                 // enumerated refs would leave HEAD dangling until the
@@ -205,7 +207,7 @@ impl GitFetcher {
             let partial_str = partial.to_str().context("git cache path is not UTF-8")?;
             args.extend([clone_url, partial_str]);
             let cloned_into_place = async {
-                run_git(None, &args, token)
+                run_git(None, &args, auth)
                     .await
                     .with_context(|| format!("cloning {clone_url}"))?;
                 tokio::fs::rename(&partial, &local)
@@ -270,8 +272,8 @@ enum RemoteHead {
     Unknown,
 }
 
-async fn remote_head(clone_url: &str, token: Option<&str>) -> anyhow::Result<RemoteHead> {
-    let out = run_git(None, &["ls-remote", "--symref", clone_url, "HEAD"], token)
+async fn remote_head(clone_url: &str, auth: Option<&GitAuth>) -> anyhow::Result<RemoteHead> {
+    let out = run_git(None, &["ls-remote", "--symref", clone_url, "HEAD"], auth)
         .await
         .with_context(|| format!("asking {clone_url} where its HEAD points"))?;
     let symref = out.lines().find_map(|line| {
@@ -484,7 +486,7 @@ const GIT_TIMEOUT: Duration = Duration::from_secs(4 * 60 * 60);
 async fn run_git(
     dir: Option<&std::path::Path>,
     args: &[&str],
-    token: Option<&str>,
+    auth: Option<&GitAuth>,
 ) -> anyhow::Result<String> {
     let mut cmd = tokio::process::Command::new("git");
     if let Some(dir) = dir {
@@ -503,10 +505,10 @@ async fn run_git(
         ("http.lowSpeedLimit", "1024".to_string()),
         ("http.lowSpeedTime", "60".to_string()),
     ];
-    if let Some(token) = token {
-        // GitHub accepts any username with the token as password.
-        let basic =
-            base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{token}"));
+    if let Some(auth) = auth {
+        // The forge adapter dictates the username its tokens pair with.
+        let basic = base64::engine::general_purpose::STANDARD
+            .encode(format!("{}:{}", auth.username, auth.token));
         config.push(("http.extraHeader", format!("Authorization: Basic {basic}")));
     }
     cmd.env("GIT_CONFIG_COUNT", config.len().to_string());
