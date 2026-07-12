@@ -449,6 +449,11 @@ pub struct ObjectStoreConfig {
     pub access_key: String,
     pub secret_key: String,
     pub region: String,
+    /// Key prefix every object lands under — empty means the bucket
+    /// root. Lets deployments share a bucket, and gives each e2e test
+    /// database its own key namespace so identical fixture commits can
+    /// never read each other's Shards.
+    pub key_prefix: String,
 }
 
 impl ObjectStoreConfig {
@@ -464,21 +469,28 @@ impl ObjectStoreConfig {
             access_key: var_or("YG_S3_ACCESS_KEY", "yggdrasil"),
             secret_key: var_or("YG_S3_SECRET_KEY", "yggdrasil"),
             region: var_or("YG_S3_REGION", "us-east-1"),
+            key_prefix: var_or("YG_S3_PREFIX", ""),
         }
     }
 
     pub fn connect(&self) -> anyhow::Result<Arc<dyn ObjectStore>> {
-        Ok(Arc::new(
-            AmazonS3Builder::new()
-                .with_endpoint(&self.endpoint)
-                .with_bucket_name(&self.bucket)
-                .with_access_key_id(&self.access_key)
-                .with_secret_access_key(&self.secret_key)
-                .with_region(&self.region)
-                .with_allow_http(true)
-                .build()
-                .context("configuring object store client")?,
-        ))
+        let s3 = AmazonS3Builder::new()
+            .with_endpoint(&self.endpoint)
+            .with_bucket_name(&self.bucket)
+            .with_access_key_id(&self.access_key)
+            .with_secret_access_key(&self.secret_key)
+            .with_region(&self.region)
+            .with_allow_http(true)
+            .build()
+            .context("configuring object store client")?;
+        Ok(if self.key_prefix.is_empty() {
+            Arc::new(s3)
+        } else {
+            Arc::new(object_store::prefix::PrefixStore::new(
+                s3,
+                self.key_prefix.as_str(),
+            ))
+        })
     }
 }
 

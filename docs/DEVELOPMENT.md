@@ -47,6 +47,7 @@ which is required:
 | `YG_S3_BUCKET` | `yggdrasil` | Shard bucket |
 | `YG_S3_ACCESS_KEY` / `YG_S3_SECRET_KEY` | `yggdrasil` / `yggdrasil` | Object storage credentials |
 | `YG_S3_REGION` | `us-east-1` | Object storage region |
+| `YG_S3_PREFIX` | *(empty)* | Key prefix all objects land under; empty means the bucket root |
 | `YG_GIT_CACHE` | `./data/git` | Worker-local cache of bare clones |
 | `YG_GITHUB_TOKEN` | — (optional) | Forge token for `github.com` Sync |
 | `YG_POLL_INTERVAL` | `300` | Seconds between a repo's default-branch head checks (per-repo override: `repo add --poll-interval`) |
@@ -93,16 +94,24 @@ the read-only `/v1/status`; `/v1/admin/*` requires the Admin token.
 
 ## Checks
 
-CI runs exactly this on every Change Request; run it locally before pushing
-(the e2e tests need the compose stack up):
+CI runs exactly this on every Change Request, as two jobs; run it locally
+before pushing. The cheap job needs no services:
 
 ```sh
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
+cargo test --workspace --exclude yg-cli --locked
+```
+
+The e2e job runs the `yg-cli` suites against the compose stack (each test
+gets its own database, and its object-store keys are prefixed with that
+database's name, so parallel tests never share state):
+
+```sh
 docker compose up -d --wait postgres minio
 docker compose run --rm minio-init
-cargo test --workspace --locked
+cargo test -p yg-cli --locked
 ```
 
 The toolchain is pinned in `rust-toolchain.toml` so a new stable clippy can't

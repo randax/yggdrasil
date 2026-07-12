@@ -1270,9 +1270,8 @@ async fn yg_serve_role_all_syncs_an_added_repo_without_a_separate_worker() {
     let head = git(&repo_dir, &["rev-parse", "HEAD"]);
 
     let db_name = create_test_db().await;
-    let (_server, url) = spawn_yg_serve(|cmd| {
-        cmd.env("YG_DATABASE_URL", format!("{DEV_POSTGRES}/{db_name}"))
-            .env("YG_BOOTSTRAP_TOKEN", TEST_TOKEN)
+    let (_server, url) = spawn_yg_serve(&db_name, |cmd| {
+        cmd.env("YG_BOOTSTRAP_TOKEN", TEST_TOKEN)
             .env("YG_GIT_CACHE", fixture.path().join("git-cache"));
     });
 
@@ -1306,7 +1305,6 @@ async fn yg_serve_role_worker_drains_the_queue_without_serving_http() {
     let head = git(&repo_dir, &["rev-parse", "HEAD"]);
 
     let db_name = create_test_db().await;
-    let db_url = format!("{DEV_POSTGRES}/{db_name}");
     let control = control_plane(&db_name).await;
     let locator = fixture_url.strip_prefix("file://").unwrap();
     let (base, slug) = locator.rsplit_once("/acme/").unwrap();
@@ -1323,16 +1321,10 @@ async fn yg_serve_role_worker_drains_the_queue_without_serving_http() {
         .unwrap();
 
     // Worker role: no HTTP, no bootstrap token — just the queue.
-    let child = std::process::Command::new(assert_cmd::cargo::cargo_bin("yg"))
-        .env_remove("YG_BOOTSTRAP_TOKEN")
-        .env("YG_DATABASE_URL", &db_url)
-        .env("YG_GIT_CACHE", fixture.path().join("git-cache"))
-        .args(["serve", "--role=worker"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .unwrap();
-    let _worker = KillOnDrop(child);
+    let _worker = spawn_yg_worker(&db_name, |cmd| {
+        cmd.env_remove("YG_BOOTSTRAP_TOKEN")
+            .env("YG_GIT_CACHE", fixture.path().join("git-cache"));
+    });
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
@@ -1348,6 +1340,41 @@ async fn yg_serve_role_worker_drains_the_queue_without_serving_http() {
         );
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
+}
+
+/// The documented split topology (docs/DEVELOPMENT.md): one process
+/// serves HTTP, a separate process drains the queues, and they meet
+/// only in Postgres and object storage. The repo-add flows API →
+/// queue, the worker syncs and indexes it, and the API process reads
+/// the published Shard back through the search Verb.
+#[tokio::test(flavor = "multi_thread")]
+async fn split_api_and_worker_processes_index_and_serve_a_repo() {
+    let (fixture, _repo_dir, fixture_url) = go_fixture_repo();
+    let db_name = create_test_db().await;
+
+    let (_api, url) = spawn_yg_api(&db_name, |cmd| {
+        cmd.env("YG_BOOTSTRAP_TOKEN", TEST_TOKEN);
+    });
+    let _worker = spawn_yg_worker(&db_name, |cmd| {
+        cmd.env_remove("YG_BOOTSTRAP_TOKEN")
+            .env("YG_GIT_CACHE", fixture.path().join("git-cache"));
+    });
+
+    post_repo(&url, serde_json::json!({"url": fixture_url})).await;
+    await_symbol(&url, "Hello", std::time::Duration::from_secs(60)).await;
+
+    // The published Shard lives under this database's key namespace —
+    // observed through an *un-prefixed* client, so the isolation is in
+    // the bucket, not a client-side illusion.
+    let raw = dev_object_store("");
+    let under_prefix = raw
+        .list_with_delimiter(Some(&object_store::path::Path::from(db_name.as_str())))
+        .await
+        .unwrap();
+    assert!(
+        !under_prefix.common_prefixes.is_empty() || !under_prefix.objects.is_empty(),
+        "the Shard must be keyed under the test database's prefix {db_name}"
+    );
 }
 
 #[tokio::test]
@@ -1629,11 +1656,10 @@ async fn health_degrades_to_503_when_a_dependency_dies() {
 #[tokio::test(flavor = "multi_thread")]
 async fn yg_serve_boots_from_env_and_answers_yg_status_end_to_end() {
     let db_name = create_test_db().await;
-    let (_server, url) = spawn_yg_serve(|cmd| {
-        cmd.env("YG_DATABASE_URL", format!("{DEV_POSTGRES}/{db_name}"))
-            // Padded on purpose: env files commonly leak whitespace
-            // around secrets; clients present the clean token below.
-            .env("YG_BOOTSTRAP_TOKEN", " ygt_test_token\n");
+    let (_server, url) = spawn_yg_serve(&db_name, |cmd| {
+        // Padded on purpose: env files commonly leak whitespace
+        // around secrets; clients present the clean token below.
+        cmd.env("YG_BOOTSTRAP_TOKEN", " ygt_test_token\n");
     });
 
     assert_cmd::Command::cargo_bin("yg")

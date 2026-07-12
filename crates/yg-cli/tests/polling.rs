@@ -8,44 +8,7 @@ mod common;
 use common::*;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
-
-/// The Symbol names the `search` Verb returns for `query`, against a
-/// server reached over HTTP (the spawned-process e2e demo).
-async fn search_hit_names(base: &str, query: &str) -> Vec<String> {
-    let resp = reqwest::Client::new()
-        .post(format!("{base}/v1/verbs/search"))
-        .bearer_auth(TEST_TOKEN)
-        .json(&serde_json::json!({"query": query}))
-        .send()
-        .await
-        .unwrap();
-    let body: serde_json::Value = resp.json().await.unwrap();
-    body["hits"]
-        .as_array()
-        .map(|hits| {
-            hits.iter()
-                .filter_map(|hit| hit["name"].as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// Poll the running server until `name` is queryable, or fail at the
-/// deadline — the observable "the Knowledge Graph caught up" check.
-async fn await_symbol(base: &str, name: &str, within: Duration) {
-    let deadline = Instant::now() + within;
-    loop {
-        if search_hit_names(base, name).await.iter().any(|n| n == name) {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "symbol {name:?} never became queryable within {within:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-}
+use std::time::Duration;
 
 /// A poll config with a real interval, for tests that drive `poll_once`
 /// directly: the fixture repo is already due (its `next_poll_at` defaults
@@ -480,9 +443,8 @@ async fn the_poll_loop_re_indexes_a_push_with_no_manual_intervention() {
     let (fixture, repo_dir, fixture_url) = go_fixture_repo();
     let db_name = create_test_db().await;
     // A 1-second poll interval so the demo doesn't wait out the default.
-    let (_server, url) = spawn_yg_serve(|cmd| {
-        cmd.env("YG_DATABASE_URL", format!("{DEV_POSTGRES}/{db_name}"))
-            .env("YG_BOOTSTRAP_TOKEN", TEST_TOKEN)
+    let (_server, url) = spawn_yg_serve(&db_name, |cmd| {
+        cmd.env("YG_BOOTSTRAP_TOKEN", TEST_TOKEN)
             .env("YG_GIT_CACHE", fixture.path().join("git-cache"))
             .env("YG_POLL_INTERVAL", "1");
     });
