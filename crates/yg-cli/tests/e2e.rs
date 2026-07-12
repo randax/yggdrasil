@@ -1796,6 +1796,10 @@ async fn yg_status_json_emits_machine_readable_output() {
         serde_json::from_str(&stdout).expect("--json output must be valid JSON");
     assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(body["repos_indexed"], 0);
+    assert!(
+        body["uptime_seconds"].is_u64(),
+        "the CLI folds the uptime header back in for machine consumers, got: {body}"
+    );
 }
 
 /// An internal failure (the control plane severed under a live server)

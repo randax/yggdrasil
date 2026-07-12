@@ -124,6 +124,12 @@ async fn mcp_responses_are_compact_key_sorted_and_stable_within_a_session() {
     });
     let envelope = raw_mcp(&h.base, &call).await;
     assert_canonical("tools/call response", &envelope);
+    assert_eq!(
+        envelope,
+        raw_mcp(&h.base, &call).await,
+        "identical tools/call against an identical Shard must serve \
+         byte-identical envelopes"
+    );
 
     let parsed: serde_json::Value = serde_json::from_str(&envelope).unwrap();
     let text = parsed["result"]["content"][0]["text"]

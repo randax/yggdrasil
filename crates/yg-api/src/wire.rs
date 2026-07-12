@@ -36,9 +36,16 @@ impl<T: Serialize> IntoResponse for Wire<T> {
     fn into_response(self) -> Response {
         match canonical_string(&self.0) {
             Ok(body) => ([(header::CONTENT_TYPE, "application/json")], body).into_response(),
+            // Even this (unreachable-in-practice) failure keeps the
+            // server's one error shape: {"error": …}.
             Err(e) => {
                 tracing::error!("canonical serialization failed: {e}");
-                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    r#"{"error":"internal server error"}"#,
+                )
+                    .into_response()
             }
         }
     }
