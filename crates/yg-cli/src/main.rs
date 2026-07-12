@@ -1170,15 +1170,39 @@ async fn gc_loop(
 }
 
 async fn status(json: bool) -> anyhow::Result<()> {
-    let (server, _) = client_env()?;
-    let body = server_json(reqwest::Method::GET, "/v1/status", None).await?;
+    // Not server_json: uptime is volatile, so the server carries it in a
+    // header instead of the (cache-stable) body, and this is the one
+    // subcommand that reads it.
+    let (server, token) = client_env()?;
+    let resp = reqwest::Client::new()
+        .get(format!("{server}/v1/status"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .with_context(|| format!("requesting {server}/v1/status"))?;
+    let code = resp.status();
+    let uptime = resp
+        .headers()
+        .get(yg_api::UPTIME_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let text = resp.text().await.context("reading the server's response")?;
+    if !code.is_success() {
+        let reason = serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|body| body["error"].as_str().map(str::to_string))
+            .unwrap_or(text);
+        bail!("the server answered /v1/status with {code}: {reason}");
+    }
+    let body: serde_json::Value =
+        serde_json::from_str(&text).context("parsing the response from /v1/status")?;
 
     if json {
         println!("{}", serde_json::to_string_pretty(&body)?);
     } else {
         println!("yggdrasil Index Server at {server}");
         println!("version:       {}", body["version"].as_str().unwrap_or("?"));
-        println!("uptime:        {}s", body["uptime_seconds"]);
+        println!("uptime:        {}s", uptime.as_deref().unwrap_or("?"));
         println!("repos indexed: {}", body["repos_indexed"]);
     }
     Ok(())

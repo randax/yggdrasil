@@ -28,6 +28,26 @@ fn skill_install_places_navigation_skill_for_claude_code() {
 }
 
 #[test]
+fn skill_install_twice_produces_byte_identical_files() {
+    let home = tempfile::tempdir().unwrap();
+    let install = || {
+        assert_cmd::Command::cargo_bin("yg")
+            .unwrap()
+            .env("HOME", home.path())
+            .arg("skill")
+            .arg("install")
+            .assert()
+            .success();
+        installed_skill(home.path())
+    };
+
+    // The Skill sits as standing early-position context in the client's
+    // prompt; a byte that drifts between installs of the same contract
+    // version invalidates every user's prompt-cache prefix.
+    assert_eq!(install(), install());
+}
+
+#[test]
 fn skill_install_falls_back_to_userprofile_when_home_is_empty() {
     let userprofile = tempfile::tempdir().unwrap();
 

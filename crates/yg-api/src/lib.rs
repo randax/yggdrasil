@@ -1,5 +1,7 @@
 //! REST + MCP server.
 
+mod wire;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -15,6 +17,7 @@ use object_store::ObjectStore;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
+use wire::Wire;
 use yg_control::ControlPlane;
 // Server config embeds the object-store half owned by yg-shard; clients
 // of this crate keep addressing it as `yg_api::ObjectStoreConfig`.
@@ -210,7 +213,7 @@ async fn require_admin(req: Request, next: Next) -> Response {
 
 /// The one shape every error leaves this server in: `{"error": "…"}`.
 fn error_json(status: StatusCode, message: impl Into<String>) -> Response {
-    (status, Json(serde_json::json!({"error": message.into()}))).into_response()
+    (status, Wire(serde_json::json!({"error": message.into()}))).into_response()
 }
 
 /// The one error type handlers leave the API through: a client status
@@ -290,7 +293,7 @@ async fn mcp(
     match input {
         serde_json::Value::Array(messages) => {
             if messages.is_empty() {
-                return Json(jsonrpc_error(
+                return Wire(jsonrpc_error(
                     serde_json::Value::Null,
                     -32600,
                     "JSON-RPC batch must not be empty",
@@ -306,11 +309,11 @@ async fn mcp(
             if responses.is_empty() {
                 StatusCode::ACCEPTED.into_response()
             } else {
-                Json(serde_json::Value::Array(responses)).into_response()
+                Wire(serde_json::Value::Array(responses)).into_response()
             }
         }
         message => match handle_mcp_message(state, message).await {
-            Some(response) => Json(response).into_response(),
+            Some(response) => Wire(response).into_response(),
             None => StatusCode::ACCEPTED.into_response(),
         },
     }
@@ -442,7 +445,7 @@ async fn mcp_call_tool(
 }
 
 fn mcp_tool_result(structured: serde_json::Value, is_error: bool) -> serde_json::Value {
-    let text = serde_json::to_string_pretty(&structured).expect("tool content serializes");
+    let text = wire::canonical_string(&structured).expect("tool content serializes");
     serde_json::json!({
         "content": [{"type": "text", "text": text}],
         "structuredContent": structured,
@@ -524,7 +527,7 @@ async fn verb_node(
     let id = yg_verbs::VerbId::parse(&req.id).map_err(ApiError::bad_request)?;
     let (path, _) = resolve_shard(&state, &id.repo, None).await?;
     let response = run_verb(path, id, yg_verbs::node).await?;
-    Ok(Json(response).into_response())
+    Ok(Wire(response).into_response())
 }
 
 /// What a `next_cursor` opaquely carries: the traversal position, the
@@ -668,7 +671,7 @@ async fn verb_neighbors(
         }
         .encode()
     });
-    Ok(Json(NeighborsResponse {
+    Ok(Wire(NeighborsResponse {
         nodes: page.nodes,
         edges: page.edges,
         next_cursor,
@@ -858,7 +861,7 @@ async fn verb_history(
             commit,
         })
         .collect();
-    Ok(Json(HistoryResponse {
+    Ok(Wire(HistoryResponse {
         commits,
         next_cursor,
     })
@@ -1106,7 +1109,7 @@ async fn verb_search(
     // No indexed repos at all (a fresh org-wide search before anything is
     // indexed): an empty result, not an error.
     if targets.is_empty() {
-        return Ok(Json(SearchResponse {
+        return Ok(Wire(SearchResponse {
             hits: vec![],
             next_cursor: None,
         })
@@ -1182,7 +1185,7 @@ async fn verb_search(
         }
         .encode()
     });
-    Ok(Json(SearchResponse {
+    Ok(Wire(SearchResponse {
         hits: page,
         next_cursor,
     })
@@ -1576,7 +1579,7 @@ async fn admin_forge_add(
         } else {
             StatusCode::OK
         },
-        Json(AddForgeResponse {
+        Wire(AddForgeResponse {
             kind: kind.to_string(),
             org,
             base_url,
@@ -1657,7 +1660,7 @@ async fn admin_forge_discover(
             "{kind} org {org} is not connected; run yg admin forge add first"
         )));
     }
-    Ok(Json(DiscoverForgeResponse {
+    Ok(Wire(DiscoverForgeResponse {
         kind: kind.to_string(),
         org,
         base_url,
@@ -1727,7 +1730,7 @@ async fn admin_rules_add(
         } else {
             StatusCode::OK
         },
-        Json(AddRuleResponse {
+        Wire(AddRuleResponse {
             forge,
             pattern: pattern.to_string(),
             action: req.action,
@@ -1755,7 +1758,7 @@ struct RuleResponse {
 
 async fn admin_rules_list(State(state): State<Arc<AppState>>) -> Result<Response, ApiError> {
     let rules = state.control.rules().await?;
-    Ok(Json(RulesResponse {
+    Ok(Wire(RulesResponse {
         rules: rules
             .into_iter()
             .map(|rule| RuleResponse {
@@ -1827,7 +1830,7 @@ async fn admin_repo_add(
         } else {
             StatusCode::OK
         },
-        Json(AddRepoResponse {
+        Wire(AddRepoResponse {
             slug: locator.slug,
             created: outcome.created,
             fetch_queued: outcome.fetch_queued,
@@ -1859,7 +1862,7 @@ async fn admin_token_issue(
     let issued = state.control.issue_member_token(member).await?;
     Ok((
         StatusCode::CREATED,
-        Json(IssueTokenResponse {
+        Wire(IssueTokenResponse {
             id: issued.id,
             member: issued.member,
             token: issued.token,
@@ -1888,7 +1891,7 @@ async fn admin_token_revoke(
             "no active member token {id:?}"
         )));
     }
-    Ok(Json(RevokeTokenResponse { id, revoked: true }).into_response())
+    Ok(Wire(RevokeTokenResponse { id, revoked: true }).into_response())
 }
 
 #[derive(Serialize)]
@@ -1975,7 +1978,7 @@ async fn admin_status(State(state): State<Arc<AppState>>) -> Result<Response, Ap
             last_synced_commit: r.last_synced_commit,
         })
         .collect();
-    Ok(Json(AdminStatusResponse { repos }).into_response())
+    Ok(Wire(AdminStatusResponse { repos }).into_response())
 }
 
 /// The stage-specific words [`job_state`] fills in: what to call a
@@ -2009,18 +2012,24 @@ fn job_state(
 #[derive(Serialize)]
 struct StatusResponse {
     version: &'static str,
-    uptime_seconds: u64,
     repos_indexed: i64,
 }
 
+/// Uptime changes every second, and response bodies must be
+/// byte-identical for identical state (they become prompt-cache
+/// history); volatile values ride in headers instead.
+pub const UPTIME_HEADER: &str = "x-yggdrasil-uptime-seconds";
+
 async fn status(State(state): State<Arc<AppState>>) -> Result<Response, ApiError> {
     let repos_indexed = state.control.indexed_repo_count().await?;
-    Ok(Json(StatusResponse {
-        version: env!("CARGO_PKG_VERSION"),
-        uptime_seconds: state.started.elapsed().as_secs(),
-        repos_indexed,
-    })
-    .into_response())
+    Ok((
+        [(UPTIME_HEADER, state.started.elapsed().as_secs().to_string())],
+        Wire(StatusResponse {
+            version: env!("CARGO_PKG_VERSION"),
+            repos_indexed,
+        }),
+    )
+        .into_response())
 }
 
 /// The unauthenticated readiness report: an overall verdict and a bare
@@ -2039,7 +2048,7 @@ struct HealthChecks {
     object_store: &'static str,
 }
 
-async fn healthz(State(state): State<Arc<AppState>>) -> (StatusCode, Json<HealthResponse>) {
+async fn healthz(State(state): State<Arc<AppState>>) -> (StatusCode, Wire<HealthResponse>) {
     let (postgres, object_store) = tokio::join!(
         state.control.ping(),
         probe_object_store(state.store.as_ref())
@@ -2065,7 +2074,7 @@ async fn healthz(State(state): State<Arc<AppState>>) -> (StatusCode, Json<Health
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
-    (code, Json(body))
+    (code, Wire(body))
 }
 
 #[cfg(test)]
