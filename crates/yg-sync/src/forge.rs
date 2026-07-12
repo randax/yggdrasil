@@ -57,7 +57,7 @@ pub trait Forge: Send + Sync {
         scheme: &str,
         segments: &[&str],
         url: &str,
-    ) -> Result<String, String> {
+    ) -> Result<String, crate::locator::LocatorError> {
         let _ = (segments, url);
         Ok(scheme.to_string())
     }

@@ -3,6 +3,43 @@
 use crate::forge::Forge;
 use crate::forge::git_generic::GitForge;
 
+/// Why a repository URL failed to parse. Typed per the repo's
+/// error-modelling rule; rendered for humans (the admin API's
+/// bad-request body) only at the I/O edge via `Display`.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum LocatorError {
+    #[error("repository URLs don't take query strings or fragments: {url}")]
+    QueryOrFragment { url: String },
+    #[error("file URLs must be absolute (file:///path/to/repo): {url}")]
+    RelativeFileUrl { url: String },
+    #[error("file URL needs at least two path segments (owner/repo): {url}")]
+    TooFewFileSegments { url: String },
+    #[error("not a repository URL (expected scheme://…): {url}")]
+    NotAUrl { url: String },
+    #[error("unsupported URL scheme {scheme:?}: {url}")]
+    UnsupportedScheme { scheme: String, url: String },
+    #[error("repository URL has no path: {url}")]
+    NoPath { url: String },
+    #[error("repository URL has no host: {url}")]
+    NoHost { url: String },
+    #[error(
+        "credentials in repository URLs are not accepted \
+         (the worker reads tokens from the Forge's environment variable): {url}"
+    )]
+    CredentialsInUrl { url: String },
+    #[error("repository path must be at least owner/repo: {url}")]
+    TooFewSegments { url: String },
+    #[error("repository paths must not contain '.' or '..' segments: {path}")]
+    DotSegments { path: String },
+    #[error("repository paths must not contain whitespace or control characters: {path}")]
+    ForbiddenPathCharacters { path: String },
+    #[error(
+        "GitHub repositories are owner/repo — drop the trailing path \
+         (got {extra} extra segment(s)): {url}"
+    )]
+    GitHubSubpageUrl { extra: usize, url: String },
+}
+
 /// Where a repository lives, split the way the control plane stores it:
 /// a Forge (`base_url`) plus a repo path on it (`slug`). The clone URL is
 /// re-derived as `{base_url}/{slug}`.
@@ -30,12 +67,10 @@ impl RepoLocator {
     /// the same forge + slug. Anything that isn't plainly a repository
     /// path — credentials, query strings, fragments, `.`/`..` segments —
     /// is rejected rather than guessed at.
-    pub fn parse(url: &str) -> Result<Self, String> {
+    pub fn parse(url: &str) -> Result<Self, LocatorError> {
         let url = url.trim().trim_end_matches('/');
         if url.contains('?') || url.contains('#') {
-            return Err(format!(
-                "repository URLs don't take query strings or fragments: {url}"
-            ));
+            return Err(LocatorError::QueryOrFragment { url: url.into() });
         }
         let stripped = url.strip_suffix(".git").unwrap_or(url);
 
@@ -43,15 +78,11 @@ impl RepoLocator {
             // file:///abs/path only — a `file://host/…` authority would
             // silently become a path component.
             if !path.starts_with('/') {
-                return Err(format!(
-                    "file URLs must be absolute (file:///path/to/repo): {url}"
-                ));
+                return Err(LocatorError::RelativeFileUrl { url: url.into() });
             }
             let segments = path_segments(path)?;
             let Some((base_parts, slug_parts)) = segments.split_last_chunk::<2>() else {
-                return Err(format!(
-                    "file URL needs at least two path segments (owner/repo): {url}"
-                ));
+                return Err(LocatorError::TooFewFileSegments { url: url.into() });
             };
             return Ok(Self {
                 kind: GitForge.kind(),
@@ -62,31 +93,29 @@ impl RepoLocator {
 
         let (scheme, rest) = stripped
             .split_once("://")
-            .ok_or_else(|| format!("not a repository URL (expected scheme://…): {url}"))?;
+            .ok_or_else(|| LocatorError::NotAUrl { url: url.into() })?;
         let scheme = scheme.to_ascii_lowercase();
         if scheme != "https" && scheme != "http" {
-            return Err(format!("unsupported URL scheme {scheme:?}: {url}"));
+            return Err(LocatorError::UnsupportedScheme {
+                scheme,
+                url: url.into(),
+            });
         }
         let (host, path) = rest
             .split_once('/')
-            .ok_or_else(|| format!("repository URL has no path: {url}"))?;
+            .ok_or_else(|| LocatorError::NoPath { url: url.into() })?;
         if host.is_empty() {
-            return Err(format!("repository URL has no host: {url}"));
+            return Err(LocatorError::NoHost { url: url.into() });
         }
         if host.contains('@') {
-            return Err(format!(
-                "credentials in repository URLs are not accepted \
-                 (the worker reads tokens from the Forge's environment variable): {url}"
-            ));
+            return Err(LocatorError::CredentialsInUrl { url: url.into() });
         }
         // DNS is case-insensitive; normalize so URL spelling can't split
         // one forge into several.
         let host = host.to_ascii_lowercase();
         let segments = path_segments(path)?;
         if segments.len() < 2 {
-            return Err(format!(
-                "repository path must be at least owner/repo: {url}"
-            ));
+            return Err(LocatorError::TooFewSegments { url: url.into() });
         }
         // The forge claiming this host owns the rest of the rules: path
         // shape (GitHub is exactly owner/repo) and canonical scheme
@@ -120,12 +149,19 @@ pub fn join_clone_url(base_url: &str, slug: &str) -> String {
 /// A repository path split into its meaningful segments: empty segments
 /// (doubled slashes) collapse; `.`/`..` segments are rejected — they
 /// never name a repository, only an escape attempt or a typo.
-fn path_segments(path: &str) -> Result<Vec<&str>, String> {
+fn path_segments(path: &str) -> Result<Vec<&str>, LocatorError> {
+    // Whitespace and control characters never appear in a real
+    // repository path; stored in the slug they would be rejoined
+    // verbatim into a clone URL that fails every fetch forever.
+    if path
+        .bytes()
+        .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+    {
+        return Err(LocatorError::ForbiddenPathCharacters { path: path.into() });
+    }
     let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     if segments.iter().any(|s| *s == "." || *s == "..") {
-        return Err(format!(
-            "repository paths must not contain '.' or '..' segments: {path}"
-        ));
+        return Err(LocatorError::DotSegments { path: path.into() });
     }
     Ok(segments)
 }
@@ -180,7 +216,7 @@ mod tests {
             "https://github.com/acme/widgets/blob/main/README.md",
         ] {
             let err = RepoLocator::parse(url).unwrap_err();
-            assert!(err.contains("owner/repo"), "{url} → {err}");
+            assert!(err.to_string().contains("owner/repo"), "{url} → {err}");
         }
     }
 
@@ -226,7 +262,10 @@ mod tests {
             "https://token@github.com/acme/widgets",
         ] {
             let err = RepoLocator::parse(url).unwrap_err();
-            assert!(err.contains("credentials"), "{url} → {err}");
+            assert!(
+                matches!(err, LocatorError::CredentialsInUrl { .. }),
+                "{url} → {err}"
+            );
         }
     }
 
@@ -250,6 +289,21 @@ mod tests {
             "file:///tmp/fixtures/../escape/acme/widgets",
         ] {
             assert!(RepoLocator::parse(url).is_err(), "{url} must be rejected");
+        }
+    }
+
+    #[test]
+    fn paths_with_whitespace_or_control_characters_are_rejected() {
+        for url in [
+            "https://gitlab.example/acme/my repo",
+            "https://gitlab.example/acme/wid\tgets",
+            "file:///tmp/fixtures/acme/my repo",
+        ] {
+            let err = RepoLocator::parse(url).unwrap_err();
+            assert!(
+                matches!(err, LocatorError::ForbiddenPathCharacters { .. }),
+                "{url} → {err}"
+            );
         }
     }
 

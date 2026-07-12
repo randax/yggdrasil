@@ -45,13 +45,12 @@ impl Forge for GitHubForge {
         _scheme: &str,
         segments: &[&str],
         url: &str,
-    ) -> Result<String, String> {
+    ) -> Result<String, crate::locator::LocatorError> {
         if segments.len() > 2 {
-            return Err(format!(
-                "GitHub repositories are owner/repo — drop the trailing path \
-                 (got {} extra segment(s)): {url}",
-                segments.len() - 2
-            ));
+            return Err(crate::locator::LocatorError::GitHubSubpageUrl {
+                extra: segments.len() - 2,
+                url: url.into(),
+            });
         }
         Ok("https".to_string())
     }

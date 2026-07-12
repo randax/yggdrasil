@@ -289,7 +289,9 @@ pub(crate) async fn admin_repo_add(
             "poll_interval must be a positive number of seconds (got {interval})"
         )));
     }
-    let locator = RepoLocator::parse(&req.url).map_err(ApiError::bad_request)?;
+    // The typed parse error renders to its human-facing form here, at
+    // the I/O edge.
+    let locator = RepoLocator::parse(&req.url).map_err(|e| ApiError::bad_request(e.to_string()))?;
     let forge = yg_sync::forge::builtin()
         .by_kind(locator.kind)
         .ok_or_else(|| ApiError::internal(anyhow::anyhow!("locator kind without an adapter")))?;
