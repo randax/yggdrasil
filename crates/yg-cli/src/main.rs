@@ -966,7 +966,12 @@ enum Role {
 /// error, one line each, and a non-zero exit.
 fn config_check(role: Role) -> anyhow::Result<()> {
     let resolution = deploy_config::resolve(role, |var| std::env::var(var).ok());
-    println!("resolved configuration (role: {}):", role_name(role));
+    // clap's value-enum name, so the report echoes exactly what --role accepts.
+    let role_name = clap::ValueEnum::to_possible_value(&role)
+        .expect("no Role variant is skipped")
+        .get_name()
+        .to_string();
+    println!("resolved configuration (role: {role_name}):");
     for setting in &resolution.settings {
         let source = match setting.source {
             deploy_config::Source::Env => "env",
@@ -977,14 +982,6 @@ fn config_check(role: Role) -> anyhow::Result<()> {
     resolution.into_config()?;
     println!("configuration valid");
     Ok(())
-}
-
-fn role_name(role: Role) -> &'static str {
-    match role {
-        Role::All => "all",
-        Role::Api => "api",
-        Role::Worker => "worker",
-    }
 }
 
 async fn serve(role: Role) -> anyhow::Result<()> {

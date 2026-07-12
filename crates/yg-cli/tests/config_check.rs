@@ -46,6 +46,10 @@ fn config_check_reports_resolved_config_without_starting_the_server() {
 fn config_check_never_prints_credentials() {
     yg().env("YG_BOOTSTRAP_TOKEN", "ygt_admin_credential")
         .env("YG_S3_SECRET_KEY", "s3_secret_credential")
+        .env(
+            "YG_DATABASE_URL",
+            "postgres://yg:db_password_credential@db.invalid:5432/yg",
+        )
         .arg("config-check")
         .assert()
         .success()
@@ -53,8 +57,10 @@ fn config_check_never_prints_credentials() {
             contains("ygt_admin_credential")
                 .not()
                 .and(contains("s3_secret_credential").not())
+                .and(contains("db_password_credential").not())
                 .and(contains("YG_BOOTSTRAP_TOKEN"))
-                .and(contains("YG_S3_SECRET_KEY")),
+                .and(contains("YG_S3_SECRET_KEY"))
+                .and(contains("db.invalid:5432/yg")),
         );
 }
 

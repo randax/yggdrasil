@@ -1,8 +1,11 @@
 //! One typed view of the deployment's `YG_*` environment (issue #50).
 //!
-//! Every server and worker setting resolves here — nowhere else in the
-//! workspace reads deployment environment variables — so this module is
-//! the single place to see, validate, and document the configuration.
+//! Every server and worker setting resolves here, so this module is the
+//! single place to see, validate, and document the configuration. The
+//! one exception is Forge tokens (`YG_GITHUB_TOKEN` by default): their
+//! env var names live in the control plane's Forge records, so the Sync
+//! worker reads them per job — resolution here cannot know them without
+//! connecting, and config-check never connects.
 //! Resolution never touches the network or the database; `yg
 //! config-check` reuses it to report the resolved configuration and
 //! every validation error without starting the server.
@@ -111,7 +114,7 @@ pub fn resolve(role: Role, lookup: impl Fn(&str) -> Option<String>) -> Resolutio
     let config = DeployConfig {
         listen,
         bootstrap_token,
-        database_url: r.string("YG_DATABASE_URL", yg_control::DEFAULT_DATABASE_URL),
+        database_url: r.database_url("YG_DATABASE_URL", yg_control::DEFAULT_DATABASE_URL),
         shard_cache: r.string("YG_SHARD_CACHE", "./data/shard-cache").into(),
         git_cache: r.string("YG_GIT_CACHE", "./data/git").into(),
         object_store: ObjectStoreConfig {
@@ -202,6 +205,22 @@ impl Resolver<'_> {
         }
     }
 
+    /// Like [`Self::string`] but shown with any URL password masked: a
+    /// database URL routinely embeds a credential, and the settings
+    /// report must never print one.
+    fn database_url(&mut self, var: &'static str, default: &str) -> String {
+        match self.raw(var) {
+            Some(value) => {
+                self.record(var, redact_url_password(&value), Source::Env);
+                value
+            }
+            None => {
+                self.record(var, redact_url_password(default), Source::Default);
+                default.to_string()
+            }
+        }
+    }
+
     fn listen_addr(&mut self, var: &'static str, default: &str) -> SocketAddr {
         let fallback: SocketAddr = default.parse().expect("default listen address parses");
         let Some(value) = self.raw(var) else {
@@ -247,6 +266,31 @@ impl Resolver<'_> {
 
 /// What the settings report shows in place of any credential.
 pub const REDACTED: &str = "(redacted)";
+
+/// Mask the password of a URL's `user:password@` userinfo, leaving the
+/// user and host visible. URLs without userinfo pass through untouched.
+/// Userinfo cannot contain an unencoded `/` or `@`, so the first `@`
+/// before the path is the userinfo delimiter.
+fn redact_url_password(url: &str) -> String {
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_string();
+    };
+    let rest = &url[scheme_end + 3..];
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    let Some(at) = rest[..authority_end].find('@') else {
+        return url.to_string();
+    };
+    let userinfo = &rest[..at];
+    let Some(colon) = userinfo.find(':') else {
+        return url.to_string();
+    };
+    format!(
+        "{}{}{}",
+        &url[..scheme_end + 3 + colon + 1],
+        REDACTED,
+        &rest[at..]
+    )
+}
 
 #[cfg(test)]
 mod tests {
@@ -420,6 +464,49 @@ mod tests {
         };
         assert_eq!(shown("YG_BOOTSTRAP_TOKEN"), REDACTED);
         assert_eq!(shown("YG_S3_SECRET_KEY"), REDACTED);
+    }
+
+    #[test]
+    fn the_database_url_password_is_redacted_in_the_settings_report() {
+        let resolution = resolve(
+            Role::Worker,
+            env(&[(
+                "YG_DATABASE_URL",
+                "postgres://yg_user:db_password@db.example.test:5432/yg",
+            )]),
+        );
+        let shown = &resolution
+            .settings
+            .iter()
+            .find(|s| s.var == "YG_DATABASE_URL")
+            .unwrap()
+            .shown;
+        assert!(!shown.contains("db_password"), "{shown} leaks the password");
+        assert!(
+            shown.contains("yg_user") && shown.contains("db.example.test:5432/yg"),
+            "{shown} should still identify the database"
+        );
+        // The config itself keeps the working URL.
+        let config = resolution.into_config().unwrap();
+        assert_eq!(
+            config.database_url,
+            "postgres://yg_user:db_password@db.example.test:5432/yg"
+        );
+    }
+
+    #[test]
+    fn a_database_url_without_a_password_is_shown_as_is() {
+        let resolution = resolve(
+            Role::Worker,
+            env(&[("YG_DATABASE_URL", "postgres://db.example.test/yg")]),
+        );
+        let shown = &resolution
+            .settings
+            .iter()
+            .find(|s| s.var == "YG_DATABASE_URL")
+            .unwrap()
+            .shown;
+        assert!(shown.contains("postgres://db.example.test/yg"), "{shown}");
     }
 
     #[test]
