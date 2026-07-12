@@ -9,6 +9,13 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::{Direction, TraversalShape};
 
+/// The longest encoded cursor the codec will decode. The largest
+/// legitimate cursor this server mints is a search cursor pinning
+/// `MAX_SEARCH_TARGETS` (1000) repos — a few hundred KB encoded — so a
+/// megabyte leaves generous headroom while stopping a multi-megabyte
+/// forgery before any base64 or JSON work is spent on it.
+const MAX_ENCODED_CURSOR_LEN: usize = 1024 * 1024;
+
 /// Encode a cursor struct into its opaque wire form.
 pub fn encode<T: Serialize>(cursor: &T) -> String {
     use base64::Engine;
@@ -18,16 +25,20 @@ pub fn encode<T: Serialize>(cursor: &T) -> String {
 
 /// Decode an opaque wire cursor. The error is client-facing and the
 /// same for every way a cursor can be malformed — a tampered cursor
-/// learns nothing about which byte offended.
+/// learns nothing about which byte offended, and an oversized one is
+/// rejected before any decode work happens.
 pub fn decode<T: DeserializeOwned>(cursor: &str) -> Result<T, String> {
     use base64::Engine;
+    let invalid =
+        || "invalid cursor: pass back next_cursor from a previous response, unmodified".to_string();
+    if cursor.len() > MAX_ENCODED_CURSOR_LEN {
+        return Err(invalid());
+    }
     base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(cursor)
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .ok_or_else(|| {
-            "invalid cursor: pass back next_cursor from a previous response, unmodified".to_string()
-        })
+        .ok_or_else(invalid)
 }
 
 /// What a `neighbors` `next_cursor` opaquely carries: the traversal
@@ -147,6 +158,29 @@ mod tests {
                 "{bad:?} must be rejected"
             );
         }
+    }
+
+    /// An oversized cursor is rejected up front — with the same message
+    /// as any other malformed cursor — instead of paying for a
+    /// multi-megabyte base64 + JSON decode an attacker controls.
+    #[test]
+    fn oversized_cursors_are_rejected_before_decoding() {
+        let huge = "A".repeat(MAX_ENCODED_CURSOR_LEN + 1);
+        let err = match decode::<HistoryCursor>(&huge) {
+            Err(err) => err,
+            Ok(_) => panic!("an oversized cursor must be rejected"),
+        };
+        assert!(err.contains("invalid cursor"), "uniform message: {err}");
+        // The bound is on the encoded form: a legitimate cursor well
+        // under it still decodes.
+        let cursor = HistoryCursor {
+            rev: "rev-1".to_string(),
+            id: "file:github.com/acme/widgets:main.go".to_string(),
+            since: None,
+            after_committed_at: 1,
+            after_sha: "abc".to_string(),
+        };
+        assert!(decode::<HistoryCursor>(&encode(&cursor)).is_ok());
     }
 
     #[test]
