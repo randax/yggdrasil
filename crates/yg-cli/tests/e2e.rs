@@ -1542,9 +1542,10 @@ async fn internal_failures_return_a_sanitized_500_and_log_the_full_chain() {
     }
     let sink = Sink::default();
     let writer = sink.clone();
-    let _ = tracing_subscriber::fmt()
+    tracing_subscriber::fmt()
         .with_writer(move || writer.clone())
-        .try_init();
+        .try_init()
+        .expect("test requires setting the global tracing subscriber");
 
     let db_name = create_test_db().await;
     let server = serve(test_config(&db_name)).await.expect("boot");
