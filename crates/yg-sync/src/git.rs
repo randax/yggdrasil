@@ -349,7 +349,7 @@ pub async fn lock_mirror(
     let remaining = timeout.saturating_sub(in_process_wait);
     let lock_path = cache_dir.join(format!("{repo_id}.git.lock"));
     let cache_dir = cache_dir.to_path_buf();
-    let lock_file = tokio::task::spawn_blocking(move || -> anyhow::Result<std::fs::File> {
+    let lock_task = tokio::task::spawn_blocking(move || -> anyhow::Result<std::fs::File> {
         std::fs::create_dir_all(&cache_dir).context("creating the git cache directory")?;
         let file = open_lock_file(&lock_path)?;
         let file_wait_started = std::time::Instant::now();
@@ -377,9 +377,23 @@ pub async fn lock_mirror(
                 }
             }
         }
-    })
-    .await
-    .context("mirror lock task panicked")??;
+    });
+    // The poll loop above bounds itself, but only once it is running: a
+    // hung filesystem call before it (create_dir_all, the open) or a
+    // saturated blocking pool would otherwise wedge this future — and
+    // the in-process guard it holds — past every deadline. Bound the
+    // whole blocking task by the same budget. On timeout the detached
+    // task's eventual result is dropped, closing (and so releasing) a
+    // lock it may still win.
+    let lock_file = tokio::time::timeout(remaining, lock_task)
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "timed out before the mirror lock poll could run — a hung cache \
+                 filesystem or a saturated blocking pool; retrying after backoff"
+            )
+        })?
+        .context("mirror lock task panicked")??;
     Ok(MirrorGuard {
         _lock_file: lock_file,
         _serialize_in_process: in_process,
