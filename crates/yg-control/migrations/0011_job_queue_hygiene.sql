@@ -40,11 +40,16 @@ CREATE INDEX repos_current_shard ON repos (current_shard_id)
 -- scheme regex that diverged from Rust's repo_qualifier (a literal split
 -- at the first "://"); this expression is asserted verbatim against
 -- yg_control::REPO_QUALIFIER_SQL, whose tests pin it to the Rust
--- function. A collision under the corrected grammar fails loudly on
--- repos_qualifier, same stance as 0006.
+-- function. The unique index is rebuilt around the rewrite so
+-- uniqueness is judged on the final state (a non-deferrable index
+-- checks row-by-row mid-UPDATE and could trip on a transient swap); a
+-- genuine collision under the corrected grammar still fails loudly on
+-- the recreate, naming the duplicate — same stance as 0006.
+DROP INDEX repos_qualifier;
 UPDATE repos r
 SET qualifier = rtrim(CASE WHEN strpos(f.base_url, '://') > 0
                            THEN substr(f.base_url, strpos(f.base_url, '://') + 3)
                            ELSE f.base_url END, '/') || '/' || r.slug
 FROM forges f
 WHERE f.id = r.forge_id;
+CREATE UNIQUE INDEX repos_qualifier ON repos (qualifier);

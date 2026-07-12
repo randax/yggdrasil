@@ -40,8 +40,9 @@ pub struct DeployConfig {
     pub discovery_interval: Duration,
     pub gc_grace: Duration,
     pub gc_interval: Duration,
-    /// How long a terminal job row is kept as `yg admin status` history
-    /// before the GC cadence removes it.
+    /// How long a terminal job row is kept before the GC cadence
+    /// removes it — retention only bounds queue-table growth; nothing
+    /// reads terminal rows (`yg admin status` already excludes them).
     pub job_retention: Duration,
 }
 

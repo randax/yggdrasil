@@ -1296,10 +1296,11 @@ impl ControlPlane {
     }
 
     /// Remove terminal job rows finished longer ago than `retention`.
-    /// Terminal jobs are kept only as `yg admin status` history; without
-    /// retention they accumulate forever. Rows still in flight (or
-    /// re-queued) carry no `finished_at` and are never touched. Returns
-    /// how many rows were removed.
+    /// Nothing reads a terminal row (`yg admin status` joins only
+    /// non-done jobs), so without retention they accumulate forever for
+    /// no one. Rows still in flight (or re-queued) carry no
+    /// `finished_at` and are never touched. Returns how many rows were
+    /// removed.
     pub async fn delete_terminal_jobs_past_retention(
         &self,
         retention: std::time::Duration,

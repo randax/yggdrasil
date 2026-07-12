@@ -102,10 +102,11 @@ impl IndexWorker {
     }
 
     /// Remove terminal job rows finished longer ago than `retention`
-    /// (issue #49): the queue is a work list plus recent history for
-    /// `yg admin status`, not an archive, and terminal rows otherwise
-    /// accumulate forever. Runs beside [`Self::gc_once`] on the GC
-    /// cadence. Returns how many rows were removed.
+    /// (issue #49): nothing reads a job row after it settles — even
+    /// `yg admin status` excludes terminal rows — so retention exists
+    /// purely to stop the queue table growing forever. Runs beside
+    /// [`Self::gc_once`] on the GC cadence. Returns how many rows were
+    /// removed.
     pub async fn retire_terminal_jobs(&self, retention: Duration) -> anyhow::Result<u64> {
         let deleted = self
             .control

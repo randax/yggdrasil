@@ -58,8 +58,7 @@ async fn terminal_jobs_older_than_the_retention_window_are_removed() {
     assert_eq!(done, 2, "fetch and index both settled terminal");
     assert_eq!(stamped, done, "every terminal job is stamped finished_at");
 
-    // Inside the retention window nothing is removed — the rows are
-    // still `yg admin status` history.
+    // Inside the retention window nothing is removed.
     assert_eq!(
         h.indexer
             .retire_terminal_jobs(Duration::from_secs(3600))
@@ -69,8 +68,8 @@ async fn terminal_jobs_older_than_the_retention_window_are_removed() {
         "jobs finished seconds ago are inside the retention window"
     );
 
-    // A queued job must survive any retention pass — it is work, not
-    // history, and carries no finished_at.
+    // A queued job must survive any retention pass — it is pending
+    // work and carries no finished_at.
     sqlx::query("INSERT INTO jobs (kind, repo_id, state) VALUES ('fetch', $1, 'queued')")
         .bind(h.repo_id().await)
         .execute(&pool)
