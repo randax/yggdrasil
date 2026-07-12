@@ -317,19 +317,24 @@ impl Resolver<'_> {
 /// What the settings report shows in place of any credential.
 pub const REDACTED: &str = "(redacted)";
 
-/// Mask the password of a URL's `user:password@` userinfo, leaving the
-/// user and host visible. Clients treat the last `@` in the authority
-/// as the userinfo delimiter, so redaction does too. A value that has
-/// an `@` but cannot be confidently parsed (no scheme, or the `@`
-/// lands outside the authority because of an unencoded `/` in the
-/// password) is replaced wholesale — a report must never gamble with a
-/// credential.
+/// Mask the credential-bearing parts of a URL, leaving the user, host,
+/// and path visible. Clients treat the last `@` in the authority as
+/// the userinfo delimiter, so redaction does too. The query string is
+/// masked wholesale: libpq-style URLs accept `?password=...`, so
+/// nothing after `?` can be vetted. A value that has an `@` but cannot
+/// be confidently parsed (no scheme, or the `@` lands outside the
+/// authority because of an unencoded `/` in the password) is replaced
+/// wholesale — a report must never gamble with a credential.
 fn redact_url_password(url: &str) -> String {
+    let (url, query_mask) = match url.split_once('?') {
+        Some((base, _)) => (base, format!("?{REDACTED}")),
+        None => (url, String::new()),
+    };
     let Some(scheme_end) = url.find("://") else {
         return if url.contains('@') {
             REDACTED.to_string()
         } else {
-            url.to_string()
+            format!("{url}{query_mask}")
         };
     };
     let rest = &url[scheme_end + 3..];
@@ -338,18 +343,19 @@ fn redact_url_password(url: &str) -> String {
         return if rest.contains('@') {
             REDACTED.to_string()
         } else {
-            url.to_string()
+            format!("{url}{query_mask}")
         };
     };
     let userinfo = &authority[..at];
     let Some(colon) = userinfo.find(':') else {
-        return url.to_string();
+        return format!("{url}{query_mask}");
     };
     format!(
-        "{}{}{}",
+        "{}{}{}{}",
         &url[..scheme_end + 3 + colon + 1],
         REDACTED,
-        &rest[at..]
+        &rest[at..],
+        query_mask
     )
 }
 
@@ -608,6 +614,16 @@ mod tests {
         );
         // Scheme-less but credential-shaped: same rule.
         assert_eq!(super::redact_url_password("user:pw@host/db"), REDACTED);
+        // libpq-style URLs take the password as a query parameter, so
+        // the query string is masked wholesale.
+        assert_eq!(
+            super::redact_url_password("postgres://user@host/yg?password=qp_secret"),
+            format!("postgres://user@host/yg?{REDACTED}")
+        );
+        assert_eq!(
+            super::redact_url_password("postgres://u:pw@host/yg?password=qp_secret&sslmode=x"),
+            format!("postgres://u:{REDACTED}@host/yg?{REDACTED}")
+        );
         // IPv6 host with a port parses fine and has no credential.
         assert_eq!(
             super::redact_url_password("postgres://[::1]:5432/yg"),

@@ -33,8 +33,20 @@ pub fn parse_client_config(contents: &str) -> Result<ClientConfig, ClientConfigE
             .span()
             .map(|span| contents[..span.start].lines().count().max(1))
             .unwrap_or(0),
-        message: e.message().to_string(),
+        message: drop_backtick_quoted(e.message()),
     })
+}
+
+/// serde's type errors quote the offending value in backticks ("invalid
+/// type: integer `123456789`, expected a string" — that integer could
+/// be a numeric token written unquoted), so every backtick-quoted
+/// segment is elided.
+fn drop_backtick_quoted(message: &str) -> String {
+    message
+        .split('`')
+        .enumerate()
+        .map(|(i, part)| if i % 2 == 0 { part } else { "…" })
+        .collect()
 }
 
 #[cfg(test)]
@@ -119,6 +131,16 @@ token = "not-my-credential"
             let message = parse_client_config(contents).unwrap_err().to_string();
             assert!(
                 !message.contains("ygt_SUPERSECRET_bare"),
+                "error echoes the credential: {message}"
+            );
+            assert!(message.contains("line"), "error should locate the problem");
+        }
+        // serde type errors backtick-quote primitive values — a numeric
+        // PIN or token written unquoted must not survive into stderr.
+        for contents in ["token = 90210411\n", "server = 90210411\n"] {
+            let message = parse_client_config(contents).unwrap_err().to_string();
+            assert!(
+                !message.contains("90210411"),
                 "error echoes the credential: {message}"
             );
             assert!(message.contains("line"), "error should locate the problem");
