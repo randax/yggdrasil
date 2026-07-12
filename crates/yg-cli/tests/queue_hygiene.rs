@@ -151,12 +151,7 @@ async fn unknown_kind_state_and_provenance_values_fail_at_the_database() {
     );
 
     // Same for the Shard provenance vocabulary.
-    for provenance in [
-        yg_shard::Provenance::Precise,
-        yg_shard::Provenance::Syntactic,
-        yg_shard::Provenance::Extracted,
-        yg_shard::Provenance::Inferred,
-    ] {
+    for provenance in yg_shard::Provenance::ALL {
         sqlx::query(
             "INSERT INTO shards (repo_id, revision, manifest_key, commit_sha,
                                  provenance_level, node_count, edge_count)
@@ -187,6 +182,25 @@ async fn unknown_kind_state_and_provenance_values_fail_at_the_database() {
         .await
         .unwrap_err(),
         "shards_provenance_level_check",
+    );
+}
+
+/// Like yg-control's kind-constraint unit test, but for the provenance
+/// vocabulary: yg-control cannot see [`yg_shard::Provenance`], so the
+/// clause the migration installs is pinned here, where both crates are
+/// in view. Needs no database — it reads the migration source.
+#[test]
+fn the_provenance_constraint_mirrors_the_rust_vocabulary() {
+    let migration = include_str!("../../yg-control/migrations/0011_job_queue_hygiene.sql");
+    let clause = format!(
+        "provenance_level IN ({})",
+        yg_shard::Provenance::ALL
+            .map(|level| format!("'{}'", level.as_str()))
+            .join(", ")
+    );
+    assert!(
+        migration.contains(&clause),
+        "migration 0011 must constrain provenance_level to {clause}"
     );
 }
 

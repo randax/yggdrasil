@@ -1434,13 +1434,6 @@ fn hex_bytes(bytes: &[u8]) -> String {
     out
 }
 
-/// The one lease-claim query, shared by every job kind so the claim
-/// protocol can't drift between kinds. `$1` is the lease in seconds.
-/// `state <> 'done'` looks implied by the queued-or-expired OR (done
-/// rows have lease_until NULL), but the planner needs the partial index
-/// predicate verbatim to use jobs_claim_scan. The lease_until::text
-/// rendering is the fencing token settle/fail compare against. Kind,
-/// an extra due-predicate (over jobs `j` and repos `r`), and the extra
 /// The GC sweep's eligibility scan (see
 /// [`ControlPlane::superseded_shards_past_grace`]): every Shard no repo
 /// points at, superseded (or published, for one that never became
@@ -1453,6 +1446,13 @@ pub const SUPERSEDED_SHARDS_PAST_GRACE_SQL: &str =
        AND coalesce(s.superseded_at, s.published_at) < now() - make_interval(secs => $1)
      ORDER BY s.id";
 
+/// The one lease-claim query, shared by every job kind so the claim
+/// protocol can't drift between kinds. `$1` is the lease in seconds.
+/// `state <> 'done'` looks implied by the queued-or-expired OR (done
+/// rows have lease_until NULL), but the planner needs the partial index
+/// predicate verbatim to use jobs_claim_scan. The lease_until::text
+/// rendering is the fencing token settle/fail compare against. Kind,
+/// an extra due-predicate (over jobs `j` and repos `r`), and the extra
 /// RETURNING columns are the only legitimate variation. Public so the
 /// e2e plan tests can EXPLAIN the exact production query.
 pub fn claim_due_sql(kind: JobKind, extra_due_predicate: &str, returning: &str) -> String {
