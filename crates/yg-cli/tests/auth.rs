@@ -62,9 +62,24 @@ async fn member_token_can_call_verbs_but_not_admin_and_revocation_is_immediate()
     );
 
     // The whole /admin subtree is gated, existing route or not — a Member
-    // must not be able to map the admin surface by probing for 404s.
-    let (status, body) = get_with_token(&h.base, "/v1/admin/nonexistent", &token).await;
-    assert_eq!(status, 403, "unknown admin paths are gated too: {body}");
+    // must not be able to map the admin surface by probing for 404s. The
+    // bare subtree root is gated too.
+    for path in ["/v1/admin/nonexistent", "/v1/admin"] {
+        let (status, body) = get_with_token(&h.base, path, &token).await;
+        assert_eq!(status, 403, "{path} is gated for members too: {body}");
+    }
+    // The trailing-slash root cannot be routed inside the admin subtree
+    // (matchit); it must answer exactly like any other unknown /v1 path —
+    // a non-differential 404 that reveals nothing about the admin surface.
+    let (admin_slash_status, admin_slash_body) =
+        get_with_token(&h.base, "/v1/admin/", &token).await;
+    let (unknown_status, unknown_body) = get_with_token(&h.base, "/v1/nonexistent", &token).await;
+    assert_eq!(unknown_status, 404, "unknown paths 404: {unknown_body}");
+    assert_eq!(
+        (admin_slash_status, &admin_slash_body),
+        (unknown_status, &unknown_body),
+        "/v1/admin/ must be indistinguishable from any unknown path"
+    );
 
     let revoked = h.yg_ok(&["admin", "token", "revoke", &token_id]).await;
     assert!(

@@ -120,12 +120,21 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<RunningServer> {
         .route("/tokens", post(admin_token_issue))
         .route("/tokens/{id}/revoke", post(admin_token_revoke))
         .route("/status", get(admin_status))
-        // A catch-all so the scope gate covers the whole /admin subtree:
-        // a Member probing an unknown admin path gets the same 403 as a
-        // real one, never a 404 that maps the admin surface.
+        // Catch-alls so the scope gate covers the whole /admin subtree,
+        // including its bare root (`{*rest}` cannot match an empty
+        // remainder): a Member probing any admin path gets the same 403
+        // as a real one, never a 404 that maps the admin surface. The
+        // one exception is the trailing-slash root `/admin/`, which
+        // matchit cannot route here; it falls through to the outer
+        // fallback and answers exactly like every other unknown `/v1`
+        // path, so it is non-differential too.
+        .route(
+            "/",
+            axum::routing::any(async || ApiError::not_found("not found")),
+        )
         .route(
             "/{*rest}",
-            axum::routing::any(async || StatusCode::NOT_FOUND),
+            axum::routing::any(async || ApiError::not_found("not found")),
         )
         .route_layer(middleware::from_fn(require_admin));
     let member_routes = Router::new()
@@ -141,6 +150,10 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<RunningServer> {
     // structural, not a path comparison inside the middleware.
     let app = Router::new()
         .nest("/v1", member_routes.nest("/admin", admin_routes))
+        // Unknown paths leave in the same `{"error": …}` shape as every
+        // other error, and — being registered before the auth layer —
+        // still answer 401 to unauthenticated callers.
+        .fallback(async || ApiError::not_found("not found"))
         .layer(middleware::from_fn_with_state(state.clone(), authenticate))
         .route("/healthz", get(healthz))
         .with_state(state);

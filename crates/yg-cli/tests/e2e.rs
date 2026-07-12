@@ -1577,10 +1577,14 @@ async fn internal_failures_return_a_sanitized_500_and_log_the_full_chain() {
         "500 bodies must not leak the error chain: {text}"
     );
 
+    // The chain must appear on the sanitizer's own log line — the db name
+    // showing up in some other writer's output (e.g. sqlx statement
+    // logging) must not satisfy this.
     let logs = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
     assert!(
-        logs.contains(&db_name),
-        "the full error chain must appear in server logs, got:\n{logs}"
+        logs.lines()
+            .any(|line| line.contains("internal error") && line.contains(&db_name)),
+        "the full error chain must appear on the internal-error log line, got:\n{logs}"
     );
 }
 
