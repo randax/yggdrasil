@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 mod fts;
+pub mod graph_schema;
 pub use fts::{
     FTS_SEGMENT_FILE, FtsIndex, LocalHit, QueryMalformed, SearchDoc, SearchParams, build_fts,
     open_fts, search, snippets_for, unpack_fts,
@@ -201,10 +202,9 @@ const _: () = {
 };
 
 impl EdgeKind {
-    /// Every edge kind, for exhaustive checks (a cross-crate test holds
-    /// yg-verbs' `KNOWN_EDGE_KINDS` filter vocabulary to this list; the
-    /// `const _` block above pins its length, the yg-api drift test its
-    /// contents).
+    /// Every edge kind, for exhaustive checks (yg-verbs reads its
+    /// `edge_kinds` filter vocabulary straight from this list; the
+    /// `const _` block above pins its length).
     pub const ALL: &'static [EdgeKind] = &[
         EdgeKind::Defines,
         EdgeKind::Calls,
@@ -1154,7 +1154,11 @@ fn read_graph_counts(bytes: &[u8]) -> anyhow::Result<Counts> {
     let conn =
         rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let counts = conn.query_row(
-        "SELECT (SELECT count(*) FROM nodes), (SELECT count(*) FROM edges)",
+        &format!(
+            "SELECT (SELECT count(*) FROM {}), (SELECT count(*) FROM {})",
+            graph_schema::NODES,
+            graph_schema::EDGES
+        ),
         [],
         |row| {
             Ok(Counts {
@@ -1176,30 +1180,33 @@ fn build_graph_sqlite(graph: &Graph) -> anyhow::Result<Vec<u8>> {
     let conn = rusqlite::Connection::open(&path)?;
     // Write-once artifact: no journal to clean up, nothing to recover.
     conn.pragma_update(None, "journal_mode", "OFF")?;
-    conn.execute_batch(
-        "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-         CREATE TABLE nodes (
-             id           TEXT PRIMARY KEY,
-             kind         TEXT NOT NULL,
-             name         TEXT,
-             path         TEXT,
-             committed_at INTEGER
-         );
-         CREATE TABLE edges (
-             src        TEXT NOT NULL,
-             dst        TEXT NOT NULL,
-             kind       TEXT NOT NULL,
-             provenance TEXT NOT NULL,
-             confidence REAL NOT NULL,
-             location   TEXT
-         );
-         -- Two single-column indexes, not one composite: the read
-         -- path's incident-edge lookup is (src = ? OR dst = ?), which
-         -- SQLite turns into two index seeks only when each side has
-         -- its own index.
-         CREATE INDEX edges_src ON edges (src);
-         CREATE INDEX edges_dst ON edges (dst);",
-    )?;
+    {
+        use graph_schema::*;
+        conn.execute_batch(&format!(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE {NODES} (
+                 {NODE_ID}           TEXT PRIMARY KEY,
+                 {NODE_KIND}         TEXT NOT NULL,
+                 {NODE_NAME}         TEXT,
+                 {NODE_PATH}         TEXT,
+                 {NODE_COMMITTED_AT} INTEGER
+             );
+             CREATE TABLE {EDGES} (
+                 {EDGE_SRC}        TEXT NOT NULL,
+                 {EDGE_DST}        TEXT NOT NULL,
+                 {EDGE_KIND}       TEXT NOT NULL,
+                 {EDGE_PROVENANCE} TEXT NOT NULL,
+                 {EDGE_CONFIDENCE} REAL NOT NULL,
+                 {EDGE_LOCATION}   TEXT
+             );
+             -- Two single-column indexes, not one composite: the read
+             -- path's incident-edge lookup is (src = ? OR dst = ?), which
+             -- SQLite turns into two index seeks only when each side has
+             -- its own index.
+             CREATE INDEX edges_src ON {EDGES} ({EDGE_SRC});
+             CREATE INDEX edges_dst ON {EDGES} ({EDGE_DST});"
+        ))?;
+    }
     conn.execute(
         "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)",
         [SCHEMA_VERSION.to_string()],
@@ -1207,10 +1214,11 @@ fn build_graph_sqlite(graph: &Graph) -> anyhow::Result<Vec<u8>> {
     {
         let tx = conn.unchecked_transaction()?;
         {
-            let mut insert_node = tx.prepare(
-                "INSERT INTO nodes (id, kind, name, path, committed_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-            )?;
+            use graph_schema::*;
+            let mut insert_node = tx.prepare(&format!(
+                "INSERT INTO {NODES} ({NODE_ID}, {NODE_KIND}, {NODE_NAME}, {NODE_PATH}, \
+                 {NODE_COMMITTED_AT}) VALUES (?1, ?2, ?3, ?4, ?5)"
+            ))?;
             for node in &graph.nodes {
                 insert_node.execute(rusqlite::params![
                     node.id,
@@ -1220,10 +1228,10 @@ fn build_graph_sqlite(graph: &Graph) -> anyhow::Result<Vec<u8>> {
                     node.committed_at
                 ])?;
             }
-            let mut insert_edge = tx.prepare(
-                "INSERT INTO edges (src, dst, kind, provenance, confidence, location)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            )?;
+            let mut insert_edge = tx.prepare(&format!(
+                "INSERT INTO {EDGES} ({EDGE_SRC}, {EDGE_DST}, {EDGE_KIND}, {EDGE_PROVENANCE}, \
+                 {EDGE_CONFIDENCE}, {EDGE_LOCATION}) VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+            ))?;
             for edge in &graph.edges {
                 insert_edge.execute(rusqlite::params![
                     edge.src,

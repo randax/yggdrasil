@@ -1,6 +1,6 @@
 [package]
 name = "yg-verbs"
-description = "Verb engine (pure: control-plane + shard reads)"
+description = "Verb engine: cursors, validation, and shard reads behind one entry point"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,7 +9,16 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow = "1.0.102"
+base64 = "0.22.1"
+# Parsing the `history` Verb's RFC3339 `since` and rendering commit dates.
+# No clock needed — disable the default `now`/`clock` features.
+chrono = { version = "0.4.45", default-features = false, features = ["std"] }
 rusqlite = { version = "0.39", features = ["bundled"] }
 schemars = { version = "1.0.4", features = ["derive"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
+thiserror = "2.0.17"
+# The engine owns the blocking-execution contract: graph reads run on
+# the blocking pool, never the async runtime's threads.
+tokio = { version = "1.52.3", features = ["rt"] }
+yg-shard = { version = "0.1.0", path = "../yg-shard" }
