@@ -1,5 +1,7 @@
 //! REST + MCP server.
 
+mod wire;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -15,6 +17,7 @@ use object_store::ObjectStore;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
+use wire::{Wire, WireJson};
 use yg_control::ControlPlane;
 // Server config embeds the object-store half owned by yg-shard; clients
 // of this crate keep addressing it as `yg_api::ObjectStoreConfig`.
@@ -105,6 +108,12 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<RunningServer> {
             "/{*rest}",
             axum::routing::any(async || ApiError::not_found("not found")),
         )
+        // Set per router: method_not_allowed_fallback only rewrites the
+        // MethodRouters that exist in *this* router when called — it
+        // does not reach routes nested later. Before the route_layer,
+        // so a Member's wrong-method probe still answers the same 403
+        // as every other admin path.
+        .method_not_allowed_fallback(wire::method_not_allowed)
         .route_layer(middleware::from_fn(require_admin));
     let member_routes = Router::new()
         .route("/status", get(status))
@@ -112,7 +121,10 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<RunningServer> {
         .route("/verbs/neighbors", post(verb_neighbors))
         .route("/verbs/history", post(verb_history))
         .route("/verbs/search", post(verb_search))
-        .route("/mcp", post(mcp));
+        .route("/mcp", post(mcp))
+        // A wrong method on a live route keeps the one error shape
+        // instead of axum's empty-body 405.
+        .method_not_allowed_fallback(wire::method_not_allowed);
     // The auth layer wraps everything routed so far — including the
     // fallback, so even nonexistent paths answer 401 to unauthenticated
     // callers. `/healthz` is added *after* the layer: its exemption is
@@ -125,6 +137,9 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<RunningServer> {
         .fallback(async || ApiError::not_found("not found"))
         .layer(middleware::from_fn_with_state(state.clone(), authenticate))
         .route("/healthz", get(healthz))
+        // For /healthz only: the /v1 routers carry their own (auth-
+        // wrapped) method fallbacks, set before nesting.
+        .method_not_allowed_fallback(wire::method_not_allowed)
         .with_state(state);
 
     let listener = TcpListener::bind(config.listen)
@@ -210,7 +225,7 @@ async fn require_admin(req: Request, next: Next) -> Response {
 
 /// The one shape every error leaves this server in: `{"error": "…"}`.
 fn error_json(status: StatusCode, message: impl Into<String>) -> Response {
-    (status, Json(serde_json::json!({"error": message.into()}))).into_response()
+    (status, Wire(serde_json::json!({"error": message.into()}))).into_response()
 }
 
 /// The one error type handlers leave the API through: a client status
@@ -279,7 +294,7 @@ const MCP_VERB_RESPONSE_LIMIT: usize = 50 * 1024 * 1024;
 async fn mcp(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(input): Json<serde_json::Value>,
+    input: Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     if !mcp_origin_allowed(&headers) {
         return error_json(
@@ -287,10 +302,14 @@ async fn mcp(
             "MCP Origin header must match the request Host",
         );
     }
+    let input = match input {
+        Ok(Json(input)) => input,
+        Err(rejection) => return wire::jsonrpc_parse_error(&rejection),
+    };
     match input {
         serde_json::Value::Array(messages) => {
             if messages.is_empty() {
-                return Json(jsonrpc_error(
+                return Wire(jsonrpc_error(
                     serde_json::Value::Null,
                     -32600,
                     "JSON-RPC batch must not be empty",
@@ -306,11 +325,11 @@ async fn mcp(
             if responses.is_empty() {
                 StatusCode::ACCEPTED.into_response()
             } else {
-                Json(serde_json::Value::Array(responses)).into_response()
+                Wire(serde_json::Value::Array(responses)).into_response()
             }
         }
         message => match handle_mcp_message(state, message).await {
-            Some(response) => Json(response).into_response(),
+            Some(response) => Wire(response).into_response(),
             None => StatusCode::ACCEPTED.into_response(),
         },
     }
@@ -442,7 +461,7 @@ async fn mcp_call_tool(
 }
 
 fn mcp_tool_result(structured: serde_json::Value, is_error: bool) -> serde_json::Value {
-    let text = serde_json::to_string_pretty(&structured).expect("tool content serializes");
+    let text = wire::canonical_string(&structured).expect("tool content serializes");
     serde_json::json!({
         "content": [{"type": "text", "text": text}],
         "structuredContent": structured,
@@ -460,21 +479,25 @@ async fn call_verb_tool(
     let response = match tool.verb {
         yg_verbs::Verb::Node => {
             let req = decode_tool_args(arguments)?;
-            verb_node(State(state), Json(req)).await.into_response()
+            verb_node(State(state), WireJson(req)).await.into_response()
         }
         yg_verbs::Verb::Neighbors => {
             let req = decode_tool_args(arguments)?;
-            verb_neighbors(State(state), Json(req))
+            verb_neighbors(State(state), WireJson(req))
                 .await
                 .into_response()
         }
         yg_verbs::Verb::Search => {
             let req = decode_tool_args(arguments)?;
-            verb_search(State(state), Json(req)).await.into_response()
+            verb_search(State(state), WireJson(req))
+                .await
+                .into_response()
         }
         yg_verbs::Verb::History => {
             let req = decode_tool_args(arguments)?;
-            verb_history(State(state), Json(req)).await.into_response()
+            verb_history(State(state), WireJson(req))
+                .await
+                .into_response()
         }
     };
     verb_response_value(response).await
@@ -519,12 +542,12 @@ async fn verb_response_value(
 /// `POST /v1/verbs/node` (RFC 0001 §7): full node + edge summary.
 async fn verb_node(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<yg_verbs::NodeRequest>,
+    WireJson(req): WireJson<yg_verbs::NodeRequest>,
 ) -> Result<Response, ApiError> {
     let id = yg_verbs::VerbId::parse(&req.id).map_err(ApiError::bad_request)?;
     let (path, _) = resolve_shard(&state, &id.repo, None).await?;
     let response = run_verb(path, id, yg_verbs::node).await?;
-    Ok(Json(response).into_response())
+    Ok(Wire(response).into_response())
 }
 
 /// What a `next_cursor` opaquely carries: the traversal position, the
@@ -608,7 +631,7 @@ impl NeighborsCursor {
 /// subgraph.
 async fn verb_neighbors(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<yg_verbs::NeighborsRequest>,
+    WireJson(req): WireJson<yg_verbs::NeighborsRequest>,
 ) -> Result<Response, ApiError> {
     let cursor = req
         .cursor
@@ -668,7 +691,7 @@ async fn verb_neighbors(
         }
         .encode()
     });
-    Ok(Json(NeighborsResponse {
+    Ok(Wire(NeighborsResponse {
         nodes: page.nodes,
         edges: page.edges,
         next_cursor,
@@ -788,7 +811,7 @@ fn parse_since(raw: &str) -> Result<i64, String> {
 /// pagination.
 async fn verb_history(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<yg_verbs::HistoryRequest>,
+    WireJson(req): WireJson<yg_verbs::HistoryRequest>,
 ) -> Result<Response, ApiError> {
     let cursor = req
         .cursor
@@ -858,7 +881,7 @@ async fn verb_history(
             commit,
         })
         .collect();
-    Ok(Json(HistoryResponse {
+    Ok(Wire(HistoryResponse {
         commits,
         next_cursor,
     })
@@ -934,6 +957,7 @@ struct SearchHit {
     #[serde(skip_serializing_if = "Option::is_none")]
     path: Option<String>,
     repo: String,
+    #[serde(serialize_with = "wire::f32_shortest")]
     score: f32,
     #[serde(skip_serializing_if = "Option::is_none")]
     snippet: Option<String>,
@@ -979,7 +1003,7 @@ fn merge_paginate(mut all: Vec<SearchHit>, offset: usize, limit: usize) -> (Vec<
 /// the indexed repos, returning one ranked page with snippets and node ids.
 async fn verb_search(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<yg_verbs::SearchRequest>,
+    WireJson(req): WireJson<yg_verbs::SearchRequest>,
 ) -> Result<Response, ApiError> {
     let cursor = req
         .cursor
@@ -1106,7 +1130,7 @@ async fn verb_search(
     // No indexed repos at all (a fresh org-wide search before anything is
     // indexed): an empty result, not an error.
     if targets.is_empty() {
-        return Ok(Json(SearchResponse {
+        return Ok(Wire(SearchResponse {
             hits: vec![],
             next_cursor: None,
         })
@@ -1182,7 +1206,7 @@ async fn verb_search(
         }
         .encode()
     });
-    Ok(Json(SearchResponse {
+    Ok(Wire(SearchResponse {
         hits: page,
         next_cursor,
     })
@@ -1549,7 +1573,7 @@ struct AddForgeResponse {
 
 async fn admin_forge_add(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<AddForgeRequest>,
+    WireJson(req): WireJson<AddForgeRequest>,
 ) -> Result<Response, ApiError> {
     let kind = github_kind(&req.kind).map_err(ApiError::bad_request)?;
     let org = github_org_slug(&req.org).map_err(ApiError::bad_request)?;
@@ -1576,7 +1600,7 @@ async fn admin_forge_add(
         } else {
             StatusCode::OK
         },
-        Json(AddForgeResponse {
+        Wire(AddForgeResponse {
             kind: kind.to_string(),
             org,
             base_url,
@@ -1647,7 +1671,7 @@ struct DiscoverForgeResponse {
 
 async fn admin_forge_discover(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<DiscoverForgeRequest>,
+    WireJson(req): WireJson<DiscoverForgeRequest>,
 ) -> Result<Response, ApiError> {
     let kind = github_kind(&req.kind).map_err(ApiError::bad_request)?;
     let org = github_org_slug(&req.org).map_err(ApiError::bad_request)?;
@@ -1657,7 +1681,7 @@ async fn admin_forge_discover(
             "{kind} org {org} is not connected; run yg admin forge add first"
         )));
     }
-    Ok(Json(DiscoverForgeResponse {
+    Ok(Wire(DiscoverForgeResponse {
         kind: kind.to_string(),
         org,
         base_url,
@@ -1687,7 +1711,7 @@ struct AddRuleResponse {
 
 async fn admin_rules_add(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<AddRuleRequest>,
+    WireJson(req): WireJson<AddRuleRequest>,
 ) -> Result<Response, ApiError> {
     let action = match req.action.as_str() {
         "include" => yg_control::RuleAction::Include,
@@ -1727,7 +1751,7 @@ async fn admin_rules_add(
         } else {
             StatusCode::OK
         },
-        Json(AddRuleResponse {
+        Wire(AddRuleResponse {
             forge,
             pattern: pattern.to_string(),
             action: req.action,
@@ -1755,7 +1779,7 @@ struct RuleResponse {
 
 async fn admin_rules_list(State(state): State<Arc<AppState>>) -> Result<Response, ApiError> {
     let rules = state.control.rules().await?;
-    Ok(Json(RulesResponse {
+    Ok(Wire(RulesResponse {
         rules: rules
             .into_iter()
             .map(|rule| RuleResponse {
@@ -1771,7 +1795,7 @@ async fn admin_rules_list(State(state): State<Arc<AppState>>) -> Result<Response
 
 async fn admin_repo_add(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<AddRepoRequest>,
+    WireJson(req): WireJson<AddRepoRequest>,
 ) -> Result<Response, ApiError> {
     if let Some(depth) = req.depth
         && depth < 1
@@ -1827,7 +1851,7 @@ async fn admin_repo_add(
         } else {
             StatusCode::OK
         },
-        Json(AddRepoResponse {
+        Wire(AddRepoResponse {
             slug: locator.slug,
             created: outcome.created,
             fetch_queued: outcome.fetch_queued,
@@ -1850,7 +1874,7 @@ struct IssueTokenResponse {
 
 async fn admin_token_issue(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<IssueTokenRequest>,
+    WireJson(req): WireJson<IssueTokenRequest>,
 ) -> Result<Response, ApiError> {
     let member = req.member.trim();
     if member.is_empty() {
@@ -1859,7 +1883,7 @@ async fn admin_token_issue(
     let issued = state.control.issue_member_token(member).await?;
     Ok((
         StatusCode::CREATED,
-        Json(IssueTokenResponse {
+        Wire(IssueTokenResponse {
             id: issued.id,
             member: issued.member,
             token: issued.token,
@@ -1888,7 +1912,7 @@ async fn admin_token_revoke(
             "no active member token {id:?}"
         )));
     }
-    Ok(Json(RevokeTokenResponse { id, revoked: true }).into_response())
+    Ok(Wire(RevokeTokenResponse { id, revoked: true }).into_response())
 }
 
 #[derive(Serialize)]
@@ -1975,7 +1999,7 @@ async fn admin_status(State(state): State<Arc<AppState>>) -> Result<Response, Ap
             last_synced_commit: r.last_synced_commit,
         })
         .collect();
-    Ok(Json(AdminStatusResponse { repos }).into_response())
+    Ok(Wire(AdminStatusResponse { repos }).into_response())
 }
 
 /// The stage-specific words [`job_state`] fills in: what to call a
@@ -2009,18 +2033,24 @@ fn job_state(
 #[derive(Serialize)]
 struct StatusResponse {
     version: &'static str,
-    uptime_seconds: u64,
     repos_indexed: i64,
 }
 
+/// Uptime changes every second, and response bodies must be
+/// byte-identical for identical state (they become prompt-cache
+/// history); volatile values ride in headers instead.
+pub const UPTIME_HEADER: &str = "x-yggdrasil-uptime-seconds";
+
 async fn status(State(state): State<Arc<AppState>>) -> Result<Response, ApiError> {
     let repos_indexed = state.control.indexed_repo_count().await?;
-    Ok(Json(StatusResponse {
-        version: env!("CARGO_PKG_VERSION"),
-        uptime_seconds: state.started.elapsed().as_secs(),
-        repos_indexed,
-    })
-    .into_response())
+    Ok((
+        [(UPTIME_HEADER, state.started.elapsed().as_secs().to_string())],
+        Wire(StatusResponse {
+            version: env!("CARGO_PKG_VERSION"),
+            repos_indexed,
+        }),
+    )
+        .into_response())
 }
 
 /// The unauthenticated readiness report: an overall verdict and a bare
@@ -2039,7 +2069,7 @@ struct HealthChecks {
     object_store: &'static str,
 }
 
-async fn healthz(State(state): State<Arc<AppState>>) -> (StatusCode, Json<HealthResponse>) {
+async fn healthz(State(state): State<Arc<AppState>>) -> (StatusCode, Wire<HealthResponse>) {
     let (postgres, object_store) = tokio::join!(
         state.control.ping(),
         probe_object_store(state.store.as_ref())
@@ -2065,7 +2095,7 @@ async fn healthz(State(state): State<Arc<AppState>>) -> (StatusCode, Json<Health
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
-    (code, Json(body))
+    (code, Wire(body))
 }
 
 #[cfg(test)]

@@ -1714,13 +1714,19 @@ async fn status_reports_version_uptime_and_repo_count_to_a_valid_token() {
         .unwrap();
 
     assert_eq!(resp.status(), 200);
+    let uptime = resp
+        .headers()
+        .get(yg_api::UPTIME_HEADER)
+        .expect("uptime is volatile, so it rides in a header")
+        .to_str()
+        .unwrap()
+        .to_string();
+    uptime
+        .parse::<u64>()
+        .expect("uptime header must be seconds");
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(body["repos_indexed"], 0, "fresh deployment indexes nothing");
-    assert!(
-        body["uptime_seconds"].is_u64(),
-        "uptime must be a number, got: {body}"
-    );
 }
 
 #[tokio::test]
@@ -1790,7 +1796,10 @@ async fn yg_status_json_emits_machine_readable_output() {
         serde_json::from_str(&stdout).expect("--json output must be valid JSON");
     assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(body["repos_indexed"], 0);
-    assert!(body["uptime_seconds"].is_u64());
+    assert!(
+        body["uptime_seconds"].is_u64(),
+        "the CLI folds the uptime header back in for machine consumers, got: {body}"
+    );
 }
 
 /// An internal failure (the control plane severed under a live server)

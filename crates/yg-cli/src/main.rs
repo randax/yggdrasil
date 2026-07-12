@@ -421,6 +421,16 @@ async fn server_json(
     path: &str,
     body: Option<serde_json::Value>,
 ) -> anyhow::Result<serde_json::Value> {
+    Ok(server_request(method, path, body).await?.1)
+}
+
+/// [`server_json`], but also returning the response headers — volatile
+/// values (uptime) ride there instead of the cache-stable body.
+async fn server_request(
+    method: reqwest::Method,
+    path: &str,
+    body: Option<serde_json::Value>,
+) -> anyhow::Result<(reqwest::header::HeaderMap, serde_json::Value)> {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     let (server, token) = client_env()?;
     let mut request = CLIENT
@@ -435,6 +445,7 @@ async fn server_json(
         .await
         .with_context(|| format!("requesting {server}{path}"))?;
     let status = resp.status();
+    let headers = resp.headers().clone();
     let text = resp.text().await.context("reading the server's response")?;
     if !status.is_success() {
         // Prefer the server's {"error": …} shape, but a proxy or crash
@@ -445,7 +456,9 @@ async fn server_json(
             .unwrap_or(text);
         bail!("the server answered {path} with {status}: {reason}");
     }
-    serde_json::from_str(&text).with_context(|| format!("parsing the response from {path}"))
+    let body =
+        serde_json::from_str(&text).with_context(|| format!("parsing the response from {path}"))?;
+    Ok((headers, body))
 }
 
 /// POST one Verb request (RFC 0001 §7).
@@ -482,11 +495,19 @@ async fn mcp_proxy() -> anyhow::Result<()> {
             .with_context(|| format!("posting MCP request to {endpoint}"))?;
         let status = resp.status();
         let text = resp.text().await.context("reading MCP HTTP response")?;
+        let parsed = serde_json::from_str::<serde_json::Value>(&text).ok();
         let Some(payload) = (if status.is_success() {
             if text.is_empty() { None } else { Some(text) }
+        } else if parsed
+            .as_ref()
+            .is_some_and(|body| body.get("jsonrpc").is_some())
+        {
+            // The server answers protocol failures (parse errors, bad
+            // requests) with a JSON-RPC envelope already; forward it
+            // verbatim instead of burying it in a synthetic error.
+            Some(text)
         } else {
-            let reason = serde_json::from_str::<serde_json::Value>(&text)
-                .ok()
+            let reason = parsed
                 .and_then(|body| body["error"].as_str().map(str::to_string))
                 .unwrap_or(text);
             Some(
@@ -534,7 +555,7 @@ where
 async fn node(id: String, json: bool) -> anyhow::Result<()> {
     let body = post_verb("node", serde_json::to_value(yg_verbs::NodeRequest { id })?).await?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&body)?);
+        println!("{}", serde_json::to_string(&body)?);
         return Ok(());
     }
     let node = &body["node"];
@@ -604,7 +625,7 @@ async fn neighbors(
     )
     .await?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&body)?);
+        println!("{}", serde_json::to_string(&body)?);
         return Ok(());
     }
     let nodes = body["nodes"].as_array().map(Vec::as_slice).unwrap_or(&[]);
@@ -667,7 +688,7 @@ async fn search(
     )
     .await?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&body)?);
+        println!("{}", serde_json::to_string(&body)?);
         return Ok(());
     }
     let hits = body["hits"].as_array().map(Vec::as_slice).unwrap_or(&[]);
@@ -729,7 +750,7 @@ async fn history(
     )
     .await?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&body)?);
+        println!("{}", serde_json::to_string(&body)?);
         return Ok(());
     }
     let commits = body["commits"].as_array().map(Vec::as_slice).unwrap_or(&[]);
@@ -922,7 +943,7 @@ async fn admin_status(json: bool) -> anyhow::Result<()> {
     let body = server_json(reqwest::Method::GET, "/v1/admin/status", None).await?;
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&body)?);
+        println!("{}", serde_json::to_string(&body)?);
         return Ok(());
     }
     let repos = body["repos"].as_array().map(Vec::as_slice).unwrap_or(&[]);
@@ -1171,14 +1192,28 @@ async fn gc_loop(
 
 async fn status(json: bool) -> anyhow::Result<()> {
     let (server, _) = client_env()?;
-    let body = server_json(reqwest::Method::GET, "/v1/status", None).await?;
+    let (headers, mut body) = server_request(reqwest::Method::GET, "/v1/status", None).await?;
+    let uptime_seconds: Option<u64> = headers
+        .get(yg_api::UPTIME_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse().ok());
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&body)?);
+        // The server keeps volatile uptime out of the (cache-stable)
+        // body; fold it back in for machine consumers, keeping the
+        // body's key-sorted form.
+        if let (Some(uptime), Some(map)) = (uptime_seconds, body.as_object_mut()) {
+            map.insert("uptime_seconds".into(), uptime.into());
+            map.sort_keys();
+        }
+        println!("{}", serde_json::to_string(&body)?);
     } else {
         println!("yggdrasil Index Server at {server}");
         println!("version:       {}", body["version"].as_str().unwrap_or("?"));
-        println!("uptime:        {}s", body["uptime_seconds"]);
+        match uptime_seconds {
+            Some(uptime) => println!("uptime:        {uptime}s"),
+            None => println!("uptime:        ?"),
+        }
         println!("repos indexed: {}", body["repos_indexed"]);
     }
     Ok(())
