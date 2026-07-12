@@ -102,6 +102,7 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
 cargo test --workspace --exclude yg-cli --locked
+cargo test -p yg-cli --bins --locked
 ```
 
 The e2e job runs the `yg-cli` suites against the compose stack (each test

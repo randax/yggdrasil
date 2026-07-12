@@ -43,6 +43,7 @@ pub async fn create_test_db() -> String {
     let admin = admin_pool().await;
     let _serialize_creates = DB_CREATE_LOCK.lock().await;
     drop_stale_test_dbs(&admin).await;
+    sweep_stale_object_prefixes(&admin).await;
     // CREATE DATABASE cannot take bind parameters; the name is generated
     // above from pid + counter + millis, not external input.
     sqlx::query(sqlx::AssertSqlSafe(format!(
@@ -88,6 +89,54 @@ async fn drop_stale_test_dbs(admin: &sqlx::PgPool) {
                 .execute(admin)
                 .await;
         }
+    }
+}
+
+/// Best-effort cleanup of object-store key prefixes left behind by
+/// earlier runs, so the shared dev bucket doesn't grow forever. Same
+/// staleness rules as [`drop_stale_test_dbs`] (skip this process's
+/// prefixes and anything younger than an hour), plus one more guard:
+/// skip any prefix whose database still exists — its run may be live,
+/// and the next sweep gets it once the database is gone.
+async fn sweep_stale_object_prefixes(admin: &sqlx::PgPool) {
+    use futures::{StreamExt, TryStreamExt};
+    let mine = format!("yg_test_{}_", std::process::id());
+    let hour_ago = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        .saturating_sub(60 * 60 * 1000);
+    let live: std::collections::HashSet<String> =
+        sqlx::query_as("SELECT datname FROM pg_database WHERE datname LIKE 'yg_test_%'")
+            .fetch_all(admin)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(name,): (String,)| name)
+            .collect();
+    let store = dev_object_store("");
+    let Ok(root) = store.list_with_delimiter(None).await else {
+        return;
+    };
+    for prefix in root.common_prefixes {
+        let name = prefix.as_ref();
+        let created_millis: u128 = name
+            .rsplit('_')
+            .next()
+            .and_then(|m| m.parse().ok())
+            .unwrap_or(0); // unparseable = old naming scheme = stale
+        if !name.starts_with("yg_test_")
+            || name.starts_with(&mine)
+            || live.contains(name)
+            || created_millis >= hour_ago
+        {
+            continue;
+        }
+        let locations = store.list(Some(&prefix)).map_ok(|o| o.location).boxed();
+        let _ = store
+            .delete_stream(locations)
+            .try_collect::<Vec<_>>()
+            .await;
     }
 }
 
