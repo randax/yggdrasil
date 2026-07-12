@@ -1455,8 +1455,14 @@ pub const SUPERSEDED_SHARDS_PAST_GRACE_SQL: &str =
 /// rendering is the fencing token settle/fail compare against. Kind,
 /// an extra due-predicate (over jobs `j` and repos `r`), and the extra
 /// RETURNING columns are the only legitimate variation. Public so the
-/// e2e plan tests can EXPLAIN the exact production query.
-pub fn claim_due_sql(kind: JobKind, extra_due_predicate: &str, returning: &str) -> String {
+/// e2e plan tests can EXPLAIN the exact production query; the fragments
+/// are `&'static str` so only compile-time constants — never runtime
+/// input — can reach the assembled SQL.
+pub fn claim_due_sql(
+    kind: JobKind,
+    extra_due_predicate: &'static str,
+    returning: &'static str,
+) -> String {
     let kind = kind.as_str();
     format!(
         "WITH due AS (

@@ -17,6 +17,10 @@ ALTER TABLE jobs
 ALTER TABLE jobs ADD COLUMN finished_at timestamptz;
 UPDATE jobs SET finished_at = created_at WHERE state = 'done';
 CREATE INDEX jobs_done_retention ON jobs (finished_at) WHERE state = 'done';
+-- Terminal ⇔ stamped, enforced: a done row with no stamp would silently
+-- escape retention forever, and a stamp on live work would age it out.
+ALTER TABLE jobs ADD CONSTRAINT jobs_done_has_finished_at
+    CHECK ((state = 'done') = (finished_at IS NOT NULL));
 
 -- kind was free text: a typo'd row satisfies no claim query's kind
 -- equality, so it sits invisible and unclaimable forever. The vocabulary

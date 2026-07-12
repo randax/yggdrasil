@@ -148,6 +148,25 @@ async fn unknown_kind_state_and_provenance_values_fail_at_the_database() {
             .unwrap_err(),
         "jobs_state_check",
     );
+    // Terminal ⇔ stamped is enforced too: an unstamped done row would
+    // silently escape retention forever, and a stamped live row would
+    // age out mid-flight.
+    violation(
+        sqlx::query("INSERT INTO jobs (kind, repo_id, state) VALUES ('fetch', $1, 'done')")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .unwrap_err(),
+        "jobs_done_has_finished_at",
+    );
+    violation(
+        sqlx::query("INSERT INTO jobs (kind, repo_id, finished_at) VALUES ('fetch', $1, now())")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .unwrap_err(),
+        "jobs_done_has_finished_at",
+    );
 
     // Same for the Shard provenance vocabulary.
     for provenance in yg_shard::Provenance::ALL {
