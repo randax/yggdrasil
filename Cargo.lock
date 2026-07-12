@@ -4119,10 +4119,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
- "base64",
- "chrono",
  "object_store",
- "rusqlite",
  "serde",
  "serde_json",
  "subtle",
@@ -4239,10 +4236,15 @@ name = "yg-verbs"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
+ "chrono",
  "rusqlite",
  "schemars",
  "serde",
  "serde_json",
+ "thiserror",
+ "tokio",
+ "yg-shard",
 ]
 
 [[package]]

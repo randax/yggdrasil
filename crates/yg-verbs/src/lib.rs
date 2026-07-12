@@ -18,6 +18,16 @@
 //!
 //! Shards store the repo-relative form (`file:cmd/main.go`,
 //! `sym:cmd/main.go#Hello`); this crate owns the translation.
+//!
+//! The [`engine`] module is the one entry point transports call: it
+//! owns cursor semantics, limit validation, Shard resolution (via
+//! [`engine::ShardResolver`]), and the blocking-execution contract.
+//! Graph SQL here is assembled from [`yg_shard::graph_schema`] — the
+//! writer's own table and column names — so writer/reader drift is a
+//! compile error, not a runtime surprise.
+
+pub mod cursor;
+pub mod engine;
 
 use std::collections::BTreeMap;
 
@@ -25,6 +35,15 @@ use anyhow::Context;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use yg_shard::graph_schema::{
+    EDGE_CONFIDENCE, EDGE_DST, EDGE_KIND, EDGE_LOCATION, EDGE_PROVENANCE, EDGE_SRC, EDGES,
+    NODE_COMMITTED_AT, NODE_ID, NODE_KIND, NODE_NAME, NODE_PATH, NODES,
+};
+
+pub use engine::{
+    Engine, HistoryCommitView, HistoryResponse, NeighborsResponse, ResolveError, ResolvedShard,
+    ShardResolver, VerbError,
+};
 
 pub const DEFAULT_NEIGHBORS_DEPTH: u32 = 1;
 pub const MIN_NEIGHBORS_DEPTH: u32 = 1;
@@ -422,7 +441,9 @@ pub fn node(conn: &rusqlite::Connection, id: &VerbId) -> anyhow::Result<Option<N
 
     let found = conn
         .query_row(
-            "SELECT kind, name, path FROM nodes WHERE id = ?1",
+            &format!(
+                "SELECT {NODE_KIND}, {NODE_NAME}, {NODE_PATH} FROM {NODES} WHERE {NODE_ID} = ?1"
+            ),
             [local],
             |row| {
                 Ok(NodeView {
@@ -444,8 +465,8 @@ pub fn node(conn: &rusqlite::Connection, id: &VerbId) -> anyhow::Result<Option<N
     Ok(Some(NodeResponse {
         node,
         edges: EdgeSummary {
-            inbound: edge_summary(conn, "dst", local)?,
-            out: edge_summary(conn, "src", local)?,
+            inbound: edge_summary(conn, EDGE_DST, local)?,
+            out: edge_summary(conn, EDGE_SRC, local)?,
         },
     }))
 }
@@ -511,18 +532,14 @@ impl Direction {
 /// Every edge kind a Shard can hold, as the wire spells them — the
 /// vocabulary `edge_kinds` filters validate against, so a typo
 /// (`CALL`, lowercase `calls`) errors instead of silently matching
-/// nothing. Must agree with yg-shard's `EdgeKind::as_str` values; a
-/// drift-guard test in yg-api holds the two together (this crate
-/// deliberately doesn't depend on the artifact writer).
-pub const KNOWN_EDGE_KINDS: &[&str] = &[
-    "AUTHORED",
-    "CALLS",
-    "DEFINES",
-    "EXTENDS",
-    "IMPLEMENTS",
-    "IMPORTS",
-    "TOUCHES",
-];
+/// nothing. Read straight from the writer's [`yg_shard::EdgeKind`], so
+/// the filter vocabulary cannot drift from what Shards actually hold;
+/// alphabetized so error messages are stable.
+fn known_edge_kinds() -> Vec<&'static str> {
+    let mut kinds: Vec<&str> = yg_shard::EdgeKind::ALL.iter().map(|k| k.as_str()).collect();
+    kinds.sort_unstable();
+    kinds
+}
 
 /// The `neighbors` Verb's filters and pagination, validated by the
 /// caller (limits, depth bounds, cursor decoding are wire concerns).
@@ -584,15 +601,16 @@ impl NeighborsOptions {
         }
         // A kind no Shard holds would silently match zero edges —
         // indistinguishable from a genuinely isolated node.
+        let known = known_edge_kinds();
         if let Some(unknown) = self
             .edge_kinds
             .iter()
             .flatten()
-            .find(|kind| !KNOWN_EDGE_KINDS.contains(&kind.as_str()))
+            .find(|kind| !known.contains(&kind.as_str()))
         {
             return Err(format!(
                 "unknown edge kind {unknown:?}: expected any of {}",
-                KNOWN_EDGE_KINDS.join(", ")
+                known.join(", ")
             ));
         }
         Ok(())
@@ -624,9 +642,11 @@ pub fn neighbors(
         return Ok(Some(empty));
     };
     let origin_exists: bool = conn
-        .query_row("SELECT count(*) FROM nodes WHERE id = ?1", [local], |row| {
-            row.get::<_, i64>(0).map(|n| n > 0)
-        })
+        .query_row(
+            &format!("SELECT count(*) FROM {NODES} WHERE {NODE_ID} = ?1"),
+            [local],
+            |row| row.get::<_, i64>(0).map(|n| n > 0),
+        )
         .context("looking up the origin node")?;
     if !origin_exists {
         return Ok(None);
@@ -761,7 +781,8 @@ fn node_views(
         return Ok(vec![]);
     }
     let mut stmt = conn.prepare(&format!(
-        "SELECT id, kind, name, path FROM nodes WHERE id IN ({})",
+        "SELECT {NODE_ID}, {NODE_KIND}, {NODE_NAME}, {NODE_PATH} FROM {NODES} \
+         WHERE {NODE_ID} IN ({})",
         vec!["?"; page.len()].join(", ")
     ))?;
     let rows = stmt
@@ -830,14 +851,18 @@ fn incident_edges(
     let kinds = match edge_kinds {
         Some(kinds) => {
             params.extend(kinds.iter().map(|kind| kind as &dyn rusqlite::ToSql));
-            format!(" AND kind IN ({})", vec!["?"; kinds.len()].join(", "))
+            format!(
+                " AND {EDGE_KIND} IN ({})",
+                vec!["?"; kinds.len()].join(", ")
+            )
         }
         None => String::new(),
     };
     let mut stmt = conn.prepare(&format!(
-        "SELECT src, dst, kind, provenance, confidence, location FROM edges
-         WHERE (src = ?1 OR dst = ?1){kinds}
-         ORDER BY src, dst, kind, location"
+        "SELECT {EDGE_SRC}, {EDGE_DST}, {EDGE_KIND}, {EDGE_PROVENANCE}, {EDGE_CONFIDENCE}, \
+         {EDGE_LOCATION} FROM {EDGES}
+         WHERE ({EDGE_SRC} = ?1 OR {EDGE_DST} = ?1){kinds}
+         ORDER BY {EDGE_SRC}, {EDGE_DST}, {EDGE_KIND}, {EDGE_LOCATION}"
     ))?;
     let edges = stmt
         .query_map(rusqlite::params_from_iter(params), |row| {
@@ -884,10 +909,11 @@ fn edge_summary(
     end: &str,
     local: &str,
 ) -> anyhow::Result<Vec<EdgeKindSummary>> {
-    // `end` is one of two literals chosen above, never client input.
+    // `end` is one of two schema constants chosen above, never client
+    // input.
     let mut stmt = conn.prepare(&format!(
-        "SELECT kind, provenance, count(*) FROM edges
-         WHERE {end} = ?1 GROUP BY kind, provenance ORDER BY kind"
+        "SELECT {EDGE_KIND}, {EDGE_PROVENANCE}, count(*) FROM {EDGES}
+         WHERE {end} = ?1 GROUP BY {EDGE_KIND}, {EDGE_PROVENANCE} ORDER BY {EDGE_KIND}"
     ))?;
     let rows = stmt.query_map([local], |row| {
         Ok((
@@ -998,13 +1024,15 @@ pub fn history(
     // to match. Fetch one past the page so the presence of a next page is
     // known without a second query. AUTHORED is a left join: an
     // unattributable commit (no author email) still appears, authorless.
-    let mut sql = String::from(
-        "SELECT c.id, c.name, c.committed_at, a.src, who.name
-         FROM edges t
-         JOIN nodes c ON c.id = t.src
-         LEFT JOIN edges a ON a.dst = c.id AND a.kind = 'AUTHORED'
-         LEFT JOIN nodes who ON who.id = a.src
-         WHERE t.kind = 'TOUCHES' AND t.dst = ?",
+    let authored = yg_shard::EdgeKind::Authored.as_str();
+    let touches = yg_shard::EdgeKind::Touches.as_str();
+    let mut sql = format!(
+        "SELECT c.{NODE_ID}, c.{NODE_NAME}, c.{NODE_COMMITTED_AT}, a.{EDGE_SRC}, who.{NODE_NAME}
+         FROM {EDGES} t
+         JOIN {NODES} c ON c.{NODE_ID} = t.{EDGE_SRC}
+         LEFT JOIN {EDGES} a ON a.{EDGE_DST} = c.{NODE_ID} AND a.{EDGE_KIND} = '{authored}'
+         LEFT JOIN {NODES} who ON who.{NODE_ID} = a.{EDGE_SRC}
+         WHERE t.{EDGE_KIND} = '{touches}' AND t.{EDGE_DST} = ?"
     );
     // The keyset resumes on the Shard-internal `commit:<sha>` id, which
     // orders identically to the bare sha the cursor carries.
@@ -1020,18 +1048,22 @@ pub fn history(
     let limit_plus_one = i64::try_from(options.limit.saturating_add(1)).unwrap_or(i64::MAX);
     let mut params: Vec<&dyn rusqlite::ToSql> = vec![&file_local];
     if let Some(since) = options.since.as_ref() {
-        sql.push_str(" AND c.committed_at >= ?");
+        sql.push_str(&format!(" AND c.{NODE_COMMITTED_AT} >= ?"));
         params.push(since);
     }
     // A row falls after `(at, id)` in the (date desc, id asc) order when
     // it is strictly older, or same-date with a later id.
     if let (Some(at), Some(id)) = (after_at.as_ref(), after_id.as_ref()) {
-        sql.push_str(" AND (c.committed_at < ? OR (c.committed_at = ? AND c.id > ?))");
+        sql.push_str(&format!(
+            " AND (c.{NODE_COMMITTED_AT} < ? OR (c.{NODE_COMMITTED_AT} = ? AND c.{NODE_ID} > ?))"
+        ));
         params.push(at);
         params.push(at);
         params.push(id);
     }
-    sql.push_str(" ORDER BY c.committed_at DESC, c.id ASC LIMIT ?");
+    sql.push_str(&format!(
+        " ORDER BY c.{NODE_COMMITTED_AT} DESC, c.{NODE_ID} ASC LIMIT ?"
+    ));
     params.push(&limit_plus_one);
 
     let mut stmt = conn.prepare(&sql)?;
@@ -1087,7 +1119,7 @@ fn resolve_history_file(
 ) -> anyhow::Result<Option<String>> {
     let found = conn
         .query_row(
-            "SELECT kind, path FROM nodes WHERE id = ?1",
+            &format!("SELECT {NODE_KIND}, {NODE_PATH} FROM {NODES} WHERE {NODE_ID} = ?1"),
             [local],
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
         )
