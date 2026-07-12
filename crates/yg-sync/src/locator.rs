@@ -94,7 +94,7 @@ impl RepoLocator {
         // because of a URL spelling and http/https variants land on one
         // forge row).
         let forge = crate::forge::builtin().for_host(&host);
-        let scheme = forge.canonical_repo_url(&scheme, &segments, url)?;
+        let scheme = forge.canonical_scheme(&scheme, &segments, url)?;
         Ok(Self {
             kind: forge.kind(),
             base_url: format!("{scheme}://{host}"),

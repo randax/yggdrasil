@@ -425,14 +425,17 @@ impl ControlPlane {
     pub async fn add_repo(&self, repo: AddRepo<'_>) -> anyhow::Result<AddRepoOutcome> {
         let mut tx = self.pool.begin().await?;
         // DO UPDATE (rather than DO NOTHING) so RETURNING yields the id
-        // on conflict too. Overwriting kind is safe: it's derived from
-        // the URL host, so every add of this base_url carries the same
-        // value. token_env only backfills a missing value — an explicit
-        // per-forge override is never clobbered by a re-add.
+        // on conflict too. The existing kind always wins: the URL
+        // locator can only recognize well-known hosts, so a repo add on
+        // a GitHub Enterprise forge arrives as generic `git` — letting
+        // it overwrite the row `forge add` registered as `github` would
+        // silently disable the org's discovery. token_env and api_root
+        // only backfill missing values — an explicit per-forge value is
+        // never clobbered by a re-add.
         let (forge_id,): (i64,) = sqlx::query_as(
             "INSERT INTO forges (kind, base_url, token_env, api_root) VALUES ($1, $2, $3, $4)
              ON CONFLICT (base_url) DO UPDATE
-             SET kind = excluded.kind,
+             SET kind = forges.kind,
                  token_env = coalesce(forges.token_env, excluded.token_env),
                  api_root = coalesce(forges.api_root, excluded.api_root)
              RETURNING id",

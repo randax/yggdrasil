@@ -52,7 +52,7 @@ pub trait Forge: Send + Sync {
     /// Forge-specific repository-URL rules, applied after the generic
     /// parse: validate the path shape and return the canonical scheme.
     /// The default accepts any path and keeps the scheme.
-    fn canonical_repo_url(
+    fn canonical_scheme(
         &self,
         scheme: &str,
         segments: &[&str],
@@ -62,8 +62,15 @@ pub trait Forge: Send + Sync {
         Ok(scheme.to_string())
     }
 
-    /// Basic-auth credentials a clone/fetch presents for `token`.
-    fn git_auth(&self, token: String) -> GitAuth;
+    /// Basic-auth credentials a clone/fetch presents for `token`. The
+    /// default is the `x-access-token` username most git hosts accept;
+    /// a forge that requires its own (GitLab's `oauth2`) overrides.
+    fn git_auth(&self, token: String) -> GitAuth {
+        GitAuth {
+            username: "x-access-token",
+            token,
+        }
+    }
 
     /// Whether a git failure message is this forge pushing back on
     /// request volume (rate limit, abuse detection) rather than an

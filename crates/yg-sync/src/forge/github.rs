@@ -5,7 +5,7 @@ use std::time::Duration;
 use anyhow::Context;
 use serde::Deserialize;
 
-use super::{BoxFuture, Forge, GitAuth, ListedRepo, OrgDiscovery, common_rate_limit_phrasing};
+use super::{BoxFuture, Forge, ListedRepo, OrgDiscovery, common_rate_limit_phrasing};
 
 const GITHUB_PAGE_SIZE: usize = 100;
 
@@ -40,7 +40,7 @@ impl Forge for GitHubForge {
     /// normalizing keeps a worker from ever sending the Forge token
     /// over plaintext because of a URL spelling, and keeps http/https
     /// variants on one forge row.
-    fn canonical_repo_url(
+    fn canonical_scheme(
         &self,
         _scheme: &str,
         segments: &[&str],
@@ -54,15 +54,6 @@ impl Forge for GitHubForge {
             ));
         }
         Ok("https".to_string())
-    }
-
-    /// GitHub accepts any username with the token as password;
-    /// `x-access-token` is the documented convention.
-    fn git_auth(&self, token: String) -> GitAuth {
-        GitAuth {
-            username: "x-access-token",
-            token,
-        }
     }
 
     fn is_rate_limit(&self, message: &str) -> bool {

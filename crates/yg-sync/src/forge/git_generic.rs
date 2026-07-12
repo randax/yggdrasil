@@ -2,7 +2,7 @@
 //! file:// fixtures, self-hosted mirrors. Claims every host, so it
 //! registers last and terminates host lookup.
 
-use super::{Forge, GitAuth, OrgDiscovery, common_rate_limit_phrasing};
+use super::{Forge, OrgDiscovery, common_rate_limit_phrasing};
 
 pub(crate) struct GitForge;
 
@@ -23,15 +23,6 @@ impl Forge for GitForge {
     /// Plain remotes have no REST API.
     fn default_api_root(&self, _base_url: &str) -> Option<String> {
         None
-    }
-
-    /// The conventional token username most git hosts accept; a forge
-    /// that requires its own gets an adapter.
-    fn git_auth(&self, token: String) -> GitAuth {
-        GitAuth {
-            username: "x-access-token",
-            token,
-        }
     }
 
     fn is_rate_limit(&self, message: &str) -> bool {

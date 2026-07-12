@@ -83,11 +83,11 @@ pub(crate) async fn admin_forge_add(
 
 /// Resolve a requested forge kind to a registered adapter that can
 /// discover org repositories.
-fn discovery_capable_forge(kind: &str) -> Result<&'static dyn Forge, &'static str> {
+fn discovery_capable_forge(kind: &str) -> Result<&'static dyn Forge, String> {
     yg_sync::forge::builtin()
         .by_kind(kind.trim().to_ascii_lowercase().as_str())
         .filter(|forge| forge.discovery().is_some())
-        .ok_or("only github forge discovery is supported in this release")
+        .ok_or_else(|| format!("forge kind {kind:?} has no discovery adapter in this release"))
 }
 
 fn github_org_slug(org: &str) -> Result<String, &'static str> {

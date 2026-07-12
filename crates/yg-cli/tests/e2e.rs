@@ -434,6 +434,57 @@ async fn admin_forge_add_normalizes_base_url_and_defaults_the_github_token_env()
     );
 }
 
+/// A repo add on a GitHub Enterprise forge arrives as generic `git` —
+/// the URL locator can't recognize arbitrary enterprise hosts — and
+/// must not reclassify the forge row that `forge add` registered as
+/// `github`, or the org's discovery would silently stop resolving an
+/// adapter.
+#[tokio::test]
+async fn adding_a_repo_does_not_reclassify_an_enterprise_forge() {
+    let db_name = create_test_db().await;
+    let control = control_plane(&db_name).await;
+    control
+        .connect_forge_org(yg_control::ConnectForgeOrg {
+            forge_kind: "github",
+            base_url: "https://github.enterprise.example",
+            org_slug: "acme",
+            token_env: Some("YG_GITHUB_TOKEN"),
+            api_root: Some("https://github.enterprise.example/api/v3"),
+        })
+        .await
+        .unwrap();
+
+    // What `admin repo add` sends for an enterprise URL: the locator
+    // falls back to the generic git kind for an unrecognized host.
+    control
+        .add_repo(yg_control::AddRepo {
+            forge_kind: "git",
+            base_url: "https://github.enterprise.example",
+            token_env: None,
+            api_root: None,
+            slug: "acme/widgets",
+            fetch_depth: None,
+            poll_interval_seconds: None,
+        })
+        .await
+        .unwrap();
+
+    let due = control
+        .claim_due_discovery(std::time::Duration::from_secs(3600))
+        .await
+        .unwrap()
+        .expect("the org must still be due for discovery");
+    assert_eq!(
+        due.forge_kind, "github",
+        "a repo add must not flip the forge kind and disable discovery"
+    );
+    assert_eq!(
+        due.api_root.as_deref(),
+        Some("https://github.enterprise.example/api/v3"),
+        "the registered API root must survive the repo add"
+    );
+}
+
 /// Adding a forge is one trait implementation plus registration (#53):
 /// a double registered under its own kind flows through the same
 /// discovery loop as GitHub — claim, adapter listing, reconciliation —
