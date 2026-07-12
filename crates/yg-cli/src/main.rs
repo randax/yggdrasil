@@ -495,11 +495,19 @@ async fn mcp_proxy() -> anyhow::Result<()> {
             .with_context(|| format!("posting MCP request to {endpoint}"))?;
         let status = resp.status();
         let text = resp.text().await.context("reading MCP HTTP response")?;
+        let parsed = serde_json::from_str::<serde_json::Value>(&text).ok();
         let Some(payload) = (if status.is_success() {
             if text.is_empty() { None } else { Some(text) }
+        } else if parsed
+            .as_ref()
+            .is_some_and(|body| body.get("jsonrpc").is_some())
+        {
+            // The server answers protocol failures (parse errors, bad
+            // requests) with a JSON-RPC envelope already; forward it
+            // verbatim instead of burying it in a synthetic error.
+            Some(text)
         } else {
-            let reason = serde_json::from_str::<serde_json::Value>(&text)
-                .ok()
+            let reason = parsed
                 .and_then(|body| body["error"].as_str().map(str::to_string))
                 .unwrap_or(text);
             Some(

@@ -163,18 +163,50 @@ async fn rejections_and_unroutable_requests_keep_the_canonical_error_shape() {
     );
 
     // A wrong method on a live route must not fall back to axum's
-    // empty-body 405.
+    // empty-body 405 — on member routes, nested admin routes, or the
+    // unauthenticated /healthz.
+    for (method, path) in [
+        (reqwest::Method::GET, "/v1/verbs/node"),
+        (reqwest::Method::POST, "/v1/admin/status"),
+        (reqwest::Method::POST, "/healthz"),
+    ] {
+        let resp = client
+            .request(method.clone(), format!("{base}{path}"))
+            .bearer_auth(TEST_TOKEN)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 405, "{method} {path}");
+        let text = resp.text().await.unwrap();
+        assert_canonical(&format!("{method} {path} response"), &text);
+        let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert!(body["error"].is_string(), "error shape: {body}");
+    }
+
+    // The method-not-allowed fallback must not open an unauthenticated
+    // side door on member routes.
     let resp = client
         .get(format!("{base}/v1/verbs/node"))
-        .bearer_auth(TEST_TOKEN)
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status().as_u16(), 405);
+    assert_eq!(resp.status().as_u16(), 401, "fallback must sit behind auth");
+
+    // A transport-level MCP rejection (wrong content-type) keeps its
+    // own status and is an invalid request, not a parse error.
+    let resp = client
+        .post(format!("{base}/v1/mcp"))
+        .bearer_auth(TEST_TOKEN)
+        .header("content-type", "text/plain")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 415);
     let text = resp.text().await.unwrap();
-    assert_canonical("method-not-allowed response", &text);
+    assert_canonical("MCP content-type rejection", &text);
     let body: serde_json::Value = serde_json::from_str(&text).unwrap();
-    assert!(body["error"].is_string(), "error shape: {body}");
+    assert_eq!(body["error"]["code"], -32600, "invalid request: {body}");
 }
 
 #[tokio::test]

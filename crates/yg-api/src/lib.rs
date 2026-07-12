@@ -108,6 +108,12 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<RunningServer> {
             "/{*rest}",
             axum::routing::any(async || ApiError::not_found("not found")),
         )
+        // Set per router: method_not_allowed_fallback only rewrites the
+        // MethodRouters that exist in *this* router when called — it
+        // does not reach routes nested later. Before the route_layer,
+        // so a Member's wrong-method probe still answers the same 403
+        // as every other admin path.
+        .method_not_allowed_fallback(wire::method_not_allowed)
         .route_layer(middleware::from_fn(require_admin));
     let member_routes = Router::new()
         .route("/status", get(status))
@@ -131,6 +137,9 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<RunningServer> {
         .fallback(async || ApiError::not_found("not found"))
         .layer(middleware::from_fn_with_state(state.clone(), authenticate))
         .route("/healthz", get(healthz))
+        // For /healthz only: the /v1 routers carry their own (auth-
+        // wrapped) method fallbacks, set before nesting.
+        .method_not_allowed_fallback(wire::method_not_allowed)
         .with_state(state);
 
     let listener = TcpListener::bind(config.listen)

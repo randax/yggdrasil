@@ -94,15 +94,21 @@ pub(crate) async fn method_not_allowed() -> Response {
     crate::error_json(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
 }
 
-/// A body `/v1/mcp` could not parse at all: the JSON-RPC parse error,
-/// id null, per spec.
+/// A request `/v1/mcp` could not read a JSON body from, as a JSON-RPC
+/// error with id null. Only a body that failed to parse is the spec's
+/// -32700; transport rejections (content-type, size) keep their own
+/// HTTP status and answer "invalid request".
 pub(crate) fn jsonrpc_parse_error(rejection: &JsonRejection) -> Response {
+    let code = match rejection {
+        JsonRejection::JsonSyntaxError(_) | JsonRejection::JsonDataError(_) => -32700,
+        _ => -32600,
+    };
     (
-        StatusCode::BAD_REQUEST,
+        rejection.status(),
         Wire(crate::jsonrpc_error(
             serde_json::Value::Null,
-            -32700,
-            format!("parse error: {}", rejection.body_text()),
+            code,
+            rejection.body_text(),
         )),
     )
         .into_response()

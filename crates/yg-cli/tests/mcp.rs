@@ -201,3 +201,40 @@ async fn yg_mcp_proxies_stdio_frames_to_the_remote_server() {
         .expect("proxied neighbors result");
     assert_eq!(nodes.len(), 2, "{body}");
 }
+
+#[tokio::test]
+async fn yg_mcp_forwards_the_servers_error_envelopes_verbatim() {
+    let server = boot_test_server().await;
+    let base = format!("http://{}", server.local_addr());
+
+    let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin("yg"));
+    cmd.env("YG_SERVER", &base)
+        .env("YG_TOKEN", TEST_TOKEN)
+        .arg("mcp")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    tokio::task::spawn_blocking(move || {
+        use std::io::Write;
+        stdin.write_all(b"{not json\n").unwrap();
+    })
+    .await
+    .unwrap();
+    let out = tokio::task::spawn_blocking(move || child.wait_with_output().unwrap())
+        .await
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "yg mcp failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The server already answers a spec-shaped JSON-RPC parse error;
+    // the proxy must hand it through, not wrap it in a synthetic
+    // -32000 envelope.
+    let body = read_stdio_message(&out.stdout);
+    assert_eq!(body["error"]["code"], -32700, "{body}");
+    assert_eq!(body["id"], serde_json::Value::Null, "{body}");
+}
