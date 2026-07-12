@@ -1011,12 +1011,29 @@ async fn a_reclaimed_jobs_old_lease_token_can_neither_renew_nor_settle() {
         .await
         .unwrap();
 
-    // Worker A stops heartbeating (its lease lapses); worker B reclaims.
+    // Worker A heartbeats twice — each renewal minting a fresh token, the
+    // zero lease keeping the deadline in the past — then stops; worker B
+    // reclaims the expired job. The fenced token below is thus a renewed
+    // token, not the claim's original.
     let stale = control
         .claim_due_fetch(std::time::Duration::ZERO)
         .await
         .unwrap()
         .expect("claimable");
+    assert!(
+        control
+            .renew_fetch(&stale, std::time::Duration::ZERO)
+            .await
+            .unwrap(),
+        "a renewal chains off the claim's token"
+    );
+    assert!(
+        control
+            .renew_fetch(&stale, std::time::Duration::ZERO)
+            .await
+            .unwrap(),
+        "a renewal chains off the previous renewal's token"
+    );
     let fresh = control
         .claim_due_fetch(std::time::Duration::from_secs(60))
         .await
@@ -1118,6 +1135,23 @@ async fn index_lease_renewal_is_fenced_the_same_way() {
             .await
             .unwrap(),
         "a reclaimed index job's old token must not renew"
+    );
+    assert!(
+        !control
+            .complete_index(
+                &stale,
+                yg_control::ShardRecord {
+                    revision: "stale-rev-syntactic-v0",
+                    manifest_key: "stale/manifest",
+                    commit_sha: "feedface0000000000000000000000000000feed",
+                    provenance_level: "syntactic",
+                    node_count: 0,
+                    edge_count: 0,
+                },
+            )
+            .await
+            .unwrap(),
+        "a reclaimed index job's old token must not complete"
     );
     assert!(
         !control.fail_index(&stale, "boom").await.unwrap(),

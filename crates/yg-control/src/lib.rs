@@ -942,6 +942,13 @@ impl ControlPlane {
     /// claim. The new deadline is a new fencing token (the token is the
     /// deadline's text rendering); a successful renewal swaps it into the
     /// job so the eventual settle still matches.
+    ///
+    /// A renewal that commits but whose response is lost leaves the
+    /// worker holding the stale token: its next renewal reads as fenced
+    /// and its result is discarded at settle, even though no one took
+    /// the job. That fails safe — the job re-runs at lease expiry — and
+    /// is accepted; distinguishing it would need a token that survives
+    /// the round trip (a fence counter column).
     async fn renew_leased_job(
         &self,
         job_id: i64,

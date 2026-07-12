@@ -134,12 +134,7 @@ impl IndexWorker {
         // A cold self-healing clone plus a long parse outlives the base
         // lease; the heartbeat keeps the job ours while the work is alive.
         let renew = async || self.control.renew_index(&job, INDEX_LEASE).await;
-        let Some(indexed) =
-            yg_sync::with_lease_heartbeat(INDEX_LEASE, renew, self.index(&job)).await
-        else {
-            tracing::warn!(slug = %job.slug, "job reclaimed mid-index; run abandoned");
-            return Ok(true);
-        };
+        let indexed = yg_sync::with_lease_heartbeat(INDEX_LEASE, renew, self.index(&job)).await;
         match indexed {
             Ok(shard) => {
                 let applied = self

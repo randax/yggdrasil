@@ -65,10 +65,7 @@ impl SyncWorker {
         // A cold clone of a large repo outlives the base lease; the
         // heartbeat keeps the job ours for as long as the work is alive.
         let renew = async || self.control.renew_fetch(&job, FETCH_LEASE).await;
-        let Some(synced) = with_lease_heartbeat(FETCH_LEASE, renew, work).await else {
-            tracing::warn!(slug = %job.slug, "job reclaimed mid-fetch; run abandoned");
-            return Ok(true);
-        };
+        let synced = with_lease_heartbeat(FETCH_LEASE, renew, work).await;
         match synced {
             Ok(commit) => {
                 if self.control.complete_fetch(&job, &commit).await? {
@@ -90,33 +87,52 @@ impl SyncWorker {
     }
 }
 
-/// Race long-running leased work against a fenced lease-renewal
-/// heartbeat, one renewal every third of the lease. `Some(output)` means
-/// the work finished while the lease was held. `None` means a renewal
-/// was fenced off — the job was reclaimed — and the work future was
-/// dropped mid-run (its git subprocesses die with it, `kill_on_drop`).
+/// Drive long-running leased work while heartbeating its lease: one
+/// fenced renewal every third of the lease, each attempt bounded by
+/// that same period so a wedged control-plane connection never stalls
+/// the work's supervision. The work always runs to completion; the
+/// heartbeat only decides whether the lease is still ours when the
+/// caller settles:
 ///
-/// A renewal *error* is logged and retried at the next tick instead of
-/// aborting: settlement is fenced anyway, so a control-plane blip must
-/// not kill an hours-long clone that is still making progress.
+/// - a renewal *error or timeout* is retried at the next tick —
+///   settlement is fenced anyway, so a control-plane blip must not
+///   doom an hours-long clone that is still making progress;
+/// - a *fenced* renewal (the job was reclaimed — or our own renewal
+///   committed but its response was lost, leaving us with the stale
+///   token) stops the heartbeat and lets the work finish. The run is
+///   already lost to the fenced settle, and cancelling it here would
+///   be worse: the index path's blocking sections (`git archive | tar`,
+///   the parse) outlive a dropped future, which would release the
+///   mirror lock and delete the scratch checkout under still-running
+///   subprocesses.
 pub async fn with_lease_heartbeat<T>(
     lease: Duration,
     renew: impl AsyncFn() -> anyhow::Result<bool>,
     work: impl Future<Output = T>,
-) -> Option<T> {
-    let period = lease / 3;
+) -> T {
+    // Guard the degenerate lease: a zero period would panic interval_at.
+    let period = (lease / 3).max(Duration::from_millis(1));
     let start = tokio::time::Instant::now() + period;
     let mut ticks = tokio::time::interval_at(start, period);
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut work = std::pin::pin!(work);
+    let mut held = true;
     loop {
         tokio::select! {
-            output = &mut work => return Some(output),
-            _ = ticks.tick() => match renew().await {
-                Ok(true) => {}
-                Ok(false) => return None,
-                Err(e) => {
+            output = &mut work => return output,
+            _ = ticks.tick(), if held => match tokio::time::timeout(period, renew()).await {
+                Ok(Ok(true)) => {}
+                Ok(Ok(false)) => {
+                    held = false;
+                    tracing::warn!(
+                        "lease renewal fenced — the job was reclaimed; the fenced settle will discard this run"
+                    );
+                }
+                Ok(Err(e)) => {
                     tracing::warn!(error = format!("{e:#}"), "lease renewal failed; retrying at the next heartbeat");
+                }
+                Err(_) => {
+                    tracing::warn!("lease renewal timed out; retrying at the next heartbeat");
                 }
             },
         }
@@ -1280,7 +1296,7 @@ mod tests {
         busy: Duration,
         answers: &[anyhow::Result<bool>],
         renewals: &std::sync::atomic::AtomicUsize,
-    ) -> Option<&'static str> {
+    ) -> &'static str {
         let renew = async || {
             let n = renewals.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             match answers[n.min(answers.len() - 1)] {
@@ -1302,7 +1318,7 @@ mod tests {
         // Three lease-lengths of work: without renewals the job would
         // have been reclaimed long before the fetch lands.
         let out = heartbeat_with(lease, lease * 3, &[Ok(true)], &renewals).await;
-        assert_eq!(out, Some("synced"));
+        assert_eq!(out, "synced");
         assert!(
             renewals.load(std::sync::atomic::Ordering::SeqCst) >= 3,
             "the lease must have been renewed while the work ran"
@@ -1314,7 +1330,7 @@ mod tests {
         let renewals = std::sync::atomic::AtomicUsize::new(0);
         let lease = Duration::from_secs(60);
         let out = heartbeat_with(lease, Duration::from_secs(1), &[Ok(true)], &renewals).await;
-        assert_eq!(out, Some("synced"));
+        assert_eq!(out, "synced");
         assert_eq!(
             renewals.load(std::sync::atomic::Ordering::SeqCst),
             0,
@@ -1323,11 +1339,15 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_fenced_renewal_abandons_the_work() {
+    async fn a_fenced_renewal_stops_the_heartbeat_but_lets_the_work_finish() {
         let renewals = std::sync::atomic::AtomicUsize::new(0);
         let lease = Duration::from_secs(60);
+        // Nine tick periods of work: the first renewal is fenced, so the
+        // remaining eight must never fire — cancelling mid-run would
+        // orphan blocking subprocesses, so the work runs out its clock
+        // and the (fenced) settle discards the result instead.
         let out = heartbeat_with(lease, lease * 3, &[Ok(false)], &renewals).await;
-        assert_eq!(out, None, "a reclaimed job must abandon its run");
+        assert_eq!(out, "synced", "fenced work must still run to completion");
         assert_eq!(
             renewals.load(std::sync::atomic::Ordering::SeqCst),
             1,
@@ -1348,8 +1368,23 @@ mod tests {
             &renewals,
         )
         .await;
-        assert_eq!(out, Some("synced"));
+        assert_eq!(out, "synced");
         assert!(renewals.load(std::sync::atomic::Ordering::SeqCst) >= 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_renewal_times_out_instead_of_stalling_the_work() {
+        let lease = Duration::from_secs(60);
+        // Every renewal black-holes (a dead control-plane connection
+        // that never errors): each attempt must be cut off at the tick
+        // period so the work is polled again and can finish.
+        let renew = async || std::future::pending::<anyhow::Result<bool>>().await;
+        let out = with_lease_heartbeat(lease, renew, async {
+            tokio::time::sleep(lease * 2).await;
+            "synced"
+        })
+        .await;
+        assert_eq!(out, "synced", "a wedged renewal must not stall the work");
     }
 
     #[test]
