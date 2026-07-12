@@ -62,7 +62,10 @@ pub struct Setting {
 /// Admin fixes one deploy, not one variable per boot attempt.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    #[error("{var}: {value:?} does not parse as host:port")]
+    #[error(
+        "{var}: {value:?} does not parse as IP:port \
+         (hostnames are not resolved), e.g. 127.0.0.1:7311"
+    )]
     InvalidListenAddr { var: &'static str, value: String },
     #[error("{var}: {value:?} must be a whole number of seconds, 1..={MAX_DURATION_SECS}")]
     InvalidDurationSecs { var: &'static str, value: String },
@@ -99,24 +102,53 @@ impl Resolution {
 /// point at the in-repo dev compose stack, and `docs/DEVELOPMENT.md`
 /// mirrors them.
 pub fn resolve(role: Role, lookup: impl Fn(&str) -> Option<String>) -> Resolution {
+    // A role only resolves — validates, reports — the settings its
+    // process actually uses: a fleet-wide YG_LISTEN typo must not
+    // refuse a worker boot, and an api report must not advertise poll
+    // knobs the process ignores. Unresolved settings keep their
+    // defaults in the typed config; the role never reads them.
+    let api = matches!(role, Role::Api | Role::All);
+    let worker = matches!(role, Role::Worker | Role::All);
     let mut r = Resolver {
         lookup: &lookup,
         settings: Vec::new(),
         errors: Vec::new(),
     };
-    let listen = r.listen_addr("YG_LISTEN", "127.0.0.1:7311");
-    let bootstrap_token = r.secret("YG_BOOTSTRAP_TOKEN");
-    if bootstrap_token.is_none() && matches!(role, Role::Api | Role::All) {
-        r.errors.push(ConfigError::MissingBootstrapToken {
-            var: "YG_BOOTSTRAP_TOKEN",
-        });
-    }
+    const DEFAULT_LISTEN: &str = "127.0.0.1:7311";
+    let listen = if api {
+        r.listen_addr("YG_LISTEN", DEFAULT_LISTEN)
+    } else {
+        DEFAULT_LISTEN
+            .parse()
+            .expect("default listen address parses")
+    };
+    let bootstrap_token = if api {
+        let token = r.secret("YG_BOOTSTRAP_TOKEN");
+        if token.is_none() {
+            r.errors.push(ConfigError::MissingBootstrapToken {
+                var: "YG_BOOTSTRAP_TOKEN",
+            });
+        }
+        token
+    } else {
+        None
+    };
     let config = DeployConfig {
         listen,
         bootstrap_token,
         database_url: r.database_url("YG_DATABASE_URL", yg_control::DEFAULT_DATABASE_URL),
-        shard_cache: r.string("YG_SHARD_CACHE", "./data/shard-cache").into(),
-        git_cache: r.string("YG_GIT_CACHE", "./data/git").into(),
+        shard_cache: if api {
+            r.string("YG_SHARD_CACHE", "./data/shard-cache")
+        } else {
+            "./data/shard-cache".to_string()
+        }
+        .into(),
+        git_cache: if worker {
+            r.string("YG_GIT_CACHE", "./data/git")
+        } else {
+            "./data/git".to_string()
+        }
+        .into(),
         object_store: ObjectStoreConfig {
             endpoint: r.string("YG_S3_ENDPOINT", "http://localhost:9000"),
             bucket: r.string("YG_S3_BUCKET", "yggdrasil"),
@@ -125,10 +157,10 @@ pub fn resolve(role: Role, lookup: impl Fn(&str) -> Option<String>) -> Resolutio
             region: r.string("YG_S3_REGION", "us-east-1"),
             key_prefix: r.string("YG_S3_PREFIX", ""),
         },
-        poll_interval: r.duration_secs("YG_POLL_INTERVAL", 5 * 60),
-        discovery_interval: r.duration_secs("YG_DISCOVERY_INTERVAL", 60 * 60),
-        gc_grace: r.duration_secs("YG_GC_GRACE", 60 * 60),
-        gc_interval: r.duration_secs("YG_GC_INTERVAL", 10 * 60),
+        poll_interval: r.worker_duration(worker, "YG_POLL_INTERVAL", 5 * 60),
+        discovery_interval: r.worker_duration(worker, "YG_DISCOVERY_INTERVAL", 60 * 60),
+        gc_grace: r.worker_duration(worker, "YG_GC_GRACE", 60 * 60),
+        gc_interval: r.worker_duration(worker, "YG_GC_INTERVAL", 10 * 60),
     };
     Resolution {
         settings: r.settings,
@@ -157,13 +189,20 @@ impl Resolver<'_> {
     }
 
     fn string(&mut self, var: &'static str, default: &str) -> String {
+        fn shown(value: &str) -> String {
+            if value.is_empty() {
+                "(empty)".to_string()
+            } else {
+                value.to_string()
+            }
+        }
         match self.raw(var) {
             Some(value) => {
-                self.record(var, format!("{value:?}"), Source::Env);
+                self.record(var, shown(&value), Source::Env);
                 value
             }
             None => {
-                self.record(var, format!("{default:?}"), Source::Default);
+                self.record(var, shown(default), Source::Default);
                 default.to_string()
             }
         }
@@ -241,6 +280,17 @@ impl Resolver<'_> {
         }
     }
 
+    /// A worker-cadence duration: resolved only for worker-running
+    /// roles, otherwise the default passes through untouched (the
+    /// process never reads it).
+    fn worker_duration(&mut self, worker: bool, var: &'static str, default_secs: u64) -> Duration {
+        if worker {
+            self.duration_secs(var, default_secs)
+        } else {
+            Duration::from_secs(default_secs)
+        }
+    }
+
     /// A whole number of seconds in `1..=MAX_DURATION_SECS`; anything
     /// else is a validation error (it used to degrade to the default
     /// with a warning, which config-check would render invisible).
@@ -268,19 +318,30 @@ impl Resolver<'_> {
 pub const REDACTED: &str = "(redacted)";
 
 /// Mask the password of a URL's `user:password@` userinfo, leaving the
-/// user and host visible. URLs without userinfo pass through untouched.
-/// Userinfo cannot contain an unencoded `/` or `@`, so the first `@`
-/// before the path is the userinfo delimiter.
+/// user and host visible. Clients treat the last `@` in the authority
+/// as the userinfo delimiter, so redaction does too. A value that has
+/// an `@` but cannot be confidently parsed (no scheme, or the `@`
+/// lands outside the authority because of an unencoded `/` in the
+/// password) is replaced wholesale — a report must never gamble with a
+/// credential.
 fn redact_url_password(url: &str) -> String {
     let Some(scheme_end) = url.find("://") else {
-        return url.to_string();
+        return if url.contains('@') {
+            REDACTED.to_string()
+        } else {
+            url.to_string()
+        };
     };
     let rest = &url[scheme_end + 3..];
-    let authority_end = rest.find('/').unwrap_or(rest.len());
-    let Some(at) = rest[..authority_end].find('@') else {
-        return url.to_string();
+    let authority = &rest[..rest.find('/').unwrap_or(rest.len())];
+    let Some(at) = authority.rfind('@') else {
+        return if rest.contains('@') {
+            REDACTED.to_string()
+        } else {
+            url.to_string()
+        };
     };
-    let userinfo = &rest[..at];
+    let userinfo = &authority[..at];
     let Some(colon) = userinfo.find(':') else {
         return url.to_string();
     };
@@ -405,7 +466,7 @@ mod tests {
     #[test]
     fn all_validation_errors_are_reported_together() {
         let resolution = resolve(
-            Role::Worker,
+            Role::All,
             env(&[
                 ("YG_LISTEN", "not-an-address"),
                 ("YG_POLL_INTERVAL", "soon"),
@@ -426,6 +487,7 @@ mod tests {
             errored,
             [
                 "YG_LISTEN",
+                "YG_BOOTSTRAP_TOKEN",
                 "YG_POLL_INTERVAL",
                 "YG_GC_GRACE",
                 "YG_GC_INTERVAL"
@@ -434,6 +496,40 @@ mod tests {
         let message = format!("{:#}", resolution.into_config().unwrap_err());
         assert!(message.contains("YG_LISTEN"), "{message}");
         assert!(message.contains("YG_POLL_INTERVAL"), "{message}");
+    }
+
+    #[test]
+    fn each_role_resolves_only_the_settings_it_uses() {
+        // A worker never binds a listen address or checks tokens
+        // (docs/DEVELOPMENT.md says so), so an api-only variable that is
+        // invalid fleet-wide must not refuse a worker boot — and must
+        // not clutter its report.
+        let worker = resolve(
+            Role::Worker,
+            env(&[("YG_LISTEN", "not-an-address"), ("YG_SHARD_CACHE", "/x")]),
+        );
+        assert!(worker.errors.is_empty(), "{:?}", worker.errors);
+        let worker_vars: Vec<&str> = worker.settings.iter().map(|s| s.var).collect();
+        assert!(!worker_vars.contains(&"YG_LISTEN"));
+        assert!(!worker_vars.contains(&"YG_BOOTSTRAP_TOKEN"));
+        assert!(!worker_vars.contains(&"YG_SHARD_CACHE"));
+        assert!(worker_vars.contains(&"YG_GIT_CACHE"));
+        assert!(worker_vars.contains(&"YG_DATABASE_URL"));
+
+        // And the api role ignores worker-only settings the same way.
+        let api = resolve(
+            Role::Api,
+            env(&[
+                ("YG_BOOTSTRAP_TOKEN", "ygt_admin"),
+                ("YG_POLL_INTERVAL", "soon"),
+            ]),
+        );
+        assert!(api.errors.is_empty(), "{:?}", api.errors);
+        let api_vars: Vec<&str> = api.settings.iter().map(|s| s.var).collect();
+        assert!(!api_vars.contains(&"YG_POLL_INTERVAL"));
+        assert!(!api_vars.contains(&"YG_GIT_CACHE"));
+        assert!(api_vars.contains(&"YG_LISTEN"));
+        assert!(api_vars.contains(&"YG_SHARD_CACHE"));
     }
 
     #[test]
@@ -491,6 +587,31 @@ mod tests {
         assert_eq!(
             config.database_url,
             "postgres://yg_user:db_password@db.example.test:5432/yg"
+        );
+    }
+
+    #[test]
+    fn ambiguous_database_urls_are_fully_redacted_never_leaked() {
+        // Unencoded '@' in the password: clients treat the LAST '@' in
+        // the authority as the userinfo delimiter, so everything up to
+        // it is credential.
+        assert_eq!(
+            super::redact_url_password("postgres://user:p@ss@host/yg"),
+            format!("postgres://user:{REDACTED}@host/yg")
+        );
+        // Unencoded '/' in the password puts the '@' outside what looks
+        // like the authority; the value is ambiguous, so nothing of it
+        // may be shown.
+        assert_eq!(
+            super::redact_url_password("postgres://user:pa/ss@host/yg"),
+            REDACTED
+        );
+        // Scheme-less but credential-shaped: same rule.
+        assert_eq!(super::redact_url_password("user:pw@host/db"), REDACTED);
+        // IPv6 host with a port parses fine and has no credential.
+        assert_eq!(
+            super::redact_url_password("postgres://[::1]:5432/yg"),
+            "postgres://[::1]:5432/yg"
         );
     }
 

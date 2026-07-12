@@ -13,11 +13,28 @@ pub struct ClientConfig {
     pub token: Option<String>,
 }
 
+/// A parse failure that never carries the file's contents: the file
+/// holds the bearer token, and toml's rendered errors quote the
+/// offending source line — an unquoted token would land in stderr, CI
+/// logs, and shell transcripts.
+#[derive(Debug, thiserror::Error)]
+#[error("invalid TOML at line {line}: {message}")]
+pub struct ClientConfigError {
+    line: usize,
+    message: String,
+}
+
 /// Parse the config file's contents. Only the top-level `server` and
 /// `token` keys are read; anything else — including keys nested inside
 /// sections — is ignored.
-pub fn parse_client_config(contents: &str) -> Result<ClientConfig, toml::de::Error> {
-    toml::from_str(contents)
+pub fn parse_client_config(contents: &str) -> Result<ClientConfig, ClientConfigError> {
+    toml::from_str(contents).map_err(|e| ClientConfigError {
+        line: e
+            .span()
+            .map(|span| contents[..span.start].lines().count().max(1))
+            .unwrap_or(0),
+        message: e.message().to_string(),
+    })
 }
 
 #[cfg(test)]
@@ -88,5 +105,23 @@ token = "not-my-credential"
     fn malformed_toml_is_an_error_not_a_silent_default() {
         assert!(parse_client_config("token = unquoted-bareword\n").is_err());
         assert!(parse_client_config("token = \"unterminated\n").is_err());
+    }
+
+    #[test]
+    fn parse_errors_never_quote_the_file_contents() {
+        // The most likely typo: an unquoted bearer token. The rendered
+        // error must locate the problem without echoing the credential.
+        for contents in [
+            "token = ygt_SUPERSECRET_bare\n",
+            "server = \"ok\"\ntoken = \"ygt_SUPERSECRET_bare\" trailing\n",
+            "token = \"ygt_SUPERSECRET_bare\nserver = 3\n",
+        ] {
+            let message = parse_client_config(contents).unwrap_err().to_string();
+            assert!(
+                !message.contains("ygt_SUPERSECRET_bare"),
+                "error echoes the credential: {message}"
+            );
+            assert!(message.contains("line"), "error should locate the problem");
+        }
     }
 }

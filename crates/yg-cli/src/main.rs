@@ -356,14 +356,20 @@ fn skill_home_dir() -> anyhow::Result<std::path::PathBuf> {
 /// Where the Index Server lives and how to authenticate, from the same
 /// env every client command reads.
 fn client_env() -> anyhow::Result<(String, String)> {
-    let config = read_client_config()?;
-    let server = std::env::var("YG_SERVER")
-        .ok()
+    let env_server = std::env::var("YG_SERVER").ok();
+    let env_token = std::env::var("YG_TOKEN").ok();
+    // The env wins over the file, so a broken config file only matters
+    // when the env leaves something for the file to answer.
+    let config = if env_server.is_none() || env_token.is_none() {
+        read_client_config()?
+    } else {
+        client_config::ClientConfig::default()
+    };
+    let server = env_server
         .or(config.server)
         .unwrap_or_else(|| "http://127.0.0.1:7311".into());
     let server = server.trim_end_matches('/').to_string();
-    let token = std::env::var("YG_TOKEN")
-        .ok()
+    let token = env_token
         .or(config.token)
         .context("YG_TOKEN must be set or token must be configured in ~/.config/yg/config.toml")?;
     Ok((server, token))
@@ -974,10 +980,12 @@ fn config_check(role: Role) -> anyhow::Result<()> {
     println!("resolved configuration (role: {role_name}):");
     for setting in &resolution.settings {
         let source = match setting.source {
-            deploy_config::Source::Env => "env",
-            deploy_config::Source::Default => "default",
+            deploy_config::Source::Env => "(env)",
+            deploy_config::Source::Default => "(default)",
         };
-        println!("  {:<22} {:<42} ({source})", setting.var, setting.shown);
+        // Source before value: values (URLs, paths) have no width bound,
+        // so they take the ragged column.
+        println!("  {:<22} {source:<10} {}", setting.var, setting.shown);
     }
     resolution.into_config()?;
     println!("configuration valid");

@@ -40,7 +40,10 @@ which is required. All of them resolve through one typed config
 (`crates/yg-cli/src/deploy_config.rs` — the source of truth this table
 mirrors), and `yg config-check [--role=api|worker|all]` prints the resolved
 configuration (credentials redacted) with every validation error, without
-starting the server. The one exception is the Forge token: its env var
+starting the server. Each role resolves, validates, and reports only the
+settings its process uses — a worker ignores `YG_LISTEN` and
+`YG_BOOTSTRAP_TOKEN`; an api process ignores the poll/GC cadences and
+`YG_GIT_CACHE`. The one exception is the Forge token: its env var
 name is stored per Forge org in the control plane (`YG_GITHUB_TOKEN` by
 default), so the Sync worker reads it per job and config-check — which
 never connects — cannot report it:
