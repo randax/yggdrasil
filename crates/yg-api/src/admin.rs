@@ -8,6 +8,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 use yg_sync::RepoLocator;
+use yg_sync::forge::Forge;
 
 use crate::AppState;
 use crate::error::ApiError;
@@ -50,23 +51,21 @@ pub(crate) async fn admin_forge_add(
     State(state): State<Arc<AppState>>,
     WireJson(req): WireJson<AddForgeRequest>,
 ) -> Result<Response, ApiError> {
-    let kind = github_kind(&req.kind).map_err(ApiError::bad_request)?;
+    let forge = discovery_capable_forge(&req.kind).map_err(ApiError::bad_request)?;
     let org = github_org_slug(&req.org).map_err(ApiError::bad_request)?;
     let base_url = github_base_url(req.base_url.as_deref()).map_err(ApiError::bad_request)?;
-    let token_env = req.token_env.as_deref().or_else(|| {
-        if kind == "github" {
-            Some("YG_GITHUB_TOKEN")
-        } else {
-            None
-        }
-    });
+    let token_env = req
+        .token_env
+        .as_deref()
+        .or_else(|| forge.default_token_env());
     let outcome = state
         .control
         .connect_forge_org(yg_control::ConnectForgeOrg {
-            forge_kind: kind,
+            forge_kind: forge.kind(),
             base_url: &base_url,
             org_slug: &org,
             token_env,
+            api_root: forge.default_api_root(&base_url).as_deref(),
         })
         .await?;
     Ok((
@@ -76,7 +75,7 @@ pub(crate) async fn admin_forge_add(
             StatusCode::OK
         },
         Wire(AddForgeResponse {
-            kind: kind.to_string(),
+            kind: forge.kind().to_string(),
             org,
             base_url,
             created: outcome.created,
@@ -85,12 +84,13 @@ pub(crate) async fn admin_forge_add(
         .into_response())
 }
 
-fn github_kind(kind: &str) -> Result<&'static str, &'static str> {
-    if kind.trim().eq_ignore_ascii_case("github") {
-        Ok("github")
-    } else {
-        Err("only github forge discovery is supported in this release")
-    }
+/// Resolve a requested forge kind to a registered adapter that can
+/// discover org repositories.
+fn discovery_capable_forge(kind: &str) -> Result<&'static dyn Forge, String> {
+    yg_sync::forge::builtin()
+        .by_kind(kind.trim().to_ascii_lowercase().as_str())
+        .filter(|forge| forge.discovery().is_some())
+        .ok_or_else(|| format!("forge kind {kind:?} has no discovery adapter in this release"))
 }
 
 fn github_org_slug(org: &str) -> Result<String, &'static str> {
@@ -148,7 +148,8 @@ pub(crate) async fn admin_forge_discover(
     State(state): State<Arc<AppState>>,
     WireJson(req): WireJson<DiscoverForgeRequest>,
 ) -> Result<Response, ApiError> {
-    let kind = github_kind(&req.kind).map_err(ApiError::bad_request)?;
+    let forge = discovery_capable_forge(&req.kind).map_err(ApiError::bad_request)?;
+    let kind = forge.kind();
     let org = github_org_slug(&req.org).map_err(ApiError::bad_request)?;
     let base_url = github_base_url(req.base_url.as_deref()).map_err(ApiError::bad_request)?;
     if !state.control.request_discovery(&base_url, &org).await? {
@@ -288,7 +289,12 @@ pub(crate) async fn admin_repo_add(
             "poll_interval must be a positive number of seconds (got {interval})"
         )));
     }
-    let locator = RepoLocator::parse(&req.url).map_err(ApiError::bad_request)?;
+    // The typed parse error renders to its human-facing form here, at
+    // the I/O edge.
+    let locator = RepoLocator::parse(&req.url).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let forge = yg_sync::forge::builtin()
+        .by_kind(locator.kind)
+        .ok_or_else(|| ApiError::internal(anyhow::anyhow!("locator kind without an adapter")))?;
     // Every node id this repo will ever mint embeds its qualifier
     // (RFC 0001 §5); a qualifier the id grammar can't address — an
     // IPv6 host, a path with a stray colon — would index a repo no
@@ -305,9 +311,10 @@ pub(crate) async fn admin_repo_add(
     let outcome = state
         .control
         .add_repo(yg_control::AddRepo {
-            forge_kind: locator.kind.as_str(),
+            forge_kind: locator.kind,
             base_url: &locator.base_url,
-            token_env: locator.kind.token_env(),
+            token_env: forge.default_token_env(),
+            api_root: forge.default_api_root(&locator.base_url).as_deref(),
             slug: &locator.slug,
             fetch_depth: req.depth,
             poll_interval_seconds: req.poll_interval,

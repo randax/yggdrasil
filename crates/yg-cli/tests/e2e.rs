@@ -49,6 +49,7 @@ async fn discovery_keeps_private_repos_discovered_until_a_private_include_rule_m
             base_url: "https://github.com",
             org_slug: "acme",
             token_env: Some("YG_GITHUB_TOKEN"),
+            api_root: None,
         })
         .await
         .unwrap();
@@ -103,6 +104,7 @@ async fn admin_repo_add_opts_in_a_previously_discovered_private_repo() {
             base_url: "https://github.com",
             org_slug: "acme",
             token_env: None,
+            api_root: None,
         })
         .await
         .unwrap();
@@ -128,6 +130,7 @@ async fn admin_repo_add_opts_in_a_previously_discovered_private_repo() {
             forge_kind: "github",
             base_url: "https://github.com",
             token_env: None,
+            api_root: None,
             slug: "acme/private-widgets",
             fetch_depth: None,
             poll_interval_seconds: None,
@@ -162,6 +165,7 @@ async fn rediscovery_does_not_requeue_repos_that_are_already_included() {
             base_url: "https://github.com",
             org_slug: "acme",
             token_env: None,
+            api_root: None,
         })
         .await
         .unwrap();
@@ -219,6 +223,7 @@ async fn exclude_rules_cancel_pending_fetches_for_included_repos() {
             forge_kind: "github",
             base_url: "https://github.com",
             token_env: None,
+            api_root: None,
             slug: "acme/widgets",
             fetch_depth: None,
             poll_interval_seconds: None,
@@ -262,6 +267,7 @@ async fn readding_a_repo_makes_its_exact_include_rule_newest_again() {
             forge_kind: "github",
             base_url: "https://github.com",
             token_env: None,
+            api_root: None,
             slug: "acme/widgets",
             fetch_depth: None,
             poll_interval_seconds: None,
@@ -292,6 +298,7 @@ async fn readding_a_repo_makes_its_exact_include_rule_newest_again() {
             forge_kind: "github",
             base_url: "https://github.com",
             token_env: None,
+            api_root: None,
             slug: "acme/widgets",
             fetch_depth: None,
             poll_interval_seconds: None,
@@ -420,6 +427,154 @@ async fn admin_forge_add_normalizes_base_url_and_defaults_the_github_token_env()
         .expect("connected forge org must be due for discovery");
     assert_eq!(due.base_url, "https://github.com");
     assert_eq!(due.token_env.as_deref(), Some("YG_GITHUB_TOKEN"));
+    assert_eq!(
+        due.api_root.as_deref(),
+        Some("https://api.github.com"),
+        "registration must record the forge's API root on the record"
+    );
+}
+
+/// A repo add on a GitHub Enterprise forge arrives as generic `git` —
+/// the URL locator can't recognize arbitrary enterprise hosts — and
+/// must not reclassify the forge row that `forge add` registered as
+/// `github`, or the org's discovery would silently stop resolving an
+/// adapter.
+#[tokio::test]
+async fn adding_a_repo_does_not_reclassify_an_enterprise_forge() {
+    let db_name = create_test_db().await;
+    let control = control_plane(&db_name).await;
+    control
+        .connect_forge_org(yg_control::ConnectForgeOrg {
+            forge_kind: "github",
+            base_url: "https://github.enterprise.example",
+            org_slug: "acme",
+            token_env: Some("YG_GITHUB_TOKEN"),
+            api_root: Some("https://github.enterprise.example/api/v3"),
+        })
+        .await
+        .unwrap();
+
+    // What `admin repo add` sends for an enterprise URL: the locator
+    // falls back to the generic git kind for an unrecognized host.
+    control
+        .add_repo(yg_control::AddRepo {
+            forge_kind: "git",
+            base_url: "https://github.enterprise.example",
+            token_env: None,
+            api_root: None,
+            slug: "acme/widgets",
+            fetch_depth: None,
+            poll_interval_seconds: None,
+        })
+        .await
+        .unwrap();
+
+    let due = control
+        .claim_due_discovery(std::time::Duration::from_secs(3600))
+        .await
+        .unwrap()
+        .expect("the org must still be due for discovery");
+    assert_eq!(
+        due.forge_kind, "github",
+        "a repo add must not flip the forge kind and disable discovery"
+    );
+    assert_eq!(
+        due.api_root.as_deref(),
+        Some("https://github.enterprise.example/api/v3"),
+        "the registered API root must survive the repo add"
+    );
+}
+
+/// Adding a forge is one trait implementation plus registration (#53):
+/// a double registered under its own kind flows through the same
+/// discovery loop as GitHub — claim, adapter listing, reconciliation —
+/// with no other code changes.
+#[tokio::test]
+async fn a_registered_forge_double_discovers_repos_through_the_worker_loop() {
+    use std::sync::Arc;
+    use yg_sync::forge::{BoxFuture, Forge, ForgeRegistry, GitAuth, ListedRepo, OrgDiscovery};
+
+    struct FakeForge;
+
+    impl Forge for FakeForge {
+        fn kind(&self) -> &'static str {
+            "fakeforge"
+        }
+        fn claims_host(&self, host: &str) -> bool {
+            host == "fake.example"
+        }
+        fn default_token_env(&self) -> Option<&'static str> {
+            None
+        }
+        fn default_api_root(&self, base_url: &str) -> Option<String> {
+            Some(format!("{base_url}/api"))
+        }
+        fn git_auth(&self, token: String) -> GitAuth {
+            GitAuth {
+                username: "fake-user",
+                token,
+            }
+        }
+        fn is_rate_limit(&self, _message: &str) -> bool {
+            false
+        }
+        fn discovery(&self) -> Option<&dyn OrgDiscovery> {
+            Some(self)
+        }
+    }
+
+    impl OrgDiscovery for FakeForge {
+        fn list_org_repos<'a>(
+            &'a self,
+            _client: &'a reqwest::Client,
+            api_root: &'a str,
+            org: &'a str,
+            _token: Option<&'a str>,
+        ) -> BoxFuture<'a, anyhow::Result<Vec<ListedRepo>>> {
+            // The API root must be the record's explicit field, not an
+            // inference from the clone root.
+            assert_eq!(api_root, "https://fake.example/api");
+            let org = org.to_string();
+            Box::pin(async move {
+                Ok(vec![ListedRepo {
+                    slug: format!("{org}/discovered-widgets"),
+                    visibility: yg_control::RepoVisibility::Public,
+                }])
+            })
+        }
+    }
+
+    let db_name = create_test_db().await;
+    let control = control_plane(&db_name).await;
+    control
+        .connect_forge_org(yg_control::ConnectForgeOrg {
+            forge_kind: "fakeforge",
+            base_url: "https://fake.example",
+            org_slug: "acme",
+            token_env: None,
+            api_root: Some("https://fake.example/api"),
+        })
+        .await
+        .unwrap();
+
+    let cache = tempfile::tempdir().unwrap();
+    let worker = yg_sync::SyncWorker::with_registry(
+        control_plane(&db_name).await,
+        cache.path(),
+        ForgeRegistry::builtin().register(Arc::new(FakeForge)),
+    );
+    let had_claim = worker
+        .discover_once(&yg_sync::DiscoveryConfig {
+            interval: std::time::Duration::from_secs(3600),
+        })
+        .await
+        .unwrap();
+    assert!(had_claim, "the connected org must be due for discovery");
+
+    let repos = control.admin_status().await.unwrap();
+    assert_eq!(repos.len(), 1, "the double's listing must be reconciled");
+    assert_eq!(repos[0].slug, "acme/discovered-widgets");
+    assert_eq!(repos[0].discovery_state, "included");
 }
 
 #[tokio::test]
@@ -432,6 +587,7 @@ async fn reconnecting_a_forge_org_refreshes_the_token_env() {
             base_url: "https://github.com",
             org_slug: "acme",
             token_env: Some("YG_OLD_TOKEN"),
+            api_root: None,
         })
         .await
         .unwrap();
@@ -441,6 +597,7 @@ async fn reconnecting_a_forge_org_refreshes_the_token_env() {
             base_url: "https://github.com",
             org_slug: "acme",
             token_env: Some("YG_NEW_TOKEN"),
+            api_root: None,
         })
         .await
         .unwrap();
@@ -755,6 +912,7 @@ async fn re_adding_heals_a_forge_row_missing_its_token_env() {
             forge_kind: "github",
             base_url: "https://github.com",
             token_env: Some("YG_GITHUB_TOKEN"),
+            api_root: None,
             slug: "acme/widgets",
             fetch_depth: None,
             poll_interval_seconds: None,
@@ -831,6 +989,7 @@ async fn a_fetch_job_outlives_its_crashed_worker_via_lease_expiry() {
             forge_kind: "github",
             base_url: "https://github.com",
             token_env: Some("YG_GITHUB_TOKEN"),
+            api_root: None,
             slug: "acme/widgets",
             fetch_depth: None,
             poll_interval_seconds: None,
@@ -874,6 +1033,7 @@ async fn a_worker_that_outlived_its_lease_cannot_clobber_the_new_claim() {
             forge_kind: "github",
             base_url: "https://github.com",
             token_env: Some("YG_GITHUB_TOKEN"),
+            api_root: None,
             slug: "acme/widgets",
             fetch_depth: None,
             poll_interval_seconds: None,
@@ -946,6 +1106,7 @@ async fn a_heartbeating_worker_keeps_a_job_whose_work_outlives_the_base_lease() 
             forge_kind: "github",
             base_url: "https://github.com",
             token_env: Some("YG_GITHUB_TOKEN"),
+            api_root: None,
             slug: "acme/widgets",
             fetch_depth: None,
             poll_interval_seconds: None,
@@ -1004,6 +1165,7 @@ async fn a_reclaimed_jobs_old_lease_token_can_neither_renew_nor_settle() {
             forge_kind: "github",
             base_url: "https://github.com",
             token_env: Some("YG_GITHUB_TOKEN"),
+            api_root: None,
             slug: "acme/widgets",
             fetch_depth: None,
             poll_interval_seconds: None,
@@ -1094,6 +1256,7 @@ async fn index_lease_renewal_is_fenced_the_same_way() {
             forge_kind: "github",
             base_url: "https://github.com",
             token_env: Some("YG_GITHUB_TOKEN"),
+            api_root: None,
             slug: "acme/widgets",
             fetch_depth: None,
             poll_interval_seconds: None,
@@ -1557,6 +1720,7 @@ async fn yg_serve_role_worker_drains_the_queue_without_serving_http() {
             forge_kind: "git",
             base_url: &format!("file://{base}"),
             token_env: None,
+            api_root: None,
             slug: &format!("acme/{slug}"),
             fetch_depth: None,
             poll_interval_seconds: None,

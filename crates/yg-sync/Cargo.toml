@@ -1,6 +1,6 @@
 [package]
 name = "yg-sync"
-description = "Forge trait + GitHub/GitLab/Forgejo (Codeberg) adapters, webhooks"
+description = "Sync workers (fetch, poll, discovery) over the Forge trait; GitHub adapter"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -12,6 +12,7 @@ anyhow = "1.0.102"
 base64 = "0.22.1"
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json"] }
 serde = { version = "1.0.228", features = ["derive"] }
+thiserror = "2"
 tokio = { version = "1.52.3", features = ["fs", "macros", "process", "time"] }
 tracing = "0.1.44"
 yg-control = { version = "0.1.0", path = "../yg-control" }
