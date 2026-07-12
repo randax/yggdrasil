@@ -55,14 +55,20 @@ impl SyncWorker {
         let token = forge_token(job.token_env.as_deref(), &clone_url);
         // A lock failure (cache dir on a dead disk) is a failed fetch,
         // not a dead worker: record it and let backoff retry.
-        let synced = async {
+        let work = async {
             let _serialize_same_mirror =
                 lock_mirror(self.fetcher.cache_dir(), job.repo_id, FETCH_LEASE).await?;
             self.fetcher
                 .sync(job.repo_id, &clone_url, token.as_deref(), job.fetch_depth)
                 .await
-        }
-        .await;
+        };
+        // A cold clone of a large repo outlives the base lease; the
+        // heartbeat keeps the job ours for as long as the work is alive.
+        let renew = async || self.control.renew_fetch(&job, FETCH_LEASE).await;
+        let Some(synced) = with_lease_heartbeat(FETCH_LEASE, renew, work).await else {
+            tracing::warn!(slug = %job.slug, "job reclaimed mid-fetch; run abandoned");
+            return Ok(true);
+        };
         match synced {
             Ok(commit) => {
                 if self.control.complete_fetch(&job, &commit).await? {
@@ -81,6 +87,39 @@ impl SyncWorker {
             }
         }
         Ok(true)
+    }
+}
+
+/// Race long-running leased work against a fenced lease-renewal
+/// heartbeat, one renewal every third of the lease. `Some(output)` means
+/// the work finished while the lease was held. `None` means a renewal
+/// was fenced off — the job was reclaimed — and the work future was
+/// dropped mid-run (its git subprocesses die with it, `kill_on_drop`).
+///
+/// A renewal *error* is logged and retried at the next tick instead of
+/// aborting: settlement is fenced anyway, so a control-plane blip must
+/// not kill an hours-long clone that is still making progress.
+pub async fn with_lease_heartbeat<T>(
+    lease: Duration,
+    renew: impl AsyncFn() -> anyhow::Result<bool>,
+    work: impl Future<Output = T>,
+) -> Option<T> {
+    let period = lease / 3;
+    let start = tokio::time::Instant::now() + period;
+    let mut ticks = tokio::time::interval_at(start, period);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut work = std::pin::pin!(work);
+    loop {
+        tokio::select! {
+            output = &mut work => return Some(output),
+            _ = ticks.tick() => match renew().await {
+                Ok(true) => {}
+                Ok(false) => return None,
+                Err(e) => {
+                    tracing::warn!(error = format!("{e:#}"), "lease renewal failed; retrying at the next heartbeat");
+                }
+            },
+        }
     }
 }
 
@@ -1231,6 +1270,86 @@ mod tests {
 
     fn parsed(url: &str) -> RepoLocator {
         RepoLocator::parse(url).expect(url)
+    }
+
+    /// Paused-time heartbeat harness: work that "runs" for `busy` while
+    /// each renewal answers from `answers` in order (sticking on the
+    /// last), counting calls into `renewals`.
+    async fn heartbeat_with(
+        lease: Duration,
+        busy: Duration,
+        answers: &[anyhow::Result<bool>],
+        renewals: &std::sync::atomic::AtomicUsize,
+    ) -> Option<&'static str> {
+        let renew = async || {
+            let n = renewals.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match answers[n.min(answers.len() - 1)] {
+                Ok(held) => Ok(held),
+                Err(ref e) => Err(anyhow::anyhow!("{e:#}")),
+            }
+        };
+        with_lease_heartbeat(lease, renew, async move {
+            tokio::time::sleep(busy).await;
+            "synced"
+        })
+        .await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_lets_work_that_outlives_the_lease_finish() {
+        let renewals = std::sync::atomic::AtomicUsize::new(0);
+        let lease = Duration::from_secs(60);
+        // Three lease-lengths of work: without renewals the job would
+        // have been reclaimed long before the fetch lands.
+        let out = heartbeat_with(lease, lease * 3, &[Ok(true)], &renewals).await;
+        assert_eq!(out, Some("synced"));
+        assert!(
+            renewals.load(std::sync::atomic::Ordering::SeqCst) >= 3,
+            "the lease must have been renewed while the work ran"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_does_not_renew_for_work_that_finishes_early() {
+        let renewals = std::sync::atomic::AtomicUsize::new(0);
+        let lease = Duration::from_secs(60);
+        let out = heartbeat_with(lease, Duration::from_secs(1), &[Ok(true)], &renewals).await;
+        assert_eq!(out, Some("synced"));
+        assert_eq!(
+            renewals.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "work inside the base lease needs no heartbeat"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_fenced_renewal_abandons_the_work() {
+        let renewals = std::sync::atomic::AtomicUsize::new(0);
+        let lease = Duration::from_secs(60);
+        let out = heartbeat_with(lease, lease * 3, &[Ok(false)], &renewals).await;
+        assert_eq!(out, None, "a reclaimed job must abandon its run");
+        assert_eq!(
+            renewals.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the fenced heartbeat must be the last"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_renewal_error_is_retried_not_fatal() {
+        let renewals = std::sync::atomic::AtomicUsize::new(0);
+        let lease = Duration::from_secs(60);
+        // The control plane blips on the first heartbeat, then recovers:
+        // the work must survive to completion.
+        let out = heartbeat_with(
+            lease,
+            lease * 2,
+            &[Err(anyhow::anyhow!("connection refused")), Ok(true)],
+            &renewals,
+        )
+        .await;
+        assert_eq!(out, Some("synced"));
+        assert!(renewals.load(std::sync::atomic::Ordering::SeqCst) >= 2);
     }
 
     #[test]

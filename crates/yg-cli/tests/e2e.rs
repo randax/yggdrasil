@@ -938,6 +938,216 @@ async fn a_worker_that_outlived_its_lease_cannot_clobber_the_new_claim() {
 }
 
 #[tokio::test]
+async fn a_heartbeating_worker_keeps_a_job_whose_work_outlives_the_base_lease() {
+    let db_name = create_test_db().await;
+    let control = control_plane(&db_name).await;
+    control
+        .add_repo(yg_control::AddRepo {
+            forge_kind: "github",
+            base_url: "https://github.com",
+            token_env: Some("YG_GITHUB_TOKEN"),
+            slug: "acme/widgets",
+            fetch_depth: None,
+            poll_interval_seconds: None,
+        })
+        .await
+        .unwrap();
+
+    // The base lease (zero — already expired) stands in for a fetch that
+    // outlives it: without a heartbeat, the job would be claimable again.
+    let job = control
+        .claim_due_fetch(std::time::Duration::ZERO)
+        .await
+        .unwrap()
+        .expect("claimable");
+
+    // A heartbeat renews the lease before anyone reclaims the job…
+    assert!(
+        control
+            .renew_fetch(&job, std::time::Duration::from_secs(60))
+            .await
+            .unwrap(),
+        "the lease holder's renewal must apply"
+    );
+
+    // …so an idle worker can no longer steal it…
+    assert!(
+        control
+            .claim_due_fetch(std::time::Duration::from_secs(60))
+            .await
+            .unwrap()
+            .is_none(),
+        "a renewed lease must block other workers"
+    );
+
+    // …and the (renewed) worker's completion lands normally.
+    assert!(
+        control
+            .complete_fetch(&job, "feedface0000000000000000000000000000feed")
+            .await
+            .unwrap(),
+        "completion under a renewed lease must apply"
+    );
+    let repos = control.admin_status().await.unwrap();
+    assert_eq!(
+        repos[0].last_synced_commit.as_deref(),
+        Some("feedface0000000000000000000000000000feed")
+    );
+}
+
+#[tokio::test]
+async fn a_reclaimed_jobs_old_lease_token_can_neither_renew_nor_settle() {
+    let db_name = create_test_db().await;
+    let control = control_plane(&db_name).await;
+    control
+        .add_repo(yg_control::AddRepo {
+            forge_kind: "github",
+            base_url: "https://github.com",
+            token_env: Some("YG_GITHUB_TOKEN"),
+            slug: "acme/widgets",
+            fetch_depth: None,
+            poll_interval_seconds: None,
+        })
+        .await
+        .unwrap();
+
+    // Worker A stops heartbeating (its lease lapses); worker B reclaims.
+    let stale = control
+        .claim_due_fetch(std::time::Duration::ZERO)
+        .await
+        .unwrap()
+        .expect("claimable");
+    let fresh = control
+        .claim_due_fetch(std::time::Duration::from_secs(60))
+        .await
+        .unwrap()
+        .expect("an expired lease must make the job claimable again");
+
+    // A's old token is fenced out of every operation: renew, complete, fail.
+    assert!(
+        !control
+            .renew_fetch(&stale, std::time::Duration::from_secs(60))
+            .await
+            .unwrap(),
+        "a reclaimed job's old token must not renew"
+    );
+    assert!(
+        !control
+            .complete_fetch(&stale, "deadbeef0000000000000000000000000000dead")
+            .await
+            .unwrap(),
+        "a reclaimed job's old token must not complete"
+    );
+    assert!(
+        !control.fail_fetch(&stale, "boom").await.unwrap(),
+        "a reclaimed job's old token must not fail the job"
+    );
+    let repos = control.admin_status().await.unwrap();
+    assert_eq!(repos[0].last_synced_commit, None);
+    assert_eq!(repos[0].attempts, 0, "a fenced failure must not count");
+    assert_eq!(
+        repos[0].job_state.as_deref(),
+        Some("leased"),
+        "the job must still belong to worker B"
+    );
+
+    // B's renewals and completion still land.
+    assert!(
+        control
+            .renew_fetch(&fresh, std::time::Duration::from_secs(60))
+            .await
+            .unwrap(),
+        "the live lease holder's renewal must apply"
+    );
+    assert!(
+        control
+            .complete_fetch(&fresh, "feedface0000000000000000000000000000feed")
+            .await
+            .unwrap(),
+        "the live lease holder's completion must apply after renewing"
+    );
+}
+
+#[tokio::test]
+async fn index_lease_renewal_is_fenced_the_same_way() {
+    let db_name = create_test_db().await;
+    let control = control_plane(&db_name).await;
+    control
+        .add_repo(yg_control::AddRepo {
+            forge_kind: "github",
+            base_url: "https://github.com",
+            token_env: Some("YG_GITHUB_TOKEN"),
+            slug: "acme/widgets",
+            fetch_depth: None,
+            poll_interval_seconds: None,
+        })
+        .await
+        .unwrap();
+
+    // A completed fetch queues the index job and sets the sync position
+    // an index claim requires.
+    let fetch = control
+        .claim_due_fetch(std::time::Duration::from_secs(60))
+        .await
+        .unwrap()
+        .expect("claimable");
+    assert!(
+        control
+            .complete_fetch(&fetch, "feedface0000000000000000000000000000feed")
+            .await
+            .unwrap()
+    );
+
+    // Worker A's index lease lapses mid-parse; worker B reclaims the job.
+    let stale = control
+        .claim_due_index(std::time::Duration::ZERO)
+        .await
+        .unwrap()
+        .expect("the queued index job must be claimable");
+    let fresh = control
+        .claim_due_index(std::time::Duration::from_secs(60))
+        .await
+        .unwrap()
+        .expect("an expired index lease must be claimable again");
+    assert_eq!(fresh.job_id, stale.job_id, "same job, not a copy");
+
+    // A's old token can neither renew nor settle the job…
+    assert!(
+        !control
+            .renew_index(&stale, std::time::Duration::from_secs(60))
+            .await
+            .unwrap(),
+        "a reclaimed index job's old token must not renew"
+    );
+    assert!(
+        !control.fail_index(&stale, "boom").await.unwrap(),
+        "a reclaimed index job's old token must not settle"
+    );
+
+    // …while B's heartbeat keeps the job through work that outlives the
+    // base lease, and its settlement lands.
+    assert!(
+        control
+            .renew_index(&fresh, std::time::Duration::from_secs(60))
+            .await
+            .unwrap(),
+        "the live lease holder's renewal must apply"
+    );
+    assert!(
+        control
+            .claim_due_index(std::time::Duration::from_secs(60))
+            .await
+            .unwrap()
+            .is_none(),
+        "a renewed index lease must block other workers"
+    );
+    assert!(
+        control.fail_index(&fresh, "parse blew up").await.unwrap(),
+        "the live lease holder's settlement must apply after renewing"
+    );
+}
+
+#[tokio::test]
 async fn admin_repo_add_rejects_non_positive_depth() {
     let server = boot_test_server().await;
     let base = format!("http://{}", server.local_addr());

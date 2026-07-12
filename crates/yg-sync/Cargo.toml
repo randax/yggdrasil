@@ -12,9 +12,11 @@ anyhow = "1.0.102"
 base64 = "0.22.1"
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json"] }
 serde = { version = "1.0.228", features = ["derive"] }
-tokio = { version = "1.52.3", features = ["fs", "process", "time"] }
+tokio = { version = "1.52.3", features = ["fs", "macros", "process", "time"] }
 tracing = "0.1.44"
 yg-control = { version = "0.1.0", path = "../yg-control" }
 
 [dev-dependencies]
 tempfile = "3.27.0"
+# `#[tokio::test(start_paused = true)]` for the lease-heartbeat tests.
+tokio = { version = "1.52.3", features = ["rt", "test-util"] }

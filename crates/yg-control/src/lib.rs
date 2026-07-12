@@ -166,7 +166,32 @@ pub struct LeasedFetch {
     /// Opaque fencing token for this claim. `complete_fetch`/`fail_fetch`
     /// only apply while it still matches — a worker that outlived its
     /// lease (the job was re-claimed) has its result discarded.
-    lease_token: String,
+    #[sqlx(try_from = "String")]
+    lease_token: LeaseToken,
+}
+
+/// The claim's fencing token. The token is the lease deadline's text
+/// rendering, so a successful renewal mints a new one; interior
+/// mutability lets the heartbeat swap it in while the work future holds
+/// a shared borrow of the same leased job. The mutex is uncontended —
+/// one worker task renews and settles sequentially — and no code panics
+/// while holding it, so poisoning is unreachable.
+struct LeaseToken(std::sync::Mutex<String>);
+
+impl LeaseToken {
+    fn current(&self) -> String {
+        self.0.lock().expect("lease token lock poisoned").clone()
+    }
+
+    fn replace(&self, token: String) {
+        *self.0.lock().expect("lease token lock poisoned") = token;
+    }
+}
+
+impl From<String> for LeaseToken {
+    fn from(token: String) -> Self {
+        Self(std::sync::Mutex::new(token))
+    }
 }
 
 /// An index job a worker holds the lease on: which repo to index, the
@@ -188,7 +213,8 @@ pub struct LeasedIndex {
     /// Shallow-clone override; `None` = full history.
     pub fetch_depth: Option<i32>,
     /// Opaque fencing token; see [`LeasedFetch::lease_token`].
-    lease_token: String,
+    #[sqlx(try_from = "String")]
+    lease_token: LeaseToken,
 }
 
 /// A published Shard as the control plane records it: the row inserted
@@ -887,6 +913,61 @@ impl ControlPlane {
             .await
     }
 
+    /// Extend a fetch job's lease so work that outlives the base lease —
+    /// a cold full-history clone — is not reclaimed mid-run. Lease-fenced
+    /// like completion: `false` means the job was reclaimed and this
+    /// worker's token is dead, so it should abandon the run.
+    pub async fn renew_fetch(
+        &self,
+        job: &LeasedFetch,
+        lease: std::time::Duration,
+    ) -> anyhow::Result<bool> {
+        self.renew_leased_job(job.job_id, &job.lease_token, lease)
+            .await
+    }
+
+    /// Extend an index job's lease, exactly like [`Self::renew_fetch`].
+    pub async fn renew_index(
+        &self,
+        job: &LeasedIndex,
+        lease: std::time::Duration,
+    ) -> anyhow::Result<bool> {
+        self.renew_leased_job(job.job_id, &job.lease_token, lease)
+            .await
+    }
+
+    /// Push a leased job's deadline out by `lease` from now, but only
+    /// while the caller still holds the lease — after reclamation the old
+    /// token matches nothing, so a lapsed worker cannot resurrect its
+    /// claim. The new deadline is a new fencing token (the token is the
+    /// deadline's text rendering); a successful renewal swaps it into the
+    /// job so the eventual settle still matches.
+    async fn renew_leased_job(
+        &self,
+        job_id: i64,
+        lease_token: &LeaseToken,
+        lease: std::time::Duration,
+    ) -> anyhow::Result<bool> {
+        let renewed: Option<(String,)> = sqlx::query_as(
+            "UPDATE jobs
+             SET lease_until = now() + make_interval(secs => $2)
+             WHERE id = $1 AND state = 'leased' AND lease_until::text = $3
+             RETURNING lease_until::text",
+        )
+        .bind(job_id)
+        .bind(lease.as_secs_f64())
+        .bind(lease_token.current())
+        .fetch_optional(&self.pool)
+        .await?;
+        match renewed {
+            Some((token,)) => {
+                lease_token.replace(token);
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
     /// Claim the most-overdue repo for a poll, advancing its `next_poll_at`
     /// by one jittered interval — in `[interval, interval·(1 + jitter)]`,
     /// the spread keeping a forge's repos off lockstep. `FOR UPDATE SKIP
@@ -1196,7 +1277,7 @@ impl ControlPlane {
     async fn fail_leased_job(
         &self,
         job_id: i64,
-        lease_token: &str,
+        lease_token: &LeaseToken,
         error: &str,
     ) -> anyhow::Result<bool> {
         let applied = sqlx::query(
@@ -1209,7 +1290,7 @@ impl ControlPlane {
         )
         .bind(job_id)
         .bind(error)
-        .bind(lease_token)
+        .bind(lease_token.current())
         .execute(&self.pool)
         .await?
         .rows_affected()
@@ -1495,7 +1576,7 @@ async fn enqueue_job_unless_in_flight(
 async fn settle_leased_job(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     job_id: i64,
-    lease_token: &str,
+    lease_token: &LeaseToken,
     done: bool,
 ) -> anyhow::Result<bool> {
     let claimed = sqlx::query(
@@ -1507,7 +1588,7 @@ async fn settle_leased_job(
          WHERE id = $1 AND state = 'leased' AND lease_until::text = $2",
     )
     .bind(job_id)
-    .bind(lease_token)
+    .bind(lease_token.current())
     .bind(done)
     .execute(&mut **tx)
     .await?
