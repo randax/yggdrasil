@@ -1109,7 +1109,12 @@ async fn run_workers(
         drain_queue(|| sync.run_once()),
         drain_queue(|| index.run_once()),
         drain_queue(|| sync.poll_once(&poll)),
-        gc_loop(&index, deploy.gc_grace, deploy.gc_interval),
+        gc_loop(
+            &index,
+            deploy.gc_grace,
+            deploy.job_retention,
+            deploy.gc_interval
+        ),
     )?;
     Ok(())
 }
@@ -1134,14 +1139,17 @@ where
 /// don't poll in lockstep.
 const POLL_JITTER_FRACTION: f64 = 0.2;
 
-/// Reclaim superseded Shards on a fixed cadence. Unlike a queue drain
-/// there is no per-item "work or not": the sweep runs every `interval`,
-/// reclaiming whatever has aged past `grace`. A sweep that fails (a
-/// control-plane or object-storage blip) is logged and retried next
-/// interval rather than ending the process — GC is best-effort.
+/// Reclaim superseded Shards and retire old terminal jobs on a fixed
+/// cadence. Unlike a queue drain there is no per-item "work or not":
+/// the sweep runs every `interval`, reclaiming whatever has aged past
+/// `grace` and removing terminal job rows older than `job_retention`.
+/// A sweep that fails (a control-plane or object-storage blip) is
+/// logged and retried next interval rather than ending the process —
+/// GC is best-effort.
 async fn gc_loop(
     index: &yg_index::IndexWorker,
     grace: std::time::Duration,
+    job_retention: std::time::Duration,
     interval: std::time::Duration,
 ) -> anyhow::Result<()> {
     loop {
@@ -1149,6 +1157,12 @@ async fn gc_loop(
             tracing::warn!(
                 error = format!("{e:#}"),
                 "shard GC sweep failed; retrying next interval"
+            );
+        }
+        if let Err(e) = index.retire_terminal_jobs(job_retention).await {
+            tracing::warn!(
+                error = format!("{e:#}"),
+                "terminal-job retention sweep failed; retrying next interval"
             );
         }
         tokio::time::sleep(interval).await;

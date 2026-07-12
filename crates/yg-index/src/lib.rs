@@ -101,6 +101,22 @@ impl IndexWorker {
         Ok(collected)
     }
 
+    /// Remove terminal job rows finished longer ago than `retention`
+    /// (issue #49): the queue is a work list plus recent history for
+    /// `yg admin status`, not an archive, and terminal rows otherwise
+    /// accumulate forever. Runs beside [`Self::gc_once`] on the GC
+    /// cadence. Returns how many rows were removed.
+    pub async fn retire_terminal_jobs(&self, retention: Duration) -> anyhow::Result<u64> {
+        let deleted = self
+            .control
+            .delete_terminal_jobs_past_retention(retention)
+            .await?;
+        if deleted > 0 {
+            tracing::info!(jobs = deleted, "removed terminal jobs past retention");
+        }
+        Ok(deleted)
+    }
+
     /// Reclaim one superseded Shard. The row goes first, under a guard
     /// that deletes it only while no repo points at it: revisions are
     /// deterministic, so a force-push back to this Shard's commit can

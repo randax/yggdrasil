@@ -65,6 +65,7 @@ never connects — cannot report it:
 | `YG_DISCOVERY_INTERVAL` | `3600` | Seconds between connected-forge org discovery reconciliations |
 | `YG_GC_GRACE` | `3600` | Seconds a superseded Shard is kept before it is garbage-collected |
 | `YG_GC_INTERVAL` | `600` | Seconds between Shard garbage-collection sweeps |
+| `YG_JOB_RETENTION` | `604800` | Seconds a terminal job row is kept as status history before the GC cadence removes it |
 
 An invalid value (an unparseable listen address, a duration that is not a
 whole number of seconds) refuses to boot with every problem listed, not

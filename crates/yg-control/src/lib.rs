@@ -110,6 +110,29 @@ impl RuleAction {
     }
 }
 
+/// The job queue's kind vocabulary. Mirrored by the `jobs_kind_check`
+/// constraint (migration 0011), so a typo can't mint a row no claim
+/// query will ever match; a new kind lands as a variant here plus a
+/// migration extending the constraint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobKind {
+    Fetch,
+    Index,
+}
+
+impl JobKind {
+    /// Every kind, in one place, so tests can assert the database
+    /// constraint accepts exactly this vocabulary.
+    pub const ALL: [JobKind; 2] = [JobKind::Fetch, JobKind::Index];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fetch => "fetch",
+            Self::Index => "index",
+        }
+    }
+}
+
 pub struct AddRule<'a> {
     pub forge_id: i64,
     pub pattern: &'a str,
@@ -244,6 +267,15 @@ pub fn repo_qualifier(base_url: &str, slug: &str) -> String {
     let root = root.trim_end_matches('/');
     format!("{root}/{slug}")
 }
+
+/// [`repo_qualifier`], rendered as SQL over a forge row `f` and a repos
+/// row `r` — what migration 0011 re-derives stored qualifiers with. The
+/// tests pin this expression to the Rust function (same output over a
+/// corpus of forge roots) and to the migration file (verbatim
+/// containment), so the grammar cannot drift in either direction.
+pub const REPO_QUALIFIER_SQL: &str = "rtrim(CASE WHEN strpos(f.base_url, '://') > 0
+                           THEN substr(f.base_url, strpos(f.base_url, '://') + 3)
+                           ELSE f.base_url END, '/') || '/' || r.slug";
 
 /// A registration that collides with an existing repo's qualifier —
 /// the same host/slug already registered through a different Forge
@@ -435,7 +467,7 @@ impl ControlPlane {
             .execute(&mut *tx)
             .await?;
         let fetch_queued = if discovery_state == "included" {
-            enqueue_job_unless_in_flight(&mut tx, "fetch", repo_id).await?
+            enqueue_job_unless_in_flight(&mut tx, JobKind::Fetch, repo_id).await?
         } else {
             false
         };
@@ -622,7 +654,7 @@ impl ControlPlane {
             };
             if state == "included"
                 && !was_included
-                && enqueue_job_unless_in_flight(&mut tx, "fetch", repo_id).await?
+                && enqueue_job_unless_in_flight(&mut tx, JobKind::Fetch, repo_id).await?
             {
                 fetches_queued += 1;
             } else if state != "included" && was_included {
@@ -673,7 +705,7 @@ impl ControlPlane {
                 .await?;
             if state == "included"
                 && !was_included
-                && enqueue_job_unless_in_flight(&mut tx, "fetch", *repo_id).await?
+                && enqueue_job_unless_in_flight(&mut tx, JobKind::Fetch, *repo_id).await?
             {
                 fetches_queued += 1;
             } else if state != "included" && was_included {
@@ -852,7 +884,7 @@ impl ControlPlane {
         // AssertSqlSafe: assembled from string constants in this file,
         // no external input.
         let sql = sqlx::AssertSqlSafe(claim_due_sql(
-            "fetch",
+            JobKind::Fetch,
             "",
             "r.slug, r.fetch_depth, f.base_url, f.token_env",
         ));
@@ -892,7 +924,7 @@ impl ControlPlane {
         // If a job is already in flight this no-ops — a queued job will
         // pick the new commit up at claim, and a leased one is re-queued
         // by complete_index when it notices the repo moved on.
-        enqueue_job_unless_in_flight(&mut tx, "index", job.repo_id).await?;
+        enqueue_job_unless_in_flight(&mut tx, JobKind::Index, job.repo_id).await?;
         sqlx::query("UPDATE repos SET last_synced_commit = $1 WHERE id = $2")
             .bind(commit)
             .bind(job.repo_id)
@@ -1048,7 +1080,7 @@ impl ControlPlane {
         .fetch_optional(&mut *tx)
         .await?;
         let queued = if included.is_some() {
-            enqueue_job_unless_in_flight(&mut tx, "fetch", repo_id).await?
+            enqueue_job_unless_in_flight(&mut tx, JobKind::Fetch, repo_id).await?
         } else {
             false
         };
@@ -1066,7 +1098,7 @@ impl ControlPlane {
         // AssertSqlSafe: assembled from string constants in this file,
         // no external input.
         let sql = sqlx::AssertSqlSafe(claim_due_sql(
-            "index",
+            JobKind::Index,
             "AND r.last_synced_commit IS NOT NULL",
             "r.slug, r.last_synced_commit AS commit,
              f.base_url, f.token_env, r.fetch_depth",
@@ -1215,7 +1247,7 @@ impl ControlPlane {
         .await?;
         let mut queued = 0;
         for (repo_id,) in outdated {
-            if enqueue_job_unless_in_flight(&mut tx, "index", repo_id).await? {
+            if enqueue_job_unless_in_flight(&mut tx, JobKind::Index, repo_id).await? {
                 queued += 1;
             }
         }
@@ -1233,15 +1265,10 @@ impl ControlPlane {
         &self,
         grace: std::time::Duration,
     ) -> anyhow::Result<Vec<SupersededShard>> {
-        let rows = sqlx::query_as(
-            "SELECT s.id AS shard_id, s.repo_id, s.revision FROM shards s
-             WHERE NOT EXISTS (SELECT 1 FROM repos r WHERE r.current_shard_id = s.id)
-               AND coalesce(s.superseded_at, s.published_at) < now() - make_interval(secs => $1)
-             ORDER BY s.id",
-        )
-        .bind(grace.as_secs_f64())
-        .fetch_all(&self.pool)
-        .await?;
+        let rows = sqlx::query_as(SUPERSEDED_SHARDS_PAST_GRACE_SQL)
+            .bind(grace.as_secs_f64())
+            .fetch_all(&self.pool)
+            .await?;
         Ok(rows)
     }
 
@@ -1265,6 +1292,27 @@ impl ControlPlane {
         .await?
         .rows_affected()
             == 1;
+        Ok(deleted)
+    }
+
+    /// Remove terminal job rows finished longer ago than `retention`.
+    /// Terminal jobs are kept only as `yg admin status` history; without
+    /// retention they accumulate forever. Rows still in flight (or
+    /// re-queued) carry no `finished_at` and are never touched. Returns
+    /// how many rows were removed.
+    pub async fn delete_terminal_jobs_past_retention(
+        &self,
+        retention: std::time::Duration,
+    ) -> anyhow::Result<u64> {
+        let deleted = sqlx::query(
+            "DELETE FROM jobs
+             WHERE state = 'done'
+               AND finished_at < now() - make_interval(secs => $1)",
+        )
+        .bind(retention.as_secs_f64())
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
         Ok(deleted)
     }
 
@@ -1393,8 +1441,22 @@ fn hex_bytes(bytes: &[u8]) -> String {
 /// predicate verbatim to use jobs_claim_scan. The lease_until::text
 /// rendering is the fencing token settle/fail compare against. Kind,
 /// an extra due-predicate (over jobs `j` and repos `r`), and the extra
-/// RETURNING columns are the only legitimate variation.
-fn claim_due_sql(kind: &str, extra_due_predicate: &str, returning: &str) -> String {
+/// The GC sweep's eligibility scan (see
+/// [`ControlPlane::superseded_shards_past_grace`]): every Shard no repo
+/// points at, superseded (or published, for one that never became
+/// current) longer ago than `$1` seconds. The pointer anti-join is
+/// served by the partial index `repos_current_shard` (migration 0011);
+/// public so the e2e plan tests can EXPLAIN the exact production query.
+pub const SUPERSEDED_SHARDS_PAST_GRACE_SQL: &str =
+    "SELECT s.id AS shard_id, s.repo_id, s.revision FROM shards s
+     WHERE NOT EXISTS (SELECT 1 FROM repos r WHERE r.current_shard_id = s.id)
+       AND coalesce(s.superseded_at, s.published_at) < now() - make_interval(secs => $1)
+     ORDER BY s.id";
+
+/// RETURNING columns are the only legitimate variation. Public so the
+/// e2e plan tests can EXPLAIN the exact production query.
+pub fn claim_due_sql(kind: JobKind, extra_due_predicate: &str, returning: &str) -> String {
+    let kind = kind.as_str();
     format!(
         "WITH due AS (
              SELECT j.id FROM jobs j JOIN repos r ON r.id = j.repo_id
@@ -1402,7 +1464,7 @@ fn claim_due_sql(kind: &str, extra_due_predicate: &str, returning: &str) -> Stri
                AND r.discovery_state = 'included'
                AND (j.state = 'queued' OR j.lease_until < now())
                {extra_due_predicate}
-             ORDER BY j.priority DESC, j.run_after
+             ORDER BY j.run_after
              LIMIT 1
              FOR UPDATE OF j SKIP LOCKED
          )
@@ -1487,7 +1549,7 @@ async fn remove_repo_from_indexing(
         .await?;
     sqlx::query(
         "UPDATE jobs
-         SET state = 'done', lease_until = NULL
+         SET state = 'done', lease_until = NULL, finished_at = now()
          WHERE repo_id = $1 AND state <> 'done'",
     )
     .bind(repo_id)
@@ -1554,14 +1616,14 @@ fn glob_matches(pattern: &str, text: &str) -> bool {
 /// whether a new job was queued.
 async fn enqueue_job_unless_in_flight(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    kind: &str,
+    kind: JobKind,
     repo_id: i64,
 ) -> anyhow::Result<bool> {
     let queued = sqlx::query(
         "INSERT INTO jobs (kind, repo_id) VALUES ($1, $2)
          ON CONFLICT (repo_id, kind) WHERE state <> 'done' DO NOTHING",
     )
-    .bind(kind)
+    .bind(kind.as_str())
     .bind(repo_id)
     .execute(&mut **tx)
     .await?
@@ -1591,6 +1653,7 @@ async fn settle_leased_job(
          SET state = CASE WHEN $3 THEN 'done' ELSE 'queued' END,
              attempts = CASE WHEN $3 THEN attempts ELSE 0 END,
              last_error = CASE WHEN $3 THEN last_error ELSE NULL END,
+             finished_at = CASE WHEN $3 THEN now() END,
              lease_until = NULL, run_after = now()
          WHERE id = $1 AND state = 'leased' AND lease_until::text = $2",
     )
@@ -1607,9 +1670,39 @@ async fn settle_leased_job(
 #[cfg(test)]
 mod tests {
     use super::{
-        RepoVisibility, RuleRow, discovery_state_for, glob_matches, member_token_id_is_valid,
-        repo_qualifier,
+        JobKind, REPO_QUALIFIER_SQL, RepoVisibility, RuleRow, discovery_state_for, glob_matches,
+        member_token_id_is_valid, repo_qualifier,
     };
+
+    const HYGIENE_MIGRATION: &str = include_str!("../migrations/0011_job_queue_hygiene.sql");
+
+    /// One direction of the single-sourced qualifier grammar: the SQL
+    /// rendering the migration re-derives with is the constant the e2e
+    /// suite pins to `repo_qualifier` — so neither the migration nor the
+    /// Rust function can drift alone.
+    #[test]
+    fn the_qualifier_migration_uses_the_pinned_sql_rendering() {
+        assert!(
+            HYGIENE_MIGRATION.contains(REPO_QUALIFIER_SQL),
+            "migration 0011 must re-derive qualifiers with REPO_QUALIFIER_SQL verbatim"
+        );
+    }
+
+    /// The kind CHECK constraint mirrors [`JobKind`]: the clause the
+    /// migration installs is exactly the one this vocabulary renders.
+    #[test]
+    fn the_kind_constraint_mirrors_the_rust_vocabulary() {
+        let clause = format!(
+            "kind IN ({})",
+            JobKind::ALL
+                .map(|kind| format!("'{}'", kind.as_str()))
+                .join(", ")
+        );
+        assert!(
+            HYGIENE_MIGRATION.contains(&clause),
+            "migration 0011 must constrain kind to {clause}"
+        );
+    }
 
     #[test]
     fn qualifiers_join_the_schemeless_forge_root_with_the_slug() {
