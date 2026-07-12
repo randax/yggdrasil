@@ -83,9 +83,9 @@ pub trait ShardResolver: Send + Sync {
 /// the server's problem (500 / 503).
 fn resolve_error(qualifier: &str, from_cursor: bool, e: ResolveError) -> VerbError {
     match e {
-        ResolveError::UnknownRepo => VerbError::NotFound(format!(
-            "no indexed repository matches {qualifier:?}"
-        )),
+        ResolveError::UnknownRepo => {
+            VerbError::NotFound(format!("no indexed repository matches {qualifier:?}"))
+        }
         ResolveError::NotIndexed => VerbError::NotFound(format!(
             "{qualifier} is registered but not yet indexed; try again shortly"
         )),
@@ -362,11 +362,7 @@ impl<R: ShardResolver> Engine<R> {
 /// graph segment and run the (blocking, SQLite-bound) verb off the
 /// runtime threads — the open does filesystem syscalls, so it belongs
 /// in the closure too. The verb's `None` is the client's 404.
-async fn run_verb<T, F>(
-    path: std::path::PathBuf,
-    id: VerbId,
-    verb: F,
-) -> Result<T, VerbError>
+async fn run_verb<T, F>(path: std::path::PathBuf, id: VerbId, verb: F) -> Result<T, VerbError>
 where
     T: Send + 'static,
     F: FnOnce(&rusqlite::Connection, &VerbId) -> anyhow::Result<Option<T>> + Send + 'static,

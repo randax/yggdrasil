@@ -441,7 +441,9 @@ pub fn node(conn: &rusqlite::Connection, id: &VerbId) -> anyhow::Result<Option<N
 
     let found = conn
         .query_row(
-            &format!("SELECT {NODE_KIND}, {NODE_NAME}, {NODE_PATH} FROM {NODES} WHERE {NODE_ID} = ?1"),
+            &format!(
+                "SELECT {NODE_KIND}, {NODE_NAME}, {NODE_PATH} FROM {NODES} WHERE {NODE_ID} = ?1"
+            ),
             [local],
             |row| {
                 Ok(NodeView {

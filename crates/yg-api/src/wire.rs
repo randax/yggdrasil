@@ -83,7 +83,10 @@ where
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
         match axum::Json::<T>::from_request(req, state).await {
             Ok(axum::Json(value)) => Ok(Self(value)),
-            Err(rejection) => Err(crate::error_json(rejection.status(), rejection.body_text())),
+            Err(rejection) => Err(crate::error::error_json(
+                rejection.status(),
+                rejection.body_text(),
+            )),
         }
     }
 }
@@ -91,7 +94,7 @@ where
 /// The canonical shape for requests the router never matched to a
 /// handler method.
 pub(crate) async fn method_not_allowed() -> Response {
-    crate::error_json(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
+    crate::error::error_json(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
 }
 
 /// A request `/v1/mcp` could not read a JSON body from, as a JSON-RPC
@@ -109,7 +112,7 @@ pub(crate) fn jsonrpc_parse_error(rejection: &JsonRejection) -> Response {
     };
     (
         rejection.status(),
-        Wire(crate::jsonrpc_error(
+        Wire(crate::mcp::jsonrpc_error(
             serde_json::Value::Null,
             code,
             rejection.body_text(),
