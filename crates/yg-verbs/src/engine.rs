@@ -158,12 +158,14 @@ pub struct HistoryResponse {
 }
 
 /// Render a unix-seconds committer date as RFC3339 UTC for display.
-fn render_date(committed_at: i64) -> String {
+/// `None` for a timestamp outside chrono's representable range — a
+/// corrupted Shard row, which the caller surfaces as an internal fault
+/// rather than putting an empty or invented date on the wire.
+fn render_date(committed_at: i64) -> Option<String> {
     use chrono::{SecondsFormat, TimeZone, Utc};
     Utc.timestamp_opt(committed_at, 0)
         .single()
         .map(|dt| dt.to_rfc3339_opts(SecondsFormat::Secs, true))
-        .unwrap_or_default()
 }
 
 /// Parse a `history` `since` filter into unix seconds: an RFC3339
@@ -346,11 +348,18 @@ impl<R: ShardResolver> Engine<R> {
         let commits = page
             .commits
             .into_iter()
-            .map(|commit| HistoryCommitView {
-                date: render_date(commit.committed_at),
-                commit,
+            .map(|commit| {
+                let date = render_date(commit.committed_at).ok_or_else(|| {
+                    VerbError::Internal(anyhow::anyhow!(
+                        "commit {} carries committer date {} outside the renderable range; \
+                         refusing to serve a corrupted history",
+                        commit.sha,
+                        commit.committed_at
+                    ))
+                })?;
+                Ok(HistoryCommitView { date, commit })
             })
-            .collect();
+            .collect::<Result<Vec<_>, VerbError>>()?;
         Ok(HistoryResponse {
             commits,
             next_cursor,
@@ -410,8 +419,14 @@ mod tests {
 
     #[test]
     fn dates_render_rfc3339_utc() {
-        assert_eq!(render_date(0), "1970-01-01T00:00:00Z");
-        assert_eq!(render_date(1_704_067_200), "2024-01-01T00:00:00Z");
+        assert_eq!(render_date(0).as_deref(), Some("1970-01-01T00:00:00Z"));
+        assert_eq!(
+            render_date(1_704_067_200).as_deref(),
+            Some("2024-01-01T00:00:00Z")
+        );
+        // A timestamp chrono cannot represent is a corrupted Shard row:
+        // no date, never an empty string on the wire.
+        assert_eq!(render_date(i64::MAX), None);
     }
 
     /// The resolver's categories map to the client statuses the Verb
