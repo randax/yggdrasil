@@ -69,10 +69,9 @@ token = "not-my-credential"
 
     #[test]
     fn comments_after_values_are_not_part_of_the_value() {
-        let config = parse_client_config(
-            "server = \"https://yg.example.test/mcp#fragment\" # comment\n",
-        )
-        .unwrap();
+        let config =
+            parse_client_config("server = \"https://yg.example.test/mcp#fragment\" # comment\n")
+                .unwrap();
         assert_eq!(
             config.server.as_deref(),
             Some("https://yg.example.test/mcp#fragment")

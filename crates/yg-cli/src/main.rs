@@ -1,6 +1,7 @@
 //! yg binary: subcommands, serve roles, MCP proxy.
 
 mod client_config;
+mod deploy_config;
 
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
@@ -21,6 +22,13 @@ enum Command {
     /// Boot the Index Server
     Serve {
         /// Which roles this process runs
+        #[arg(long, value_enum, default_value_t = Role::All)]
+        role: Role,
+    },
+    /// Report the resolved YG_* configuration and its validation errors
+    /// without starting the server
+    ConfigCheck {
+        /// Which roles the configuration is checked for
         #[arg(long, value_enum, default_value_t = Role::All)]
         role: Role,
     },
@@ -245,6 +253,7 @@ enum RepoCommand {
 async fn main() -> anyhow::Result<()> {
     match Cli::parse().command {
         Command::Serve { role } => serve(role).await,
+        Command::ConfigCheck { role } => config_check(role),
         Command::Status { json } => status(json).await,
         Command::Node { id, json } => node(id, json).await,
         Command::Neighbors {
@@ -951,6 +960,33 @@ enum Role {
     Worker,
 }
 
+/// Resolve and validate the deployment configuration, print the report,
+/// and exit — never connecting to anything. The settings table goes to
+/// stdout (scripts diff it); validation errors surface as the command's
+/// error, one line each, and a non-zero exit.
+fn config_check(role: Role) -> anyhow::Result<()> {
+    let resolution = deploy_config::resolve(role, |var| std::env::var(var).ok());
+    println!("resolved configuration (role: {}):", role_name(role));
+    for setting in &resolution.settings {
+        let source = match setting.source {
+            deploy_config::Source::Env => "env",
+            deploy_config::Source::Default => "default",
+        };
+        println!("  {:<22} {:<42} ({source})", setting.var, setting.shown);
+    }
+    resolution.into_config()?;
+    println!("configuration valid");
+    Ok(())
+}
+
+fn role_name(role: Role) -> &'static str {
+    match role {
+        Role::All => "all",
+        Role::Api => "api",
+        Role::Worker => "worker",
+    }
+}
+
 async fn serve(role: Role) -> anyhow::Result<()> {
     // Logs go to stderr; stdout carries only the address announcement so
     // scripts (and the e2e tests) can parse it.
@@ -958,20 +994,24 @@ async fn serve(role: Role) -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
+    // The one read of the deployment environment: every YG_* setting
+    // resolves and validates here, before anything connects.
+    let deploy = deploy_config::resolve(role, |var| std::env::var(var).ok()).into_config()?;
+
     match role {
         Role::Api => {
-            let server = yg_api::serve(yg_api::ServerConfig::from_env()?).await?;
+            let server = yg_api::serve(server_config(&deploy)?).await?;
             println!("listening on http://{}", server.local_addr());
             server.wait().await
         }
         Role::Worker => {
-            let workers = workers_from_env().await?;
+            let workers = workers(&deploy).await?;
             println!("worker running");
-            run_workers(workers).await
+            run_workers(&deploy, workers).await
         }
         Role::All => {
-            let server = yg_api::serve(yg_api::ServerConfig::from_env()?).await?;
-            let workers = workers_from_env().await?;
+            let server = yg_api::serve(server_config(&deploy)?).await?;
+            let workers = workers(&deploy).await?;
             // Announce only once the whole process is up: scripts and
             // the e2e harness treat this line as the readiness signal,
             // and a worker-boot failure after it would read as a crash
@@ -981,21 +1021,34 @@ async fn serve(role: Role) -> anyhow::Result<()> {
             // server that accepts repos it will never sync helps nobody.
             tokio::select! {
                 result = server.wait() => result,
-                result = run_workers(workers) => result.context("worker exited"),
+                result = run_workers(&deploy, workers) => result.context("worker exited"),
             }
         }
     }
 }
 
-/// Build the worker pair from the `YG_*` environment. Workers need the
-/// control plane, the git cache, and object storage (Shards land there)
-/// — no bootstrap token.
-async fn workers_from_env() -> anyhow::Result<(yg_sync::SyncWorker, yg_index::IndexWorker)> {
-    let database_url = std::env::var("YG_DATABASE_URL")
-        .unwrap_or_else(|_| yg_control::DEFAULT_DATABASE_URL.to_string());
-    let git_cache = std::env::var("YG_GIT_CACHE").unwrap_or_else(|_| "./data/git".to_string());
-    let control = yg_control::ControlPlane::connect_and_migrate(&database_url).await?;
-    let store = yg_api::ObjectStoreConfig::from_env().connect()?;
+/// The API server's slice of the deployment config. The bootstrap token
+/// was already validated for API-serving roles during resolution.
+fn server_config(deploy: &deploy_config::DeployConfig) -> anyhow::Result<yg_api::ServerConfig> {
+    Ok(yg_api::ServerConfig {
+        listen: deploy.listen,
+        database_url: deploy.database_url.clone(),
+        object_store: deploy.object_store.clone(),
+        bootstrap_token: deploy
+            .bootstrap_token
+            .clone()
+            .context("YG_BOOTSTRAP_TOKEN must be set for API-serving roles")?,
+        shard_cache: deploy.shard_cache.clone(),
+    })
+}
+
+/// Build the worker pair. Workers need the control plane, the git
+/// cache, and object storage (Shards land there) — no bootstrap token.
+async fn workers(
+    deploy: &deploy_config::DeployConfig,
+) -> anyhow::Result<(yg_sync::SyncWorker, yg_index::IndexWorker)> {
+    let control = yg_control::ControlPlane::connect_and_migrate(&deploy.database_url).await?;
+    let store = deploy.object_store.connect()?;
     // Fail at boot, not on every index job: connect() never touches the
     // network, so this probe is the first thing that would notice a
     // missing or wrong YG_S3_* configuration.
@@ -1003,8 +1056,8 @@ async fn workers_from_env() -> anyhow::Result<(yg_sync::SyncWorker, yg_index::In
         .await
         .context("object storage unreachable at worker boot")?;
     Ok((
-        yg_sync::SyncWorker::new(control.clone(), &git_cache),
-        yg_index::IndexWorker::new(control, store, &git_cache),
+        yg_sync::SyncWorker::new(control.clone(), &deploy.git_cache),
+        yg_index::IndexWorker::new(control, store, &deploy.git_cache),
     ))
 }
 
@@ -1012,6 +1065,7 @@ async fn workers_from_env() -> anyhow::Result<(yg_sync::SyncWorker, yg_index::In
 /// one kind (a cold monorepo clone, a huge syntactic pass) never stalls
 /// the other queue. An error from either side ends both.
 async fn run_workers(
+    deploy: &deploy_config::DeployConfig,
     (sync, index): (yg_sync::SyncWorker, yg_index::IndexWorker),
 ) -> anyhow::Result<()> {
     // Converge after a deploy that bumped the Shard schema: the read
@@ -1031,16 +1085,19 @@ async fn run_workers(
     // drains. Each loop runs on its own task so a slow job of one kind
     // never stalls another. Queue and poll control-plane errors end the
     // process; GC logs transient sweep failures and retries on its cadence.
-    let poll = poll_config_from_env();
-    let discovery = discovery_config_from_env();
-    let gc_grace = env_duration_secs("YG_GC_GRACE", DEFAULT_GC_GRACE_SECS);
-    let gc_interval = env_duration_secs("YG_GC_INTERVAL", DEFAULT_GC_INTERVAL_SECS);
+    let poll = yg_sync::PollConfig {
+        default_interval: deploy.poll_interval,
+        jitter_fraction: POLL_JITTER_FRACTION,
+    };
+    let discovery = yg_sync::DiscoveryConfig {
+        interval: deploy.discovery_interval,
+    };
     tokio::try_join!(
         drain_queue(|| sync.discover_once(&discovery)),
         drain_queue(|| sync.run_once()),
         drain_queue(|| index.run_once()),
         drain_queue(|| sync.poll_once(&poll)),
-        gc_loop(&index, gc_grace, gc_interval),
+        gc_loop(&index, deploy.gc_grace, deploy.gc_interval),
     )?;
     Ok(())
 }
@@ -1061,57 +1118,9 @@ where
     }
 }
 
-/// Default poll interval per repo when `YG_POLL_INTERVAL` is unset.
-const DEFAULT_POLL_INTERVAL_SECS: u64 = 5 * 60;
-/// Default connected-forge discovery interval (`YG_DISCOVERY_INTERVAL`).
-const DEFAULT_DISCOVERY_INTERVAL_SECS: u64 = 60 * 60;
-/// Default grace window before a superseded Shard is reclaimed
-/// (`YG_GC_GRACE`).
-const DEFAULT_GC_GRACE_SECS: u64 = 60 * 60;
-/// Default cadence of the GC sweep (`YG_GC_INTERVAL`).
-const DEFAULT_GC_INTERVAL_SECS: u64 = 10 * 60;
 /// Fraction of the interval added as random jitter so a forge's repos
 /// don't poll in lockstep.
 const POLL_JITTER_FRACTION: f64 = 0.2;
-/// Ceiling on an env-configured duration. A poll/GC cadence is fed to
-/// Postgres `make_interval`, which errors (out of range) on absurd
-/// values — and that error propagates out of the poll loop and kills the
-/// worker. Clamp to ten years: far beyond any sane cadence, far inside
-/// `make_interval`'s range, so a typo degrades to "very slow" not "crash".
-const MAX_DURATION_SECS: u64 = 10 * 365 * 24 * 3600;
-
-fn poll_config_from_env() -> yg_sync::PollConfig {
-    yg_sync::PollConfig {
-        default_interval: env_duration_secs("YG_POLL_INTERVAL", DEFAULT_POLL_INTERVAL_SECS),
-        jitter_fraction: POLL_JITTER_FRACTION,
-    }
-}
-
-fn discovery_config_from_env() -> yg_sync::DiscoveryConfig {
-    yg_sync::DiscoveryConfig {
-        interval: env_duration_secs("YG_DISCOVERY_INTERVAL", DEFAULT_DISCOVERY_INTERVAL_SECS),
-    }
-}
-
-/// A positive-integer-seconds duration from `var`, falling back to
-/// `default_secs` when the variable is unset or not a positive integer.
-fn env_duration_secs(var: &str, default_secs: u64) -> std::time::Duration {
-    let secs = match std::env::var(var) {
-        Ok(value) => match value.trim().parse::<u64>() {
-            Ok(secs) if secs >= 1 => secs.min(MAX_DURATION_SECS),
-            _ => {
-                tracing::warn!(
-                    var,
-                    value,
-                    "ignoring {var} (want a positive integer of seconds); using the default"
-                );
-                default_secs
-            }
-        },
-        Err(_) => default_secs,
-    };
-    std::time::Duration::from_secs(secs)
-}
 
 /// Reclaim superseded Shards on a fixed cadence. Unlike a queue drain
 /// there is no per-item "work or not": the sweep runs every `interval`,
@@ -1148,4 +1157,3 @@ async fn status(json: bool) -> anyhow::Result<()> {
     }
     Ok(())
 }
-

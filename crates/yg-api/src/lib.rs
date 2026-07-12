@@ -31,37 +31,6 @@ pub struct ServerConfig {
     pub shard_cache: std::path::PathBuf,
 }
 
-impl ServerConfig {
-    /// Build from `YG_*` environment variables. Everything defaults to the
-    /// in-repo dev compose stack except the bootstrap Admin token, which
-    /// has no safe default.
-    pub fn from_env() -> anyhow::Result<Self> {
-        fn var_or(key: &str, default: &str) -> String {
-            std::env::var(key).unwrap_or_else(|_| default.to_string())
-        }
-        // Trimmed before storing: env files commonly leak whitespace, and
-        // HTTP strips it from header values, so a padded token could never
-        // be presented by any client.
-        let bootstrap_token = std::env::var("YG_BOOTSTRAP_TOKEN")
-            .ok()
-            .map(|token| token.trim().to_string())
-            .filter(|token| !token.is_empty())
-            .context(
-                "YG_BOOTSTRAP_TOKEN must be set to a non-empty token; \
-                 the server refuses to boot without an Admin token",
-            )?;
-        Ok(Self {
-            listen: var_or("YG_LISTEN", "127.0.0.1:7311")
-                .parse()
-                .context("parsing YG_LISTEN as host:port")?,
-            database_url: var_or("YG_DATABASE_URL", yg_control::DEFAULT_DATABASE_URL),
-            object_store: ObjectStoreConfig::from_env(),
-            bootstrap_token,
-            shard_cache: var_or("YG_SHARD_CACHE", "./data/shard-cache").into(),
-        })
-    }
-}
-
 /// A booted Index Server, listening until dropped or the process exits.
 pub struct RunningServer {
     local_addr: SocketAddr,
