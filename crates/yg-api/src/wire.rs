@@ -99,8 +99,12 @@ pub(crate) async fn method_not_allowed() -> Response {
 /// -32700; transport rejections (content-type, size) keep their own
 /// HTTP status and answer "invalid request".
 pub(crate) fn jsonrpc_parse_error(rejection: &JsonRejection) -> Response {
+    // JsonDataError is syntactically valid JSON that failed
+    // deserialization — an invalid request, not a parse error. It
+    // cannot occur here today (the extractor targets Value), but the
+    // mapping must not misclassify if a typed extractor ever lands.
     let code = match rejection {
-        JsonRejection::JsonSyntaxError(_) | JsonRejection::JsonDataError(_) => -32700,
+        JsonRejection::JsonSyntaxError(_) => -32700,
         _ => -32600,
     };
     (
