@@ -1321,11 +1321,10 @@ async fn yg_serve_role_worker_drains_the_queue_without_serving_http() {
         .unwrap();
 
     // Worker role: no HTTP, no bootstrap token — just the queue.
-    let (_worker, announcement) = spawn_yg_role("worker", &db_name, |cmd| {
+    let _worker = spawn_yg_worker(&db_name, |cmd| {
         cmd.env_remove("YG_BOOTSTRAP_TOKEN")
             .env("YG_GIT_CACHE", fixture.path().join("git-cache"));
     });
-    assert_eq!(announcement, "worker running");
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
@@ -1356,11 +1355,10 @@ async fn split_api_and_worker_processes_index_and_serve_a_repo() {
     let (_api, url) = spawn_yg_api(&db_name, |cmd| {
         cmd.env("YG_BOOTSTRAP_TOKEN", TEST_TOKEN);
     });
-    let (_worker, announcement) = spawn_yg_role("worker", &db_name, |cmd| {
+    let _worker = spawn_yg_worker(&db_name, |cmd| {
         cmd.env_remove("YG_BOOTSTRAP_TOKEN")
             .env("YG_GIT_CACHE", fixture.path().join("git-cache"));
     });
-    assert_eq!(announcement, "worker running");
 
     post_repo(&url, serde_json::json!({"url": fixture_url})).await;
     await_symbol(&url, "Hello", std::time::Duration::from_secs(60)).await;

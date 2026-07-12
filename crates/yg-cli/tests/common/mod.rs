@@ -272,6 +272,17 @@ pub fn spawn_yg_api(
     (server, url)
 }
 
+/// [`spawn_yg_role`] for the worker role, asserting its readiness
+/// announcement (workers serve no HTTP, so there is no URL to return).
+pub fn spawn_yg_worker(
+    db_name: &str,
+    configure: impl FnOnce(&mut std::process::Command),
+) -> KillOnDrop {
+    let (worker, announcement) = spawn_yg_role("worker", db_name, configure);
+    assert_eq!(announcement, "worker running");
+    worker
+}
+
 fn base_url(announcement: &str) -> String {
     announcement
         .strip_prefix("listening on ")

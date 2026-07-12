@@ -33,13 +33,18 @@ jobs:
           RUSTDOCFLAGS: -D warnings
       # Every test outside the yg-cli e2e package runs without Postgres
       # or MinIO; a service-needing test added to another crate breaks
-      # this job loudly instead of silently serializing CI again.
+      # this job loudly instead of silently serializing CI again. The
+      # yg binary's own unit tests are service-free too — only yg-cli's
+      # integration targets need the stack.
       - run: cargo test --workspace --exclude yg-cli --locked
+      - run: cargo test -p yg-cli --bins --locked
 
   # The e2e suites exercise real server processes against the compose
-  # Postgres + MinIO stack.
+  # Postgres + MinIO stack. Gated on the cheap job so a formatting or
+  # lint failure never spends the compose stack.
   e2e:
     name: e2e
+    needs: checks
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
