@@ -359,11 +359,17 @@ fn client_env() -> anyhow::Result<(String, String)> {
     let env_server = std::env::var("YG_SERVER").ok();
     let env_token = std::env::var("YG_TOKEN").ok();
     // The env wins over the file, so a broken config file only matters
-    // when the env leaves something for the file to answer.
-    let config = if env_server.is_none() || env_token.is_none() {
-        read_client_config()?
-    } else {
-        client_config::ClientConfig::default()
+    // when the env leaves something for the file to answer. When only
+    // the server is left open it has a built-in default, so a broken
+    // file downgrades to a warning; a missing credential has no
+    // fallback, so there the parse error surfaces.
+    let config = match (&env_server, &env_token) {
+        (Some(_), Some(_)) => client_config::ClientConfig::default(),
+        (None, Some(_)) => read_client_config().unwrap_or_else(|e| {
+            eprintln!("warning: ignoring client config ({e:#}); using the default server");
+            client_config::ClientConfig::default()
+        }),
+        (_, None) => read_client_config()?,
     };
     let server = env_server
         .or(config.server)
@@ -982,6 +988,7 @@ fn config_check(role: Role) -> anyhow::Result<()> {
         let source = match setting.source {
             deploy_config::Source::Env => "(env)",
             deploy_config::Source::Default => "(default)",
+            deploy_config::Source::Unset => "(unset)",
         };
         // Source before value: values (URLs, paths) have no width bound,
         // so they take the ragged column.
