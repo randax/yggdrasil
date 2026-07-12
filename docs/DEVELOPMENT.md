@@ -36,7 +36,11 @@ volumes (`yggdrasil-dev_postgres-data`, `yggdrasil-dev_minio-data`);
 
 The server is configured through `YG_*` environment variables; everything
 defaults to the dev compose stack above except the bootstrap Admin token,
-which is required:
+which is required. All of them resolve through one typed config
+(`crates/yg-cli/src/deploy_config.rs` — the source of truth this table
+mirrors), and `yg config-check [--role=api|worker|all]` prints the resolved
+configuration (credentials redacted) with every validation error, without
+starting the server:
 
 | Variable | Default | Purpose |
 |---|---|---|
@@ -48,11 +52,17 @@ which is required:
 | `YG_S3_ACCESS_KEY` / `YG_S3_SECRET_KEY` | `yggdrasil` / `yggdrasil` | Object storage credentials |
 | `YG_S3_REGION` | `us-east-1` | Object storage region |
 | `YG_S3_PREFIX` | *(empty)* | Key prefix all objects land under; empty means the bucket root |
+| `YG_SHARD_CACHE` | `./data/shard-cache` | Server-local tier of Shard segments |
 | `YG_GIT_CACHE` | `./data/git` | Worker-local cache of bare clones |
 | `YG_GITHUB_TOKEN` | — (optional) | Forge token for `github.com` Sync |
 | `YG_POLL_INTERVAL` | `300` | Seconds between a repo's default-branch head checks (per-repo override: `repo add --poll-interval`) |
+| `YG_DISCOVERY_INTERVAL` | `3600` | Seconds between connected-forge org discovery reconciliations |
 | `YG_GC_GRACE` | `3600` | Seconds a superseded Shard is kept before it is garbage-collected |
 | `YG_GC_INTERVAL` | `600` | Seconds between Shard garbage-collection sweeps |
+
+An invalid value (an unparseable listen address, a duration that is not a
+whole number of seconds) refuses to boot with every problem listed, not
+just the first.
 
 `yg serve --role=api|worker|all` picks what the process runs: `api` serves
 HTTP only, `worker` drains the Sync and indexing queues only (it needs the
@@ -72,7 +82,9 @@ process-local config); it is never written to disk or stored in the control
 plane.
 
 The CLI talks to a server via `YG_SERVER` (default `http://127.0.0.1:7311`)
-and `YG_TOKEN`.
+and `YG_TOKEN`; both can instead be set as top-level `server` and `token`
+keys in `~/.config/yg/config.toml` (standard TOML; the environment wins
+over the file).
 
 End to end from a clean checkout:
 
