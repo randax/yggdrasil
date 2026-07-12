@@ -42,11 +42,14 @@ pub struct DeployConfig {
     pub gc_interval: Duration,
 }
 
-/// Where a resolved setting came from.
+/// Where a resolved setting came from. `Unset` marks a setting with no
+/// value at all — a required secret has no default, so calling its
+/// absence a "default" would mislead anyone reading the report.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
     Env,
     Default,
+    Unset,
 }
 
 /// One resolved setting, ready to print: secrets arrive here already
@@ -223,10 +226,11 @@ impl Resolver<'_> {
         }
     }
 
-    /// A required-by-some-roles secret with no default: `None` when
-    /// unset or blank (whitespace-padded tokens are trimmed — env files
-    /// commonly leak whitespace, and HTTP strips it from header values,
-    /// so a padded token could never be presented by any client).
+    /// A required-by-some-roles secret with no default — recorded as
+    /// [`Source::Unset`] when absent. `None` when unset or blank
+    /// (whitespace-padded tokens are trimmed — env files commonly leak
+    /// whitespace, and HTTP strips it from header values, so a padded
+    /// token could never be presented by any client).
     fn secret(&mut self, var: &'static str) -> Option<String> {
         let value = self
             .raw(var)
@@ -238,7 +242,7 @@ impl Resolver<'_> {
                 Some(value)
             }
             None => {
-                self.record(var, "(unset)".into(), Source::Default);
+                self.record(var, "—".into(), Source::Unset);
                 None
             }
         }
@@ -456,6 +460,16 @@ mod tests {
         }
         let config = resolve(Role::Worker, env(&[])).into_config().unwrap();
         assert_eq!(config.bootstrap_token, None);
+
+        // The token has no default, so its absence is reported as
+        // unset, not as a default.
+        let resolution = resolve(Role::Api, env(&[]));
+        let token = resolution
+            .settings
+            .iter()
+            .find(|s| s.var == "YG_BOOTSTRAP_TOKEN")
+            .unwrap();
+        assert_eq!(token.source, Source::Unset);
     }
 
     #[test]
