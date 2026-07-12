@@ -69,6 +69,15 @@ pub enum Provenance {
 }
 
 impl Provenance {
+    /// Every provenance level, in one place, so tests can assert the
+    /// control plane's CHECK constraint mirrors exactly this vocabulary.
+    pub const ALL: [Provenance; 4] = [
+        Provenance::Precise,
+        Provenance::Syntactic,
+        Provenance::Extracted,
+        Provenance::Inferred,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Provenance::Precise => "precise",

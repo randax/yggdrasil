@@ -40,6 +40,10 @@ pub struct DeployConfig {
     pub discovery_interval: Duration,
     pub gc_grace: Duration,
     pub gc_interval: Duration,
+    /// How long a terminal job row is kept before the GC cadence
+    /// removes it — retention only bounds queue-table growth; nothing
+    /// reads terminal rows (`yg admin status` already excludes them).
+    pub job_retention: Duration,
 }
 
 /// Where a resolved setting came from. `Unset` marks a setting with no
@@ -164,6 +168,7 @@ pub fn resolve(role: Role, lookup: impl Fn(&str) -> Option<String>) -> Resolutio
         discovery_interval: r.worker_duration(worker, "YG_DISCOVERY_INTERVAL", 60 * 60),
         gc_grace: r.worker_duration(worker, "YG_GC_GRACE", 60 * 60),
         gc_interval: r.worker_duration(worker, "YG_GC_INTERVAL", 10 * 60),
+        job_retention: r.worker_duration(worker, "YG_JOB_RETENTION", 7 * 24 * 3600),
     };
     Resolution {
         settings: r.settings,
@@ -399,6 +404,7 @@ mod tests {
         assert_eq!(config.discovery_interval, Duration::from_secs(60 * 60));
         assert_eq!(config.gc_grace, Duration::from_secs(60 * 60));
         assert_eq!(config.gc_interval, Duration::from_secs(10 * 60));
+        assert_eq!(config.job_retention, Duration::from_secs(7 * 24 * 3600));
     }
 
     #[test]
@@ -421,6 +427,7 @@ mod tests {
                 ("YG_DISCOVERY_INTERVAL", "120"),
                 ("YG_GC_GRACE", "10"),
                 ("YG_GC_INTERVAL", "5"),
+                ("YG_JOB_RETENTION", "86400"),
             ]),
         )
         .into_config()
@@ -444,6 +451,7 @@ mod tests {
         assert_eq!(config.discovery_interval, Duration::from_secs(120));
         assert_eq!(config.gc_grace, Duration::from_secs(10));
         assert_eq!(config.gc_interval, Duration::from_secs(5));
+        assert_eq!(config.job_retention, Duration::from_secs(86400));
     }
 
     #[test]
@@ -690,7 +698,8 @@ mod tests {
                 "YG_POLL_INTERVAL",
                 "YG_DISCOVERY_INTERVAL",
                 "YG_GC_GRACE",
-                "YG_GC_INTERVAL"
+                "YG_GC_INTERVAL",
+                "YG_JOB_RETENTION"
             ]
         );
         let listen = &resolution.settings[0];

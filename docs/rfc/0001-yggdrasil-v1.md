@@ -14,7 +14,7 @@ forges(id, kind /* github|gitlab|codeberg */, base_url, token_ref, rate_budget)
 repos(id, forge_id, remote_id, slug, visibility, default_branch, indexed bool,
       discovery_state /* discovered|included|excluded */, last_synced_commit, …)
 rules(id, forge_id, pattern, action /* include|exclude */, applies_to_private bool)
-jobs(id, kind, repo_id, payload jsonb, state, lease_until, attempts, priority)
+jobs(id, kind, repo_id, state, lease_until, attempts, run_after, finished_at)
 shards(repo_id, revision, manifest_key, commit_sha, provenance_level, published_at)
 members(id, name, kind /* human|agent */)
 tokens(id, member_id, hash, created_at, last_used_at, revoked_at)
