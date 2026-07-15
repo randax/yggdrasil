@@ -29,6 +29,7 @@
 pub mod cursor;
 pub mod engine;
 pub mod metrics;
+mod search;
 
 use std::collections::BTreeMap;
 
@@ -46,6 +47,10 @@ pub use engine::{
     ShardResolver, VerbError,
 };
 pub use metrics::Metrics;
+pub use search::{
+    RepoQualifier, SearchHit, SearchNodeName, SearchPath, SearchResponse, SearchSnippet,
+    SearchTarget, ShardRevision,
+};
 
 pub const DEFAULT_NEIGHBORS_DEPTH: u32 = 1;
 pub const MIN_NEIGHBORS_DEPTH: u32 = 1;

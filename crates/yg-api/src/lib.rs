@@ -25,6 +25,7 @@ use axum::middleware;
 use axum::routing::{get, post};
 use object_store::ObjectStore;
 use tokio::net::TcpListener;
+use tokio::sync::oneshot;
 use yg_control::ControlPlane;
 
 pub use config::{ObjectStoreConfig, RunningServer, ServerConfig, probe_object_store};
@@ -37,7 +38,6 @@ use verbs::ShardAccess;
 pub(crate) struct AppState {
     control: ControlPlane,
     store: Arc<dyn ObjectStore>,
-    shards: Arc<yg_shard::ShardCache>,
     engine: yg_verbs::Engine<ShardAccess>,
     metrics: Metrics,
     bootstrap_token: String,
@@ -91,7 +91,6 @@ pub async fn serve_with_metrics(
             metrics.verbs(),
         ),
         control,
-        shards,
         store,
         metrics,
         bootstrap_token: config.bootstrap_token,
@@ -187,15 +186,24 @@ pub async fn serve_with_metrics(
         .await
         .with_context(|| format!("binding {}", config.listen))?;
     let local_addr = listener.local_addr()?;
+    let (shutdown, shutdown_requested) = oneshot::channel::<config::ServerShutdown>();
     let handle = tokio::spawn(async move {
-        let result = axum::serve(listener, app).await;
+        let result = axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_requested.await;
+            })
+            .await;
         if let Err(e) = &result {
             tracing::error!("server exited: {e}");
         }
         result
     });
 
-    Ok(RunningServer { local_addr, handle })
+    Ok(RunningServer {
+        local_addr,
+        handle,
+        shutdown: Some(shutdown),
+    })
 }
 
 /// Bind a worker-only Prometheus listener with the same access-policy choice
@@ -232,14 +240,23 @@ pub async fn serve_metrics(
         .await
         .with_context(|| format!("binding worker metrics listener {listen}"))?;
     let local_addr = listener.local_addr()?;
+    let (shutdown, shutdown_requested) = oneshot::channel::<config::ServerShutdown>();
     let handle = tokio::spawn(async move {
-        let result = axum::serve(listener, app).await;
+        let result = axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_requested.await;
+            })
+            .await;
         if let Err(error) = &result {
             tracing::error!("worker metrics server exited: {error}");
         }
         result
     });
-    Ok(RunningServer { local_addr, handle })
+    Ok(RunningServer {
+        local_addr,
+        handle,
+        shutdown: Some(shutdown),
+    })
 }
 
 #[cfg(test)]

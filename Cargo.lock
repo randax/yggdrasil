@@ -4279,6 +4279,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+ "tracing",
  "yg-shard",
 ]
 

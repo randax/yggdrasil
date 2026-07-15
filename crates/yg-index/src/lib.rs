@@ -39,6 +39,78 @@ pub struct IndexWorker {
     git_cache: PathBuf,
 }
 
+enum IndexAttempt {
+    Published {
+        shard: yg_shard::PublishedShard,
+        operation: yg_control::ShardOperationGuard,
+    },
+    ReclamationInProgress {
+        operation: yg_control::ShardOperationGuard,
+    },
+}
+
+enum PrePublication<Fence> {
+    Published {
+        shard: yg_shard::PublishedShard,
+        operation: Fence,
+    },
+    ReclamationInProgress {
+        operation: Fence,
+    },
+    Prepared(yg_shard::PreparedShard),
+}
+
+async fn prepare_or_reuse_published<
+    Fence,
+    StateProbe,
+    StateFuture,
+    PublishedProbe,
+    PublishedFuture,
+    Lock,
+    LockFuture,
+    Prepare,
+    PreparedFuture,
+>(
+    mut state: StateProbe,
+    mut published: PublishedProbe,
+    lock: Lock,
+    prepare: Prepare,
+) -> anyhow::Result<PrePublication<Fence>>
+where
+    Fence: yg_control::ShardOperationFence,
+    StateProbe: FnMut() -> StateFuture,
+    StateFuture: std::future::Future<Output = anyhow::Result<Option<yg_control::ShardState>>>,
+    PublishedProbe: FnMut() -> PublishedFuture,
+    PublishedFuture: std::future::Future<Output = anyhow::Result<Option<yg_shard::PublishedShard>>>,
+    Lock: FnOnce() -> LockFuture,
+    LockFuture: std::future::Future<Output = anyhow::Result<Fence>>,
+    Prepare: FnOnce() -> PreparedFuture,
+    PreparedFuture: std::future::Future<Output = anyhow::Result<yg_shard::PreparedShard>>,
+{
+    // A reclaiming row must take the normal preparation path. Its state may
+    // change before preparation finishes, so only the later locked re-check
+    // is allowed to decide whether the job is deferred.
+    if state().await? == Some(yg_control::ShardState::Reclaiming) {
+        return Ok(PrePublication::Prepared(prepare().await?));
+    }
+    if published().await?.is_none() {
+        return Ok(PrePublication::Prepared(prepare().await?));
+    }
+
+    let operation = lock().await?;
+    if state().await? == Some(yg_control::ShardState::Reclaiming) {
+        return Ok(PrePublication::ReclamationInProgress { operation });
+    }
+    if let Some(shard) = published().await? {
+        return Ok(PrePublication::Published { shard, operation });
+    }
+
+    // GC may have removed the artifact after the lock-free probe. Never parse
+    // while holding the revision lock; release it and join the normal path.
+    operation.release().await;
+    Ok(PrePublication::Prepared(prepare().await?))
+}
+
 impl IndexWorker {
     pub fn new(
         control: ControlPlane,
@@ -74,11 +146,10 @@ impl IndexWorker {
 
     /// Reclaim object storage from superseded Shards (issue #9): for every
     /// Shard no repo points at that has been superseded longer than
-    /// `grace`, drop its control-plane row and delete its object-storage
-    /// segments. A Shard that became current again between the scan and
-    /// the delete is skipped; one whose row is deleted but object cleanup
-    /// fails is logged as orphaned rather than blocking the rest. Returns
-    /// how many Shards were collected.
+    /// `grace`, claim its row, delete its object-storage segments, and
+    /// reap the row. A Shard that became current again between the scan
+    /// and claim is skipped; failed cleanup leaves a reclaiming row for
+    /// the next sweep to resume. Returns how many Shards were collected.
     pub async fn gc_once(&self, grace: Duration) -> anyhow::Result<u64> {
         let stale = self.control.superseded_shards_past_grace(grace).await?;
         let mut collected = 0;
@@ -91,7 +162,7 @@ impl IndexWorker {
                     repo_id = shard.repo_id,
                     revision = %shard.revision,
                     error = format!("{e:#}"),
-                    "could not delete object-storage segments for superseded Shard; these segments are now orphaned"
+                    "could not finish reclaiming superseded Shard; a later sweep will retry"
                 ),
             }
         }
@@ -118,46 +189,102 @@ impl IndexWorker {
         Ok(deleted)
     }
 
-    /// Reclaim one superseded Shard. The row goes first, under a guard
-    /// that deletes it only while no repo points at it: revisions are
-    /// deterministic, so a force-push back to this Shard's commit can
-    /// republish its exact revision — reusing this very row — and make it
-    /// current again between the sweep's scan and now. Deleting the row
-    /// first proves the Shard is not current at delete time; a re-index
-    /// would have to fully complete (fetch, checkout, parse, swap) within
-    /// the few milliseconds before the object delete to resurrect it,
-    /// which it cannot. So the live current Shard's segments are never
-    /// deleted. The cost is that a crash between the two orphans the
-    /// segments — a bounded, rare storage leak, traded for never deleting
-    /// a current Shard's data. Returns whether the Shard was collected
-    /// (`false` = it became current again and was skipped).
+    /// Reclaim one superseded Shard. The control-plane row first moves to
+    /// `reclaiming`, preserving the `(repo, revision)` uniqueness fence
+    /// while object deletion runs. A colliding index completion requeues
+    /// instead of pointing at those objects. Successful deletion reaps
+    /// the row; a crash leaves it reclaiming for the next sweep. Returns
+    /// whether the Shard was collected (`false` = it became current again
+    /// and was skipped).
     async fn collect_shard(&self, shard: &yg_control::SupersededShard) -> anyhow::Result<bool> {
-        if !self.control.delete_superseded_shard(shard.shard_id).await? {
-            return Ok(false);
-        }
-        yg_shard::delete_shard(self.store.as_ref(), shard.repo_id, &shard.revision)
+        let operation = self
+            .control
+            .lock_shard_operation(shard.repo_id, &shard.revision)
             .await
-            .context("deleting the Shard's object-storage segments")?;
-        Ok(true)
+            .context("locking the Shard revision for reclamation")?;
+        yg_control::finish_shard_operation(operation, async {
+            if !self.control.delete_superseded_shard(shard.shard_id).await? {
+                return Ok(false);
+            }
+            yg_shard::delete_shard(self.store.as_ref(), shard.repo_id, &shard.revision)
+                .await
+                .context("deleting the Shard's object-storage segments")?;
+            self.control
+                .finish_shard_reclamation(shard.shard_id)
+                .await
+                .context("reaping the reclaimed Shard row")
+        })
+        .await
     }
 
     /// Claim and run one due index job. Returns whether there was work.
     /// A failed run is recorded (with backoff) rather than returned as an
     /// error — `Err` means the control plane itself is unreachable.
     pub async fn run_once(&self) -> anyhow::Result<bool> {
-        let Some(job) = self.control.claim_due_index(INDEX_LEASE).await? else {
+        self.run_once_with_optional_shutdown(None).await
+    }
+
+    /// Claim and run one due job while observing process shutdown. New
+    /// claims stop immediately; an active index gets until the shared
+    /// work cutoff to settle normally, then its lease is returned fresh
+    /// to the queue before the work future is dropped.
+    pub async fn run_once_with_shutdown(
+        &self,
+        shutdown: yg_sync::Shutdown,
+    ) -> anyhow::Result<bool> {
+        if shutdown.deadline().is_some() {
             return Ok(false);
+        }
+        self.run_once_with_optional_shutdown(Some(shutdown)).await
+    }
+
+    async fn run_once_with_optional_shutdown(
+        &self,
+        shutdown: Option<yg_sync::Shutdown>,
+    ) -> anyhow::Result<bool> {
+        let (job, timer) = match claim_due_index_with_optional_shutdown(
+            shutdown.as_ref(),
+            self.control.claim_due_index(INDEX_LEASE),
+            async |job| self.control.release_index(job).await,
+            || self.control.start_job(yg_control::JobKind::Index),
+        )
+        .await?
+        {
+            ShutdownClaim::Empty => return Ok(false),
+            ShutdownClaim::Ready { job, timer } => (job, timer),
+            ShutdownClaim::Released { timer } => {
+                timer.finish(yg_control::JobOutcome::Discarded);
+                return Ok(true);
+            }
         };
-        let timer = self.control.start_job(yg_control::JobKind::Index);
         // A cold self-healing clone plus a long parse outlives the base
         // lease; the heartbeat keeps the job ours while the work is alive.
         let renew = async || self.control.renew_index(&job, INDEX_LEASE).await;
-        let indexed = yg_sync::with_lease_heartbeat(INDEX_LEASE, renew, self.index(&job)).await;
+        let indexed = if let Some(shutdown) = shutdown {
+            let release = async || self.control.release_index(&job).await;
+            match yg_sync::with_lease_heartbeat_until_shutdown(
+                INDEX_LEASE,
+                renew,
+                release,
+                shutdown,
+                self.index(&job),
+            )
+            .await?
+            {
+                yg_sync::LeaseShutdown::Finished(indexed) => indexed,
+                yg_sync::LeaseShutdown::Released => {
+                    timer.finish(yg_control::JobOutcome::Discarded);
+                    return Ok(true);
+                }
+            }
+        } else {
+            yg_sync::with_lease_heartbeat(INDEX_LEASE, renew, self.index(&job)).await
+        };
         match indexed {
-            Ok(shard) => {
-                let applied = self
-                    .control
-                    .complete_index(
+            Ok(IndexAttempt::Published { shard, operation }) => {
+                let applied = yg_control::finish_shard_operation(
+                    operation,
+                    self.control.complete_index(
                         &job,
                         yg_control::ShardRecord {
                             revision: &shard.revision,
@@ -167,15 +294,29 @@ impl IndexWorker {
                             node_count: shard.node_count,
                             edge_count: shard.edge_count,
                         },
-                    )
-                    .await?;
+                    ),
+                )
+                .await?;
                 if applied {
                     tracing::info!(slug = %job.slug, revision = %shard.revision, "indexed");
                     timer.finish(yg_control::JobOutcome::Success);
                 } else {
-                    tracing::warn!(slug = %job.slug, "lease lapsed mid-index; result discarded");
+                    tracing::warn!(slug = %job.slug, "index result was fenced or its lease lapsed; job will retry when needed");
                     timer.finish(yg_control::JobOutcome::Discarded);
                 }
+            }
+            Ok(IndexAttempt::ReclamationInProgress { operation }) => {
+                let deferred = yg_control::finish_shard_operation(
+                    operation,
+                    self.control.defer_index_for_reclamation(&job),
+                )
+                .await?;
+                if deferred {
+                    tracing::info!(slug = %job.slug, "deferred index while its Shard revision is being reclaimed");
+                } else {
+                    tracing::warn!(slug = %job.slug, "index reclamation deferral lost its lease");
+                }
+                timer.finish(yg_control::JobOutcome::Discarded);
             }
             Err(e) => {
                 let error = format!("{e:#}");
@@ -193,18 +334,68 @@ impl IndexWorker {
 
     /// Run the syntactic pass over the job's commit and publish the
     /// resulting Shard.
-    async fn index(
-        &self,
-        job: &yg_control::LeasedIndex,
-    ) -> anyhow::Result<yg_shard::PublishedShard> {
-        // Revisions are deterministic per commit: when this one is
-        // already published (a re-add, a retried job, another worker got
-        // there first), answer from storage without touching git.
+    async fn index(&self, job: &yg_control::LeasedIndex) -> anyhow::Result<IndexAttempt> {
+        let revision = yg_shard::syntactic_revision(&job.commit);
+        // This read-only probe is only an optimization. A complete current-
+        // schema artifact lets retries avoid checkout, parsing, and holding
+        // prepared segment bytes while they wait for the publication lock.
+        // Reclaiming revisions deliberately miss this fastpath: the locked
+        // state check below remains authoritative and decides deferral.
+        let before_lock = prepare_or_reuse_published(
+            || self.control.shard_state(job.repo_id, &revision),
+            || yg_shard::published_shard(self.store.as_ref(), job.repo_id, &job.commit),
+            || async {
+                self.control
+                    .lock_shard_operation(job.repo_id, &revision)
+                    .await
+                    .context("locking the Shard revision for publication")
+            },
+            || self.prepare(job),
+        )
+        .await?;
+        let prepared = match before_lock {
+            PrePublication::Published { shard, operation } => {
+                return Ok(IndexAttempt::Published { shard, operation });
+            }
+            PrePublication::ReclamationInProgress { operation } => {
+                return Ok(IndexAttempt::ReclamationInProgress { operation });
+            }
+            PrePublication::Prepared(prepared) => prepared,
+        };
+        // Parsing and segment construction are deliberately outside the
+        // Shard-operation lock. Only publication needs serialization: after
+        // taking the lock, re-check reclamation and existing publication
+        // before the first object write.
+        let operation = self
+            .control
+            .lock_shard_operation(job.repo_id, &revision)
+            .await
+            .context("locking the Shard revision for publication")?;
+        if self.control.shard_state(job.repo_id, &revision).await?
+            == Some(yg_control::ShardState::Reclaiming)
+        {
+            return Ok(IndexAttempt::ReclamationInProgress { operation });
+        }
+        // Revisions are deterministic per commit: a publisher that won while
+        // this worker parsed lets us reuse its artifact without object writes.
         if let Some(published) =
             yg_shard::published_shard(self.store.as_ref(), job.repo_id, &job.commit).await?
         {
-            return Ok(published);
+            return Ok(IndexAttempt::Published {
+                shard: published,
+                operation,
+            });
         }
+        let shard =
+            yg_shard::publish_shard(self.store.as_ref(), job.repo_id, &job.commit, prepared)
+                .await?;
+        Ok(IndexAttempt::Published { shard, operation })
+    }
+
+    async fn prepare(
+        &self,
+        job: &yg_control::LeasedIndex,
+    ) -> anyhow::Result<yg_shard::PreparedShard> {
         let checkout = tempfile::tempdir().context("creating a scratch checkout dir")?;
         // Materialize the checkout and walk the git history while the
         // mirror is locked: both read mirror objects, so a concurrent
@@ -243,14 +434,7 @@ impl IndexWorker {
         // Fold history in once the syntactic File nodes exist — they are
         // the ground truth for which TOUCHES edges may keep their target.
         merge_history(&mut graph, history);
-        yg_shard::write_shard(
-            self.store.as_ref(),
-            job.repo_id,
-            &job.commit,
-            graph,
-            search_docs,
-        )
-        .await
+        yg_shard::prepare_shard(graph, search_docs).await
     }
 
     /// The local mirror, guaranteed to contain the job's commit. The
@@ -286,6 +470,30 @@ impl IndexWorker {
         }
         Ok(mirror)
     }
+}
+
+enum ShutdownClaim<T, M> {
+    Empty,
+    Ready { job: T, timer: M },
+    Released { timer: M },
+}
+
+async fn claim_due_index_with_optional_shutdown<T, M>(
+    shutdown: Option<&yg_sync::Shutdown>,
+    claim: impl Future<Output = anyhow::Result<Option<T>>>,
+    release: impl AsyncFnOnce(&T) -> anyhow::Result<bool>,
+    start_timer: impl FnOnce() -> M,
+) -> anyhow::Result<ShutdownClaim<T, M>> {
+    let Some(job) = claim.await? else {
+        return Ok(ShutdownClaim::Empty);
+    };
+    let timer = start_timer();
+    if shutdown.is_some_and(|shutdown| shutdown.request().is_some()) {
+        let released = release(&job).await?;
+        tracing::info!(released, "released fresh index claim for shutdown");
+        return Ok(ShutdownClaim::Released { timer });
+    }
+    Ok(ShutdownClaim::Ready { job, timer })
 }
 
 /// Whether `commit` is present in the (possibly absent) bare mirror.
@@ -2825,7 +3033,169 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<FileEntry>) -> anyhow::R
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use tokio::time::Instant;
+
     use super::*;
+    use yg_control::ShardOperationFence;
+
+    struct CountingFence<'a> {
+        releases: &'a std::sync::atomic::AtomicUsize,
+    }
+
+    impl yg_control::ShardOperationFence for CountingFence<'_> {
+        async fn release(self) {
+            self.releases
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_already_published_revision_rechecks_under_lock_without_preparation() {
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let repo_id = 17;
+        let commit = "0123456789abcdef0123456789abcdef01234567";
+        let fixture = yg_shard::prepare_shard(Graph::default(), Vec::new())
+            .await
+            .expect("fixture segments build");
+        yg_shard::publish_shard(store.as_ref(), repo_id, commit, fixture)
+            .await
+            .expect("fixture shard publishes");
+
+        let state_probes = std::sync::atomic::AtomicUsize::new(0);
+        let publication_probes = std::sync::atomic::AtomicUsize::new(0);
+        let lock_acquisitions = std::sync::atomic::AtomicUsize::new(0);
+        let lock_releases = std::sync::atomic::AtomicUsize::new(0);
+        let preparation_runs = std::sync::atomic::AtomicUsize::new(0);
+        let result = prepare_or_reuse_published(
+            || {
+                state_probes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::future::ready(Ok(Some(yg_control::ShardState::Published)))
+            },
+            || {
+                publication_probes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let store = store.clone();
+                async move { yg_shard::published_shard(store.as_ref(), repo_id, commit).await }
+            },
+            || {
+                lock_acquisitions.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::future::ready(Ok(CountingFence {
+                    releases: &lock_releases,
+                }))
+            },
+            || async {
+                preparation_runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                yg_shard::prepare_shard(Graph::default(), Vec::new()).await
+            },
+        )
+        .await
+        .expect("the published fastpath succeeds");
+
+        let PrePublication::Published { shard, operation } = result else {
+            panic!("the current published shard must take the fastpath");
+        };
+        assert_eq!(shard.revision, yg_shard::syntactic_revision(commit));
+        assert_eq!(
+            state_probes.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "state is probed lock-free and authoritatively under the lock"
+        );
+        assert_eq!(
+            publication_probes.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the real manifest and segment HEADs are checked again under the lock"
+        );
+        assert_eq!(
+            lock_acquisitions.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            preparation_runs.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a retry for an already-published revision must not parse or build segments"
+        );
+        assert_eq!(
+            lock_releases.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the fastpath must return with the lock held for complete_index"
+        );
+        operation.release().await;
+        assert_eq!(lock_releases.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_reclaiming_revision_bypasses_the_published_fastpath() {
+        let publication_probes = std::sync::atomic::AtomicUsize::new(0);
+        let lock_acquisitions = std::sync::atomic::AtomicUsize::new(0);
+        let lock_releases = std::sync::atomic::AtomicUsize::new(0);
+        let preparation_runs = std::sync::atomic::AtomicUsize::new(0);
+        let result = prepare_or_reuse_published(
+            || std::future::ready(Ok(Some(yg_control::ShardState::Reclaiming))),
+            || {
+                publication_probes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::future::ready(Ok(None::<yg_shard::PublishedShard>))
+            },
+            || {
+                lock_acquisitions.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::future::ready(Ok(CountingFence {
+                    releases: &lock_releases,
+                }))
+            },
+            || async {
+                preparation_runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                yg_shard::prepare_shard(Graph::default(), Vec::new()).await
+            },
+        )
+        .await
+        .expect("reclaiming joins the normal preparation path");
+
+        assert!(matches!(result, PrePublication::Prepared(_)));
+        assert_eq!(
+            publication_probes.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(
+            lock_acquisitions.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(
+            preparation_runs.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn index_claim_completing_after_shutdown_is_released_before_work_starts() {
+        let (trigger, shutdown) = yg_sync::shutdown_channel();
+        let released_job = AtomicUsize::new(0);
+        let claim = async {
+            assert!(trigger.request(
+                Instant::now() + Duration::from_secs(30),
+                yg_sync::ShutdownCause::Signal,
+            ));
+            Ok(Some(43_usize))
+        };
+
+        let claimed = claim_due_index_with_optional_shutdown(
+            Some(&shutdown),
+            claim,
+            async |job| {
+                released_job.store(*job, Ordering::SeqCst);
+                Ok(true)
+            },
+            || 79_usize,
+        )
+        .await
+        .expect("post-claim shutdown check");
+
+        assert!(
+            matches!(claimed, ShutdownClaim::Released { timer: 79 }),
+            "shutdown claims must be released with their timer"
+        );
+        assert_eq!(released_job.load(Ordering::SeqCst), 43);
+    }
 
     /// Folding history into the syntactic graph keeps a TOUCHES only when
     /// the syntactic pass minted a File node for its target — a since-
