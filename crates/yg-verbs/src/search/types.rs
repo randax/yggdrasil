@@ -72,7 +72,7 @@ impl SearchTarget {
 }
 
 /// A node display name returned by search.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SearchNodeName(String);
 
@@ -87,7 +87,7 @@ impl SearchNodeName {
 }
 
 /// A repository-relative node path returned by search.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SearchPath(String);
 
@@ -102,7 +102,7 @@ impl SearchPath {
 }
 
 /// A highlighted search excerpt returned for a content hit.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SearchSnippet(String);
 
@@ -117,11 +117,18 @@ impl SearchSnippet {
 }
 
 /// One ranked search hit.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SearchHit {
-    #[serde(serialize_with = "serialize_verb_id")]
+    #[serde(
+        serialize_with = "serialize_verb_id",
+        deserialize_with = "deserialize_verb_id"
+    )]
     pub id: VerbId,
-    #[serde(serialize_with = "serialize_node_kind")]
+    #[serde(
+        serialize_with = "serialize_node_kind",
+        deserialize_with = "deserialize_node_kind"
+    )]
     pub kind: yg_shard::NodeKind,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<SearchNodeName>,
@@ -132,6 +139,14 @@ pub struct SearchHit {
     pub score: f32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snippet: Option<SearchSnippet>,
+}
+
+/// The search answer as it appears on every transport boundary.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SearchWireResponse {
+    pub hits: Vec<SearchHit>,
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Debug)]
@@ -163,11 +178,26 @@ fn serialize_verb_id<S: serde::Serializer>(id: &VerbId, serializer: S) -> Result
     serializer.serialize_str(&id.external())
 }
 
+fn deserialize_verb_id<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<VerbId, D::Error> {
+    let id = String::deserialize(deserializer)?;
+    VerbId::parse(&id).map_err(serde::de::Error::custom)
+}
+
 fn serialize_node_kind<S: serde::Serializer>(
     kind: &yg_shard::NodeKind,
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
     serializer.serialize_str(kind.as_str())
+}
+
+fn deserialize_node_kind<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<yg_shard::NodeKind, D::Error> {
+    let kind = String::deserialize(deserializer)?;
+    yg_shard::NodeKind::parse(&kind)
+        .ok_or_else(|| serde::de::Error::custom(format!("unknown node kind {kind:?}")))
 }
 
 /// Preserve the existing shortest-f32 wire representation when canonical JSON first converts this response through `serde_json::Value`.

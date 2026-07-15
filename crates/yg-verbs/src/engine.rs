@@ -8,7 +8,7 @@
 //! encode the typed result or the sanitized [`VerbError`].
 
 use anyhow::Context;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::cursor::{self, HistoryCursor, NeighborsCursor};
 use crate::search::{RepoQualifier, SearchResponse, SearchTarget};
@@ -148,7 +148,8 @@ fn resolve_error(qualifier: &str, from_cursor: bool, e: ResolveError) -> VerbErr
 
 /// The `neighbors` answer as every transport serves it: one page plus
 /// the opaque cursor.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NeighborsResponse {
     pub nodes: Vec<NodeView>,
     pub edges: Vec<GraphEdge>,
@@ -167,9 +168,40 @@ pub struct HistoryCommitView {
     pub date: String,
 }
 
+impl<'de> Deserialize<'de> for HistoryCommitView {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct WireFields {
+            commit: String,
+            sha: String,
+            subject: Option<String>,
+            committed_at: i64,
+            author: Option<crate::HistoryAuthor>,
+            date: String,
+        }
+
+        let fields = WireFields::deserialize(deserializer)?;
+        Ok(Self {
+            commit: HistoryCommit {
+                commit: fields.commit,
+                sha: fields.sha,
+                subject: fields.subject,
+                committed_at: fields.committed_at,
+                author: fields.author,
+            },
+            date: fields.date,
+        })
+    }
+}
+
 /// The `history` answer as every transport serves it: one page of
 /// commits plus the opaque cursor.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HistoryResponse {
     pub commits: Vec<HistoryCommitView>,
     pub next_cursor: Option<String>,

@@ -13,7 +13,7 @@ mod types;
 
 pub use types::{
     RepoQualifier, SearchHit, SearchNodeName, SearchPath, SearchResponse, SearchSnippet,
-    SearchTarget, ShardRevision,
+    SearchTarget, SearchWireResponse, ShardRevision,
 };
 
 /// The deepest a search cursor may page and each repository may rank.

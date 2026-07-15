@@ -57,7 +57,8 @@ pub const SYNTACTIC_PASS: &str = "syntactic";
 
 /// How a graph edge was derived (ADR 0002, CONTEXT.md). Carried by every
 /// edge from day one, even while only syntactic values exist.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Provenance {
     /// Compiler-grade indexer (SCIP) — arrives with the M1 precise pass.
     Precise,
@@ -87,9 +88,13 @@ impl Provenance {
             Provenance::Inferred => "inferred",
         }
     }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|item| item.as_str() == value)
+    }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NodeKind {
     File,
     Symbol,
@@ -170,7 +175,8 @@ impl NodeKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum EdgeKind {
     Defines,
     Calls,
@@ -225,6 +231,13 @@ impl EdgeKind {
             EdgeKind::Touches => "TOUCHES",
             EdgeKind::Authored => "AUTHORED",
         }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|item| item.as_str() == value)
     }
 }
 
