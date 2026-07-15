@@ -253,7 +253,9 @@ impl IndexWorker {
             ShutdownClaim::Empty => return Ok(false),
             ShutdownClaim::Ready { job, timer } => (job, timer),
             ShutdownClaim::Released { timer } => {
-                timer.finish(yg_control::JobOutcome::Discarded);
+                // The job was released untouched for a healthy retry: no
+                // work happened, so no outcome is recorded.
+                drop(timer);
                 return Ok(true);
             }
         };
