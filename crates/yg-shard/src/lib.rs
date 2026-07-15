@@ -432,10 +432,25 @@ pub async fn delete_shard(
 ) -> anyhow::Result<()> {
     use futures::{StreamExt, TryStreamExt};
     let prefix = object_store::path::Path::from(format!("shards/{repo_id}/{revision}/"));
+    let manifest = object_store::path::Path::from(manifest_key(repo_id, revision));
     let locations = store
         .list(Some(&prefix))
         .map_ok(|object| object.location)
-        .boxed();
+        .try_collect::<Vec<_>>()
+        .await
+        .with_context(|| format!("listing Shard objects under {prefix}"))?;
+
+    delete_if_present(store, &manifest)
+        .await
+        .context("deleting the Shard manifest before its segments")?;
+    let manifest_for_filter = manifest.clone();
+    let locations = futures::stream::iter(
+        locations
+            .into_iter()
+            .filter(move |location| location != &manifest_for_filter)
+            .map(Ok),
+    )
+    .boxed();
     store
         .delete_stream(locations)
         .filter_map(|deleted| async {
@@ -448,7 +463,27 @@ pub async fn delete_shard(
         .try_collect::<Vec<_>>()
         .await
         .with_context(|| format!("deleting Shard objects under {prefix}"))?;
+
+    // A publisher that started before the reclaiming control-plane row
+    // became visible may have recreated the manifest while segment
+    // deletion was in flight. Remove it once more before the row is
+    // reaped: either the racing completion is requeued, or it begins
+    // after this fence and publishes a complete artifact after cleanup.
+    delete_if_present(store, &manifest)
+        .await
+        .context("fencing a racing Shard manifest after segment deletion")?;
     Ok(())
+}
+
+async fn delete_if_present(
+    store: &dyn ObjectStore,
+    location: &object_store::path::Path,
+) -> object_store::Result<()> {
+    use object_store::ObjectStoreExt;
+    match store.delete(location).await {
+        Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 /// S3-compatible object storage holding the Shards (ADR 0005).
@@ -551,6 +586,16 @@ pub async fn published_shard(
                 "the published manifest at {manifest_key} records no {required} segment; \
                  refusing to trust it"
             );
+        }
+    }
+    for file in manifest.segments.keys() {
+        let key = object_store::path::Path::from(format!("shards/{repo_id}/{revision}/{file}"));
+        match object_store::ObjectStoreExt::head(store, &key).await {
+            Ok(_) => {}
+            Err(object_store::Error::NotFound { .. }) => return Ok(None),
+            Err(error) => {
+                return Err(error).with_context(|| format!("checking published segment {file}"));
+            }
         }
     }
     Ok(Some(PublishedShard {
@@ -719,11 +764,11 @@ pub async fn write_shard(
 /// materialized once into `dir` under their checksum and reused for
 /// every later query, so warm queries never touch object storage.
 ///
-/// Everything cached is immutable — manifests by their key (published
-/// revisions are never rewritten), segments by their checksum — so
-/// nothing here ever invalidates; pointer swaps are picked up because
-/// the *caller* resolves the current revision per query and only then
-/// asks this cache.
+/// Segments are immutable by checksum. Manifests normally stay cached by
+/// key, but same-revision repair may replace one; a missing or mismatched
+/// segment evicts the cached manifest and retries once against storage.
+/// Pointer swaps are picked up because the *caller* resolves the current
+/// revision per query and only then asks this cache.
 pub struct ShardCache {
     store: Arc<dyn ObjectStore>,
     dir: std::path::PathBuf,
@@ -777,6 +822,21 @@ impl std::fmt::Display for SchemaOutdated {
 
 impl std::error::Error for SchemaOutdated {}
 
+#[derive(Debug)]
+struct SegmentNeedsManifestRefresh {
+    revision: String,
+    message: String,
+    missing: bool,
+}
+
+impl std::fmt::Display for SegmentNeedsManifestRefresh {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for SegmentNeedsManifestRefresh {}
+
 impl ShardCache {
     pub fn new(store: Arc<dyn ObjectStore>, dir: impl Into<std::path::PathBuf>) -> Self {
         Self {
@@ -796,6 +856,26 @@ impl ShardCache {
     /// A revision that was never published (or has been GC'd) fails
     /// with [`RevisionMissing`].
     pub async fn graph_path(
+        &self,
+        repo_id: i64,
+        revision: &str,
+    ) -> anyhow::Result<std::path::PathBuf> {
+        match self.graph_path_once(repo_id, revision).await {
+            Err(error)
+                if error
+                    .downcast_ref::<SegmentNeedsManifestRefresh>()
+                    .is_some() =>
+            {
+                self.forget_manifest(repo_id, revision);
+                self.graph_path_once(repo_id, revision)
+                    .await
+                    .map_err(public_segment_error)
+            }
+            result => result,
+        }
+    }
+
+    async fn graph_path_once(
         &self,
         repo_id: i64,
         revision: &str,
@@ -872,18 +952,24 @@ impl ShardCache {
             // was partially) GC'd — gone for the caller's purposes, same
             // as a missing manifest.
             Err(object_store::Error::NotFound { .. }) => {
-                return Err(anyhow::Error::new(RevisionMissing {
+                return Err(anyhow::Error::new(SegmentNeedsManifestRefresh {
                     revision: revision.to_string(),
+                    message: format!("the {what} for {revision} is missing from object storage"),
+                    missing: true,
                 }));
             }
             Err(e) => return Err(e).with_context(|| format!("fetching the {what}")),
         };
         let (fetched, digest) = digest_off_thread(fetched).await?;
         if digest != sha {
-            anyhow::bail!(
-                "the {what} for {revision} does not match its manifest \
-                 (manifest says sha256 {sha}, storage holds {digest}); refusing to serve it"
-            );
+            return Err(anyhow::Error::new(SegmentNeedsManifestRefresh {
+                revision: revision.to_string(),
+                message: format!(
+                    "the {what} for {revision} does not match its manifest \
+                     (manifest says sha256 {sha}, storage holds {digest}); refusing to serve it"
+                ),
+                missing: false,
+            }));
         }
         tokio::fs::create_dir_all(&self.dir)
             .await
@@ -929,6 +1015,26 @@ impl ShardCache {
     /// A revision that was never published (or has been GC'd) fails with
     /// [`RevisionMissing`].
     pub async fn fts_path(
+        &self,
+        repo_id: i64,
+        revision: &str,
+    ) -> anyhow::Result<std::path::PathBuf> {
+        match self.fts_path_once(repo_id, revision).await {
+            Err(error)
+                if error
+                    .downcast_ref::<SegmentNeedsManifestRefresh>()
+                    .is_some() =>
+            {
+                self.forget_manifest(repo_id, revision);
+                self.fts_path_once(repo_id, revision)
+                    .await
+                    .map_err(public_segment_error)
+            }
+            result => result,
+        }
+    }
+
+    async fn fts_path_once(
         &self,
         repo_id: i64,
         revision: &str,
@@ -1005,9 +1111,18 @@ impl ShardCache {
         Ok(unpacked)
     }
 
-    /// A revision's manifest, fetched at most once per process: published
-    /// manifests are immutable, so a cached one is true forever. Fetched
-    /// manifests get the same fail-closed scrutiny as [`published_shard`]:
+    fn forget_manifest(&self, repo_id: i64, revision: &str) {
+        self.manifests
+            .lock()
+            .expect("shard cache lock poisoned")
+            .remove(&manifest_key(repo_id, revision));
+    }
+
+    /// A revision's manifest, normally fetched once per process. A
+    /// same-revision repair can replace it, so segment retrieval evicts
+    /// and refetches this entry once when stored bytes are missing or no
+    /// longer match. Fetched manifests get the same fail-closed scrutiny
+    /// as [`published_shard`]:
     /// the revision id asserts (commit, pass, schema), and a manifest
     /// that disagrees — bucket aliasing across deployments, a manual
     /// repair gone wrong — must not be served as this revision.
@@ -1089,6 +1204,15 @@ impl ShardCache {
             .expect("shard cache lock poisoned")
             .insert(key.to_string(), manifest.clone());
         Ok(manifest)
+    }
+}
+
+fn public_segment_error(error: anyhow::Error) -> anyhow::Error {
+    match error.downcast_ref::<SegmentNeedsManifestRefresh>() {
+        Some(refresh) if refresh.missing => anyhow::Error::new(RevisionMissing {
+            revision: refresh.revision.clone(),
+        }),
+        _ => error,
     }
 }
 

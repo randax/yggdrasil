@@ -39,6 +39,16 @@ pub struct IndexWorker {
     git_cache: PathBuf,
 }
 
+enum IndexAttempt {
+    Published {
+        shard: yg_shard::PublishedShard,
+        operation: yg_control::ShardOperationGuard,
+    },
+    ReclamationInProgress {
+        operation: yg_control::ShardOperationGuard,
+    },
+}
+
 impl IndexWorker {
     pub fn new(
         control: ControlPlane,
@@ -74,11 +84,10 @@ impl IndexWorker {
 
     /// Reclaim object storage from superseded Shards (issue #9): for every
     /// Shard no repo points at that has been superseded longer than
-    /// `grace`, drop its control-plane row and delete its object-storage
-    /// segments. A Shard that became current again between the scan and
-    /// the delete is skipped; one whose row is deleted but object cleanup
-    /// fails is logged as orphaned rather than blocking the rest. Returns
-    /// how many Shards were collected.
+    /// `grace`, claim its row, delete its object-storage segments, and
+    /// reap the row. A Shard that became current again between the scan
+    /// and claim is skipped; failed cleanup leaves a reclaiming row for
+    /// the next sweep to resume. Returns how many Shards were collected.
     pub async fn gc_once(&self, grace: Duration) -> anyhow::Result<u64> {
         let stale = self.control.superseded_shards_past_grace(grace).await?;
         let mut collected = 0;
@@ -91,7 +100,7 @@ impl IndexWorker {
                     repo_id = shard.repo_id,
                     revision = %shard.revision,
                     error = format!("{e:#}"),
-                    "could not delete object-storage segments for superseded Shard; these segments are now orphaned"
+                    "could not finish reclaiming superseded Shard; a later sweep will retry"
                 ),
             }
         }
@@ -118,27 +127,32 @@ impl IndexWorker {
         Ok(deleted)
     }
 
-    /// Reclaim one superseded Shard. The row goes first, under a guard
-    /// that deletes it only while no repo points at it: revisions are
-    /// deterministic, so a force-push back to this Shard's commit can
-    /// republish its exact revision — reusing this very row — and make it
-    /// current again between the sweep's scan and now. Deleting the row
-    /// first proves the Shard is not current at delete time; a re-index
-    /// would have to fully complete (fetch, checkout, parse, swap) within
-    /// the few milliseconds before the object delete to resurrect it,
-    /// which it cannot. So the live current Shard's segments are never
-    /// deleted. The cost is that a crash between the two orphans the
-    /// segments — a bounded, rare storage leak, traded for never deleting
-    /// a current Shard's data. Returns whether the Shard was collected
-    /// (`false` = it became current again and was skipped).
+    /// Reclaim one superseded Shard. The control-plane row first moves to
+    /// `reclaiming`, preserving the `(repo, revision)` uniqueness fence
+    /// while object deletion runs. A colliding index completion requeues
+    /// instead of pointing at those objects. Successful deletion reaps
+    /// the row; a crash leaves it reclaiming for the next sweep. Returns
+    /// whether the Shard was collected (`false` = it became current again
+    /// and was skipped).
     async fn collect_shard(&self, shard: &yg_control::SupersededShard) -> anyhow::Result<bool> {
-        if !self.control.delete_superseded_shard(shard.shard_id).await? {
-            return Ok(false);
-        }
-        yg_shard::delete_shard(self.store.as_ref(), shard.repo_id, &shard.revision)
+        let operation = self
+            .control
+            .lock_shard_operation(shard.repo_id, &shard.revision)
             .await
-            .context("deleting the Shard's object-storage segments")?;
-        Ok(true)
+            .context("locking the Shard revision for reclamation")?;
+        yg_control::finish_shard_operation(operation, async {
+            if !self.control.delete_superseded_shard(shard.shard_id).await? {
+                return Ok(false);
+            }
+            yg_shard::delete_shard(self.store.as_ref(), shard.repo_id, &shard.revision)
+                .await
+                .context("deleting the Shard's object-storage segments")?;
+            self.control
+                .finish_shard_reclamation(shard.shard_id)
+                .await
+                .context("reaping the reclaimed Shard row")
+        })
+        .await
     }
 
     /// Claim and run one due index job. Returns whether there was work.
@@ -153,10 +167,10 @@ impl IndexWorker {
         let renew = async || self.control.renew_index(&job, INDEX_LEASE).await;
         let indexed = yg_sync::with_lease_heartbeat(INDEX_LEASE, renew, self.index(&job)).await;
         match indexed {
-            Ok(shard) => {
-                let applied = self
-                    .control
-                    .complete_index(
+            Ok(IndexAttempt::Published { shard, operation }) => {
+                let applied = yg_control::finish_shard_operation(
+                    operation,
+                    self.control.complete_index(
                         &job,
                         yg_control::ShardRecord {
                             revision: &shard.revision,
@@ -166,12 +180,25 @@ impl IndexWorker {
                             node_count: shard.node_count,
                             edge_count: shard.edge_count,
                         },
-                    )
-                    .await?;
+                    ),
+                )
+                .await?;
                 if applied {
                     tracing::info!(slug = %job.slug, revision = %shard.revision, "indexed");
                 } else {
-                    tracing::warn!(slug = %job.slug, "lease lapsed mid-index; result discarded");
+                    tracing::warn!(slug = %job.slug, "index result was fenced or its lease lapsed; job will retry when needed");
+                }
+            }
+            Ok(IndexAttempt::ReclamationInProgress { operation }) => {
+                let deferred = yg_control::finish_shard_operation(
+                    operation,
+                    self.control.defer_index_for_reclamation(&job),
+                )
+                .await?;
+                if deferred {
+                    tracing::info!(slug = %job.slug, "deferred index while its Shard revision is being reclaimed");
+                } else {
+                    tracing::warn!(slug = %job.slug, "index reclamation deferral lost its lease");
                 }
             }
             Err(e) => {
@@ -188,17 +215,28 @@ impl IndexWorker {
 
     /// Run the syntactic pass over the job's commit and publish the
     /// resulting Shard.
-    async fn index(
-        &self,
-        job: &yg_control::LeasedIndex,
-    ) -> anyhow::Result<yg_shard::PublishedShard> {
+    async fn index(&self, job: &yg_control::LeasedIndex) -> anyhow::Result<IndexAttempt> {
+        let revision = yg_shard::syntactic_revision(&job.commit);
+        let operation = self
+            .control
+            .lock_shard_operation(job.repo_id, &revision)
+            .await
+            .context("locking the Shard revision for publication")?;
+        if self.control.shard_state(job.repo_id, &revision).await?
+            == Some(yg_control::ShardState::Reclaiming)
+        {
+            return Ok(IndexAttempt::ReclamationInProgress { operation });
+        }
         // Revisions are deterministic per commit: when this one is
         // already published (a re-add, a retried job, another worker got
         // there first), answer from storage without touching git.
         if let Some(published) =
             yg_shard::published_shard(self.store.as_ref(), job.repo_id, &job.commit).await?
         {
-            return Ok(published);
+            return Ok(IndexAttempt::Published {
+                shard: published,
+                operation,
+            });
         }
         let checkout = tempfile::tempdir().context("creating a scratch checkout dir")?;
         // Materialize the checkout and walk the git history while the
@@ -238,14 +276,15 @@ impl IndexWorker {
         // Fold history in once the syntactic File nodes exist — they are
         // the ground truth for which TOUCHES edges may keep their target.
         merge_history(&mut graph, history);
-        yg_shard::write_shard(
+        let shard = yg_shard::write_shard(
             self.store.as_ref(),
             job.repo_id,
             &job.commit,
             graph,
             search_docs,
         )
-        .await
+        .await?;
+        Ok(IndexAttempt::Published { shard, operation })
     }
 
     /// The local mirror, guaranteed to contain the job's commit. The
