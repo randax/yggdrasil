@@ -5,11 +5,12 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use futures::StreamExt;
 use object_store::memory::InMemory;
 use object_store::{GetOptions, GetResult, ObjectStore, PutOptions, PutPayload, PutResult};
 use yg_shard::{
     Edge, EdgeKind, Graph, Node, NodeKind, Provenance, SearchDoc, SearchParams, ShardCache,
-    delete_shard, write_shard,
+    delete_shard, published_shard, write_shard,
 };
 
 /// An object store that counts reads, so tests can assert which queries
@@ -112,6 +113,14 @@ impl ObjectStore for CountingStore {
 
 /// A tiny published Shard to read back: one File defining one Symbol.
 async fn publish_fixture_shard(store: &dyn ObjectStore, repo_id: i64, commit: &str) -> String {
+    let (graph, search_docs) = fixture_shard();
+    write_shard(store, repo_id, commit, graph, search_docs)
+        .await
+        .expect("publishing the fixture Shard")
+        .revision
+}
+
+fn fixture_shard() -> (Graph, Vec<SearchDoc>) {
     let graph = Graph {
         nodes: vec![Node::file("main.go"), Node::symbol("main.go", "Hello", 1)],
         edges: vec![Edge {
@@ -139,10 +148,310 @@ async fn publish_fixture_shard(store: &dyn ObjectStore, repo_id: i64, commit: &s
             content: String::new(),
         },
     ];
-    write_shard(store, repo_id, commit, graph, search_docs)
+    (graph, search_docs)
+}
+
+#[derive(Debug)]
+struct DeletionSeamStore {
+    inner: Arc<InMemory>,
+    deletions: Arc<std::sync::Mutex<Vec<String>>>,
+    delete_count: Arc<AtomicUsize>,
+    fail_at: Option<usize>,
+    fail_listing: bool,
+}
+
+impl DeletionSeamStore {
+    fn new(fail_at: Option<usize>) -> Self {
+        Self {
+            inner: Arc::new(InMemory::new()),
+            deletions: Arc::new(std::sync::Mutex::new(Vec::new())),
+            delete_count: Arc::new(AtomicUsize::new(0)),
+            fail_at,
+            fail_listing: false,
+        }
+    }
+
+    fn with_listing_failure() -> Self {
+        Self {
+            fail_listing: true,
+            ..Self::new(None)
+        }
+    }
+
+    fn deletions(&self) -> Vec<String> {
+        self.deletions.lock().unwrap().clone()
+    }
+}
+
+impl std::fmt::Display for DeletionSeamStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DeletionSeamStore({})", self.inner)
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for DeletionSeamStore {
+    async fn put_opts(
+        &self,
+        location: &object_store::path::Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> object_store::Result<PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &object_store::path::Path,
+        opts: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &object_store::path::Path,
+        options: GetOptions,
+    ) -> object_store::Result<GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<
+            'static,
+            object_store::Result<object_store::path::Path>,
+        >,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+        let inner = self.inner.clone();
+        let deletions = self.deletions.clone();
+        let delete_count = self.delete_count.clone();
+        let fail_at = self.fail_at;
+        locations
+            .then(move |location| {
+                let inner = inner.clone();
+                let deletions = deletions.clone();
+                let delete_count = delete_count.clone();
+                async move {
+                    let location = location?;
+                    deletions.lock().unwrap().push(location.to_string());
+                    let attempt = delete_count.fetch_add(1, Ordering::SeqCst) + 1;
+                    if fail_at == Some(attempt) {
+                        return Err(object_store::Error::Generic {
+                            store: "deletion seam",
+                            source: Box::new(std::io::Error::other("simulated GC crash")),
+                        });
+                    }
+                    object_store::ObjectStoreExt::delete(inner.as_ref(), &location).await?;
+                    Ok(location)
+                }
+            })
+            .boxed()
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        if self.fail_listing {
+            return futures::stream::once(futures::future::ready(Err(
+                object_store::Error::NotFound {
+                    path: "simulated listing page".into(),
+                    source: Box::new(std::io::Error::other("simulated listing failure")),
+                },
+            )))
+            .boxed();
+        }
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        options: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+#[tokio::test]
+async fn deletion_removes_the_manifest_before_every_segment() {
+    let store = DeletionSeamStore::new(None);
+    let revision = publish_fixture_shard(&store, 7, "ordered").await;
+
+    delete_shard(&store, 7, &revision).await.unwrap();
+
+    let deletions = store.deletions();
+    assert_eq!(
+        deletions.first(),
+        Some(&yg_shard::manifest_key(7, &revision))
+    );
+    for segment in [
+        yg_shard::graph_segment_key(7, &revision),
+        yg_shard::fts_segment_key(7, &revision),
+    ] {
+        assert!(
+            deletions.iter().position(|key| key == &segment)
+                > deletions
+                    .iter()
+                    .position(|key| key == &yg_shard::manifest_key(7, &revision)),
+            "manifest deletion must precede {segment}: {deletions:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn deletion_does_not_mistake_a_listing_not_found_for_an_idempotent_object_delete() {
+    let store = DeletionSeamStore::with_listing_failure();
+
+    let error = delete_shard(&store, 7, "listing-failure")
         .await
-        .expect("publishing the fixture Shard")
-        .revision
+        .expect_err("a listing failure must abort reclamation");
+
+    assert!(
+        error
+            .chain()
+            .any(|cause| cause.to_string().contains("simulated listing page")),
+        "listing error provenance must be retained: {error:#}"
+    );
+}
+
+#[tokio::test]
+async fn a_partial_reclamation_is_fully_republished_and_served() {
+    use object_store::ObjectStoreExt;
+
+    let store = Arc::new(DeletionSeamStore::new(Some(3)));
+    let commit = "repairable";
+    let revision = publish_fixture_shard(store.as_ref(), 9, commit).await;
+    let error = delete_shard(store.as_ref(), 9, &revision)
+        .await
+        .expect_err("the injected deletion failure must interrupt reclamation");
+    assert!(error.to_string().contains("deleting Shard objects"));
+    assert!(matches!(
+        store
+            .get(&yg_shard::manifest_key(9, &revision).as_str().into())
+            .await,
+        Err(object_store::Error::NotFound { .. })
+    ));
+
+    let (graph, search_docs) = fixture_shard();
+    write_shard(store.as_ref(), 9, commit, graph, search_docs)
+        .await
+        .expect("the next index run repairs the partial deletion");
+    let dir = tempfile::tempdir().unwrap();
+    let cache = ShardCache::new(store, dir.path());
+    let graph_path = cache.graph_path(9, &revision).await.unwrap();
+    assert!(graph_path.is_file());
+    let fts_path = cache.fts_path(9, &revision).await.unwrap();
+    let index = yg_shard::open_fts(&fts_path).unwrap();
+    assert!(
+        !yg_shard::search(
+            &index,
+            &SearchParams {
+                query: "Hello",
+                kinds: None,
+                limit: 10,
+            },
+        )
+        .unwrap()
+        .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn a_cold_fts_segment_refreshes_a_warm_manifest_after_same_revision_republish() {
+    let store = Arc::new(InMemory::new());
+    let commit = "warm-repair";
+    let revision = publish_fixture_shard(store.as_ref(), 11, commit).await;
+    let dir = tempfile::tempdir().unwrap();
+    let cache = ShardCache::new(store.clone(), dir.path());
+
+    cache
+        .graph_path(11, &revision)
+        .await
+        .expect("warm the original manifest without fetching full text");
+    delete_shard(store.as_ref(), 11, &revision).await.unwrap();
+    let (graph, mut search_docs) = fixture_shard();
+    search_docs.push(SearchDoc {
+        node_id: "sym:main.go#Repaired".into(),
+        kind: NodeKind::Symbol,
+        name: Some("Repaired".into()),
+        path: Some("main.go".into()),
+        content: "Repaired".into(),
+    });
+    write_shard(store.as_ref(), 11, commit, graph, search_docs)
+        .await
+        .unwrap();
+
+    let fts_path = cache.fts_path(11, &revision).await.unwrap();
+    let index = yg_shard::open_fts(&fts_path).unwrap();
+    let hits = yg_shard::search(
+        &index,
+        &SearchParams {
+            query: "Repaired",
+            kinds: None,
+            limit: 10,
+        },
+    )
+    .unwrap();
+    assert!(
+        hits.iter()
+            .any(|hit| hit.name.as_deref() == Some("Repaired"))
+    );
+}
+
+#[tokio::test]
+async fn a_manifest_with_a_missing_listed_segment_is_not_published() {
+    use object_store::ObjectStoreExt;
+
+    let store = InMemory::new();
+    let commit = "incomplete";
+    let revision = publish_fixture_shard(&store, 3, commit).await;
+    store
+        .delete(&yg_shard::fts_segment_key(3, &revision).as_str().into())
+        .await
+        .unwrap();
+
+    assert!(published_shard(&store, 3, commit).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn every_manifest_listed_segment_must_exist_before_publication_is_trusted() {
+    use object_store::ObjectStoreExt;
+
+    let store = InMemory::new();
+    let commit = "extra-segment";
+    let revision = publish_fixture_shard(&store, 4, commit).await;
+    let key = yg_shard::manifest_key(4, &revision);
+    let bytes = store
+        .get(&key.as_str().into())
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    let mut manifest: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    manifest["segments"]["symbols.sqlite"] = serde_json::json!({
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "bytes": 1
+    });
+    store
+        .put(
+            &key.as_str().into(),
+            serde_json::to_vec(&manifest).unwrap().into(),
+        )
+        .await
+        .unwrap();
+
+    assert!(published_shard(&store, 4, commit).await.unwrap().is_none());
 }
 
 #[tokio::test]
