@@ -17,7 +17,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 # crate's transitive feature unification.
 serde_json = { version = "1.0.150", features = ["preserve_order"] }
 subtle = "2.6.1"
-tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "signal", "net", "time"] }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "signal", "net", "sync", "time"] }
 tracing = "0.1.44"
 yg-control = { version = "0.1.0", path = "../yg-control" }
 yg-shard = { version = "0.1.0", path = "../yg-shard" }

@@ -28,6 +28,7 @@
 
 pub mod cursor;
 pub mod engine;
+mod search;
 
 use std::collections::BTreeMap;
 
@@ -43,6 +44,10 @@ use yg_shard::graph_schema::{
 pub use engine::{
     Engine, HistoryCommitView, HistoryResponse, NeighborsResponse, ResolveError, ResolvedShard,
     ShardResolver, VerbError,
+};
+pub use search::{
+    RepoQualifier, SearchHit, SearchNodeName, SearchPath, SearchResponse, SearchSnippet,
+    SearchTarget, ShardRevision,
 };
 
 pub const DEFAULT_NEIGHBORS_DEPTH: u32 = 1;

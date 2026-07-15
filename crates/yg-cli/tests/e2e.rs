@@ -1671,6 +1671,84 @@ async fn yg_admin_repo_add_and_admin_status_drive_the_admin_surface() {
     );
 }
 
+/// multi_thread: the yg binary blocks this thread while the in-process
+/// server it queries runs on the same test runtime.
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_status_summarizes_mixed_repository_visibility() {
+    let db_name = create_test_db().await;
+    let control = control_plane(&db_name).await;
+    let forge = control
+        .connect_forge_org(yg_control::ConnectForgeOrg {
+            forge_kind: "github",
+            base_url: "https://github.com",
+            org_slug: "acme",
+            token_env: None,
+            api_root: None,
+        })
+        .await
+        .unwrap();
+    control
+        .discover_forge_repos(
+            forge.org_id,
+            &[
+                yg_control::DiscoveredRepo {
+                    slug: "acme/public-widgets",
+                    visibility: yg_control::RepoVisibility::Public,
+                    fetch_depth: None,
+                },
+                yg_control::DiscoveredRepo {
+                    slug: "acme/internal-widgets",
+                    visibility: yg_control::RepoVisibility::Internal,
+                    fetch_depth: None,
+                },
+                yg_control::DiscoveredRepo {
+                    slug: "acme/private-widgets",
+                    visibility: yg_control::RepoVisibility::Private,
+                    fetch_depth: None,
+                },
+            ],
+        )
+        .await
+        .unwrap();
+
+    let server = serve(test_config(&db_name)).await.unwrap();
+    let env = [
+        ("YG_SERVER", format!("http://{}", server.local_addr())),
+        ("YG_TOKEN", TEST_TOKEN.into()),
+    ];
+
+    let status = assert_cmd::Command::cargo_bin("yg")
+        .unwrap()
+        .envs(env.iter().cloned())
+        .args(["admin", "status"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(status.get_output().stdout.clone()).unwrap();
+    assert_eq!(
+        stdout.lines().find(|line| line.starts_with("visibility:")),
+        Some("visibility: public=1 internal=1 private=1"),
+        "human status must summarize visibility counts, got:\n{stdout}"
+    );
+
+    let json = assert_cmd::Command::cargo_bin("yg")
+        .unwrap()
+        .envs(env.iter().cloned())
+        .args(["admin", "status", "--json"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(json.get_output().stdout.clone()).unwrap();
+    let body: serde_json::Value =
+        serde_json::from_str(&stdout).expect("--json output must be valid JSON");
+    assert_eq!(
+        body["visibility_counts"],
+        serde_json::json!({
+            "public": 1,
+            "internal": 1,
+            "private": 1,
+        })
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn yg_serve_role_all_syncs_an_added_repo_without_a_separate_worker() {
     let (fixture, repo_dir, fixture_url) = fixture_repo(1);

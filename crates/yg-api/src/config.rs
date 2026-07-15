@@ -3,6 +3,7 @@
 use std::net::SocketAddr;
 
 use anyhow::Context;
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 // Server config embeds the object-store half owned by yg-shard; clients
@@ -19,21 +20,33 @@ pub struct ServerConfig {
     pub shard_cache: std::path::PathBuf,
 }
 
-/// A booted Index Server, listening until dropped or the process exits.
+/// A booted Index Server with an explicit graceful-drain trigger.
 pub struct RunningServer {
     pub(crate) local_addr: SocketAddr,
     pub(crate) handle: JoinHandle<std::io::Result<()>>,
+    pub(crate) shutdown: Option<oneshot::Sender<ServerShutdown>>,
 }
+
+/// Typed control message that asks axum to stop accepting and drain.
+pub(crate) struct ServerShutdown;
 
 impl RunningServer {
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
     }
 
+    /// Ask axum to stop accepting new connections and drain in-flight
+    /// requests. Repeated calls are harmless.
+    pub fn begin_shutdown(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(ServerShutdown);
+        }
+    }
+
     /// Run until the server task ends (it normally never does); a serve
     /// error surfaces here instead of being silently logged.
-    pub async fn wait(self) -> anyhow::Result<()> {
-        self.handle
+    pub async fn wait(&mut self) -> anyhow::Result<()> {
+        (&mut self.handle)
             .await
             .context("server task panicked")?
             .context("server exited with an error")
