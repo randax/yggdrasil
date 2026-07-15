@@ -8,6 +8,19 @@ use base64::Engine;
 
 use crate::forge::GitAuth;
 
+/// Locale used for git's human-readable diagnostics, which rate-limit
+/// detection subsequently matches as English prose.
+const GIT_LOCALE: &str = "C";
+
+/// Construct every git child with the process-wide non-interactive and
+/// diagnostic-language contract applied in one place.
+fn git_command(program: impl AsRef<std::ffi::OsStr>) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(program);
+    command.env("GIT_TERMINAL_PROMPT", "0");
+    command.env("LC_ALL", GIT_LOCALE);
+    command
+}
+
 /// Resolve the Forge token for a clone: read the env var the control
 /// plane names, if any. Defense in depth: whatever the control plane
 /// says, a Forge token only ever travels over TLS.
@@ -296,11 +309,10 @@ async fn remote_head(clone_url: &str, auth: Option<&GitAuth>) -> anyhow::Result<
 /// answer a question about repository state. `--git-dir` for the same
 /// no-discovery reason as [`run_git`].
 async fn git_says_yes(dir: &std::path::Path, args: &[&str]) -> anyhow::Result<bool> {
-    let mut cmd = tokio::process::Command::new("git");
+    let mut cmd = git_command("git");
     cmd.arg("--git-dir").arg(dir);
     cmd.args(args);
     cmd.kill_on_drop(true);
-    cmd.env("GIT_TERMINAL_PROMPT", "0");
     cmd.stdout(std::process::Stdio::null());
     cmd.stderr(std::process::Stdio::null());
     let status = tokio::time::timeout(GIT_TIMEOUT, cmd.status())
@@ -502,7 +514,7 @@ async fn run_git(
     args: &[&str],
     auth: Option<&GitAuth>,
 ) -> anyhow::Result<String> {
-    let mut cmd = tokio::process::Command::new("git");
+    let mut cmd = git_command("git");
     if let Some(dir) = dir {
         cmd.arg("--git-dir").arg(dir);
     }
@@ -510,7 +522,6 @@ async fn run_git(
     // If this future is dropped (shutdown, lease handling), take the git
     // process down with it instead of orphaning a half-done clone.
     cmd.kill_on_drop(true);
-    cmd.env("GIT_TERMINAL_PROMPT", "0");
     // Transfers that stall — under 1 KB/s for a minute straight — are
     // dead connections, not slow ones; have git kill them itself so a
     // blackholed remote fails the job in ~a minute instead of holding
@@ -553,6 +564,34 @@ async fn run_git(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn localized_git_stderr_still_exposes_an_english_rate_limit() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = dir.path().join("git");
+        std::fs::write(
+            &fixture,
+            include_str!("../testdata/localized-git-stderr.sh"),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fixture).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fixture, permissions).unwrap();
+
+        let output = git_command(&fixture).output().await.unwrap();
+        assert!(!output.status.success());
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains("The requested URL returned error: 429"));
+        assert!(
+            crate::forge::builtin()
+                .for_kind("github")
+                .is_rate_limit(&stderr),
+            "C-locale git stderr must remain recognizable as a rate limit: {stderr:?}"
+        );
+    }
 
     #[test]
     fn head_validation_rejects_crash_artifacts_and_accepts_gits_shapes() {

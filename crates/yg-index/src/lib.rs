@@ -291,7 +291,8 @@ async fn commit_available(mirror: &Path, commit: &str) -> bool {
     let mut cmd = tokio::process::Command::new("git");
     cmd.arg("--git-dir")
         .arg(mirror)
-        .args(["cat-file", "-e", &format!("{commit}^{{commit}}")]);
+        .args(["cat-file", "-e", &format!("{commit}^{{commit}}")])
+        .env("LC_ALL", "C");
     cmd.kill_on_drop(true);
     matches!(cmd.status().await, Ok(status) if status.success())
 }
@@ -314,6 +315,7 @@ fn extract_tree(mirror: &Path, commit: &str, dest: &Path) -> anyhow::Result<()> 
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env("GIT_TERMINAL_PROMPT", "0")
+        .env("LC_ALL", "C")
         .spawn()
         .context("running git archive (is git installed on this worker?)")?;
     // Drain stderr concurrently: left unread, a chatty git (GIT_TRACE,
@@ -573,6 +575,7 @@ async fn git_log_history(git_dir: &Path, commit: &str) -> anyhow::Result<String>
         .args(["log", commit, "--no-renames", "--name-only", "-z"])
         .arg("--pretty=format:%H%x00%ct%x00%an%x00%ae%x00%s%x00")
         .env("GIT_TERMINAL_PROMPT", "0")
+        .env("LC_ALL", "C")
         .kill_on_drop(true);
     let out = tokio::time::timeout(HISTORY_LOG_TIMEOUT, cmd.output())
         .await
