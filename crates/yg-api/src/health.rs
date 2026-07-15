@@ -8,16 +8,11 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 use yg_shard::probe_object_store;
+use yg_verbs::status::StatusResponse;
 
 use crate::AppState;
 use crate::error::ApiError;
 use crate::wire::Wire;
-
-#[derive(Serialize)]
-struct StatusResponse {
-    version: &'static str,
-    repos_indexed: i64,
-}
 
 /// Uptime changes every second, and response bodies must be
 /// byte-identical for identical state (they become prompt-cache
@@ -29,7 +24,7 @@ pub(crate) async fn status(State(state): State<Arc<AppState>>) -> Result<Respons
     Ok((
         [(UPTIME_HEADER, state.started.elapsed().as_secs().to_string())],
         Wire(StatusResponse {
-            version: env!("CARGO_PKG_VERSION"),
+            version: env!("CARGO_PKG_VERSION").to_string(),
             repos_indexed,
         }),
     )

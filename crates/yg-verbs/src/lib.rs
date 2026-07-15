@@ -26,10 +26,12 @@
 //! writer's own table and column names — so writer/reader drift is a
 //! compile error, not a runtime surprise.
 
+pub mod admin;
 pub mod cursor;
 pub mod engine;
 pub mod metrics;
 mod search;
+pub mod status;
 
 use std::collections::BTreeMap;
 
@@ -49,8 +51,9 @@ pub use engine::{
 pub use metrics::Metrics;
 pub use search::{
     RepoQualifier, SearchHit, SearchNodeName, SearchPath, SearchResponse, SearchSnippet,
-    SearchTarget, ShardRevision,
+    SearchTarget, SearchWireResponse, ShardRevision,
 };
+pub use yg_shard::{EdgeKind, Provenance};
 
 pub const DEFAULT_NEIGHBORS_DEPTH: u32 = 1;
 pub const MIN_NEIGHBORS_DEPTH: u32 = 1;
@@ -392,14 +395,93 @@ impl VerbId {
     }
 }
 
+impl Serialize for VerbId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.external())
+    }
+}
+
+impl<'de> Deserialize<'de> for VerbId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let id = String::deserialize(deserializer)?;
+        Self::parse(&id).map_err(serde::de::Error::custom)
+    }
+}
+
+impl std::fmt::Display for VerbId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.external())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResponseNodeKind {
+    Repo,
+    File,
+    Symbol,
+    Package,
+    Commit,
+    Contributor,
+}
+
+impl ResponseNodeKind {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "Repo" => Some(Self::Repo),
+            "File" => Some(Self::File),
+            "Symbol" => Some(Self::Symbol),
+            "Package" => Some(Self::Package),
+            "Commit" => Some(Self::Commit),
+            "Contributor" => Some(Self::Contributor),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Repo => "Repo",
+            Self::File => "File",
+            Self::Symbol => "Symbol",
+            Self::Package => "Package",
+            Self::Commit => "Commit",
+            Self::Contributor => "Contributor",
+        }
+    }
+}
+
+impl From<yg_shard::NodeKind> for ResponseNodeKind {
+    fn from(kind: yg_shard::NodeKind) -> Self {
+        match kind {
+            yg_shard::NodeKind::File => Self::File,
+            yg_shard::NodeKind::Symbol => Self::Symbol,
+            yg_shard::NodeKind::Package => Self::Package,
+            yg_shard::NodeKind::Commit => Self::Commit,
+            yg_shard::NodeKind::Contributor => Self::Contributor,
+        }
+    }
+}
+
+impl std::fmt::Display for ResponseNodeKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 /// A node as Verb responses carry it: the external id plus everything
 /// the Shard knows about the node itself. A Commit's committer date is
 /// deliberately not here — it is surfaced by the `history` Verb, the one
 /// place commit dates are answered; `node`/`neighbors` describe structure.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NodeView {
-    pub id: String,
-    pub kind: String,
+    pub id: VerbId,
+    pub kind: ResponseNodeKind,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -408,17 +490,19 @@ pub struct NodeView {
 
 /// One edge kind's worth of a node's edges, with how those edges were
 /// derived: `{"kind": "DEFINES", "count": 2, "provenance": {"syntactic": 2}}`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EdgeKindSummary {
-    pub kind: String,
+    pub kind: yg_shard::EdgeKind,
     pub count: i64,
     /// Edge count per provenance value (CONTEXT.md: how an edge was
     /// derived).
-    pub provenance: BTreeMap<String, i64>,
+    pub provenance: BTreeMap<yg_shard::Provenance, i64>,
 }
 
 /// A node's edges grouped by direction then kind.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EdgeSummary {
     #[serde(rename = "in")]
     pub inbound: Vec<EdgeKindSummary>,
@@ -426,7 +510,8 @@ pub struct EdgeSummary {
 }
 
 /// The `node` Verb's answer: full node + edge summary (RFC 0001 §7).
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NodeResponse {
     pub node: NodeView,
     pub edges: EdgeSummary,
@@ -441,8 +526,8 @@ pub fn node(conn: &rusqlite::Connection, id: &VerbId) -> anyhow::Result<Option<N
         // no repo-level edges.
         return Ok(Some(NodeResponse {
             node: NodeView {
-                id: id.external(),
-                kind: "Repo".to_string(),
+                id: id.clone(),
+                kind: ResponseNodeKind::Repo,
                 name: None,
                 path: None,
             },
@@ -459,14 +544,7 @@ pub fn node(conn: &rusqlite::Connection, id: &VerbId) -> anyhow::Result<Option<N
                 "SELECT {NODE_KIND}, {NODE_NAME}, {NODE_PATH} FROM {NODES} WHERE {NODE_ID} = ?1"
             ),
             [local],
-            |row| {
-                Ok(NodeView {
-                    id: id.external(),
-                    kind: row.get(0)?,
-                    name: row.get(1)?,
-                    path: row.get(2)?,
-                })
-            },
+            |row| Ok((row.get::<_, String>(0)?, row.get(1)?, row.get(2)?)),
         )
         .map(Some)
         .or_else(|e| match e {
@@ -474,7 +552,17 @@ pub fn node(conn: &rusqlite::Connection, id: &VerbId) -> anyhow::Result<Option<N
             e => Err(e),
         })
         .context("reading the node")?;
-    let Some(node) = found else { return Ok(None) };
+    let Some((kind, name, path)) = found else {
+        return Ok(None);
+    };
+    let kind = ResponseNodeKind::parse(&kind)
+        .with_context(|| format!("the node has unknown kind {kind:?}"))?;
+    let node = NodeView {
+        id: id.clone(),
+        kind,
+        name,
+        path,
+    };
 
     Ok(Some(NodeResponse {
         node,
@@ -487,12 +575,13 @@ pub fn node(conn: &rusqlite::Connection, id: &VerbId) -> anyhow::Result<Option<N
 
 /// An edge as Verb responses carry it: endpoints in external form, plus
 /// how the edge was derived and how sure the deriving pass was.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GraphEdge {
-    pub src: String,
-    pub dst: String,
-    pub kind: String,
-    pub provenance: String,
+    pub src: VerbId,
+    pub dst: VerbId,
+    pub kind: yg_shard::EdgeKind,
+    pub provenance: yg_shard::Provenance,
     pub confidence: f64,
     /// Where the edge was witnessed (`<path>:<line>:<col>`,
     /// repo-relative, 1-based; `col` is a byte offset within the line),
@@ -741,20 +830,29 @@ pub fn neighbors(
     // nothing: it belongs to its own node's page (the origin's to the
     // first page, below).
     let mut edges = Vec::new();
-    let mut push_edge = |edge: &RawEdge| {
+    let mut push_edge = |edge: &RawEdge| -> anyhow::Result<()> {
+        let src = VerbId::parse(&id.qualify(&edge.src))
+            .map_err(|error| anyhow::anyhow!("invalid stored edge source: {error}"))?;
+        let dst = VerbId::parse(&id.qualify(&edge.dst))
+            .map_err(|error| anyhow::anyhow!("invalid stored edge destination: {error}"))?;
+        let kind = yg_shard::EdgeKind::parse(&edge.kind)
+            .with_context(|| format!("the edge has unknown kind {:?}", edge.kind))?;
+        let provenance = yg_shard::Provenance::parse(&edge.provenance)
+            .with_context(|| format!("the edge has unknown provenance {:?}", edge.provenance))?;
         edges.push(GraphEdge {
-            src: id.qualify(&edge.src),
-            dst: id.qualify(&edge.dst),
-            kind: edge.kind.clone(),
-            provenance: edge.provenance.clone(),
+            src,
+            dst,
+            kind,
+            provenance,
             confidence: edge.confidence,
             location: edge.location.clone(),
         });
+        Ok(())
     };
     if start == 0 {
         for edge in memo.edges_of(conn, local, options.edge_kinds.as_deref())? {
             if edge.src == edge.dst {
-                push_edge(edge);
+                push_edge(edge)?;
             }
         }
     }
@@ -766,7 +864,7 @@ pub fn neighbors(
                     .get(edge.other_end(local))
                     .is_some_and(|&far_rank| far_rank < my_rank);
             if qualifies {
-                push_edge(edge);
+                push_edge(edge)?;
             }
         }
     }
@@ -820,9 +918,13 @@ fn node_views(
             let (kind, name, path) = rows.get(local).with_context(|| {
                 format!("the Shard has an edge to {local} but no such node; refusing to serve an inconsistent graph")
             })?;
+            let id = VerbId::parse(external)
+                .map_err(|error| anyhow::anyhow!("invalid traversed node id: {error}"))?;
+            let kind = ResponseNodeKind::parse(kind)
+                .with_context(|| format!("the node has unknown kind {kind:?}"))?;
             Ok(NodeView {
-                id: external.clone(),
-                kind: kind.clone(),
+                id,
+                kind,
                 name: name.clone(),
                 path: path.clone(),
             })
@@ -939,6 +1041,10 @@ fn edge_summary(
     let mut summaries: Vec<EdgeKindSummary> = Vec::new();
     for row in rows {
         let (kind, provenance, count) = row.context("summarizing edges")?;
+        let kind = yg_shard::EdgeKind::parse(&kind)
+            .with_context(|| format!("the edge summary has unknown kind {kind:?}"))?;
+        let provenance = yg_shard::Provenance::parse(&provenance)
+            .with_context(|| format!("the edge summary has unknown provenance {provenance:?}"))?;
         match summaries.last_mut() {
             Some(last) if last.kind == kind => {
                 last.count += count;
@@ -956,7 +1062,8 @@ fn edge_summary(
 
 /// One commit in the `history` Verb's answer: the commit, when it landed,
 /// what it was, and who wrote it (RFC 0001 §7).
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HistoryCommit {
     /// External commit id (`commit:<repo>:<sha>`).
     pub commit: String,
@@ -975,7 +1082,8 @@ pub struct HistoryCommit {
 
 /// A commit's author, as a Contributor reference (CONTEXT.md): deduped by
 /// email within this repo's Shard — cross-Forge identity merge is M2.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HistoryAuthor {
     /// External contributor id (`contributor:<repo>:<email>`).
     pub id: String,

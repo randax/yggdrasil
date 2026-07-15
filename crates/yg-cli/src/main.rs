@@ -416,21 +416,49 @@ fn client_config_path() -> Option<std::path::PathBuf> {
 /// send, then either parse the JSON response or fail with the server's
 /// own reason. The client is built once — it pools connections and is
 /// designed to be reused.
-async fn server_json(
+struct ServerResponse<T> {
+    headers: reqwest::header::HeaderMap,
+    body: T,
+}
+
+fn canonical_json<T: serde::Serialize>(body: &T) -> anyhow::Result<String> {
+    fn sort_keys(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(map) => {
+                map.sort_keys();
+                map.values_mut().for_each(sort_keys);
+            }
+            serde_json::Value::Array(items) => items.iter_mut().for_each(sort_keys),
+            _ => {}
+        }
+    }
+
+    let mut value = serde_json::to_value(body)?;
+    sort_keys(&mut value);
+    Ok(serde_json::to_string(&value)?)
+}
+
+async fn server_json<T>(
     method: reqwest::Method,
     path: &str,
     body: Option<serde_json::Value>,
-) -> anyhow::Result<serde_json::Value> {
-    Ok(server_request(method, path, body).await?.1)
+) -> anyhow::Result<ServerResponse<T>>
+where
+    T: serde::de::DeserializeOwned + serde::Serialize,
+{
+    server_request(method, path, body).await
 }
 
 /// [`server_json`], but also returning the response headers — volatile
 /// values (uptime) ride there instead of the cache-stable body.
-async fn server_request(
+async fn server_request<T>(
     method: reqwest::Method,
     path: &str,
     body: Option<serde_json::Value>,
-) -> anyhow::Result<(reqwest::header::HeaderMap, serde_json::Value)> {
+) -> anyhow::Result<ServerResponse<T>>
+where
+    T: serde::de::DeserializeOwned + serde::Serialize,
+{
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     let (server, token) = client_env()?;
     let mut request = CLIENT
@@ -456,13 +484,16 @@ async fn server_request(
             .unwrap_or(text);
         bail!("the server answered {path} with {status}: {reason}");
     }
-    let body =
-        serde_json::from_str(&text).with_context(|| format!("parsing the response from {path}"))?;
-    Ok((headers, body))
+    let body = serde_json::from_str(&text)
+        .with_context(|| format!("parsing the typed response from {path}"))?;
+    Ok(ServerResponse { headers, body })
 }
 
 /// POST one Verb request (RFC 0001 §7).
-async fn post_verb(verb: &str, body: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+async fn post_verb<T>(verb: &str, body: serde_json::Value) -> anyhow::Result<ServerResponse<T>>
+where
+    T: serde::de::DeserializeOwned + serde::Serialize,
+{
     server_json(
         reqwest::Method::POST,
         &format!("/v1/verbs/{verb}"),
@@ -553,51 +584,75 @@ where
 }
 
 async fn node(id: String, json: bool) -> anyhow::Result<()> {
-    let body = post_verb("node", serde_json::to_value(yg_verbs::NodeRequest { id })?).await?;
+    let response = post_verb::<yg_verbs::NodeResponse>(
+        "node",
+        serde_json::to_value(yg_verbs::NodeRequest { id })?,
+    )
+    .await?;
     if json {
-        println!("{}", serde_json::to_string(&body)?);
+        println!("{}", canonical_json(&response.body)?);
         return Ok(());
     }
-    let node = &body["node"];
-    let kind = node["kind"].as_str().unwrap_or("?");
-    match node["name"].as_str() {
+    let body = response.body;
+    let node = &body.node;
+    let kind = &node.kind;
+    match node.name.as_deref() {
         Some(name) => println!("{kind} {name}"),
         None => println!("{kind}"),
     }
-    println!("id:   {}", node["id"].as_str().unwrap_or("?"));
-    if let Some(path) = node["path"].as_str() {
+    println!("id:   {}", node.id);
+    if let Some(path) = node.path.as_deref() {
         println!("path: {path}");
     }
-    for direction in ["in", "out"] {
+    for (direction, summaries) in [("in", &body.edges.inbound), ("out", &body.edges.out)] {
         // Pad "in:" so both directions' columns line up.
         let label = if direction == "in" { "in: " } else { "out:" };
-        let summaries = body["edges"][direction]
-            .as_array()
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
         if summaries.is_empty() {
             println!("{label}  (no edges)");
             continue;
         }
         for summary in summaries {
             // "in:   DEFINES ×1 (syntactic: 1)"
-            let provenance = summary["provenance"]
-                .as_object()
-                .map(|p| {
-                    p.iter()
-                        .map(|(how, n)| format!("{how}: {n}"))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                })
-                .unwrap_or_default();
+            let provenance = format_provenance(&summary.provenance);
             println!(
                 "{label}  {} ×{} ({provenance})",
-                summary["kind"].as_str().unwrap_or("?"),
-                summary["count"]
+                summary.kind.as_str(),
+                summary.count
             );
         }
     }
     Ok(())
+}
+
+fn format_provenance(counts: &std::collections::BTreeMap<yg_verbs::Provenance, i64>) -> String {
+    let mut counts = counts
+        .iter()
+        .map(|(how, count)| (how.as_str(), count))
+        .collect::<Vec<_>>();
+    counts.sort_unstable_by_key(|(how, _)| *how);
+    counts
+        .into_iter()
+        .map(|(how, count)| format!("{how}: {count}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+#[cfg(test)]
+mod typed_render_tests {
+    use super::*;
+
+    #[test]
+    fn provenance_keeps_the_wire_objects_lexicographic_display_order() {
+        let counts = std::collections::BTreeMap::from([
+            (yg_verbs::Provenance::Syntactic, 2),
+            (yg_verbs::Provenance::Precise, 1),
+            (yg_verbs::Provenance::Inferred, 3),
+        ]);
+        assert_eq!(
+            format_provenance(&counts),
+            "inferred: 3, precise: 1, syntactic: 2"
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -610,7 +665,7 @@ async fn neighbors(
     cursor: Option<String>,
     json: bool,
 ) -> anyhow::Result<()> {
-    let body = post_verb(
+    let response = post_verb::<yg_verbs::NeighborsResponse>(
         "neighbors",
         serde_json::to_value(yg_verbs::NeighborsRequest {
             shape: yg_verbs::TraversalShape {
@@ -625,42 +680,39 @@ async fn neighbors(
     )
     .await?;
     if json {
-        println!("{}", serde_json::to_string(&body)?);
+        println!("{}", canonical_json(&response.body)?);
         return Ok(());
     }
-    let nodes = body["nodes"].as_array().map(Vec::as_slice).unwrap_or(&[]);
-    if nodes.is_empty() {
+    let body = response.body;
+    if body.nodes.is_empty() {
         println!("no neighbors");
         return Ok(());
     }
-    for node in nodes {
-        print!(
-            "{}  {}",
-            node["kind"].as_str().unwrap_or("?"),
-            node["id"].as_str().unwrap_or("?")
-        );
-        if let Some(name) = node["name"].as_str() {
+    for node in &body.nodes {
+        print!("{}  {}", node.kind, node.id);
+        if let Some(name) = node.name.as_deref() {
             print!("  ({name})");
         }
         println!();
     }
-    for edge in body["edges"].as_array().map(Vec::as_slice).unwrap_or(&[]) {
+    for edge in &body.edges {
+        let confidence = serde_json::to_string(&edge.confidence)?;
         print!(
             "{} -[{} {} {}]-> {}",
-            edge["src"].as_str().unwrap_or("?"),
-            edge["kind"].as_str().unwrap_or("?"),
-            edge["provenance"].as_str().unwrap_or("?"),
-            edge["confidence"],
-            edge["dst"].as_str().unwrap_or("?"),
+            edge.src,
+            edge.kind.as_str(),
+            edge.provenance.as_str(),
+            confidence,
+            edge.dst,
         );
         // The edge's witnessed site (a CALLS edge's call site), when it
         // has one.
-        if let Some(location) = edge["location"].as_str() {
+        if let Some(location) = edge.location.as_deref() {
             print!("  @ {location}");
         }
         println!();
     }
-    if let Some(cursor) = body["next_cursor"].as_str() {
+    if let Some(cursor) = body.next_cursor {
         println!("more: pass --cursor {cursor}");
     }
     Ok(())
@@ -675,7 +727,7 @@ async fn search(
     cursor: Option<String>,
     json: bool,
 ) -> anyhow::Result<()> {
-    let body = post_verb(
+    let response = post_verb::<yg_verbs::SearchWireResponse>(
         "search",
         serde_json::to_value(yg_verbs::SearchRequest {
             query: Some(query),
@@ -688,31 +740,28 @@ async fn search(
     )
     .await?;
     if json {
-        println!("{}", serde_json::to_string(&body)?);
+        println!("{}", canonical_json(&response.body)?);
         return Ok(());
     }
-    let hits = body["hits"].as_array().map(Vec::as_slice).unwrap_or(&[]);
-    if hits.is_empty() {
+    let body = response.body;
+    if body.hits.is_empty() {
         println!("no matches");
         return Ok(());
     }
-    for hit in hits {
-        print!(
-            "{}  {}",
-            hit["kind"].as_str().unwrap_or("?"),
-            hit["id"].as_str().unwrap_or("?")
-        );
-        if let Some(name) = hit["name"].as_str() {
+    for hit in &body.hits {
+        print!("{}  {}", hit.kind.as_str(), hit.id.external());
+        if let Some(name) = hit.name.as_ref() {
+            let name = name.as_str();
             print!("  ({name})");
         }
         println!();
         // The snippet rides along on its own indented line, with the
         // server's <b>…</b> match highlighting flattened to plain text.
-        if let Some(snippet) = hit["snippet"].as_str() {
-            println!("    {}", plain_snippet(snippet));
+        if let Some(snippet) = hit.snippet.as_ref() {
+            println!("    {}", plain_snippet(snippet.as_str()));
         }
     }
-    if let Some(cursor) = body["next_cursor"].as_str() {
+    if let Some(cursor) = body.next_cursor {
         println!("more: pass --cursor {cursor}");
     }
     Ok(())
@@ -739,7 +788,7 @@ async fn history(
     cursor: Option<String>,
     json: bool,
 ) -> anyhow::Result<()> {
-    let body = post_verb(
+    let response = post_verb::<yg_verbs::HistoryResponse>(
         "history",
         serde_json::to_value(yg_verbs::HistoryRequest {
             id,
@@ -750,29 +799,31 @@ async fn history(
     )
     .await?;
     if json {
-        println!("{}", serde_json::to_string(&body)?);
+        println!("{}", canonical_json(&response.body)?);
         return Ok(());
     }
-    let commits = body["commits"].as_array().map(Vec::as_slice).unwrap_or(&[]);
-    if commits.is_empty() {
+    let body = response.body;
+    if body.commits.is_empty() {
         println!("no history");
         return Ok(());
     }
-    for commit in commits {
-        let sha = commit["sha"].as_str().unwrap_or("?");
+    for view in &body.commits {
+        let commit = &view.commit;
+        let sha = &commit.sha;
         // Short sha: .get so an odd server value never splits a UTF-8 boundary.
         let short = sha.get(..12).unwrap_or(sha);
-        let date = commit["date"].as_str().unwrap_or("?");
+        let date = &view.date;
         // The author's name, falling back to their email, then to a
         // placeholder for an unattributable commit.
-        let who = commit["author"]["name"]
-            .as_str()
-            .or_else(|| commit["author"]["email"].as_str())
+        let who = commit
+            .author
+            .as_ref()
+            .map(|author| author.name.as_deref().unwrap_or(&author.email))
             .unwrap_or("(unknown)");
-        let subject = commit["subject"].as_str().unwrap_or("");
+        let subject = commit.subject.as_deref().unwrap_or("");
         println!("{short}  {date}  {who}  {subject}");
     }
-    if let Some(cursor) = body["next_cursor"].as_str() {
+    if let Some(cursor) = body.next_cursor {
         println!("more: pass --cursor {cursor}");
     }
     Ok(())
@@ -783,19 +834,19 @@ async fn admin_repo_add(
     depth: Option<i32>,
     poll_interval: Option<i32>,
 ) -> anyhow::Result<()> {
-    let body = server_json(
+    let response = server_json::<yg_verbs::admin::AddRepoResponse>(
         reqwest::Method::POST,
         "/v1/admin/repos",
         Some(serde_json::json!({"url": url, "depth": depth, "poll_interval": poll_interval})),
     )
     .await?;
-    let slug = body["slug"].as_str().unwrap_or("?");
-    let registered = if body["created"] == true {
-        format!("registered {slug}")
+    let body = response.body;
+    let registered = if body.created {
+        format!("registered {}", body.slug)
     } else {
-        format!("{slug} already registered")
+        format!("{} already registered", body.slug)
     };
-    let sync = if body["fetch_queued"] == true {
+    let sync = if body.fetch_queued {
         "fetch queued"
     } else {
         "sync already pending"
@@ -810,7 +861,7 @@ async fn admin_forge_add(
     base_url: Option<String>,
     token_env: Option<String>,
 ) -> anyhow::Result<()> {
-    let body = server_json(
+    let response = server_json::<yg_verbs::admin::AddForgeResponse>(
         reqwest::Method::POST,
         "/v1/admin/forges",
         Some(serde_json::json!({
@@ -821,13 +872,17 @@ async fn admin_forge_add(
         })),
     )
     .await?;
-    let kind = body["kind"].as_str().unwrap_or("?");
-    let org = body["org"].as_str().unwrap_or("?");
-    let base_url = body["base_url"].as_str().unwrap_or("?");
-    if body["created"] == true {
-        println!("connected {kind} org {org} ({base_url})");
+    let body = response.body;
+    if body.created {
+        println!(
+            "connected {} org {} ({})",
+            body.kind, body.org, body.base_url
+        );
     } else {
-        println!("{kind} org {org} already connected ({base_url})");
+        println!(
+            "{} org {} already connected ({})",
+            body.kind, body.org, body.base_url
+        );
     }
     Ok(())
 }
@@ -837,7 +892,7 @@ async fn admin_forge_discover(
     org: String,
     base_url: Option<String>,
 ) -> anyhow::Result<()> {
-    let body = server_json(
+    let response = server_json::<yg_verbs::admin::DiscoverForgeResponse>(
         reqwest::Method::POST,
         "/v1/admin/forges/discover",
         Some(serde_json::json!({
@@ -847,11 +902,10 @@ async fn admin_forge_discover(
         })),
     )
     .await?;
+    let body = response.body;
     println!(
         "discovery requested for {} org {} ({})",
-        body["kind"].as_str().unwrap_or("?"),
-        body["org"].as_str().unwrap_or("?"),
-        body["base_url"].as_str().unwrap_or("?")
+        body.kind, body.org, body.base_url
     );
     Ok(())
 }
@@ -862,7 +916,7 @@ async fn admin_rules_add(
     forge: String,
     applies_to_private: bool,
 ) -> anyhow::Result<()> {
-    let body = server_json(
+    let response = server_json::<yg_verbs::admin::AddRuleResponse>(
         reqwest::Method::POST,
         "/v1/admin/rules",
         Some(serde_json::json!({
@@ -873,54 +927,55 @@ async fn admin_rules_add(
         })),
     )
     .await?;
-    let scope = if body["applies_to_private"] == true {
+    let body = response.body;
+    let scope = if body.applies_to_private {
         "private"
     } else {
         "public/internal"
     };
     println!(
         "{} {} on {} ({scope}; {} fetches queued)",
-        body["action"].as_str().unwrap_or("?"),
-        body["pattern"].as_str().unwrap_or("?"),
-        body["forge"].as_str().unwrap_or("?"),
-        body["fetches_queued"].as_u64().unwrap_or(0)
+        body.action, body.pattern, body.forge, body.fetches_queued
     );
     Ok(())
 }
 
 async fn admin_rules_list() -> anyhow::Result<()> {
-    let body = server_json(reqwest::Method::GET, "/v1/admin/rules", None).await?;
-    let rules = body["rules"].as_array().map(Vec::as_slice).unwrap_or(&[]);
-    if rules.is_empty() {
+    let response = server_json::<yg_verbs::admin::RulesResponse>(
+        reqwest::Method::GET,
+        "/v1/admin/rules",
+        None,
+    )
+    .await?;
+    if response.body.rules.is_empty() {
         println!("no discovery rules");
         return Ok(());
     }
-    for rule in rules {
-        let private = if rule["applies_to_private"] == true {
+    for rule in response.body.rules {
+        let private = if rule.applies_to_private {
             "private"
         } else {
             "public/internal"
         };
         println!(
             "{}  {}  {}  {private}",
-            rule["forge"].as_str().unwrap_or("?"),
-            rule["action"].as_str().unwrap_or("?"),
-            rule["pattern"].as_str().unwrap_or("?")
+            rule.forge, rule.action, rule.pattern
         );
     }
     Ok(())
 }
 
 async fn admin_token_issue(member: String) -> anyhow::Result<()> {
-    let body = server_json(
+    let response = server_json::<yg_verbs::admin::IssueTokenResponse>(
         reqwest::Method::POST,
         "/v1/admin/tokens",
         Some(serde_json::json!({ "member": member })),
     )
     .await?;
-    println!("id: {}", body["id"].as_str().unwrap_or("?"));
-    println!("member: {}", body["member"].as_str().unwrap_or("?"));
-    println!("token: {}", body["token"].as_str().unwrap_or("?"));
+    let body = response.body;
+    println!("id: {}", body.id);
+    println!("member: {}", body.member);
+    println!("token: {}", body.token);
     println!("save this token now; it will not be shown again");
     Ok(())
 }
@@ -929,81 +984,80 @@ async fn admin_token_revoke(id: String) -> anyhow::Result<()> {
     if !yg_control::member_token_id_is_valid(&id) {
         bail!("member token id must look like mtok_<24 hex characters>");
     }
-    let body = server_json(
+    let response = server_json::<yg_verbs::admin::RevokeTokenResponse>(
         reqwest::Method::POST,
         &format!("/v1/admin/tokens/{id}/revoke"),
         None,
     )
     .await?;
-    println!("revoked {}", body["id"].as_str().unwrap_or(id.as_str()));
+    println!("revoked {}", response.body.id);
     Ok(())
 }
 
 async fn admin_status(json: bool) -> anyhow::Result<()> {
-    let body = server_json(reqwest::Method::GET, "/v1/admin/status", None).await?;
+    let response = server_json::<yg_verbs::admin::AdminStatusResponse>(
+        reqwest::Method::GET,
+        "/v1/admin/status",
+        None,
+    )
+    .await?;
 
     if json {
-        println!("{}", serde_json::to_string(&body)?);
+        println!("{}", canonical_json(&response.body)?);
         return Ok(());
     }
-    let visibility_counts = parse_visibility_counts(&body)?;
-    let repos = body["repos"].as_array().map(Vec::as_slice).unwrap_or(&[]);
-    if repos.is_empty() {
+    let body = response.body;
+    if body.repos.is_empty() {
         println!("no repositories registered — add one with: yg admin repo add <url>");
         return Ok(());
     }
-    print_visibility_counts(visibility_counts);
-    for repo in repos {
-        let slug = repo["slug"].as_str().unwrap_or("?");
-        let state = repo["sync"]["state"].as_str().unwrap_or("?");
-        let commit = repo["last_synced_commit"]
-            .as_str()
+    print_visibility_counts(body.visibility_counts);
+    for repo in body.repos {
+        let commit = repo
+            .last_synced_commit
+            .as_deref()
             // .get: never split a UTF-8 boundary, however odd the server's
             // idea of a commit id.
             .map(|sha| sha.get(..12).unwrap_or(sha))
             .unwrap_or("-");
-        print!("{slug}  {state}  {commit}");
-        let visibility = repo["visibility"].as_str().unwrap_or("public");
-        let discovery = repo["discovery_state"].as_str().unwrap_or("included");
-        if visibility != "public" || discovery != "included" {
-            print!("  ({visibility}, {discovery})");
+        print!("{}  {}  {commit}", repo.slug, repo.sync.state);
+        if repo.visibility != yg_verbs::admin::RepoVisibility::Public
+            || repo.discovery_state != yg_verbs::admin::DiscoveryState::Included
+        {
+            print!("  ({}, {})", repo.visibility, repo.discovery_state);
         }
-        if let Some(error) = repo["sync"]["last_error"].as_str() {
-            print!("  [attempt {}: {error}]", repo["sync"]["attempts"]);
+        if let Some(error) = repo.sync.last_error.as_deref() {
+            print!("  [attempt {}: {error}]", repo.sync.attempts);
         }
-        if let Some(revision) = repo["shard"]["revision"].as_str() {
+        if let Some(shard) = repo.shard {
             print!(
-                "  shard {revision} ({} nodes, {} edges)",
-                repo["shard"]["nodes"], repo["shard"]["edges"]
+                "  shard {} ({} nodes, {} edges)",
+                shard.revision, shard.nodes, shard.edges
             );
         }
-        if let Some(error) = repo["index"]["last_error"].as_str() {
-            print!("  [index attempt {}: {error}]", repo["index"]["attempts"]);
+        if let Some(error) = repo.index.last_error.as_deref() {
+            print!("  [index attempt {}: {error}]", repo.index.attempts);
         }
         println!();
     }
     Ok(())
 }
 
-#[derive(serde::Deserialize)]
-struct AdminStatusSummary {
-    visibility_counts: VisibilityCounts,
-}
+#[cfg(test)]
+fn parse_visibility_counts(
+    body: &serde_json::Value,
+) -> anyhow::Result<yg_verbs::admin::VisibilityCounts> {
+    #[derive(serde::Deserialize)]
+    struct AdminStatusSummary {
+        visibility_counts: yg_verbs::admin::VisibilityCounts,
+    }
 
-#[derive(serde::Deserialize)]
-struct VisibilityCounts {
-    public: u64,
-    internal: u64,
-    private: u64,
-}
-
-fn parse_visibility_counts(body: &serde_json::Value) -> anyhow::Result<VisibilityCounts> {
     serde_json::from_value::<AdminStatusSummary>(body.clone())
         .map(|status| status.visibility_counts)
         .context("parsing visibility counts from /v1/admin/status")
 }
 
-fn print_visibility_counts(counts: VisibilityCounts) {
+fn print_visibility_counts(counts: yg_verbs::admin::VisibilityCounts) {
     println!(
         "visibility: public={} internal={} private={}",
         counts.public, counts.internal, counts.private,
@@ -1750,29 +1804,45 @@ async fn gc_loop(
 
 async fn status(json: bool) -> anyhow::Result<()> {
     let (server, _) = client_env()?;
-    let (headers, mut body) = server_request(reqwest::Method::GET, "/v1/status", None).await?;
-    let uptime_seconds: Option<u64> = headers
+    let response = server_request::<yg_verbs::status::StatusResponse>(
+        reqwest::Method::GET,
+        "/v1/status",
+        None,
+    )
+    .await?;
+    let uptime_header = response
+        .headers
         .get(yg_api::UPTIME_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse().ok());
+        .with_context(|| format!("{0} is missing from /v1/status", yg_api::UPTIME_HEADER))?;
+    let uptime_header = uptime_header.to_str().with_context(|| {
+        format!(
+            "parsing the {} header from /v1/status as text",
+            yg_api::UPTIME_HEADER
+        )
+    })?;
+    let uptime_seconds: u64 = uptime_header.parse().with_context(|| {
+        format!(
+            "parsing the {} header from /v1/status as seconds",
+            yg_api::UPTIME_HEADER
+        )
+    })?;
 
     if json {
         // The server keeps volatile uptime out of the (cache-stable)
         // body; fold it back in for machine consumers, keeping the
         // body's key-sorted form.
-        if let (Some(uptime), Some(map)) = (uptime_seconds, body.as_object_mut()) {
-            map.insert("uptime_seconds".into(), uptime.into());
-            map.sort_keys();
-        }
-        println!("{}", serde_json::to_string(&body)?);
+        let mut body = serde_json::to_value(&response.body)?;
+        let map = body
+            .as_object_mut()
+            .context("the typed /v1/status response must serialize as an object")?;
+        map.insert("uptime_seconds".into(), uptime_seconds.into());
+        println!("{}", canonical_json(&body)?);
     } else {
+        let body = response.body;
         println!("yggdrasil Index Server at {server}");
-        println!("version:       {}", body["version"].as_str().unwrap_or("?"));
-        match uptime_seconds {
-            Some(uptime) => println!("uptime:        {uptime}s"),
-            None => println!("uptime:        ?"),
-        }
-        println!("repos indexed: {}", body["repos_indexed"]);
+        println!("version:       {}", body.version);
+        println!("uptime:        {uptime_seconds}s");
+        println!("repos indexed: {}", body.repos_indexed);
     }
     Ok(())
 }
