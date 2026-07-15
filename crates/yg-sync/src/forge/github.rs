@@ -184,7 +184,12 @@ fn list_org_repos<'a>(
                         retry_after_or_default(retry_after_header.as_deref(), SystemTime::now());
                     return Err(ForgeRateLimit::new(status, retry_after).into());
                 }
-                anyhow::bail!("GitHub repo discovery for {org} returned {status}: {text}");
+                return Err(GitHubListingError::HttpStatus {
+                    status,
+                    org: org.to_string(),
+                    response_body: text,
+                }
+                .into());
             }
             let page: Vec<GitHubRepo> = response
                 .json()
@@ -209,6 +214,16 @@ enum GitHubPaginationError {
     PageLimit { limit: usize },
     #[error("GitHub org listing repeated next-link {url}")]
     Cycle { url: String },
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum GitHubListingError {
+    #[error("GitHub repo discovery for {org} returned {status}: {response_body}")]
+    HttpStatus {
+        status: reqwest::StatusCode,
+        org: String,
+        response_body: String,
+    },
 }
 
 impl Pagination {
@@ -533,6 +548,48 @@ mod tests {
         };
 
         assert_eq!(signal.retry_after(), RATE_LIMIT_COOLDOWN);
+    }
+
+    #[tokio::test]
+    async fn github_non_success_status_surfaces_a_typed_listing_error() {
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("binding status fixture server: {error}"),
+        };
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0; 1024];
+            let _ = socket.readable().await;
+            let _ = socket.try_read(&mut buf);
+            let body = "not found";
+            let response = format!(
+                "HTTP/1.1 404 Not Found\r\ncontent-length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            socket.writable().await.unwrap();
+            socket.try_write(response.as_bytes()).unwrap();
+        });
+
+        let error = GitHubForge
+            .list_org_repos(&discovery_client(), &format!("http://{addr}"), "acme", None)
+            .await
+            .expect_err("the fixture returns a non-success status");
+        server.await.unwrap();
+
+        assert!(matches!(
+            error.downcast_ref::<GitHubListingError>(),
+            Some(GitHubListingError::HttpStatus {
+                status: reqwest::StatusCode::NOT_FOUND,
+                org,
+                response_body,
+            }) if org == "acme" && response_body == "not found"
+        ));
+        assert_eq!(
+            error.to_string(),
+            "GitHub repo discovery for acme returned 404 Not Found: not found"
+        );
     }
 
     async fn rate_limit_from_fixture(

@@ -6,6 +6,8 @@
 pub(crate) mod git_generic;
 pub(crate) mod github;
 
+pub use github::GitHubListingError;
+
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
