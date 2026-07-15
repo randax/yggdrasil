@@ -1033,18 +1033,43 @@ async fn serve(role: Role) -> anyhow::Result<()> {
 
     match role {
         Role::Api => {
-            let server = yg_api::serve(server_config(&deploy)?).await?;
+            let mut server = yg_api::serve(server_config(&deploy)?).await?;
             println!("listening on http://{}", server.local_addr());
-            server.wait().await
+            tokio::select! {
+                result = server.wait() => result,
+                signal = shutdown_signal() => {
+                    signal?;
+                    let deadlines = ShutdownDeadlines::from_now();
+                    server.begin_shutdown();
+                    drain_until(deadlines.terminate, server.wait(), "API server").await
+                }
+            }
         }
         Role::Worker => {
             let workers = workers(&deploy).await?;
+            let (shutdown_trigger, shutdown) = yg_sync::shutdown_channel();
             println!("worker running");
-            run_workers(&deploy, workers).await
+            let mut running = std::pin::pin!(run_workers(
+                &deploy,
+                workers,
+                shutdown_trigger.clone(),
+                shutdown,
+            ));
+            tokio::select! {
+                result = &mut running => result,
+                signal = shutdown_signal() => {
+                    signal?;
+                    let deadlines = ShutdownDeadlines::from_now();
+                    shutdown_trigger.request(deadlines.work);
+                    drain_until(deadlines.terminate, &mut running, "workers").await
+                }
+            }
         }
         Role::All => {
-            let server = yg_api::serve(server_config(&deploy)?).await?;
+            let mut server = yg_api::serve(server_config(&deploy)?).await?;
             let workers = workers(&deploy).await?;
+            let (shutdown_trigger, shutdown) = yg_sync::shutdown_channel();
+            let mut worker_stopping = shutdown.clone();
             // Announce only once the whole process is up: scripts and
             // the e2e harness treat this line as the readiness signal,
             // and a worker-boot failure after it would read as a crash
@@ -1052,12 +1077,144 @@ async fn serve(role: Role) -> anyhow::Result<()> {
             println!("listening on http://{}", server.local_addr());
             // Either side dying takes the process down — a half-alive
             // server that accepts repos it will never sync helps nobody.
+            let mut running_workers = std::pin::pin!(run_workers(
+                &deploy,
+                workers,
+                shutdown_trigger.clone(),
+                shutdown,
+            ));
             tokio::select! {
-                result = server.wait() => result,
-                result = run_workers(&deploy, workers) => result.context("worker exited"),
+                result = server.wait() => {
+                    let deadlines = ShutdownDeadlines::from_now();
+                    shutdown_trigger.request(deadlines.work);
+                    drain_until(deadlines.terminate, &mut running_workers, "workers").await?;
+                    result
+                },
+                result = &mut running_workers => {
+                    let terminate = worker_stopping
+                        .deadline()
+                        .map(|work| work + LEASE_RELEASE_RESERVE)
+                        .unwrap_or_else(|| ShutdownDeadlines::from_now().terminate);
+                    server.begin_shutdown();
+                    drain_until(terminate, server.wait(), "API server").await?;
+                    result.context("worker exited")
+                },
+                work_deadline = worker_stopping.requested() => {
+                    let terminate = work_deadline + LEASE_RELEASE_RESERVE;
+                    server.begin_shutdown();
+                    drain_until(terminate, async {
+                        let (server_result, worker_result) = tokio::join!(
+                            server.wait(),
+                            &mut running_workers,
+                        );
+                        server_result?;
+                        worker_result.context("worker exited")
+                    }, "combined server and workers").await
+                },
+                signal = shutdown_signal() => {
+                    signal?;
+                    let deadlines = ShutdownDeadlines::from_now();
+                    server.begin_shutdown();
+                    drain_until(deadlines.terminate, async {
+                        // Workers stay live until every admitted API
+                        // request has finished and can enqueue its final
+                        // job. The API phase is itself bounded so worker
+                        // lease release retains its reserved time.
+                        let (api_drained, worker_ended) = tokio::select! {
+                            server_result = server.wait() => {
+                                server_result?;
+                                (true, None)
+                            }
+                            worker_result = &mut running_workers => (false, Some(worker_result)),
+                            _ = tokio::time::sleep_until(deadlines.api) => {
+                                tracing::warn!("API drain phase elapsed; starting worker drain");
+                                (false, None)
+                            }
+                        };
+                        if let Some(worker_result) = worker_ended {
+                            server.wait().await?;
+                            return worker_result.context("worker exited");
+                        }
+                        shutdown_trigger.request(deadlines.work);
+                        if api_drained {
+                            (&mut running_workers).await.context("worker exited")
+                        } else {
+                            let (server_result, worker_result) = tokio::join!(
+                                server.wait(),
+                                &mut running_workers,
+                            );
+                            server_result?;
+                            worker_result.context("worker exited")
+                        }
+                    }, "combined server and workers").await
+                },
             }
         }
     }
+}
+
+/// Maximum wall-clock time allowed for the API and workers to drain
+/// after shutdown begins. The final two seconds are reserved for a
+/// worker to return an unfinished fenced lease before process exit.
+const SHUTDOWN_DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+const API_DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
+const LEASE_RELEASE_RESERVE: std::time::Duration = std::time::Duration::from_secs(2);
+
+#[derive(Clone, Copy)]
+struct ShutdownDeadlines {
+    api: tokio::time::Instant,
+    work: tokio::time::Instant,
+    terminate: tokio::time::Instant,
+}
+
+impl ShutdownDeadlines {
+    fn from_now() -> Self {
+        let now = tokio::time::Instant::now();
+        let terminate = now + SHUTDOWN_DRAIN_DEADLINE;
+        Self {
+            api: now + API_DRAIN_BUDGET,
+            work: terminate - LEASE_RELEASE_RESERVE,
+            terminate,
+        }
+    }
+}
+
+async fn drain_until<F>(
+    deadline: tokio::time::Instant,
+    future: F,
+    component: &'static str,
+) -> anyhow::Result<()>
+where
+    F: std::future::Future<Output = anyhow::Result<()>>,
+{
+    match tokio::time::timeout_at(deadline, future).await {
+        Ok(result) => result,
+        Err(_) => {
+            tracing::warn!(component, "shutdown drain deadline elapsed");
+            // Tokio waits indefinitely for started spawn_blocking tasks
+            // when its runtime drops. A hard process exit is therefore
+            // the only wall-clock guarantee after graceful cleanup has
+            // consumed the full advertised budget.
+            std::process::exit(0)
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn shutdown_signal() -> anyhow::Result<()> {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("installing SIGTERM handler")?;
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => result.context("installing SIGINT handler"),
+        signal = terminate.recv() => signal.context("SIGTERM stream ended").map(drop),
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() -> anyhow::Result<()> {
+    tokio::signal::ctrl_c()
+        .await
+        .context("installing interrupt handler")
 }
 
 /// The API server's slice of the deployment config. The bootstrap token
@@ -1100,7 +1257,10 @@ async fn workers(
 async fn run_workers(
     deploy: &deploy_config::DeployConfig,
     (sync, index): (yg_sync::SyncWorker, yg_index::IndexWorker),
+    shutdown_trigger: yg_sync::ShutdownTrigger,
+    shutdown: yg_sync::Shutdown,
 ) -> anyhow::Result<()> {
+    let mut shutdown_monitor = shutdown.clone();
     // Converge after a deploy that bumped the Shard schema: the read
     // path refuses artifacts from older schema versions, so every
     // stranded Shard needs re-indexing. Queued once at boot, then
@@ -1125,33 +1285,90 @@ async fn run_workers(
     let discovery = yg_sync::DiscoveryConfig {
         interval: deploy.discovery_interval,
     };
-    tokio::try_join!(
-        drain_queue(|| sync.discover_once(&discovery)),
-        drain_queue(|| sync.run_once()),
-        drain_queue(|| index.run_once()),
-        drain_queue(|| sync.poll_once(&poll)),
+    let discover = supervise_worker_loop(
+        shutdown_trigger.clone(),
+        drain_queue(shutdown.clone(), || sync.discover_once(&discovery)),
+    );
+    let fetch_shutdown = shutdown.clone();
+    let fetch = supervise_worker_loop(
+        shutdown_trigger.clone(),
+        drain_queue(shutdown.clone(), || {
+            sync.run_once_with_shutdown(fetch_shutdown.clone())
+        }),
+    );
+    let index_shutdown = shutdown.clone();
+    let indexing = supervise_worker_loop(
+        shutdown_trigger.clone(),
+        drain_queue(shutdown.clone(), || {
+            index.run_once_with_shutdown(index_shutdown.clone())
+        }),
+    );
+    let polling = supervise_worker_loop(
+        shutdown_trigger.clone(),
+        drain_queue(shutdown.clone(), || sync.poll_once(&poll)),
+    );
+    let gc = supervise_worker_loop(
+        shutdown_trigger,
         gc_loop(
             &index,
             deploy.gc_grace,
             deploy.job_retention,
-            deploy.gc_interval
+            deploy.gc_interval,
+            shutdown,
         ),
-    )?;
-    Ok(())
+    );
+    let joined = async { tokio::join!(discover, fetch, indexing, polling, gc) };
+    let mut joined = std::pin::pin!(joined);
+    let results = tokio::select! {
+        results = &mut joined => results,
+        work_deadline = shutdown_monitor.requested() => {
+            let terminate = work_deadline + LEASE_RELEASE_RESERVE;
+            match tokio::time::timeout_at(terminate, &mut joined).await {
+                Ok(results) => results,
+                Err(_) => {
+                    tracing::warn!("worker shutdown deadline elapsed");
+                    std::process::exit(0)
+                }
+            }
+        }
+    };
+    results.0?;
+    results.1?;
+    results.2?;
+    results.3?;
+    results.4
+}
+
+async fn supervise_worker_loop<F>(
+    shutdown: yg_sync::ShutdownTrigger,
+    future: F,
+) -> anyhow::Result<()>
+where
+    F: std::future::Future<Output = anyhow::Result<()>>,
+{
+    let result = future.await;
+    shutdown.request(ShutdownDeadlines::from_now().work);
+    result
 }
 
 /// Run one queue's claim loop forever, sleeping briefly when it's empty.
 /// Drives the poll loop too: `poll_once` returns `true` while repos are
 /// due (claiming one per call) and `false` when none is, so the same
 /// work-or-sleep shape applies.
-async fn drain_queue<F, Fut>(run_once: F) -> anyhow::Result<()>
+async fn drain_queue<F, Fut>(mut shutdown: yg_sync::Shutdown, run_once: F) -> anyhow::Result<()>
 where
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<bool>>,
 {
     loop {
+        if shutdown.deadline().is_some() {
+            return Ok(());
+        }
         if !run_once().await? {
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
+                _ = shutdown.requested() => return Ok(()),
+            }
         }
     }
 }
@@ -1172,8 +1389,12 @@ async fn gc_loop(
     grace: std::time::Duration,
     job_retention: std::time::Duration,
     interval: std::time::Duration,
+    mut shutdown: yg_sync::Shutdown,
 ) -> anyhow::Result<()> {
     loop {
+        if shutdown.deadline().is_some() {
+            return Ok(());
+        }
         if let Err(e) = index.gc_once(grace).await {
             tracing::warn!(
                 error = format!("{e:#}"),
@@ -1186,7 +1407,10 @@ async fn gc_loop(
                 "terminal-job retention sweep failed; retrying next interval"
             );
         }
-        tokio::time::sleep(interval).await;
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {}
+            _ = shutdown.requested() => return Ok(()),
+        }
     }
 }
 

@@ -2,6 +2,16 @@
 
 use std::time::Duration;
 
+use crate::shutdown::Shutdown;
+
+/// Result of shutdown-aware leased work.
+pub enum LeaseShutdown<T> {
+    /// Work finished while the lease was still held and may be settled.
+    Finished(T),
+    /// The cutoff elapsed, the lease was returned, and cleanup finished.
+    Released,
+}
+
 /// Drive long-running leased work while heartbeating its lease: one
 /// fenced renewal every third of the lease, each attempt bounded by
 /// that same period so a wedged control-plane connection never stalls
@@ -75,9 +85,96 @@ pub async fn with_lease_heartbeat<T>(
     }
 }
 
+/// Drive leased work with heartbeats until it finishes or shutdown's
+/// work cutoff elapses. At shutdown, no new renewal is started. Any
+/// renewal already in flight is drained before the fenced release, so
+/// the release always uses the latest known token. After releasing, the
+/// work is still driven to completion: index blocking tasks may outlive
+/// a dropped future and must retain their mirror lock and scratch tree.
+pub async fn with_lease_heartbeat_until_shutdown<T>(
+    lease: Duration,
+    renew: impl AsyncFn() -> anyhow::Result<bool>,
+    release: impl AsyncFn() -> anyhow::Result<bool>,
+    mut shutdown: Shutdown,
+    work: impl Future<Output = T>,
+) -> anyhow::Result<LeaseShutdown<T>> {
+    let period = (lease / 3).max(Duration::from_millis(1));
+    let start = tokio::time::Instant::now() + period;
+    let mut ticks = tokio::time::interval_at(start, period);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut work = std::pin::pin!(work);
+    let mut held = true;
+    loop {
+        tokio::select! {
+            output = &mut work => return Ok(LeaseShutdown::Finished(output)),
+            deadline = shutdown.requested() => {
+                return finish_or_release(deadline, work.as_mut(), &release).await;
+            }
+            _ = ticks.tick(), if held => {}
+        }
+
+        let mut renewal = std::pin::pin!(tokio::time::timeout(period, renew()));
+        tokio::select! {
+            output = &mut work => {
+                let _ = renewal.await;
+                return Ok(LeaseShutdown::Finished(output));
+            }
+            deadline = shutdown.requested() => {
+                // The token may change when this completes. Drain it
+                // before release even if the work cutoff passes; the CLI
+                // owns the separate hard termination deadline.
+                let output = tokio::select! {
+                    output = &mut work => Some(output),
+                    _ = &mut renewal => None,
+                };
+                if let Some(output) = output {
+                    let _ = renewal.await;
+                    return Ok(LeaseShutdown::Finished(output));
+                }
+                return finish_or_release(deadline, work.as_mut(), &release).await;
+            }
+            outcome = &mut renewal => {
+                match outcome {
+                    Ok(Ok(true)) => {}
+                    Ok(Ok(false)) => {
+                        held = false;
+                        tracing::warn!(
+                            "lease renewal fenced — the job was reclaimed; the fenced settle will discard this run"
+                        );
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!(error = format!("{e:#}"), "lease renewal failed; retrying at the next heartbeat");
+                    }
+                    Err(_) => {
+                        tracing::warn!("lease renewal timed out; retrying at the next heartbeat");
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn finish_or_release<T>(
+    deadline: tokio::time::Instant,
+    work: std::pin::Pin<&mut impl Future<Output = T>>,
+    release: &impl AsyncFn() -> anyhow::Result<bool>,
+) -> anyhow::Result<LeaseShutdown<T>> {
+    let mut work = work;
+    match tokio::time::timeout_at(deadline, &mut work).await {
+        Ok(output) => Ok(LeaseShutdown::Finished(output)),
+        Err(_) => {
+            let released = release().await?;
+            tracing::info!(released, "released unfinished lease for shutdown");
+            let _ = work.await;
+            Ok(LeaseShutdown::Released)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     /// Paused-time heartbeat harness: work that "runs" for `busy` while
     /// each renewal answers from `answers` in order (sticking on the
@@ -100,6 +197,83 @@ mod tests {
             "synced"
         })
         .await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_releases_at_cutoff_but_drives_work_cleanup_to_completion() {
+        let released = std::sync::Arc::new(AtomicUsize::new(0));
+        let cleaned_up = std::sync::Arc::new(AtomicBool::new(false));
+        let (trigger, shutdown) = crate::shutdown_channel();
+        let released_in_task = released.clone();
+        let cleanup_in_task = cleaned_up.clone();
+        let task = tokio::spawn(with_lease_heartbeat_until_shutdown(
+            Duration::from_secs(60),
+            async || Ok(true),
+            async move || {
+                released_in_task.fetch_add(1, Ordering::SeqCst);
+                Ok(true)
+            },
+            shutdown,
+            async move {
+                tokio::time::sleep(Duration::from_secs(20)).await;
+                cleanup_in_task.store(true, Ordering::SeqCst);
+            },
+        ));
+        tokio::task::yield_now().await;
+        trigger.request(tokio::time::Instant::now() + Duration::from_secs(5));
+
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(released.load(Ordering::SeqCst), 1);
+        assert!(!cleaned_up.load(Ordering::SeqCst));
+
+        tokio::time::advance(Duration::from_secs(15)).await;
+        assert!(matches!(
+            task.await.unwrap().unwrap(),
+            LeaseShutdown::Released
+        ));
+        assert!(cleaned_up.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_drains_an_in_flight_renewal_before_releasing() {
+        let renewed = std::sync::Arc::new(AtomicBool::new(false));
+        let release_saw_renewal = std::sync::Arc::new(AtomicBool::new(false));
+        let renewal_started = std::sync::Arc::new(tokio::sync::Notify::new());
+        let (trigger, shutdown) = crate::shutdown_channel();
+        let renewed_in_task = renewed.clone();
+        let renewed_at_release = renewed.clone();
+        let release_saw_renewal_in_task = release_saw_renewal.clone();
+        let renewal_started_in_task = renewal_started.clone();
+        let task = tokio::spawn(with_lease_heartbeat_until_shutdown(
+            Duration::from_secs(9),
+            async move || {
+                renewal_started_in_task.notify_one();
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                renewed_in_task.store(true, Ordering::SeqCst);
+                Ok(true)
+            },
+            async move || {
+                release_saw_renewal_in_task
+                    .store(renewed_at_release.load(Ordering::SeqCst), Ordering::SeqCst);
+                Ok(true)
+            },
+            shutdown,
+            async { tokio::time::sleep(Duration::from_secs(10)).await },
+        ));
+        renewal_started.notified().await;
+        trigger.request(tokio::time::Instant::now() + Duration::from_secs(1));
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert!(matches!(
+            task.await.unwrap().unwrap(),
+            LeaseShutdown::Released
+        ));
+        assert!(release_saw_renewal.load(Ordering::SeqCst));
     }
 
     #[tokio::test(start_paused = true)]

@@ -145,13 +145,50 @@ impl IndexWorker {
     /// A failed run is recorded (with backoff) rather than returned as an
     /// error — `Err` means the control plane itself is unreachable.
     pub async fn run_once(&self) -> anyhow::Result<bool> {
+        self.run_once_with_optional_shutdown(None).await
+    }
+
+    /// Claim and run one due job while observing process shutdown. New
+    /// claims stop immediately; an active index gets until the shared
+    /// work cutoff to settle normally, then its lease is returned fresh
+    /// to the queue before the work future is dropped.
+    pub async fn run_once_with_shutdown(
+        &self,
+        shutdown: yg_sync::Shutdown,
+    ) -> anyhow::Result<bool> {
+        if shutdown.deadline().is_some() {
+            return Ok(false);
+        }
+        self.run_once_with_optional_shutdown(Some(shutdown)).await
+    }
+
+    async fn run_once_with_optional_shutdown(
+        &self,
+        shutdown: Option<yg_sync::Shutdown>,
+    ) -> anyhow::Result<bool> {
         let Some(job) = self.control.claim_due_index(INDEX_LEASE).await? else {
             return Ok(false);
         };
         // A cold self-healing clone plus a long parse outlives the base
         // lease; the heartbeat keeps the job ours while the work is alive.
         let renew = async || self.control.renew_index(&job, INDEX_LEASE).await;
-        let indexed = yg_sync::with_lease_heartbeat(INDEX_LEASE, renew, self.index(&job)).await;
+        let indexed = if let Some(shutdown) = shutdown {
+            let release = async || self.control.release_index(&job).await;
+            match yg_sync::with_lease_heartbeat_until_shutdown(
+                INDEX_LEASE,
+                renew,
+                release,
+                shutdown,
+                self.index(&job),
+            )
+            .await?
+            {
+                yg_sync::LeaseShutdown::Finished(indexed) => indexed,
+                yg_sync::LeaseShutdown::Released => return Ok(true),
+            }
+        } else {
+            yg_sync::with_lease_heartbeat(INDEX_LEASE, renew, self.index(&job)).await
+        };
         match indexed {
             Ok(shard) => {
                 let applied = self

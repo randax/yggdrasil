@@ -9,9 +9,10 @@ use yg_control::ControlPlane;
 
 use crate::forge::{Forge, ForgeRegistry, github::discovery_client};
 use crate::git::{GitFetcher, forge_token, lock_mirror, remote_head_commit};
-use crate::lease::with_lease_heartbeat;
+use crate::lease::{LeaseShutdown, with_lease_heartbeat, with_lease_heartbeat_until_shutdown};
 use crate::locator::join_clone_url;
 use crate::rate::{RATE_LIMIT_COOLDOWN, TokenBucket};
+use crate::shutdown::Shutdown;
 
 /// How long a worker may hold a fetch job before a crashed run becomes
 /// claimable again. Generous: a cold full-history clone of a large repo.
@@ -64,6 +65,24 @@ impl SyncWorker {
     /// failed fetch is recorded (with backoff) rather than returned as an
     /// error — `Err` means the control plane itself is unreachable.
     pub async fn run_once(&self) -> anyhow::Result<bool> {
+        self.run_once_with_optional_shutdown(None).await
+    }
+
+    /// Claim and run one due job while observing process shutdown. New
+    /// claims stop immediately; an active fetch gets until the shared
+    /// work cutoff to settle normally, then its lease is returned fresh
+    /// to the queue before the work future is dropped.
+    pub async fn run_once_with_shutdown(&self, shutdown: Shutdown) -> anyhow::Result<bool> {
+        if shutdown.deadline().is_some() {
+            return Ok(false);
+        }
+        self.run_once_with_optional_shutdown(Some(shutdown)).await
+    }
+
+    async fn run_once_with_optional_shutdown(
+        &self,
+        shutdown: Option<Shutdown>,
+    ) -> anyhow::Result<bool> {
         let Some(job) = self.control.claim_due_fetch(FETCH_LEASE).await? else {
             return Ok(false);
         };
@@ -82,7 +101,23 @@ impl SyncWorker {
         // A cold clone of a large repo outlives the base lease; the
         // heartbeat keeps the job ours for as long as the work is alive.
         let renew = async || self.control.renew_fetch(&job, FETCH_LEASE).await;
-        let synced = with_lease_heartbeat(FETCH_LEASE, renew, work).await;
+        let synced = if let Some(shutdown) = shutdown {
+            let release = async || self.control.release_fetch(&job).await;
+            match with_lease_heartbeat_until_shutdown(
+                FETCH_LEASE,
+                renew,
+                release,
+                shutdown.clone(),
+                work,
+            )
+            .await?
+            {
+                LeaseShutdown::Finished(synced) => synced,
+                LeaseShutdown::Released => return Ok(true),
+            }
+        } else {
+            with_lease_heartbeat(FETCH_LEASE, renew, work).await
+        };
         match synced {
             Ok(commit) => {
                 if self.control.complete_fetch(&job, &commit).await? {
