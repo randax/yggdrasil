@@ -107,8 +107,8 @@ pub async fn with_lease_heartbeat_until_shutdown<T>(
     loop {
         tokio::select! {
             output = &mut work => return Ok(LeaseShutdown::Finished(output)),
-            deadline = shutdown.requested() => {
-                return finish_or_release(deadline, work.as_mut(), &release).await;
+            request = shutdown.requested() => {
+                return finish_or_release(request.work_deadline(), work.as_mut(), &release).await;
             }
             _ = ticks.tick(), if held => {}
         }
@@ -119,7 +119,7 @@ pub async fn with_lease_heartbeat_until_shutdown<T>(
                 let _ = renewal.await;
                 return Ok(LeaseShutdown::Finished(output));
             }
-            deadline = shutdown.requested() => {
+            request = shutdown.requested() => {
                 // The token may change when this completes. Drain it
                 // before release even if the work cutoff passes; the CLI
                 // owns the separate hard termination deadline.
@@ -131,7 +131,7 @@ pub async fn with_lease_heartbeat_until_shutdown<T>(
                     let _ = renewal.await;
                     return Ok(LeaseShutdown::Finished(output));
                 }
-                return finish_or_release(deadline, work.as_mut(), &release).await;
+                return finish_or_release(request.work_deadline(), work.as_mut(), &release).await;
             }
             outcome = &mut renewal => {
                 match outcome {
@@ -163,9 +163,12 @@ async fn finish_or_release<T>(
     match tokio::time::timeout_at(deadline, &mut work).await {
         Ok(output) => Ok(LeaseShutdown::Finished(output)),
         Err(_) => {
-            let released = release().await?;
-            tracing::info!(released, "released unfinished lease for shutdown");
+            let release_result = release().await;
+            if let Ok(released) = &release_result {
+                tracing::info!(released, "released unfinished lease for shutdown");
+            }
             let _ = work.await;
+            release_result?;
             Ok(LeaseShutdown::Released)
         }
     }
@@ -220,7 +223,10 @@ mod tests {
             },
         ));
         tokio::task::yield_now().await;
-        trigger.request(tokio::time::Instant::now() + Duration::from_secs(5));
+        trigger.request(
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            crate::ShutdownCause::Signal,
+        );
 
         tokio::time::advance(Duration::from_secs(5)).await;
         tokio::task::yield_now().await;
@@ -232,6 +238,51 @@ mod tests {
             task.await.unwrap().unwrap(),
             LeaseShutdown::Released
         ));
+        assert!(cleaned_up.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_release_failure_still_drives_work_cleanup_to_completion() {
+        let release_attempts = std::sync::Arc::new(AtomicUsize::new(0));
+        let cleaned_up = std::sync::Arc::new(AtomicBool::new(false));
+        let (trigger, shutdown) = crate::shutdown_channel();
+        let attempts_in_task = release_attempts.clone();
+        let cleanup_in_task = cleaned_up.clone();
+        let task = tokio::spawn(with_lease_heartbeat_until_shutdown(
+            Duration::from_secs(60),
+            async || Ok(true),
+            async move || {
+                attempts_in_task.fetch_add(1, Ordering::SeqCst);
+                Err(anyhow::anyhow!("control plane unavailable"))
+            },
+            shutdown,
+            async move {
+                tokio::time::sleep(Duration::from_secs(20)).await;
+                cleanup_in_task.store(true, Ordering::SeqCst);
+            },
+        ));
+        tokio::task::yield_now().await;
+        trigger.request(
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            crate::ShutdownCause::Signal,
+        );
+
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(release_attempts.load(Ordering::SeqCst), 1);
+        assert!(!cleaned_up.load(Ordering::SeqCst));
+        assert!(
+            !task.is_finished(),
+            "release failure must not drop the cleanup future"
+        );
+
+        tokio::time::advance(Duration::from_secs(15)).await;
+        let result = task.await.unwrap();
+        let error = match result {
+            Ok(_) => panic!("the release failure must be propagated"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("control plane unavailable"));
         assert!(cleaned_up.load(Ordering::SeqCst));
     }
 
@@ -262,7 +313,10 @@ mod tests {
             async { tokio::time::sleep(Duration::from_secs(10)).await },
         ));
         renewal_started.notified().await;
-        trigger.request(tokio::time::Instant::now() + Duration::from_secs(1));
+        trigger.request(
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            crate::ShutdownCause::Signal,
+        );
 
         tokio::time::advance(Duration::from_secs(1)).await;
         tokio::task::yield_now().await;

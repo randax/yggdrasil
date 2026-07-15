@@ -60,6 +60,51 @@ async fn combined_sigterm_drains_an_in_flight_request_before_clean_exit() {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn second_sigterm_during_drain_forces_a_nonzero_exit() {
+    let db_name = create_test_db().await;
+    let _migrated = control_plane(&db_name).await;
+    let pool = sqlx::PgPool::connect(&format!("{DEV_POSTGRES}/{db_name}"))
+        .await
+        .unwrap();
+    let mut lock = pool.begin().await.unwrap();
+    sqlx::query("LOCK TABLE repos IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *lock)
+        .await
+        .unwrap();
+
+    let (mut server, base) = spawn_yg_serve(&db_name, |command| {
+        command.env("YG_BOOTSTRAP_TOKEN", TEST_TOKEN);
+    });
+    let request = tokio::spawn(async move {
+        reqwest::Client::new()
+            .get(format!("{base}/v1/admin/status"))
+            .bearer_auth(TEST_TOKEN)
+            .send()
+            .await
+    });
+    await_handler_lock(&db_name).await;
+
+    for _ in 0..2 {
+        let signal = std::process::Command::new("kill")
+            .args(["-TERM", &server.0.id().to_string()])
+            .status()
+            .expect("sending SIGTERM");
+        assert!(signal.success(), "kill -TERM must succeed");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    let status = await_process_exit(&mut server).await;
+    assert!(
+        !status.success(),
+        "a repeated shutdown signal must force a nonzero exit: {status}"
+    );
+
+    request.abort();
+    lock.rollback().await.unwrap();
+}
+
 #[tokio::test]
 async fn released_index_lease_is_immediately_reclaimable_and_stays_fenced() {
     let db_name = create_test_db().await;
