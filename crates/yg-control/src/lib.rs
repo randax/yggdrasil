@@ -126,7 +126,21 @@ pub struct ConnectForgeOrg<'a> {
 pub struct ConnectForgeOrgOutcome {
     pub forge_id: i64,
     pub org_id: i64,
+    pub forge_kind: StoredForgeKind,
     pub created: bool,
+}
+
+/// The forge kind read from a persisted forge record.
+pub struct StoredForgeKind(String);
+
+impl StoredForgeKind {
+    fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 /// One connected org due for repository discovery.
@@ -667,13 +681,13 @@ impl ControlPlane {
         org: ConnectForgeOrg<'_>,
     ) -> anyhow::Result<ConnectForgeOrgOutcome> {
         let mut tx = self.pool.begin().await?;
-        let (forge_id,): (i64,) = sqlx::query_as(
+        let (forge_id, forge_kind): (i64, String) = sqlx::query_as(
             "INSERT INTO forges (kind, base_url, token_env, api_root) VALUES ($1, $2, $3, $4)
              ON CONFLICT (base_url) DO UPDATE
              SET kind = excluded.kind,
                  token_env = coalesce(excluded.token_env, forges.token_env),
                  api_root = coalesce(excluded.api_root, forges.api_root)
-             RETURNING id",
+             RETURNING id, kind",
         )
         .bind(org.forge_kind)
         .bind(org.base_url)
@@ -696,6 +710,7 @@ impl ControlPlane {
         Ok(ConnectForgeOrgOutcome {
             forge_id,
             org_id,
+            forge_kind: StoredForgeKind::new(forge_kind),
             created,
         })
     }
@@ -911,20 +926,23 @@ impl ControlPlane {
         Ok(row.map(|(id,)| id))
     }
 
-    pub async fn request_discovery(&self, base_url: &str, org_slug: &str) -> anyhow::Result<bool> {
-        let updated = sqlx::query(
+    pub async fn request_discovery(
+        &self,
+        base_url: &str,
+        org_slug: &str,
+    ) -> anyhow::Result<Option<StoredForgeKind>> {
+        let row: Option<(String,)> = sqlx::query_as(
             "UPDATE forge_orgs o
              SET next_discovery_at = now()
              FROM forges f
-             WHERE f.id = o.forge_id AND f.base_url = $1 AND o.org_slug = $2",
+             WHERE f.id = o.forge_id AND f.base_url = $1 AND o.org_slug = $2
+             RETURNING f.kind",
         )
         .bind(base_url)
         .bind(org_slug)
-        .execute(&self.pool)
-        .await?
-        .rows_affected()
-            == 1;
-        Ok(updated)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(kind,)| StoredForgeKind::new(kind)))
     }
 
     pub async fn rules(&self) -> anyhow::Result<Vec<DiscoveryRule>> {

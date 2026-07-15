@@ -114,12 +114,22 @@ impl std::fmt::Display for MemberName {
 #[serde(rename_all = "lowercase")]
 pub enum ForgeKind {
     Github,
+    Git,
 }
 
 impl ForgeKind {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "github" => Some(Self::Github),
+            "git" => Some(Self::Git),
+            _ => None,
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Github => "github",
+            Self::Git => "git",
         }
     }
 }

@@ -160,12 +160,87 @@ pub struct NeighborsResponse {
 /// display-ready date — the engine owns rendering (like search
 /// snippets), so clients print it verbatim instead of each re-deriving
 /// a format from `committed_at`.
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct HistoryCommitView {
-    #[serde(flatten)]
     pub commit: HistoryCommit,
     /// `committed_at` as RFC3339 UTC (`2024-01-01T00:00:00Z`).
     pub date: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HistoryCommitViewWire {
+    commit: String,
+    sha: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    subject: Option<String>,
+    committed_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    author: Option<crate::HistoryAuthor>,
+    date: String,
+}
+
+impl From<&HistoryCommitView> for HistoryCommitViewWire {
+    fn from(view: &HistoryCommitView) -> Self {
+        let HistoryCommitView {
+            commit:
+                HistoryCommit {
+                    commit,
+                    sha,
+                    subject,
+                    committed_at,
+                    author,
+                },
+            date,
+        } = view;
+        Self {
+            commit: commit.clone(),
+            sha: sha.clone(),
+            subject: subject.clone(),
+            committed_at: *committed_at,
+            author: author.as_ref().map(|author| {
+                let crate::HistoryAuthor { id, name, email } = author;
+                crate::HistoryAuthor {
+                    id: id.clone(),
+                    name: name.clone(),
+                    email: email.clone(),
+                }
+            }),
+            date: date.clone(),
+        }
+    }
+}
+
+impl From<HistoryCommitViewWire> for HistoryCommitView {
+    fn from(wire: HistoryCommitViewWire) -> Self {
+        let HistoryCommitViewWire {
+            commit,
+            sha,
+            subject,
+            committed_at,
+            author,
+            date,
+        } = wire;
+        Self {
+            commit: HistoryCommit {
+                commit,
+                sha,
+                subject,
+                committed_at,
+                author,
+            },
+            date,
+        }
+    }
+}
+
+impl Serialize for HistoryCommitView {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        HistoryCommitViewWire::from(self).serialize(serializer)
+    }
 }
 
 impl<'de> Deserialize<'de> for HistoryCommitView {
@@ -173,28 +248,7 @@ impl<'de> Deserialize<'de> for HistoryCommitView {
     where
         D: serde::Deserializer<'de>,
     {
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct WireFields {
-            commit: String,
-            sha: String,
-            subject: Option<String>,
-            committed_at: i64,
-            author: Option<crate::HistoryAuthor>,
-            date: String,
-        }
-
-        let fields = WireFields::deserialize(deserializer)?;
-        Ok(Self {
-            commit: HistoryCommit {
-                commit: fields.commit,
-                sha: fields.sha,
-                subject: fields.subject,
-                committed_at: fields.committed_at,
-                author: fields.author,
-            },
-            date: fields.date,
-        })
+        HistoryCommitViewWire::deserialize(deserializer).map(Into::into)
     }
 }
 

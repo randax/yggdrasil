@@ -58,6 +58,7 @@ pub(crate) async fn admin_forge_add(
             api_root: forge.default_api_root(&base_url).as_deref(),
         })
         .await?;
+    let kind = stored_forge_kind(outcome.forge_kind.as_str())?;
     Ok((
         if outcome.created {
             StatusCode::CREATED
@@ -65,7 +66,7 @@ pub(crate) async fn admin_forge_add(
             StatusCode::OK
         },
         Wire(AddForgeResponse {
-            kind: ForgeKind::Github,
+            kind,
             org: OrgName::new(org),
             base_url: ForgeBaseUrl::new(base_url),
             created: outcome.created,
@@ -134,18 +135,24 @@ pub(crate) async fn admin_forge_discover(
     let kind = forge.kind();
     let org = github_org_slug(&req.org).map_err(ApiError::bad_request)?;
     let base_url = github_base_url(req.base_url.as_deref()).map_err(ApiError::bad_request)?;
-    if !state.control.request_discovery(&base_url, &org).await? {
+    let Some(stored_kind) = state.control.request_discovery(&base_url, &org).await? else {
         return Err(ApiError::not_found(format!(
             "{kind} org {org} is not connected; run yg admin forge add first"
         )));
-    }
+    };
     Ok(Wire(DiscoverForgeResponse {
-        kind: ForgeKind::Github,
+        kind: stored_forge_kind(stored_kind.as_str())?,
         org: OrgName::new(org),
         base_url: ForgeBaseUrl::new(base_url),
         queued: true,
     })
     .into_response())
+}
+
+fn stored_forge_kind(kind: &str) -> Result<ForgeKind, ApiError> {
+    ForgeKind::parse(kind).ok_or_else(|| {
+        ApiError::internal(anyhow::anyhow!("unsupported stored forge kind {kind:?}"))
+    })
 }
 
 #[derive(Deserialize)]
@@ -456,5 +463,31 @@ fn job_state(
         (Some(_), ..) => JobState::Unknown,
         (None, _, true) => words.done,
         (None, _, false) => words.never_ran,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stored_non_github_forge_kind_remains_typed_in_the_response_path() {
+        let kind = stored_forge_kind("git").expect("git is a stored forge kind");
+        let response = AddForgeResponse {
+            kind,
+            org: OrgName::new("acme".to_string()),
+            base_url: ForgeBaseUrl::new("https://git.example".to_string()),
+            created: false,
+        };
+
+        assert_eq!(
+            serde_json::to_value(response).expect("forge response serialization"),
+            serde_json::json!({
+                "kind": "git",
+                "org": "acme",
+                "base_url": "https://git.example",
+                "created": false,
+            })
+        );
     }
 }

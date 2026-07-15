@@ -1,6 +1,76 @@
 use serde_json::json;
 
 #[test]
+fn history_commit_view_preserves_the_flat_wire_shape() {
+    let response = yg_verbs::HistoryResponse {
+        commits: vec![yg_verbs::HistoryCommitView {
+            commit: yg_verbs::HistoryCommit {
+                commit: "commit:github.com/acme/widgets:abc".to_string(),
+                sha: "abc".to_string(),
+                subject: Some("keep the wire stable".to_string()),
+                committed_at: 1,
+                author: Some(yg_verbs::HistoryAuthor {
+                    id: "contributor:github.com/acme/widgets:ada@example.com".to_string(),
+                    name: Some("Ada".to_string()),
+                    email: "ada@example.com".to_string(),
+                }),
+            },
+            date: "1970-01-01T00:00:01Z".to_string(),
+        }],
+        next_cursor: None,
+    };
+    let expected = r#"{"commits":[{"commit":"commit:github.com/acme/widgets:abc","sha":"abc","subject":"keep the wire stable","committed_at":1,"author":{"id":"contributor:github.com/acme/widgets:ada@example.com","name":"Ada","email":"ada@example.com"},"date":"1970-01-01T00:00:01Z"}],"next_cursor":null}"#;
+
+    let encoded = serde_json::to_string(&response).expect("history response serialization");
+    assert_eq!(encoded, expected);
+    let decoded: yg_verbs::HistoryResponse =
+        serde_json::from_str(&encoded).expect("history response deserialization");
+    assert_eq!(
+        serde_json::to_string(&decoded).expect("history response reserialization"),
+        expected
+    );
+}
+
+#[test]
+fn history_commit_view_omits_absent_optional_fields() {
+    let response = yg_verbs::HistoryResponse {
+        commits: vec![
+            yg_verbs::HistoryCommitView {
+                commit: yg_verbs::HistoryCommit {
+                    commit: "commit:github.com/acme/widgets:abc".to_string(),
+                    sha: "abc".to_string(),
+                    subject: None,
+                    committed_at: 1,
+                    author: None,
+                },
+                date: "1970-01-01T00:00:01Z".to_string(),
+            },
+            yg_verbs::HistoryCommitView {
+                commit: yg_verbs::HistoryCommit {
+                    commit: "commit:github.com/acme/widgets:def".to_string(),
+                    sha: "def".to_string(),
+                    subject: None,
+                    committed_at: 2,
+                    author: Some(yg_verbs::HistoryAuthor {
+                        id: "contributor:github.com/acme/widgets:ada@example.com".to_string(),
+                        name: None,
+                        email: "ada@example.com".to_string(),
+                    }),
+                },
+                date: "1970-01-01T00:00:02Z".to_string(),
+            },
+        ],
+        next_cursor: None,
+    };
+    let expected = r#"{"commits":[{"commit":"commit:github.com/acme/widgets:abc","sha":"abc","committed_at":1,"date":"1970-01-01T00:00:01Z"},{"commit":"commit:github.com/acme/widgets:def","sha":"def","committed_at":2,"author":{"id":"contributor:github.com/acme/widgets:ada@example.com","email":"ada@example.com"},"date":"1970-01-01T00:00:02Z"}],"next_cursor":null}"#;
+
+    assert_eq!(
+        serde_json::to_string(&response).expect("history response serialization"),
+        expected
+    );
+}
+
+#[test]
 fn admin_identifier_newtypes_preserve_bare_string_wire_values() {
     use yg_verbs::admin::{ForgeBaseUrl, MemberName, OrgName, RepoSlug, TokenId};
 
