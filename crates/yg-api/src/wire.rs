@@ -19,21 +19,6 @@ pub(crate) fn canonical_string(body: &impl Serialize) -> serde_json::Result<Stri
     serde_json::to_string(&value)
 }
 
-/// Serializes an `f32` as the `f64` its shortest decimal form denotes.
-/// [`canonical_string`]'s trip through `serde_json::to_value` widens
-/// floats with a bare cast, which would put "5.480152130126953" on the
-/// wire where the f32 wrote "5.480152".
-pub(crate) fn f32_shortest<S: serde::Serializer>(
-    value: &f32,
-    serializer: S,
-) -> Result<S::Ok, S::Error> {
-    let shortest: f64 = value
-        .to_string()
-        .parse()
-        .unwrap_or_else(|_| f64::from(*value));
-    serializer.serialize_f64(shortest)
-}
-
 fn sort_keys(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Object(map) => {

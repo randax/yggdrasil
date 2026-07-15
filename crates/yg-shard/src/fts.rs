@@ -39,8 +39,8 @@ pub struct SearchDoc {
 }
 
 /// The filters and page size a lexical search runs under. Cross-repo
-/// fan-out and cursor pagination are the caller's (yg-api's) concern; one
-/// segment answers one ranked page.
+/// fan-out and cursor pagination are the Verb engine's concern; one segment
+/// answers one ranked page.
 pub struct SearchParams<'a> {
     /// The user's natural-language query, in tantivy query syntax.
     pub query: &'a str,

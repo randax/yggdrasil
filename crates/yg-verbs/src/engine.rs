@@ -11,6 +11,7 @@ use anyhow::Context;
 use serde::Serialize;
 
 use crate::cursor::{self, HistoryCursor, NeighborsCursor};
+use crate::search::{RepoQualifier, SearchResponse, SearchTarget};
 use crate::{
     DEFAULT_HISTORY_LIMIT, DEFAULT_NEIGHBORS_DEPTH, DEFAULT_NEIGHBORS_LIMIT, Direction, GraphEdge,
     HistoryCommit, HistoryOptions, HistoryRequest, MAX_HISTORY_LIMIT, MIN_PAGE_LIMIT,
@@ -75,6 +76,23 @@ pub trait ShardResolver: Send + Sync {
         qualifier: &str,
         pinned: Option<String>,
     ) -> impl Future<Output = Result<ResolvedShard, ResolveError>> + Send;
+
+    /// Resolve one explicitly named repo to the revision a fresh search pins.
+    fn resolve_search_target(
+        &self,
+        qualifier: &RepoQualifier,
+    ) -> impl Future<Output = Result<SearchTarget, ResolveError>> + Send;
+
+    /// List every current-schema indexed repo for an org-wide search.
+    fn indexed_search_targets(
+        &self,
+    ) -> impl Future<Output = Result<Vec<SearchTarget>, ResolveError>> + Send;
+
+    /// Materialize the FTS segment pinned by a search target.
+    fn resolve_fts(
+        &self,
+        target: &SearchTarget,
+    ) -> impl Future<Output = Result<std::path::PathBuf, ResolveError>> + Send;
 }
 
 /// Map a resolution failure to the client's error. The words are the
@@ -191,16 +209,31 @@ fn parse_since(raw: &str) -> Result<i64, String> {
 /// every transport (RFC 0001 §7 mandates one behavior across REST, MCP,
 /// and CLI — this is the one implementation that makes it structural).
 pub struct Engine<R> {
-    resolver: R,
+    resolver: std::sync::Arc<R>,
+    metrics: crate::Metrics,
 }
 
-impl<R: ShardResolver> Engine<R> {
+impl<R: ShardResolver + 'static> Engine<R> {
     pub fn new(resolver: R) -> Self {
-        Self { resolver }
+        Self::with_metrics(resolver, crate::Metrics::unregistered())
+    }
+
+    /// Build an engine using the supplied Verb latency collectors.
+    pub fn with_metrics(resolver: R, metrics: crate::Metrics) -> Self {
+        Self {
+            resolver: std::sync::Arc::new(resolver),
+            metrics,
+        }
+    }
+
+    /// The metrics handle shared with API-owned Verbs such as `search`.
+    pub fn metrics(&self) -> &crate::Metrics {
+        &self.metrics
     }
 
     /// The `node` Verb, end to end: parse, resolve, read.
     pub async fn node(&self, req: NodeRequest) -> Result<NodeResponse, VerbError> {
+        let _timer = self.metrics.timer(crate::Verb::Node);
         let id = VerbId::parse(&req.id).map_err(VerbError::BadRequest)?;
         let shard = self
             .resolver
@@ -210,10 +243,17 @@ impl<R: ShardResolver> Engine<R> {
         run_verb(shard.path, id, crate::node).await
     }
 
+    /// The `search` Verb, end to end: cursor policy, target resolution,
+    /// bounded FTS fan-out, deterministic merge, and snippet hydration.
+    pub async fn search(&self, req: crate::SearchRequest) -> Result<SearchResponse, VerbError> {
+        crate::search::search(self.resolver.clone(), req).await
+    }
+
     /// The `neighbors` Verb, end to end: cursor decode and agreement,
     /// validation, resolve (pinned by the cursor where present), read,
     /// cursor encode.
     pub async fn neighbors(&self, req: NeighborsRequest) -> Result<NeighborsResponse, VerbError> {
+        let _timer = self.metrics.timer(crate::Verb::Neighbors);
         let cursor = req
             .cursor
             .as_deref()
@@ -285,6 +325,7 @@ impl<R: ShardResolver> Engine<R> {
     /// `since` normalization, validation, resolve (pinned by the cursor
     /// where present), read, cursor encode, date rendering.
     pub async fn history(&self, req: HistoryRequest) -> Result<HistoryResponse, VerbError> {
+        let _timer = self.metrics.timer(crate::Verb::History);
         let cursor = req
             .cursor
             .as_deref()

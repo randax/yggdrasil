@@ -5,13 +5,15 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use yg_control::ControlPlane;
+use yg_control::{ControlPlane, JobKind, JobOutcome};
 
 use crate::forge::{Forge, ForgeRegistry, github::discovery_client};
 use crate::git::{GitFetcher, forge_token, lock_mirror, remote_head_commit};
-use crate::lease::with_lease_heartbeat;
+use crate::lease::{LeaseShutdown, with_lease_heartbeat, with_lease_heartbeat_until_shutdown};
 use crate::locator::join_clone_url;
+use crate::metrics::Metrics;
 use crate::rate::{RATE_LIMIT_COOLDOWN, TokenBucket};
+use crate::shutdown::Shutdown;
 
 /// How long a worker may hold a fetch job before a crashed run becomes
 /// claimable again. Generous: a cold full-history clone of a large repo.
@@ -37,11 +39,21 @@ pub struct SyncWorker {
     /// rate-limit signal. In-process: one worker's view of its own
     /// request rate (the per-repo interval smooths the fleet's).
     poll_buckets: Mutex<HashMap<i64, TokenBucket>>,
+    metrics: Metrics,
 }
 
 impl SyncWorker {
     pub fn new(control: ControlPlane, git_cache: impl Into<PathBuf>) -> Self {
-        Self::with_registry(control, git_cache, ForgeRegistry::builtin())
+        Self::with_metrics(control, git_cache, Metrics::unregistered())
+    }
+
+    /// A worker whose poll observations are emitted through `metrics`.
+    pub fn with_metrics(
+        control: ControlPlane,
+        git_cache: impl Into<PathBuf>,
+        metrics: Metrics,
+    ) -> Self {
+        Self::with_registry_and_metrics(control, git_cache, ForgeRegistry::builtin(), metrics)
     }
 
     /// A worker dispatching through `registry` instead of the built-in
@@ -51,12 +63,23 @@ impl SyncWorker {
         git_cache: impl Into<PathBuf>,
         registry: ForgeRegistry,
     ) -> Self {
+        Self::with_registry_and_metrics(control, git_cache, registry, Metrics::unregistered())
+    }
+
+    /// A worker with both an injected Forge registry and metrics handle.
+    pub fn with_registry_and_metrics(
+        control: ControlPlane,
+        git_cache: impl Into<PathBuf>,
+        registry: ForgeRegistry,
+        metrics: Metrics,
+    ) -> Self {
         Self {
             control,
             fetcher: GitFetcher::new(git_cache),
             registry,
             discovery_client: discovery_client(),
             poll_buckets: Mutex::new(HashMap::new()),
+            metrics,
         }
     }
 
@@ -64,8 +87,40 @@ impl SyncWorker {
     /// failed fetch is recorded (with backoff) rather than returned as an
     /// error — `Err` means the control plane itself is unreachable.
     pub async fn run_once(&self) -> anyhow::Result<bool> {
-        let Some(job) = self.control.claim_due_fetch(FETCH_LEASE).await? else {
+        self.run_once_with_optional_shutdown(None).await
+    }
+
+    /// Claim and run one due job while observing process shutdown. New
+    /// claims stop immediately; an active fetch gets until the shared
+    /// work cutoff to settle normally, then its lease is returned fresh
+    /// to the queue before the work future is dropped.
+    pub async fn run_once_with_shutdown(&self, shutdown: Shutdown) -> anyhow::Result<bool> {
+        if shutdown.deadline().is_some() {
             return Ok(false);
+        }
+        self.run_once_with_optional_shutdown(Some(shutdown)).await
+    }
+
+    async fn run_once_with_optional_shutdown(
+        &self,
+        shutdown: Option<Shutdown>,
+    ) -> anyhow::Result<bool> {
+        let (job, timer) = match claim_due_fetch_with_optional_shutdown(
+            shutdown.as_ref(),
+            self.control.claim_due_fetch(FETCH_LEASE),
+            async |job| self.control.release_fetch(job).await,
+            || self.control.start_job(JobKind::Fetch),
+        )
+        .await?
+        {
+            ShutdownClaim::Empty => return Ok(false),
+            ShutdownClaim::Ready { job, timer } => (job, timer),
+            ShutdownClaim::Released { timer } => {
+                // The job was released untouched for a healthy retry: no
+                // work happened, so no outcome is recorded.
+                timer.disarm();
+                return Ok(true);
+            }
         };
         let clone_url = join_clone_url(&job.base_url, &job.slug);
         let forge = self.registry.for_kind(&job.forge_kind);
@@ -82,20 +137,43 @@ impl SyncWorker {
         // A cold clone of a large repo outlives the base lease; the
         // heartbeat keeps the job ours for as long as the work is alive.
         let renew = async || self.control.renew_fetch(&job, FETCH_LEASE).await;
-        let synced = with_lease_heartbeat(FETCH_LEASE, renew, work).await;
+        let synced = if let Some(shutdown) = shutdown {
+            let release = async || self.control.release_fetch(&job).await;
+            match with_lease_heartbeat_until_shutdown(
+                FETCH_LEASE,
+                renew,
+                release,
+                shutdown.clone(),
+                work,
+            )
+            .await?
+            {
+                LeaseShutdown::Finished(synced) => synced,
+                LeaseShutdown::Released => {
+                    timer.finish(JobOutcome::Discarded);
+                    return Ok(true);
+                }
+            }
+        } else {
+            with_lease_heartbeat(FETCH_LEASE, renew, work).await
+        };
         match synced {
             Ok(commit) => {
                 if self.control.complete_fetch(&job, &commit).await? {
+                    timer.finish(JobOutcome::Success);
                     tracing::info!(slug = %job.slug, %commit, "synced");
                 } else {
+                    timer.finish(JobOutcome::Discarded);
                     tracing::warn!(slug = %job.slug, "lease lapsed mid-fetch; result discarded");
                 }
             }
             Err(e) => {
                 let error = format!("{e:#}");
                 if self.control.fail_fetch(&job, &error).await? {
+                    timer.finish(JobOutcome::Failure);
                     tracing::warn!(slug = %job.slug, attempt = job.attempts + 1, error, "fetch failed");
                 } else {
+                    timer.finish(JobOutcome::Discarded);
                     tracing::warn!(slug = %job.slug, "lease lapsed mid-fetch; failure discarded");
                 }
             }
@@ -220,6 +298,8 @@ impl SyncWorker {
         else {
             return Ok(false);
         };
+        self.metrics
+            .observe_poll_lag(&due.base_url, due.poll_lag_seconds);
         // Spend a rate-budget token; over budget, reschedule the repo for
         // when one frees up and back off (no head check this cycle).
         if let Err(retry) = self.take_poll_token(due.forge_id, due.rate_budget) {
@@ -293,6 +373,30 @@ impl SyncWorker {
     }
 }
 
+enum ShutdownClaim<T, M> {
+    Empty,
+    Ready { job: T, timer: M },
+    Released { timer: M },
+}
+
+async fn claim_due_fetch_with_optional_shutdown<T, M>(
+    shutdown: Option<&Shutdown>,
+    claim: impl Future<Output = anyhow::Result<Option<T>>>,
+    release: impl AsyncFnOnce(&T) -> anyhow::Result<bool>,
+    start_timer: impl FnOnce() -> M,
+) -> anyhow::Result<ShutdownClaim<T, M>> {
+    let Some(job) = claim.await? else {
+        return Ok(ShutdownClaim::Empty);
+    };
+    let timer = start_timer();
+    if shutdown.is_some_and(|shutdown| shutdown.request().is_some()) {
+        let released = release(&job).await?;
+        tracing::info!(released, "released fresh fetch claim for shutdown");
+        return Ok(ShutdownClaim::Released { timer });
+    }
+    Ok(ShutdownClaim::Ready { job, timer })
+}
+
 /// How the poll loop is paced: the default interval between a repo's
 /// default-branch head checks, and the jitter spread (a fraction of the
 /// interval) that keeps a forge's repos from polling in lockstep. A
@@ -319,4 +423,46 @@ fn in_flight_fetch_repoll(due: &yg_control::DuePoll, cfg: &PollConfig) -> Durati
     repo_interval
         .min(FETCH_IN_FLIGHT_REPOLL_MAX)
         .max(Duration::from_secs(1))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use tokio::time::Instant;
+
+    use super::{ShutdownClaim, claim_due_fetch_with_optional_shutdown};
+    use crate::{ShutdownCause, shutdown_channel};
+
+    #[tokio::test]
+    async fn fetch_claim_completing_after_shutdown_is_released_before_work_starts() {
+        let (trigger, shutdown) = shutdown_channel();
+        let released_job = AtomicUsize::new(0);
+        let claim = async {
+            assert!(trigger.request(
+                Instant::now() + Duration::from_secs(30),
+                ShutdownCause::Signal,
+            ));
+            Ok(Some(41_usize))
+        };
+
+        let claimed = claim_due_fetch_with_optional_shutdown(
+            Some(&shutdown),
+            claim,
+            async |job| {
+                released_job.store(*job, Ordering::SeqCst);
+                Ok(true)
+            },
+            || 73_usize,
+        )
+        .await
+        .expect("post-claim shutdown check");
+
+        assert!(
+            matches!(claimed, ShutdownClaim::Released { timer: 73 }),
+            "shutdown claims must be released with their timer"
+        );
+        assert_eq!(released_job.load(Ordering::SeqCst), 41);
+    }
 }

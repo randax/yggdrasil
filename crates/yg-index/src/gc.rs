@@ -21,7 +21,7 @@ pub(crate) async fn collect_superseded(
                 repo_id = shard.repo_id,
                 revision = %shard.revision,
                 error = format!("{error:#}"),
-                "could not delete object-storage segments for superseded Shard; these segments are now orphaned"
+                "could not finish reclaiming superseded Shard; a later sweep will retry"
             ),
         }
     }
@@ -49,11 +49,21 @@ async fn collect_shard(
     store: &dyn ObjectStore,
     shard: &yg_control::SupersededShard,
 ) -> anyhow::Result<bool> {
-    if !control.delete_superseded_shard(shard.shard_id).await? {
-        return Ok(false);
-    }
-    yg_shard::delete_shard(store, shard.repo_id, &shard.revision)
+    let operation = control
+        .lock_shard_operation(shard.repo_id, &shard.revision)
         .await
-        .context("deleting the Shard's object-storage segments")?;
-    Ok(true)
+        .context("locking the Shard revision for reclamation")?;
+    yg_control::finish_shard_operation(operation, async {
+        if !control.delete_superseded_shard(shard.shard_id).await? {
+            return Ok(false);
+        }
+        yg_shard::delete_shard(store, shard.repo_id, &shard.revision)
+            .await
+            .context("deleting the Shard's object-storage segments")?;
+        control
+            .finish_shard_reclamation(shard.shard_id)
+            .await
+            .context("reaping the reclaimed Shard row")
+    })
+    .await
 }

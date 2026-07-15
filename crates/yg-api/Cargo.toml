@@ -11,13 +11,14 @@ rust-version.workspace = true
 anyhow = "1.0.102"
 axum = "0.8.9"
 object_store = { version = "0.13.2", features = ["aws"] }
+prometheus-client.workspace = true
 serde = { version = "1.0.228", features = ["derive"] }
 # preserve_order backs wire::sort_keys (Map::sort_keys only exists with
 # it); declared here so canonical serialization never rests on another
 # crate's transitive feature unification.
 serde_json = { version = "1.0.150", features = ["preserve_order"] }
 subtle = "2.6.1"
-tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "signal", "net", "time"] }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "signal", "net", "sync", "time"] }
 tracing = "0.1.44"
 yg-control = { version = "0.1.0", path = "../yg-control" }
 yg-shard = { version = "0.1.0", path = "../yg-shard" }

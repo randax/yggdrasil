@@ -1,13 +1,15 @@
 //! Opaque pagination cursors: one codec for every Verb (ADR 0003).
 //!
 //! A cursor is URL-safe base64 over the JSON of a cursor struct. The
-//! codec exists exactly once — every Verb's cursor, including the
-//! transport-owned search cursor, encodes and decodes through here — so
+//! codec exists exactly once — every Verb's cursor, including search,
+//! encodes and decodes through here — so
 //! the "opaque, replay-exactly" contract cannot drift between Verbs.
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use thiserror::Error;
 
-use crate::{Direction, TraversalShape};
+use crate::search::SearchTarget;
+use crate::{Direction, SearchRequest, TraversalShape};
 
 /// The longest encoded cursor the codec will decode. The largest
 /// legitimate cursor this server mints is a search cursor pinning
@@ -117,6 +119,199 @@ pub(crate) struct HistoryCursor {
     pub after_sha: String,
 }
 
+/// What a search `next_cursor` opaquely carries: the query state and the
+/// pinned fan-out set, plus how many hits have already been returned.
+/// The field names and types are the compatibility contract for cursors
+/// minted before search orchestration moved into the engine.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SearchCursor {
+    pub(crate) query: String,
+    pub(crate) kinds: Option<Vec<SearchKind>>,
+    pub(crate) mode: SearchMode,
+    pub(crate) targets: Vec<SearchTarget>,
+    pub(crate) offset: usize,
+}
+
+/// A search mode recorded in an opaque continuation cursor.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) enum SearchMode {
+    Lexical,
+    Semantic,
+    Hybrid,
+    // Unknown values remain representable for cursor wire compatibility: they
+    // must reach the existing mode gate instead of becoming decode failures.
+    Unknown(String),
+}
+
+impl SearchMode {
+    pub(crate) fn as_str(&self) -> &str {
+        match self {
+            Self::Lexical => "lexical",
+            Self::Semantic => "semantic",
+            Self::Hybrid => "hybrid",
+            Self::Unknown(value) => value,
+        }
+    }
+
+    pub(crate) fn into_string(self) -> String {
+        match self {
+            Self::Lexical => "lexical".to_string(),
+            Self::Semantic => "semantic".to_string(),
+            Self::Hybrid => "hybrid".to_string(),
+            Self::Unknown(value) => value,
+        }
+    }
+}
+
+impl From<String> for SearchMode {
+    fn from(value: String) -> Self {
+        match value.as_str() {
+            "lexical" => Self::Lexical,
+            "semantic" => Self::Semantic,
+            "hybrid" => Self::Hybrid,
+            _ => Self::Unknown(value),
+        }
+    }
+}
+
+impl From<SearchMode> for String {
+    fn from(mode: SearchMode) -> Self {
+        mode.into_string()
+    }
+}
+
+impl PartialEq<&str> for SearchMode {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
+impl std::fmt::Debug for SearchMode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.as_str().fmt(formatter)
+    }
+}
+
+impl Serialize for SearchMode {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for SearchMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        String::deserialize(deserializer).map(Self::from)
+    }
+}
+
+/// A node-kind spelling recorded in a cursor and validated by the search gate.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub(crate) struct SearchKind(String);
+
+impl SearchKind {
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub(crate) fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl From<String> for SearchKind {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<SearchKind> for String {
+    fn from(kind: SearchKind) -> Self {
+        kind.into_string()
+    }
+}
+
+/// Why a continuation cursor cannot be used with a search request.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub(crate) enum SearchCursorAgreementError {
+    #[error(
+        "this cursor belongs to a different query; start a fresh search or pass the cursor without a query"
+    )]
+    Query,
+    #[error(
+        "this cursor belongs to a different search mode; page it without a mode, or start a fresh search"
+    )]
+    Mode,
+    #[error(
+        "this cursor belongs to a different kinds filter; page it without kinds, or start a fresh search"
+    )]
+    Kinds,
+    #[error(
+        "this cursor belongs to a different repos filter; page it without repos, or start a fresh search"
+    )]
+    Repos,
+    #[error("invalid cursor: it names too many repositories")]
+    TargetCap,
+}
+
+impl SearchCursor {
+    /// A resumed search may repeat its pinned query shape in an equivalent
+    /// spelling or omit it. Only page size may actually change.
+    pub(crate) fn agrees_with(
+        &self,
+        req: &SearchRequest,
+        max_targets: usize,
+    ) -> Result<(), SearchCursorAgreementError> {
+        fn str_set(items: &[String]) -> std::collections::HashSet<&str> {
+            items.iter().map(String::as_str).collect()
+        }
+
+        fn kind_set(items: &[SearchKind]) -> std::collections::HashSet<&str> {
+            items.iter().map(SearchKind::as_str).collect()
+        }
+
+        if req
+            .query
+            .as_deref()
+            .is_some_and(|query| query.trim() != self.query)
+        {
+            return Err(SearchCursorAgreementError::Query);
+        }
+        if req
+            .mode
+            .as_deref()
+            .is_some_and(|mode| mode != self.mode.as_str())
+        {
+            return Err(SearchCursorAgreementError::Mode);
+        }
+        if req.kinds.as_ref().is_some_and(|kinds| {
+            str_set(kinds) != kind_set(self.kinds.as_deref().unwrap_or_default())
+        }) {
+            return Err(SearchCursorAgreementError::Kinds);
+        }
+        if req.repos.as_ref().is_some_and(|repos| {
+            str_set(repos)
+                != self
+                    .targets
+                    .iter()
+                    .map(|target| target.qualifier().as_str())
+                    .collect()
+        }) {
+            return Err(SearchCursorAgreementError::Repos);
+        }
+        if self.targets.len() > max_targets {
+            return Err(SearchCursorAgreementError::TargetCap);
+        }
+        Ok(())
+    }
+}
+
 impl HistoryCursor {
     /// A follow-up may repeat the original id and `since` or omit
     /// `since`, nothing else. The `since` is compared already-normalized,
@@ -222,5 +417,135 @@ mod tests {
         assert!(cursor.agrees_with(&cursor.id, Some(100)).is_ok(), "same");
         assert!(cursor.agrees_with(&cursor.id, Some(101)).is_err());
         assert!(cursor.agrees_with("file:other:x", None).is_err());
+    }
+
+    #[test]
+    fn search_cursor_round_trips_the_legacy_shape() {
+        let cursor = SearchCursor {
+            query: "rate limit".to_string(),
+            kinds: Some(vec![SearchKind::from("Symbol".to_string())]),
+            mode: SearchMode::Lexical,
+            targets: vec![SearchTarget::new(
+                7,
+                crate::RepoQualifier::new("github.com/acme/widgets".to_string()),
+                crate::ShardRevision::new("abc-syntactic-v4".to_string()),
+            )],
+            offset: 20,
+        };
+        let encoded = encode(&cursor);
+        assert_eq!(
+            encoded,
+            "eyJxdWVyeSI6InJhdGUgbGltaXQiLCJraW5kcyI6WyJTeW1ib2wiXSwibW9kZSI6ImxleGljYWwiLCJ0YXJnZXRzIjpbeyJyZXBvX2lkIjo3LCJxdWFsaWZpZXIiOiJnaXRodWIuY29tL2FjbWUvd2lkZ2V0cyIsInJldmlzaW9uIjoiYWJjLXN5bnRhY3RpYy12NCJ9XSwib2Zmc2V0IjoyMH0"
+        );
+        let decoded: SearchCursor = decode(&encoded).expect("round-trips");
+        assert_eq!(decoded.query, cursor.query);
+        assert_eq!(decoded.kinds, cursor.kinds);
+        assert_eq!(decoded.mode, SearchMode::Lexical);
+        assert_eq!(decoded.targets[0].repo_id(), 7);
+        assert_eq!(
+            decoded.targets[0].qualifier().as_str(),
+            "github.com/acme/widgets"
+        );
+        assert_eq!(decoded.offset, 20);
+    }
+
+    #[test]
+    fn search_cursor_agreement_normalizes_query_and_filter_sets() {
+        let cursor = SearchCursor {
+            query: "rate limit".to_string(),
+            kinds: Some(vec![
+                SearchKind::from("File".to_string()),
+                SearchKind::from("Symbol".to_string()),
+            ]),
+            mode: SearchMode::Lexical,
+            targets: vec![
+                SearchTarget::new(
+                    1,
+                    crate::RepoQualifier::new("a".to_string()),
+                    crate::ShardRevision::new("ra".to_string()),
+                ),
+                SearchTarget::new(
+                    2,
+                    crate::RepoQualifier::new("b".to_string()),
+                    crate::ShardRevision::new("rb".to_string()),
+                ),
+            ],
+            offset: 20,
+        };
+        let equivalent = SearchRequest {
+            query: Some("  rate limit  ".to_string()),
+            kinds: Some(vec!["Symbol".to_string(), "File".to_string()]),
+            repos: Some(vec!["b".to_string(), "a".to_string(), "a".to_string()]),
+            mode: Some("lexical".to_string()),
+            limit: Some(5),
+            cursor: None,
+        };
+        assert!(cursor.agrees_with(&equivalent, 1_000).is_ok());
+
+        let mut different = equivalent;
+        different.query = Some("other".to_string());
+        assert_eq!(
+            cursor.agrees_with(&different, 1_000),
+            Err(SearchCursorAgreementError::Query)
+        );
+        different.query = None;
+        different.mode = Some("semantic".to_string());
+        assert_eq!(
+            cursor.agrees_with(&different, 1_000),
+            Err(SearchCursorAgreementError::Mode)
+        );
+    }
+
+    #[test]
+    fn search_cursor_unknown_values_preserve_the_legacy_validation_path() {
+        let legacy_json =
+            r#"{"query":"q","kinds":["FutureKind"],"mode":"future-mode","targets":[],"offset":0}"#;
+        let wire = {
+            use base64::Engine;
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(legacy_json)
+        };
+        let cursor: SearchCursor = decode(&wire).expect("unknown values still decode");
+
+        assert_eq!(cursor.mode, SearchMode::Unknown("future-mode".to_string()));
+        assert_eq!(
+            cursor.kinds.as_deref().expect("kinds")[0].as_str(),
+            "FutureKind"
+        );
+        assert_eq!(
+            encode(&cursor),
+            wire,
+            "unknown spellings serialize unchanged"
+        );
+        assert_eq!(format!("{:?}", cursor.mode), "\"future-mode\"");
+    }
+
+    #[test]
+    fn search_cursor_agreement_errors_keep_the_wire_messages() {
+        let errors = [
+            (
+                SearchCursorAgreementError::Query,
+                "this cursor belongs to a different query; start a fresh search or pass the cursor without a query",
+            ),
+            (
+                SearchCursorAgreementError::Mode,
+                "this cursor belongs to a different search mode; page it without a mode, or start a fresh search",
+            ),
+            (
+                SearchCursorAgreementError::Kinds,
+                "this cursor belongs to a different kinds filter; page it without kinds, or start a fresh search",
+            ),
+            (
+                SearchCursorAgreementError::Repos,
+                "this cursor belongs to a different repos filter; page it without repos, or start a fresh search",
+            ),
+            (
+                SearchCursorAgreementError::TargetCap,
+                "invalid cursor: it names too many repositories",
+            ),
+        ];
+
+        for (error, expected) in errors {
+            assert_eq!(error.to_string(), expected);
+        }
     }
 }

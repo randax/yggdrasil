@@ -28,6 +28,8 @@
 
 pub mod cursor;
 pub mod engine;
+pub mod metrics;
+mod search;
 
 use std::collections::BTreeMap;
 
@@ -43,6 +45,11 @@ use yg_shard::graph_schema::{
 pub use engine::{
     Engine, HistoryCommitView, HistoryResponse, NeighborsResponse, ResolveError, ResolvedShard,
     ShardResolver, VerbError,
+};
+pub use metrics::Metrics;
+pub use search::{
+    RepoQualifier, SearchHit, SearchNodeName, SearchPath, SearchResponse, SearchSnippet,
+    SearchTarget, ShardRevision,
 };
 
 pub const DEFAULT_NEIGHBORS_DEPTH: u32 = 1;
@@ -66,7 +73,7 @@ pub struct VerbTool {
     pub description: &'static str,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum Verb {
     Node,
     Neighbors,
@@ -75,6 +82,13 @@ pub enum Verb {
 }
 
 impl Verb {
+    pub const ALL: [Self; 4] = [Self::Node, Self::Neighbors, Self::Search, Self::History];
+
+    /// The stable Prometheus label for this Verb.
+    pub fn label(self) -> &'static str {
+        self.tool().name
+    }
+
     pub fn tool(self) -> &'static VerbTool {
         VERB_TOOLS
             .iter()
