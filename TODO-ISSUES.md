@@ -10,7 +10,7 @@ Critical path: **#59 → {#60, #62, #64} → {#63, #65, #66}**.
 - [x] **#40** Torn-Shard repair: manifest-first deletion, GC soft-delete (`reclaiming` state). *Riskiest storage change — blocks #29.*
 - [ ] **#54** Declarative language packs replacing the seven hand-rolled parser setups; split `yg-index/lib.rs` into pass/resolve/history/gc/worker modules. *Blocks #43.*
 - [x] **#46** Graceful shutdown: `with_graceful_shutdown` + SIGTERM drain for server and sync worker.
-- [ ] **#47** Prometheus `/metrics` endpoint (queue depth, poll lag, Verb latency, cache stats). *Blocks #68.*
+- [x] **#47** Prometheus `/metrics` endpoint (queue depth, poll lag, Verb latency, cache stats). *Blocks #68.*
 - [x] **#55** (remainder) Count-by-visibility summary in `AdminStatusResponse` + CLI. *Per-repo field already shipped.*
 - [ ] **#42** (remainder) Pin `LC_ALL` for git subprocesses; cap `list_org_repos` pagination; honor `Retry-After`; charge discovery to the Forge budget. *Git deadlines already shipped; pairs with #48.*
 

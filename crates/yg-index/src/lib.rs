@@ -242,14 +242,22 @@ impl IndexWorker {
         &self,
         shutdown: Option<yg_sync::Shutdown>,
     ) -> anyhow::Result<bool> {
-        let Some(job) = claim_due_index_with_optional_shutdown(
+        let (job, timer) = match claim_due_index_with_optional_shutdown(
             shutdown.as_ref(),
             self.control.claim_due_index(INDEX_LEASE),
             async |job| self.control.release_index(job).await,
+            || self.control.start_job(yg_control::JobKind::Index),
         )
         .await?
-        else {
-            return Ok(false);
+        {
+            ShutdownClaim::Empty => return Ok(false),
+            ShutdownClaim::Ready { job, timer } => (job, timer),
+            ShutdownClaim::Released { timer } => {
+                // The job was released untouched for a healthy retry: no
+                // work happened, so no outcome is recorded.
+                timer.disarm();
+                return Ok(true);
+            }
         };
         // A cold self-healing clone plus a long parse outlives the base
         // lease; the heartbeat keeps the job ours while the work is alive.
@@ -266,7 +274,10 @@ impl IndexWorker {
             .await?
             {
                 yg_sync::LeaseShutdown::Finished(indexed) => indexed,
-                yg_sync::LeaseShutdown::Released => return Ok(true),
+                yg_sync::LeaseShutdown::Released => {
+                    timer.finish(yg_control::JobOutcome::Discarded);
+                    return Ok(true);
+                }
             }
         } else {
             yg_sync::with_lease_heartbeat(INDEX_LEASE, renew, self.index(&job)).await
@@ -290,8 +301,10 @@ impl IndexWorker {
                 .await?;
                 if applied {
                     tracing::info!(slug = %job.slug, revision = %shard.revision, "indexed");
+                    timer.finish(yg_control::JobOutcome::Success);
                 } else {
                     tracing::warn!(slug = %job.slug, "index result was fenced or its lease lapsed; job will retry when needed");
+                    timer.finish(yg_control::JobOutcome::Discarded);
                 }
             }
             Ok(IndexAttempt::ReclamationInProgress { operation }) => {
@@ -305,13 +318,16 @@ impl IndexWorker {
                 } else {
                     tracing::warn!(slug = %job.slug, "index reclamation deferral lost its lease");
                 }
+                timer.finish(yg_control::JobOutcome::Discarded);
             }
             Err(e) => {
                 let error = format!("{e:#}");
                 if self.control.fail_index(&job, &error).await? {
                     tracing::warn!(slug = %job.slug, attempt = job.attempts + 1, error, "index failed");
+                    timer.finish(yg_control::JobOutcome::Failure);
                 } else {
                     tracing::warn!(slug = %job.slug, "lease lapsed mid-index; failure discarded");
+                    timer.finish(yg_control::JobOutcome::Discarded);
                 }
             }
         }
@@ -458,20 +474,28 @@ impl IndexWorker {
     }
 }
 
-async fn claim_due_index_with_optional_shutdown<T>(
+enum ShutdownClaim<T, M> {
+    Empty,
+    Ready { job: T, timer: M },
+    Released { timer: M },
+}
+
+async fn claim_due_index_with_optional_shutdown<T, M>(
     shutdown: Option<&yg_sync::Shutdown>,
     claim: impl Future<Output = anyhow::Result<Option<T>>>,
     release: impl AsyncFnOnce(&T) -> anyhow::Result<bool>,
-) -> anyhow::Result<Option<T>> {
+    start_timer: impl FnOnce() -> M,
+) -> anyhow::Result<ShutdownClaim<T, M>> {
     let Some(job) = claim.await? else {
-        return Ok(None);
+        return Ok(ShutdownClaim::Empty);
     };
+    let timer = start_timer();
     if shutdown.is_some_and(|shutdown| shutdown.request().is_some()) {
         let released = release(&job).await?;
         tracing::info!(released, "released fresh index claim for shutdown");
-        return Ok(None);
+        return Ok(ShutdownClaim::Released { timer });
     }
-    Ok(Some(job))
+    Ok(ShutdownClaim::Ready { job, timer })
 }
 
 /// Whether `commit` is present in the (possibly absent) bare mirror.
@@ -3156,14 +3180,22 @@ mod tests {
             Ok(Some(43_usize))
         };
 
-        let claimed = claim_due_index_with_optional_shutdown(Some(&shutdown), claim, async |job| {
-            released_job.store(*job, Ordering::SeqCst);
-            Ok(true)
-        })
+        let claimed = claim_due_index_with_optional_shutdown(
+            Some(&shutdown),
+            claim,
+            async |job| {
+                released_job.store(*job, Ordering::SeqCst);
+                Ok(true)
+            },
+            || 79_usize,
+        )
         .await
         .expect("post-claim shutdown check");
 
-        assert!(claimed.is_none(), "shutdown claims must not start work");
+        assert!(
+            matches!(claimed, ShutdownClaim::Released { timer: 79 }),
+            "shutdown claims must be released with their timer"
+        );
         assert_eq!(released_job.load(Ordering::SeqCst), 43);
     }
 

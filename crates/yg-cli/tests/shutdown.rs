@@ -105,6 +105,34 @@ async fn second_sigterm_during_drain_forces_a_nonzero_exit() {
     lock.rollback().await.unwrap();
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_metrics_listener_drains_with_workers_on_sigterm() {
+    let db_name = create_test_db().await;
+    let _migrated = control_plane(&db_name).await;
+    let (mut worker, announcement) = spawn_yg_role("worker", &db_name, |command| {
+        command
+            .env("YG_WORKER_METRICS_ADDR", "127.0.0.1:0")
+            .env("YG_BOOTSTRAP_TOKEN", TEST_TOKEN);
+    });
+    assert!(
+        announcement.starts_with("listening on http://"),
+        "worker metrics listener must announce readiness: {announcement}"
+    );
+
+    let signal = std::process::Command::new("kill")
+        .args(["-TERM", &worker.0.id().to_string()])
+        .status()
+        .expect("sending SIGTERM");
+    assert!(signal.success(), "kill -TERM must succeed");
+
+    let status = await_process_exit(&mut worker).await;
+    assert!(
+        status.success(),
+        "worker metrics listener and workers must drain cleanly: {status}"
+    );
+}
+
 #[tokio::test]
 async fn released_index_lease_is_immediately_reclaimable_and_stays_fenced() {
     let db_name = create_test_db().await;

@@ -1,5 +1,8 @@
 //! Postgres models, job queue.
 
+pub mod metrics;
+pub use metrics::{JobOutcome, JobTimer, Metrics};
+
 use anyhow::Context;
 use sqlx::PgPool;
 use sqlx::pool::PoolConnection;
@@ -14,6 +17,7 @@ pub const DEFAULT_DATABASE_URL: &str = "postgres://yggdrasil:yggdrasil@localhost
 #[derive(Clone)]
 pub struct ControlPlane {
     pool: PgPool,
+    metrics: Metrics,
 }
 
 /// Exclusive ownership of one Shard revision's object/control-plane
@@ -225,6 +229,14 @@ impl JobKind {
             Self::Index => "index",
         }
     }
+
+    fn from_database(value: &str) -> Option<Self> {
+        match value {
+            "fetch" => Some(Self::Fetch),
+            "index" => Some(Self::Index),
+            _ => None,
+        }
+    }
 }
 
 pub struct AddRule<'a> {
@@ -287,6 +299,7 @@ pub struct LeasedFetch {
     /// lease (the job was re-claimed) has its result discarded.
     #[sqlx(try_from = "String")]
     lease_token: LeaseToken,
+    claim_latency_seconds: f64,
 }
 
 /// The claim's fencing token. The token is the lease deadline's text
@@ -336,6 +349,7 @@ pub struct LeasedIndex {
     /// Opaque fencing token; see [`LeasedFetch::lease_token`].
     #[sqlx(try_from = "String")]
     lease_token: LeaseToken,
+    claim_latency_seconds: f64,
 }
 
 /// A published Shard as the control plane records it: the row inserted
@@ -442,6 +456,8 @@ pub struct DuePoll {
     pub synced_commit: String,
     /// Conditional requests per minute allowed against this forge.
     pub rate_budget: i32,
+    /// Seconds this repo was overdue when claimed for polling.
+    pub poll_lag_seconds: f64,
 }
 
 /// A superseded Shard the GC sweep may reclaim: no repo points at it and
@@ -559,6 +575,14 @@ impl ControlPlane {
     /// tracked in `_sqlx_migrations`, so restarting against an
     /// already-migrated database is a no-op.
     pub async fn connect_and_migrate(database_url: &str) -> anyhow::Result<Self> {
+        Self::connect_and_migrate_with_metrics(database_url, Metrics::unregistered()).await
+    }
+
+    /// Connect using job collectors supplied by the process composition root.
+    pub async fn connect_and_migrate_with_metrics(
+        database_url: &str,
+        metrics: Metrics,
+    ) -> anyhow::Result<Self> {
         // Sizing invariant: shard-operation guards each pin one dedicated
         // connection while the same task acquires a second, transient one
         // for coordinated SQL. The worker wiring runs at most one index
@@ -574,7 +598,7 @@ impl ControlPlane {
             .run(&pool)
             .await
             .context("running control-plane migrations")?;
-        Ok(Self { pool })
+        Ok(Self { pool, metrics })
     }
 
     /// Register a repository for Sync: upsert its Forge, the repo row,
@@ -1055,6 +1079,39 @@ impl ControlPlane {
         Ok(rows)
     }
 
+    /// Refresh queue-depth gauges from Postgres, the source of truth
+    /// shared by API-only and worker-only processes.
+    pub async fn refresh_job_queue_depths(&self) -> anyhow::Result<()> {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT kind, count(*)::bigint
+             FROM jobs
+             WHERE state <> 'done'
+             GROUP BY kind",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut depths = [0_u64; JobKind::ALL.len()];
+        for (raw_kind, depth) in rows {
+            let kind = JobKind::from_database(&raw_kind)
+                .with_context(|| format!("unknown job kind in queue: {raw_kind}"))?;
+            let depth = u64::try_from(depth).context("job queue depth cannot be negative")?;
+            let index = JobKind::ALL
+                .iter()
+                .position(|candidate| *candidate == kind)
+                .expect("every parsed job kind is in JobKind::ALL");
+            depths[index] = depth;
+        }
+        for (kind, depth) in JobKind::ALL.into_iter().zip(depths) {
+            self.metrics.set_queue_depth(kind, depth);
+        }
+        Ok(())
+    }
+
+    /// Start a typed duration/outcome observation for worker execution.
+    pub fn start_job(&self, kind: JobKind) -> JobTimer {
+        self.metrics.start_job(kind)
+    }
+
     /// Claim the next due fetch job under a lease. `FOR UPDATE SKIP
     /// LOCKED` lets parallel workers claim without contention; a job whose
     /// lease expired (worker crashed mid-fetch) is due again. Returns
@@ -1070,10 +1127,14 @@ impl ControlPlane {
             "",
             "r.slug, r.fetch_depth, f.kind AS forge_kind, f.base_url, f.token_env",
         ));
-        let row = sqlx::query_as(sql)
+        let row: Option<LeasedFetch> = sqlx::query_as(sql)
             .bind(lease.as_secs_f64())
             .fetch_optional(&self.pool)
             .await?;
+        if let Some(job) = &row {
+            self.metrics
+                .observe_claim_latency(JobKind::Fetch, job.claim_latency_seconds);
+        }
         Ok(row)
     }
 
@@ -1213,7 +1274,10 @@ impl ControlPlane {
     ) -> anyhow::Result<Option<DuePoll>> {
         let row = sqlx::query_as(
             "WITH due AS (
-                 SELECT r.id FROM repos r
+                 SELECT r.id,
+                        greatest(extract(epoch FROM now() - r.next_poll_at), 0)::float8
+                            AS poll_lag_seconds
+                 FROM repos r
                  WHERE r.discovery_state = 'included'
                    AND r.last_synced_commit IS NOT NULL
                    AND r.next_poll_at <= now()
@@ -1230,7 +1294,8 @@ impl ControlPlane {
              RETURNING r.id AS repo_id, r.slug, f.id AS forge_id,
                        f.kind AS forge_kind, f.base_url, f.token_env, r.fetch_depth,
                        r.poll_interval_seconds,
-                       r.last_synced_commit AS synced_commit, f.rate_budget",
+                       r.last_synced_commit AS synced_commit, f.rate_budget,
+                       due.poll_lag_seconds",
         )
         .bind(default_interval.as_secs_f64())
         .bind(jitter_fraction)
@@ -1292,10 +1357,14 @@ impl ControlPlane {
             "r.slug, r.last_synced_commit AS commit,
              f.kind AS forge_kind, f.base_url, f.token_env, r.fetch_depth",
         ));
-        let row = sqlx::query_as(sql)
+        let row: Option<LeasedIndex> = sqlx::query_as(sql)
             .bind(lease.as_secs_f64())
             .fetch_optional(&self.pool)
             .await?;
+        if let Some(job) = &row {
+            self.metrics
+                .observe_claim_latency(JobKind::Index, job.claim_latency_seconds);
+        }
         Ok(row)
     }
 
@@ -1721,7 +1790,12 @@ pub fn claim_due_sql(
     let kind = kind.as_str();
     format!(
         "WITH due AS (
-             SELECT j.id FROM jobs j JOIN repos r ON r.id = j.repo_id
+             SELECT j.id,
+                    greatest(extract(epoch FROM now() - CASE
+                        WHEN j.state = 'leased' THEN j.lease_until
+                        ELSE j.run_after
+                    END), 0)::float8 AS claim_latency_seconds
+             FROM jobs j JOIN repos r ON r.id = j.repo_id
              WHERE j.kind = '{kind}' AND j.state <> 'done' AND j.run_after <= now()
                AND r.discovery_state = 'included'
                AND (j.state = 'queued' OR j.lease_until < now())
@@ -1735,7 +1809,8 @@ pub fn claim_due_sql(
          FROM due, repos r JOIN forges f ON f.id = r.forge_id
          WHERE j.id = due.id AND r.id = j.repo_id
          RETURNING j.id AS job_id, j.repo_id, j.attempts, {returning},
-                   j.lease_until::text AS lease_token"
+                   j.lease_until::text AS lease_token,
+                   due.claim_latency_seconds"
     )
 }
 

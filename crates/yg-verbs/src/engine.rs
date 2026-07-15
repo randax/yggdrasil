@@ -210,17 +210,30 @@ fn parse_since(raw: &str) -> Result<i64, String> {
 /// and CLI — this is the one implementation that makes it structural).
 pub struct Engine<R> {
     resolver: std::sync::Arc<R>,
+    metrics: crate::Metrics,
 }
 
 impl<R: ShardResolver + 'static> Engine<R> {
     pub fn new(resolver: R) -> Self {
+        Self::with_metrics(resolver, crate::Metrics::unregistered())
+    }
+
+    /// Build an engine using the supplied Verb latency collectors.
+    pub fn with_metrics(resolver: R, metrics: crate::Metrics) -> Self {
         Self {
             resolver: std::sync::Arc::new(resolver),
+            metrics,
         }
+    }
+
+    /// The metrics handle shared with API-owned Verbs such as `search`.
+    pub fn metrics(&self) -> &crate::Metrics {
+        &self.metrics
     }
 
     /// The `node` Verb, end to end: parse, resolve, read.
     pub async fn node(&self, req: NodeRequest) -> Result<NodeResponse, VerbError> {
+        let _timer = self.metrics.timer(crate::Verb::Node);
         let id = VerbId::parse(&req.id).map_err(VerbError::BadRequest)?;
         let shard = self
             .resolver
@@ -240,6 +253,7 @@ impl<R: ShardResolver + 'static> Engine<R> {
     /// validation, resolve (pinned by the cursor where present), read,
     /// cursor encode.
     pub async fn neighbors(&self, req: NeighborsRequest) -> Result<NeighborsResponse, VerbError> {
+        let _timer = self.metrics.timer(crate::Verb::Neighbors);
         let cursor = req
             .cursor
             .as_deref()
@@ -311,6 +325,7 @@ impl<R: ShardResolver + 'static> Engine<R> {
     /// `since` normalization, validation, resolve (pinned by the cursor
     /// where present), read, cursor encode, date rendering.
     pub async fn history(&self, req: HistoryRequest) -> Result<HistoryResponse, VerbError> {
+        let _timer = self.metrics.timer(crate::Verb::History);
         let cursor = req
             .cursor
             .as_deref()

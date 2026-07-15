@@ -1041,7 +1041,7 @@ enum Role {
     All,
     /// API only — pair with worker processes elsewhere
     Api,
-    /// Workers only: drain the fetch and index queues (no HTTP, no token)
+    /// Workers only; optionally expose process-local metrics over HTTP
     Worker,
 }
 
@@ -1087,10 +1087,16 @@ async fn serve(role: Role) -> anyhow::Result<()> {
     // The one read of the deployment environment: every YG_* setting
     // resolves and validates here, before anything connects.
     let deploy = deploy_config::resolve(role, |var| std::env::var(var).ok()).into_config()?;
+    let metrics = yg_api::Metrics::new();
 
     match role {
         Role::Api => {
-            let mut server = yg_api::serve(server_config(&deploy)?).await?;
+            let mut server = yg_api::serve_with_metrics(
+                server_config(&deploy)?,
+                metrics,
+                metrics_access(&deploy),
+            )
+            .await?;
             println!("listening on http://{}", server.local_addr());
             tokio::select! {
                 result = server.wait() => {
@@ -1113,35 +1119,89 @@ async fn serve(role: Role) -> anyhow::Result<()> {
             }
         }
         Role::Worker => {
-            let workers = workers(&deploy).await?;
+            let workers = workers(&deploy, &metrics).await?;
             let (shutdown_trigger, shutdown) = yg_sync::shutdown_channel();
-            println!("worker running");
-            let mut running = std::pin::pin!(run_workers(
-                &deploy,
-                workers,
-                shutdown_trigger.clone(),
-                shutdown,
-            ));
-            tokio::select! {
-                result = &mut running => result,
-                signal = signals.recv() => {
-                    signal?;
-                    let cause = yg_sync::ShutdownCause::Signal;
-                    let deadlines = ShutdownDeadlines::for_cause(cause);
-                    shutdown_trigger.request(deadlines.work, cause);
-                    drain_until(
-                        deadlines.terminate,
-                        &mut running,
-                        "workers",
-                        cause,
-                        &mut signals,
-                    ).await
+            if let Some(listen) = deploy.worker_metrics_addr {
+                let mut server = yg_api::serve_metrics(
+                    listen,
+                    metrics,
+                    metrics_access(&deploy),
+                    deploy.bootstrap_token.clone(),
+                )
+                .await?;
+                println!("listening on http://{}", server.local_addr());
+                let mut running = std::pin::pin!(run_workers(
+                    &deploy,
+                    workers,
+                    shutdown_trigger.clone(),
+                    shutdown,
+                ));
+                tokio::select! {
+                    result = server.wait() => {
+                        let failure = component_exit(result, "worker metrics server");
+                        log_shutdown_failure(&failure, "worker metrics server");
+                        let cause = yg_sync::ShutdownCause::Failure;
+                        let deadlines = ShutdownDeadlines::for_cause(cause);
+                        shutdown_trigger.request(deadlines.work, cause);
+                        drain_until(deadlines.terminate, &mut running, "workers", cause, &mut signals).await?;
+                        failure
+                    },
+                    result = &mut running => {
+                        let failure = component_exit(result, "workers");
+                        log_shutdown_failure(&failure, "workers");
+                        let cause = yg_sync::ShutdownCause::Failure;
+                        let deadlines = ShutdownDeadlines::for_cause(cause);
+                        server.begin_shutdown();
+                        drain_until(deadlines.terminate, server.wait(), "worker metrics server", cause, &mut signals).await?;
+                        failure
+                    },
+                    signal = signals.recv() => {
+                        signal?;
+                        let cause = yg_sync::ShutdownCause::Signal;
+                        let deadlines = ShutdownDeadlines::for_cause(cause);
+                        server.begin_shutdown();
+                        shutdown_trigger.request(deadlines.work, cause);
+                        drain_until(deadlines.terminate, async {
+                            let (server_result, worker_result) = tokio::join!(server.wait(), &mut running);
+                            server_result?;
+                            worker_result
+                        }, "worker metrics server and workers", cause, &mut signals).await
+                    },
+                }
+            } else {
+                println!("worker running");
+                let mut running = std::pin::pin!(run_workers(
+                    &deploy,
+                    workers,
+                    shutdown_trigger.clone(),
+                    shutdown,
+                ));
+                tokio::select! {
+                    result = &mut running => result,
+                    signal = signals.recv() => {
+                        signal?;
+                        let cause = yg_sync::ShutdownCause::Signal;
+                        let deadlines = ShutdownDeadlines::for_cause(cause);
+                        shutdown_trigger.request(deadlines.work, cause);
+                        drain_until(
+                            deadlines.terminate,
+                            &mut running,
+                            "workers",
+                            cause,
+                            &mut signals,
+                        ).await
+                    }
                 }
             }
         }
         Role::All => {
-            let mut server = yg_api::serve(server_config(&deploy)?).await?;
-            let workers = workers(&deploy).await?;
+            let mut server = yg_api::serve_with_metrics(
+                server_config(&deploy)?,
+                metrics.clone(),
+                metrics_access(&deploy),
+            )
+            .await?;
+            let workers = workers(&deploy, &metrics).await?;
             let (shutdown_trigger, shutdown) = yg_sync::shutdown_channel();
             let mut worker_stopping = shutdown.clone();
             // Announce only once the whole process is up: scripts and
@@ -1251,6 +1311,14 @@ async fn serve(role: Role) -> anyhow::Result<()> {
                 },
             }
         }
+    }
+}
+
+fn metrics_access(deploy: &deploy_config::DeployConfig) -> yg_api::MetricsAccess {
+    if deploy.metrics_unauthenticated {
+        yg_api::MetricsAccess::Unauthenticated
+    } else {
+        yg_api::MetricsAccess::Admin
     }
 }
 
@@ -1445,12 +1513,23 @@ fn server_config(deploy: &deploy_config::DeployConfig) -> anyhow::Result<yg_api:
     })
 }
 
-/// Build the worker pair. Workers need the control plane, the git
-/// cache, and object storage (Shards land there) — no bootstrap token.
+/// Build the worker pair and retain a control-plane handle for periodic
+/// metric refreshes. Workers need the control plane, the git
+/// cache, and object storage (Shards land there). A bootstrap token is only
+/// consumed by the optional authenticated metrics listener at composition.
 async fn workers(
     deploy: &deploy_config::DeployConfig,
-) -> anyhow::Result<(yg_sync::SyncWorker, yg_index::IndexWorker)> {
-    let control = yg_control::ControlPlane::connect_and_migrate(&deploy.database_url).await?;
+    metrics: &yg_api::Metrics,
+) -> anyhow::Result<(
+    yg_sync::SyncWorker,
+    yg_index::IndexWorker,
+    yg_control::ControlPlane,
+)> {
+    let control = yg_control::ControlPlane::connect_and_migrate_with_metrics(
+        &deploy.database_url,
+        metrics.control(),
+    )
+    .await?;
     let store = deploy.object_store.connect()?;
     // Fail at boot, not on every index job: connect() never touches the
     // network, so this probe is the first thing that would notice a
@@ -1459,8 +1538,13 @@ async fn workers(
         .await
         .context("object storage unreachable at worker boot")?;
     Ok((
-        yg_sync::SyncWorker::new(control.clone(), &deploy.git_cache),
-        yg_index::IndexWorker::new(control, store, &deploy.git_cache),
+        yg_sync::SyncWorker::with_metrics(
+            control.clone(),
+            &deploy.git_cache,
+            metrics.sync_worker(),
+        ),
+        yg_index::IndexWorker::new(control.clone(), store, &deploy.git_cache),
+        control,
     ))
 }
 
@@ -1469,7 +1553,11 @@ async fn workers(
 /// the other queue. An error from either side ends both.
 async fn run_workers(
     deploy: &deploy_config::DeployConfig,
-    (sync, index): (yg_sync::SyncWorker, yg_index::IndexWorker),
+    (sync, index, control): (
+        yg_sync::SyncWorker,
+        yg_index::IndexWorker,
+        yg_control::ControlPlane,
+    ),
     shutdown_trigger: yg_sync::ShutdownTrigger,
     shutdown: yg_sync::Shutdown,
 ) -> anyhow::Result<()> {
@@ -1524,6 +1612,7 @@ async fn run_workers(
         shutdown_trigger,
         gc_loop(
             &index,
+            &control,
             deploy.gc_grace,
             deploy.job_retention,
             deploy.gc_interval,
@@ -1619,10 +1708,12 @@ const POLL_JITTER_FRACTION: f64 = 0.2;
 /// the sweep runs every `interval`, reclaiming whatever has aged past
 /// `grace` and removing terminal job rows older than `job_retention`.
 /// A sweep that fails (a control-plane or object-storage blip) is
-/// logged and retried next interval rather than ending the process —
-/// GC is best-effort.
+/// logged and retried next interval rather than ending the process. The
+/// queue-depth gauge refresh shares this cadence so scrape frequency never
+/// drives database work. Both maintenance activities are best-effort.
 async fn gc_loop(
     index: &yg_index::IndexWorker,
+    control: &yg_control::ControlPlane,
     grace: std::time::Duration,
     job_retention: std::time::Duration,
     interval: std::time::Duration,
@@ -1631,6 +1722,12 @@ async fn gc_loop(
     loop {
         if shutdown.deadline().is_some() {
             return Ok(());
+        }
+        if let Err(e) = control.refresh_job_queue_depths().await {
+            tracing::warn!(
+                error = format!("{e:#}"),
+                "job queue depth refresh failed; retaining stale gauges until next GC interval"
+            );
         }
         if let Err(e) = index.gc_once(grace).await {
             tracing::warn!(
