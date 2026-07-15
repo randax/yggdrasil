@@ -1,13 +1,14 @@
 //! Opaque pagination cursors: one codec for every Verb (ADR 0003).
 //!
 //! A cursor is URL-safe base64 over the JSON of a cursor struct. The
-//! codec exists exactly once — every Verb's cursor, including the
-//! transport-owned search cursor, encodes and decodes through here — so
+//! codec exists exactly once — every Verb's cursor, including search,
+//! encodes and decodes through here — so
 //! the "opaque, replay-exactly" contract cannot drift between Verbs.
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-use crate::{Direction, TraversalShape};
+use crate::search::SearchTarget;
+use crate::{Direction, SearchRequest, TraversalShape};
 
 /// The longest encoded cursor the codec will decode. The largest
 /// legitimate cursor this server mints is a search cursor pinning
@@ -117,6 +118,72 @@ pub(crate) struct HistoryCursor {
     pub after_sha: String,
 }
 
+/// What a search `next_cursor` opaquely carries: the query state and the
+/// pinned fan-out set, plus how many hits have already been returned.
+/// The field names and types are the compatibility contract for cursors
+/// minted before search orchestration moved into the engine.
+#[derive(Serialize, Deserialize)]
+pub(crate) struct SearchCursor {
+    pub query: String,
+    pub kinds: Option<Vec<String>>,
+    pub mode: String,
+    pub targets: Vec<SearchTarget>,
+    pub offset: usize,
+}
+
+impl SearchCursor {
+    /// A resumed search may repeat its pinned query shape in an equivalent
+    /// spelling or omit it. Only page size may actually change.
+    pub fn agrees_with(&self, req: &SearchRequest) -> Result<(), String> {
+        fn str_set(items: &[String]) -> std::collections::HashSet<&str> {
+            items.iter().map(String::as_str).collect()
+        }
+
+        if req
+            .query
+            .as_deref()
+            .is_some_and(|query| query.trim() != self.query)
+        {
+            return Err(
+                "this cursor belongs to a different query; start a fresh search or \
+                 pass the cursor without a query"
+                    .to_string(),
+            );
+        }
+        if req.mode.as_ref().is_some_and(|mode| mode != &self.mode) {
+            return Err(
+                "this cursor belongs to a different search mode; page it without a \
+                 mode, or start a fresh search"
+                    .to_string(),
+            );
+        }
+        if req.kinds.as_ref().is_some_and(|kinds| {
+            str_set(kinds) != str_set(self.kinds.as_deref().unwrap_or_default())
+        }) {
+            return Err(
+                "this cursor belongs to a different kinds filter; page it without \
+                 kinds, or start a fresh search"
+                    .to_string(),
+            );
+        }
+        if req.repos.as_ref().is_some_and(|repos| {
+            str_set(repos)
+                != self
+                    .targets
+                    .iter()
+                    .map(|target| target.qualifier().as_str())
+                    .collect()
+        }) {
+            return Err(
+                "this cursor belongs to a different repos filter; page it without \
+                 repos, or start a fresh search"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
 impl HistoryCursor {
     /// A follow-up may repeat the original id and `since` or omit
     /// `since`, nothing else. The `since` is compared already-normalized,
@@ -222,5 +289,66 @@ mod tests {
         assert!(cursor.agrees_with(&cursor.id, Some(100)).is_ok(), "same");
         assert!(cursor.agrees_with(&cursor.id, Some(101)).is_err());
         assert!(cursor.agrees_with("file:other:x", None).is_err());
+    }
+
+    #[test]
+    fn search_cursor_round_trips_the_legacy_shape() {
+        let cursor = SearchCursor {
+            query: "rate limit".to_string(),
+            kinds: Some(vec!["Symbol".to_string()]),
+            mode: "lexical".to_string(),
+            targets: vec![SearchTarget::new(
+                7,
+                crate::RepoQualifier::new("github.com/acme/widgets".to_string()),
+                crate::ShardRevision::new("abc-syntactic-v4".to_string()),
+            )],
+            offset: 20,
+        };
+        let decoded: SearchCursor = decode(&encode(&cursor)).expect("round-trips");
+        assert_eq!(decoded.query, cursor.query);
+        assert_eq!(decoded.targets[0].repo_id(), 7);
+        assert_eq!(
+            decoded.targets[0].qualifier().as_str(),
+            "github.com/acme/widgets"
+        );
+        assert_eq!(decoded.offset, 20);
+    }
+
+    #[test]
+    fn search_cursor_agreement_normalizes_query_and_filter_sets() {
+        let cursor = SearchCursor {
+            query: "rate limit".to_string(),
+            kinds: Some(vec!["File".to_string(), "Symbol".to_string()]),
+            mode: "lexical".to_string(),
+            targets: vec![
+                SearchTarget::new(
+                    1,
+                    crate::RepoQualifier::new("a".to_string()),
+                    crate::ShardRevision::new("ra".to_string()),
+                ),
+                SearchTarget::new(
+                    2,
+                    crate::RepoQualifier::new("b".to_string()),
+                    crate::ShardRevision::new("rb".to_string()),
+                ),
+            ],
+            offset: 20,
+        };
+        let equivalent = SearchRequest {
+            query: Some("  rate limit  ".to_string()),
+            kinds: Some(vec!["Symbol".to_string(), "File".to_string()]),
+            repos: Some(vec!["b".to_string(), "a".to_string(), "a".to_string()]),
+            mode: Some("lexical".to_string()),
+            limit: Some(5),
+            cursor: None,
+        };
+        assert!(cursor.agrees_with(&equivalent).is_ok());
+
+        let mut different = equivalent;
+        different.query = Some("other".to_string());
+        assert!(cursor.agrees_with(&different).is_err());
+        different.query = None;
+        different.mode = Some("semantic".to_string());
+        assert!(cursor.agrees_with(&different).is_err());
     }
 }
