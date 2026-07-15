@@ -559,6 +559,12 @@ impl ControlPlane {
     /// tracked in `_sqlx_migrations`, so restarting against an
     /// already-migrated database is a no-op.
     pub async fn connect_and_migrate(database_url: &str) -> anyhow::Result<Self> {
+        // Sizing invariant: shard-operation guards each pin one dedicated
+        // connection while the same task acquires a second, transient one
+        // for coordinated SQL. The worker wiring runs at most one index
+        // job and one GC sweep concurrently (two guards, four connections
+        // worst case), so five suffices. Raising worker concurrency
+        // requires raising this bound with it.
         let pool = PgPoolOptions::new()
             .max_connections(5)
             .connect(database_url)
