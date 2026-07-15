@@ -402,6 +402,25 @@ pub(crate) async fn admin_token_revoke(
 #[derive(Serialize)]
 struct AdminStatusResponse {
     repos: Vec<AdminRepoStatus>,
+    visibility_counts: VisibilityCounts,
+}
+
+#[derive(Default, Serialize)]
+struct VisibilityCounts {
+    public: usize,
+    internal: usize,
+    private: usize,
+    unknown: usize,
+}
+
+impl VisibilityCounts {
+    fn record(&mut self, visibility: yg_control::RepoVisibility) {
+        match visibility {
+            yg_control::RepoVisibility::Public => self.public += 1,
+            yg_control::RepoVisibility::Internal => self.internal += 1,
+            yg_control::RepoVisibility::Private => self.private += 1,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -435,6 +454,10 @@ struct ShardStatus {
 
 pub(crate) async fn admin_status(State(state): State<Arc<AppState>>) -> Result<Response, ApiError> {
     let repos = state.control.admin_status().await?;
+    let mut visibility_counts = VisibilityCounts::default();
+    for repo in &repos {
+        visibility_counts.record(repo.visibility);
+    }
     let repos = repos
         .into_iter()
         .map(|r| AdminRepoStatus {
@@ -483,7 +506,11 @@ pub(crate) async fn admin_status(State(state): State<Arc<AppState>>) -> Result<R
             last_synced_commit: r.last_synced_commit,
         })
         .collect();
-    Ok(Wire(AdminStatusResponse { repos }).into_response())
+    Ok(Wire(AdminStatusResponse {
+        repos,
+        visibility_counts,
+    })
+    .into_response())
 }
 
 /// The stage-specific words [`job_state`] fills in: what to call a

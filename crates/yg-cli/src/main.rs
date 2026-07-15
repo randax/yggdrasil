@@ -946,6 +946,7 @@ async fn admin_status(json: bool) -> anyhow::Result<()> {
         println!("{}", serde_json::to_string(&body)?);
         return Ok(());
     }
+    print_visibility_counts(&body);
     let repos = body["repos"].as_array().map(Vec::as_slice).unwrap_or(&[]);
     if repos.is_empty() {
         println!("no repositories registered — add one with: yg admin repo add <url>");
@@ -981,6 +982,17 @@ async fn admin_status(json: bool) -> anyhow::Result<()> {
         println!();
     }
     Ok(())
+}
+
+fn print_visibility_counts(body: &serde_json::Value) {
+    let counts = &body["visibility_counts"];
+    println!(
+        "visibility: public={} internal={} private={} unknown={}",
+        counts["public"].as_u64().unwrap_or(0),
+        counts["internal"].as_u64().unwrap_or(0),
+        counts["private"].as_u64().unwrap_or(0),
+        counts["unknown"].as_u64().unwrap_or(0),
+    );
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
