@@ -35,7 +35,6 @@ use verbs::ShardAccess;
 pub(crate) struct AppState {
     control: ControlPlane,
     store: Arc<dyn ObjectStore>,
-    shards: Arc<yg_shard::ShardCache>,
     engine: yg_verbs::Engine<ShardAccess>,
     bootstrap_token: String,
     started: std::time::Instant,
@@ -55,7 +54,6 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<RunningServer> {
     let state = Arc::new(AppState {
         engine: yg_verbs::Engine::new(ShardAccess::new(control.clone(), shards.clone())),
         control,
-        shards,
         store,
         bootstrap_token: config.bootstrap_token,
         started: std::time::Instant::now(),

@@ -11,7 +11,9 @@ use std::sync::Arc;
 use axum::extract::State;
 use axum::response::{IntoResponse, Response};
 use yg_control::ControlPlane;
-use yg_verbs::{ResolveError, ResolvedShard, ShardResolver};
+use yg_verbs::{
+    RepoQualifier, ResolveError, ResolvedShard, SearchTarget, ShardResolver, ShardRevision,
+};
 
 use crate::AppState;
 use crate::error::ApiError;
@@ -50,14 +52,62 @@ impl ShardResolver for ShardAccess {
         };
         match self.shards.graph_path(target.repo_id, &revision).await {
             Ok(path) => Ok(ResolvedShard { path, revision }),
-            Err(e) if e.downcast_ref::<yg_shard::RevisionMissing>().is_some() => {
-                Err(ResolveError::RevisionMissing(e))
-            }
-            Err(e) if e.downcast_ref::<yg_shard::SchemaOutdated>().is_some() => {
-                Err(ResolveError::SchemaOutdated)
-            }
-            Err(e) => Err(ResolveError::Internal(e)),
+            Err(error) => Err(map_cache_error(error)),
         }
+    }
+
+    async fn resolve_search_target(
+        &self,
+        qualifier: &RepoQualifier,
+    ) -> Result<SearchTarget, ResolveError> {
+        let target = self
+            .control
+            .verb_target(qualifier.as_str())
+            .await
+            .map_err(ResolveError::Internal)?
+            .ok_or(ResolveError::UnknownRepo)?;
+        let revision = target.revision.ok_or(ResolveError::NotIndexed)?;
+        Ok(SearchTarget::new(
+            target.repo_id,
+            qualifier.clone(),
+            ShardRevision::new(revision),
+        ))
+    }
+
+    async fn indexed_search_targets(&self) -> Result<Vec<SearchTarget>, ResolveError> {
+        self.control
+            .indexed_repos(&yg_shard::syntactic_revision_suffix())
+            .await
+            .map_err(ResolveError::Internal)
+            .map(|repos| {
+                repos
+                    .into_iter()
+                    .map(|repo| {
+                        SearchTarget::new(
+                            repo.repo_id,
+                            RepoQualifier::new(repo.qualifier),
+                            ShardRevision::new(repo.revision),
+                        )
+                    })
+                    .collect()
+            })
+    }
+
+    async fn resolve_fts(&self, target: &SearchTarget) -> Result<std::path::PathBuf, ResolveError> {
+        self.shards
+            .fts_path(target.repo_id(), target.revision().as_str())
+            .await
+            .map_err(map_cache_error)
+    }
+}
+
+fn map_cache_error(error: anyhow::Error) -> ResolveError {
+    if error.downcast_ref::<yg_shard::RevisionMissing>().is_some() {
+        ResolveError::RevisionMissing(error)
+    } else if error.downcast_ref::<yg_shard::SchemaOutdated>().is_some() {
+        ResolveError::SchemaOutdated
+    } else {
+        ResolveError::Internal(error)
     }
 }
 
