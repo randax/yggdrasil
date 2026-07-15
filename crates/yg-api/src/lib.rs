@@ -44,6 +44,11 @@ pub(crate) struct AppState {
     started: std::time::Instant,
 }
 
+pub(crate) struct MetricsServerState {
+    metrics: Metrics,
+    bootstrap_token: String,
+}
+
 /// Boot the Index Server: connect to the control plane, verify object
 /// storage, and start serving.
 pub async fn serve(config: ServerConfig) -> anyhow::Result<RunningServer> {
@@ -190,6 +195,50 @@ pub async fn serve_with_metrics(
         result
     });
 
+    Ok(RunningServer { local_addr, handle })
+}
+
+/// Bind a worker-only Prometheus listener with the same access-policy choice
+/// as the API server. This server owns no database or application routes: a
+/// scrape only encodes the supplied process-local registry.
+pub async fn serve_metrics(
+    listen: std::net::SocketAddr,
+    metrics: Metrics,
+    metrics_access: MetricsAccess,
+    bootstrap_token: Option<String>,
+) -> anyhow::Result<RunningServer> {
+    let bootstrap_token = match metrics_access {
+        MetricsAccess::Admin => bootstrap_token
+            .context("a bootstrap Admin token is required for an authenticated metrics listener")?,
+        MetricsAccess::Unauthenticated => String::new(),
+    };
+    let state = Arc::new(MetricsServerState {
+        metrics,
+        bootstrap_token,
+    });
+    let app = Router::new()
+        .route("/metrics", get(metrics::standalone_metrics))
+        .method_not_allowed_fallback(wire::method_not_allowed);
+    let app = match metrics_access {
+        MetricsAccess::Admin => app.route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::authenticate_metrics_admin,
+        )),
+        MetricsAccess::Unauthenticated => app,
+    }
+    .with_state(state);
+
+    let listener = TcpListener::bind(listen)
+        .await
+        .with_context(|| format!("binding worker metrics listener {listen}"))?;
+    let local_addr = listener.local_addr()?;
+    let handle = tokio::spawn(async move {
+        let result = axum::serve(listener, app).await;
+        if let Err(error) = &result {
+            tracing::error!("worker metrics server exited: {error}");
+        }
+        result
+    });
     Ok(RunningServer { local_addr, handle })
 }
 

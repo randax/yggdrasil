@@ -10,7 +10,25 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 
 use crate::AppState;
+use crate::MetricsServerState;
 use crate::error::{ApiError, error_json};
+
+fn presented_bearer(req: &Request) -> Option<&str> {
+    req.headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        // RFC 9110: the scheme is case-insensitive.
+        .and_then(|value| value.split_once(' '))
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+        // RFC 9110 allows 1*SP between scheme and credentials.
+        .map(|(_, presented)| presented.trim_start_matches(' '))
+}
+
+fn is_bootstrap_token(presented: &str, expected: &str) -> bool {
+    use subtle::ConstantTimeEq;
+
+    presented.as_bytes().ct_eq(expected.as_bytes()).into()
+}
 
 /// What a bearer token is scoped to, decided once by [`authenticate`] and
 /// carried in request extensions. Authorization itself lives in the route
@@ -30,30 +48,14 @@ pub(crate) async fn authenticate(
     mut req: Request,
     next: Next,
 ) -> Response {
-    use subtle::ConstantTimeEq;
-
-    let presented = req
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        // RFC 9110: the scheme is case-insensitive.
-        .and_then(|v| v.split_once(' '))
-        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
-        // RFC 9110 allows 1*SP between scheme and credentials.
-        .map(|(_, presented)| presented.trim_start_matches(' ').to_string());
-
-    let Some(presented) = presented else {
+    let Some(presented) = presented_bearer(&req) else {
         return error_json(StatusCode::UNAUTHORIZED, "missing or invalid bearer token");
     };
 
-    let admin: bool = presented
-        .as_bytes()
-        .ct_eq(state.bootstrap_token.as_bytes())
-        .into();
-    let scope = if admin {
+    let scope = if is_bootstrap_token(presented, &state.bootstrap_token) {
         TokenScope::Admin
     } else {
-        match state.control.authenticate_member_token(&presented).await {
+        match state.control.authenticate_member_token(presented).await {
             Ok(true) => TokenScope::Member,
             Ok(false) => {
                 return error_json(StatusCode::UNAUTHORIZED, "missing or invalid bearer token");
@@ -62,6 +64,22 @@ pub(crate) async fn authenticate(
         }
     };
     req.extensions_mut().insert(scope);
+    next.run(req).await
+}
+
+/// Bootstrap-token authentication for the worker's metrics-only listener.
+/// It shares bearer parsing and constant-time comparison with the full API,
+/// but deliberately has no member-token database fallback.
+pub(crate) async fn authenticate_metrics_admin(
+    State(state): State<Arc<MetricsServerState>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let authenticated = presented_bearer(&req)
+        .is_some_and(|presented| is_bootstrap_token(presented, &state.bootstrap_token));
+    if !authenticated {
+        return error_json(StatusCode::UNAUTHORIZED, "missing or invalid bearer token");
+    }
     next.run(req).await
 }
 

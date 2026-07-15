@@ -9,6 +9,7 @@ use prometheus_client::encoding::text::encode;
 use prometheus_client::registry::Registry;
 
 use crate::AppState;
+use crate::MetricsServerState;
 use crate::error::ApiError;
 
 /// All process-local collectors exposed by the server's registry.
@@ -71,9 +72,18 @@ impl Default for Metrics {
 /// `YG_METRICS_UNAUTHENTICATED=true`, the composition root deliberately adds
 /// this route outside those layers so a network-restricted scraper can call it.
 pub(crate) async fn metrics(State(state): State<Arc<AppState>>) -> Result<Response, ApiError> {
-    state.control.refresh_job_queue_depths().await?;
+    response(&state.metrics)
+}
+
+pub(crate) async fn standalone_metrics(
+    State(state): State<Arc<MetricsServerState>>,
+) -> Result<Response, ApiError> {
+    response(&state.metrics)
+}
+
+fn response(metrics: &Metrics) -> Result<Response, ApiError> {
     let mut body = String::new();
-    encode(&mut body, &state.metrics.registry)
+    encode(&mut body, &metrics.registry)
         .map_err(|error| ApiError::internal(anyhow::Error::msg(error.to_string())))?;
     Ok((
         [(

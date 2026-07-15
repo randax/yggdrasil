@@ -41,8 +41,8 @@ which is required. All of them resolve through one typed config
 mirrors), and `yg config-check [--role=api|worker|all]` prints the resolved
 configuration (credentials redacted) with every validation error, without
 starting the server. Each role resolves, validates, and reports only the
-settings its process uses — a worker ignores `YG_LISTEN` and
-`YG_BOOTSTRAP_TOKEN`; an api process ignores the poll/GC cadences and
+settings its process uses — a worker ignores `YG_LISTEN` and, unless its
+optional metrics listener is enabled, `YG_BOOTSTRAP_TOKEN`; an api process ignores the poll/GC cadences and
 `YG_GIT_CACHE`. The one exception is the Forge token: its env var
 name is stored per Forge org in the control plane (`YG_GITHUB_TOKEN` by
 default), so the Sync worker reads it per job and config-check — which
@@ -50,8 +50,9 @@ never connects — cannot report it:
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `YG_BOOTSTRAP_TOKEN` | — (required for api/all) | Bootstrap Admin bearer token |
+| `YG_BOOTSTRAP_TOKEN` | — (required for api/all and authenticated worker metrics) | Bootstrap Admin bearer token |
 | `YG_LISTEN` | `127.0.0.1:7311` | Server bind address |
+| `YG_WORKER_METRICS_ADDR` | — (disabled) | Worker-only `/metrics` bind address (for example `0.0.0.0:9400`); absent means no HTTP listener |
 | `YG_METRICS_UNAUTHENTICATED` | `false` | Expose `GET /metrics` without a bearer token for scraper convenience |
 | `YG_DATABASE_URL` | dev compose Postgres | Control-plane database |
 | `YG_S3_ENDPOINT` | `http://localhost:9000` | Object storage endpoint |
@@ -73,9 +74,12 @@ whole number of seconds) refuses to boot with every problem listed, not
 just the first.
 
 `yg serve --role=api|worker|all` picks what the process runs: `api` serves
-HTTP only, `worker` drains the Sync and indexing queues only (it needs the
+HTTP only, `worker` drains the Sync and indexing queues (it needs the
 control plane, a git cache, and object storage — Shards land there — but no
-bootstrap token and no listen address), and `all` runs both in one process.
+API listen address), and `all` runs both in one process. A worker binds no HTTP
+listener by default. Set `YG_WORKER_METRICS_ADDR` to expose its process-local
+`GET /metrics`; the endpoint requires `YG_BOOTSTRAP_TOKEN` unless
+`YG_METRICS_UNAUTHENTICATED=true` is set behind a deployment network boundary.
 
 ### Forge token scope
 
@@ -116,6 +120,8 @@ by default; set `YG_METRICS_UNAUTHENTICATED=true` only when the scrape endpoint
 is protected by the deployment network boundary. Metrics are process-local:
 `serve --role=all` exposes both API and worker observations; in a split-role
 deployment the API endpoint cannot aggregate the separate worker process.
+Configure `YG_WORKER_METRICS_ADDR` on each split worker and scrape that endpoint
+to collect its job and forge observations.
 
 ## Checks
 

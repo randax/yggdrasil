@@ -30,8 +30,12 @@ pub const MAX_DURATION_SECS: u64 = 10 * 365 * 24 * 3600;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeployConfig {
     pub listen: SocketAddr,
+    /// Optional worker-only Prometheus listener. A split worker exposes no
+    /// HTTP surface unless this address is configured explicitly.
+    pub worker_metrics_addr: Option<SocketAddr>,
     pub database_url: String,
     /// Required for roles that serve the API (`api`, `all`).
+    /// Also required by an authenticated worker metrics listener.
     pub bootstrap_token: Option<String>,
     /// Whether `/metrics` bypasses Admin authentication for scrapers.
     pub metrics_unauthenticated: bool,
@@ -104,8 +108,8 @@ impl std::fmt::Display for ConfigError {
             ),
             Self::MissingBootstrapToken { var } => write!(
                 f,
-                "{var} must be set to a non-empty token; the server refuses to boot without an \
-                 Admin token"
+                "{var} must be set to a non-empty token; an API or authenticated metrics \
+                 listener refuses to boot without an Admin token"
             ),
         }
     }
@@ -160,7 +164,17 @@ pub fn resolve(role: Role, lookup: impl Fn(&str) -> Option<String>) -> Resolutio
             .parse()
             .expect("default listen address parses")
     };
-    let bootstrap_token = if api {
+    let worker_metrics_addr = if matches!(role, Role::Worker) {
+        r.optional_listen_addr("YG_WORKER_METRICS_ADDR")
+    } else {
+        None
+    };
+    let metrics_unauthenticated = r.boolean(
+        api || worker_metrics_addr.is_some(),
+        "YG_METRICS_UNAUTHENTICATED",
+        false,
+    );
+    let bootstrap_token = if api || (worker_metrics_addr.is_some() && !metrics_unauthenticated) {
         let token = r.secret("YG_BOOTSTRAP_TOKEN");
         if token.is_none() {
             r.errors.push(ConfigError::MissingBootstrapToken {
@@ -173,8 +187,9 @@ pub fn resolve(role: Role, lookup: impl Fn(&str) -> Option<String>) -> Resolutio
     };
     let config = DeployConfig {
         listen,
+        worker_metrics_addr,
         bootstrap_token,
-        metrics_unauthenticated: r.boolean(api, "YG_METRICS_UNAUTHENTICATED", false),
+        metrics_unauthenticated,
         database_url: r.database_url("YG_DATABASE_URL", yg_control::DEFAULT_DATABASE_URL),
         shard_cache: if api {
             r.string("YG_SHARD_CACHE", "./data/shard-cache")
@@ -265,7 +280,10 @@ impl Resolver<'_> {
                     }
                 }
             }
-            None => default,
+            None => {
+                self.record(var, default.to_string(), Source::Default);
+                default
+            }
         }
     }
 
@@ -338,6 +356,27 @@ impl Resolver<'_> {
                 self.errors
                     .push(ConfigError::InvalidListenAddr { var, value });
                 fallback
+            }
+        }
+    }
+
+    /// An opt-in listener. Absence is a meaningful disabled state rather
+    /// than a default bind address, and is reported that way by config-check.
+    fn optional_listen_addr(&mut self, var: &'static str) -> Option<SocketAddr> {
+        let Some(value) = self.raw(var) else {
+            self.record(var, "—".into(), Source::Unset);
+            return None;
+        };
+        match value.parse() {
+            Ok(addr) => {
+                self.record(var, value, Source::Env);
+                Some(addr)
+            }
+            Err(_) => {
+                self.record(var, value.clone(), Source::Env);
+                self.errors
+                    .push(ConfigError::InvalidListenAddr { var, value });
+                None
             }
         }
     }
@@ -440,6 +479,7 @@ mod tests {
             .into_config()
             .unwrap();
         assert_eq!(config.listen, "127.0.0.1:7311".parse().unwrap());
+        assert_eq!(config.worker_metrics_addr, None);
         assert_eq!(config.database_url, yg_control::DEFAULT_DATABASE_URL);
         assert_eq!(config.bootstrap_token.as_deref(), Some("ygt_admin"));
         assert_eq!(
@@ -508,7 +548,7 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_token_is_required_for_api_serving_roles_only() {
+    fn bootstrap_token_is_required_for_api_and_authenticated_metrics() {
         for role in [Role::Api, Role::All] {
             let resolution = resolve(role, env(&[]));
             assert!(
@@ -521,6 +561,32 @@ mod tests {
         }
         let config = resolve(Role::Worker, env(&[])).into_config().unwrap();
         assert_eq!(config.bootstrap_token, None);
+
+        let protected_worker = resolve(
+            Role::Worker,
+            env(&[("YG_WORKER_METRICS_ADDR", "127.0.0.1:9400")]),
+        );
+        assert!(
+            protected_worker
+                .errors
+                .iter()
+                .any(|error| matches!(error, ConfigError::MissingBootstrapToken { .. }))
+        );
+        let open_worker = resolve(
+            Role::Worker,
+            env(&[
+                ("YG_WORKER_METRICS_ADDR", "127.0.0.1:9400"),
+                ("YG_METRICS_UNAUTHENTICATED", "true"),
+            ]),
+        )
+        .into_config()
+        .unwrap();
+        assert_eq!(
+            open_worker.worker_metrics_addr,
+            Some("127.0.0.1:9400".parse().unwrap())
+        );
+        assert!(open_worker.metrics_unauthenticated);
+        assert_eq!(open_worker.bootstrap_token, None);
 
         // The token has no default, so its absence is reported as
         // unset, not as a default.
@@ -581,8 +647,8 @@ mod tests {
 
     #[test]
     fn each_role_resolves_only_the_settings_it_uses() {
-        // A worker never binds a listen address or checks tokens
-        // (docs/DEVELOPMENT.md says so), so an api-only variable that is
+        // A worker without its optional metrics listener never binds an API
+        // address or checks tokens, so an api-only variable that is
         // invalid fleet-wide must not refuse a worker boot — and must
         // not clutter its report.
         let worker = resolve(
@@ -596,6 +662,7 @@ mod tests {
         assert!(!worker_vars.contains(&"YG_SHARD_CACHE"));
         assert!(worker_vars.contains(&"YG_GIT_CACHE"));
         assert!(worker_vars.contains(&"YG_DATABASE_URL"));
+        assert!(worker_vars.contains(&"YG_WORKER_METRICS_ADDR"));
 
         // And the api role ignores worker-only settings the same way.
         let api = resolve(
@@ -738,6 +805,7 @@ mod tests {
             vars,
             [
                 "YG_LISTEN",
+                "YG_METRICS_UNAUTHENTICATED",
                 "YG_BOOTSTRAP_TOKEN",
                 "YG_DATABASE_URL",
                 "YG_SHARD_CACHE",
@@ -758,8 +826,10 @@ mod tests {
         let listen = &resolution.settings[0];
         assert_eq!(listen.source, Source::Env);
         assert!(
-            resolution.settings[2..]
+            resolution
+                .settings
                 .iter()
+                .filter(|s| !matches!(s.var, "YG_LISTEN" | "YG_BOOTSTRAP_TOKEN"))
                 .all(|s| s.source == Source::Default)
         );
     }

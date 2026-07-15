@@ -989,7 +989,7 @@ enum Role {
     All,
     /// API only — pair with worker processes elsewhere
     Api,
-    /// Workers only: drain the fetch and index queues (no HTTP, no token)
+    /// Workers only; optionally expose process-local metrics over HTTP
     Worker,
 }
 
@@ -1045,8 +1045,23 @@ async fn serve(role: Role) -> anyhow::Result<()> {
         }
         Role::Worker => {
             let workers = workers(&deploy, &metrics).await?;
-            println!("worker running");
-            run_workers(&deploy, workers).await
+            if let Some(listen) = deploy.worker_metrics_addr {
+                let server = yg_api::serve_metrics(
+                    listen,
+                    metrics,
+                    metrics_access(&deploy),
+                    deploy.bootstrap_token.clone(),
+                )
+                .await?;
+                println!("listening on http://{}", server.local_addr());
+                tokio::select! {
+                    result = server.wait() => result.context("worker metrics server exited"),
+                    result = run_workers(&deploy, workers) => result.context("worker exited"),
+                }
+            } else {
+                println!("worker running");
+                run_workers(&deploy, workers).await
+            }
         }
         Role::All => {
             let server = yg_api::serve_with_metrics(
@@ -1094,12 +1109,18 @@ fn server_config(deploy: &deploy_config::DeployConfig) -> anyhow::Result<yg_api:
     })
 }
 
-/// Build the worker pair. Workers need the control plane, the git
-/// cache, and object storage (Shards land there) — no bootstrap token.
+/// Build the worker pair and retain a control-plane handle for periodic
+/// metric refreshes. Workers need the control plane, the git
+/// cache, and object storage (Shards land there). A bootstrap token is only
+/// consumed by the optional authenticated metrics listener at composition.
 async fn workers(
     deploy: &deploy_config::DeployConfig,
     metrics: &yg_api::Metrics,
-) -> anyhow::Result<(yg_sync::SyncWorker, yg_index::IndexWorker)> {
+) -> anyhow::Result<(
+    yg_sync::SyncWorker,
+    yg_index::IndexWorker,
+    yg_control::ControlPlane,
+)> {
     let control = yg_control::ControlPlane::connect_and_migrate_with_metrics(
         &deploy.database_url,
         metrics.control(),
@@ -1118,7 +1139,8 @@ async fn workers(
             &deploy.git_cache,
             metrics.sync_worker(),
         ),
-        yg_index::IndexWorker::new(control, store, &deploy.git_cache),
+        yg_index::IndexWorker::new(control.clone(), store, &deploy.git_cache),
+        control,
     ))
 }
 
@@ -1127,7 +1149,11 @@ async fn workers(
 /// the other queue. An error from either side ends both.
 async fn run_workers(
     deploy: &deploy_config::DeployConfig,
-    (sync, index): (yg_sync::SyncWorker, yg_index::IndexWorker),
+    (sync, index, control): (
+        yg_sync::SyncWorker,
+        yg_index::IndexWorker,
+        yg_control::ControlPlane,
+    ),
 ) -> anyhow::Result<()> {
     // Converge after a deploy that bumped the Shard schema: the read
     // path refuses artifacts from older schema versions, so every
@@ -1160,6 +1186,7 @@ async fn run_workers(
         drain_queue(|| sync.poll_once(&poll)),
         gc_loop(
             &index,
+            &control,
             deploy.gc_grace,
             deploy.job_retention,
             deploy.gc_interval
@@ -1193,15 +1220,23 @@ const POLL_JITTER_FRACTION: f64 = 0.2;
 /// the sweep runs every `interval`, reclaiming whatever has aged past
 /// `grace` and removing terminal job rows older than `job_retention`.
 /// A sweep that fails (a control-plane or object-storage blip) is
-/// logged and retried next interval rather than ending the process —
-/// GC is best-effort.
+/// logged and retried next interval rather than ending the process. The
+/// queue-depth gauge refresh shares this cadence so scrape frequency never
+/// drives database work. Both maintenance activities are best-effort.
 async fn gc_loop(
     index: &yg_index::IndexWorker,
+    control: &yg_control::ControlPlane,
     grace: std::time::Duration,
     job_retention: std::time::Duration,
     interval: std::time::Duration,
 ) -> anyhow::Result<()> {
     loop {
+        if let Err(e) = control.refresh_job_queue_depths().await {
+            tracing::warn!(
+                error = format!("{e:#}"),
+                "job queue depth refresh failed; retaining stale gauges until next GC interval"
+            );
+        }
         if let Err(e) = index.gc_once(grace).await {
             tracing::warn!(
                 error = format!("{e:#}"),

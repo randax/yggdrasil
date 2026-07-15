@@ -6,7 +6,7 @@ use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
-use prometheus_client::metrics::histogram::{Histogram, exponential_buckets};
+use prometheus_client::metrics::histogram::Histogram;
 use prometheus_client::registry::Registry;
 
 use crate::JobKind;
@@ -46,8 +46,6 @@ pub enum JobOutcome {
 }
 
 impl JobOutcome {
-    const ALL: [Self; 3] = [Self::Success, Self::Failure, Self::Discarded];
-
     const fn as_str(self) -> &'static str {
         match self {
             Self::Success => "success",
@@ -96,25 +94,12 @@ impl Metrics {
 
     /// Construct collectors without registering them for exposition.
     pub fn unregistered() -> Self {
-        let metrics = Self {
+        Self {
             queue_depth: Family::default(),
-            claim_latency: Family::new_with_constructor(new_histogram),
+            claim_latency: Family::new_with_constructor(new_claim_latency_histogram),
             outcomes: Family::default(),
-            durations: Family::new_with_constructor(new_histogram),
-        };
-        for kind in JobKind::ALL {
-            let kind_labels = KindLabels::from(kind);
-            let _ = metrics.queue_depth.get_or_create(&kind_labels);
-            let _ = metrics.claim_latency.get_or_create(&kind_labels);
-            let _ = metrics.durations.get_or_create(&kind_labels);
-            for outcome in JobOutcome::ALL {
-                let _ = metrics.outcomes.get_or_create(&OutcomeLabels {
-                    kind: kind.as_str(),
-                    outcome: outcome.as_str(),
-                });
-            }
+            durations: Family::new_with_constructor(new_job_duration_histogram),
         }
-        metrics
     }
 
     pub(crate) fn set_queue_depth(&self, kind: JobKind, depth: u64) {
@@ -149,8 +134,23 @@ impl Metrics {
     }
 }
 
-fn new_histogram() -> Histogram {
-    Histogram::new(exponential_buckets(0.005, 2.0, 24))
+// Claim latency is expected to range from milliseconds under a quiet queue to
+// minutes under contention. Job execution can legitimately take much longer,
+// so its ladder extends to one hour. Explicit ladders keep both collectors
+// readable and bounded while preserving useful resolution in their ranges.
+const CLAIM_LATENCY_BUCKETS: [f64; 15] = [
+    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0,
+];
+const JOB_DURATION_BUCKETS: [f64; 15] = [
+    0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1_200.0, 1_800.0, 3_600.0,
+];
+
+fn new_claim_latency_histogram() -> Histogram {
+    Histogram::new(CLAIM_LATENCY_BUCKETS)
+}
+
+fn new_job_duration_histogram() -> Histogram {
+    Histogram::new(JOB_DURATION_BUCKETS)
 }
 
 /// An in-flight job duration observation.
@@ -189,6 +189,28 @@ mod tests {
             body.contains("yggdrasil_job_outcomes_total{kind=\"index\",outcome=\"success\"} 1")
         );
         assert!(body.contains("yggdrasil_job_claim_latency_seconds_count{kind=\"fetch\"} 1"));
+    }
+
+    #[test]
+    fn registered_collectors_do_not_publish_unobserved_series() {
+        let mut registry = Registry::default();
+        let _metrics = Metrics::registered(&mut registry);
+
+        let mut body = String::new();
+        encode(&mut body, &registry).unwrap();
+
+        assert!(!body.contains("yggdrasil_job_queue_depth{"));
+        assert!(!body.contains("yggdrasil_job_claim_latency_seconds_bucket{"));
+        assert!(!body.contains("yggdrasil_job_outcomes_total{"));
+        assert!(!body.contains("yggdrasil_job_duration_seconds_bucket{"));
+    }
+
+    #[test]
+    fn histogram_ladders_match_each_signal_range() {
+        assert_eq!(CLAIM_LATENCY_BUCKETS.last(), Some(&300.0));
+        assert_eq!(JOB_DURATION_BUCKETS.last(), Some(&3_600.0));
+        assert_eq!(CLAIM_LATENCY_BUCKETS.len(), 15);
+        assert_eq!(JOB_DURATION_BUCKETS.len(), 15);
     }
 
     #[test]

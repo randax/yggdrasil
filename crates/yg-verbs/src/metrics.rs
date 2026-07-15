@@ -11,8 +11,10 @@ use prometheus_client::registry::Registry;
 use crate::Verb;
 
 const REQUEST_DURATION: &str = "yggdrasil_verb_request_duration_seconds";
-const HISTOGRAM_BUCKETS: [f64; 11] = [
-    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+// Sub-millisecond reads are common, while the upper buckets retain visibility
+// into unusually slow requests without making the family excessively large.
+const HISTOGRAM_BUCKETS: [f64; 14] = [
+    0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
 ];
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
