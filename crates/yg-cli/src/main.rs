@@ -1030,21 +1030,32 @@ async fn serve(role: Role) -> anyhow::Result<()> {
     // The one read of the deployment environment: every YG_* setting
     // resolves and validates here, before anything connects.
     let deploy = deploy_config::resolve(role, |var| std::env::var(var).ok()).into_config()?;
+    let metrics = yg_api::Metrics::new();
 
     match role {
         Role::Api => {
-            let server = yg_api::serve(server_config(&deploy)?).await?;
+            let server = yg_api::serve_with_metrics(
+                server_config(&deploy)?,
+                metrics,
+                metrics_access(&deploy),
+            )
+            .await?;
             println!("listening on http://{}", server.local_addr());
             server.wait().await
         }
         Role::Worker => {
-            let workers = workers(&deploy).await?;
+            let workers = workers(&deploy, &metrics).await?;
             println!("worker running");
             run_workers(&deploy, workers).await
         }
         Role::All => {
-            let server = yg_api::serve(server_config(&deploy)?).await?;
-            let workers = workers(&deploy).await?;
+            let server = yg_api::serve_with_metrics(
+                server_config(&deploy)?,
+                metrics.clone(),
+                metrics_access(&deploy),
+            )
+            .await?;
+            let workers = workers(&deploy, &metrics).await?;
             // Announce only once the whole process is up: scripts and
             // the e2e harness treat this line as the readiness signal,
             // and a worker-boot failure after it would read as a crash
@@ -1057,6 +1068,14 @@ async fn serve(role: Role) -> anyhow::Result<()> {
                 result = run_workers(&deploy, workers) => result.context("worker exited"),
             }
         }
+    }
+}
+
+fn metrics_access(deploy: &deploy_config::DeployConfig) -> yg_api::MetricsAccess {
+    if deploy.metrics_unauthenticated {
+        yg_api::MetricsAccess::Unauthenticated
+    } else {
+        yg_api::MetricsAccess::Admin
     }
 }
 
@@ -1079,8 +1098,13 @@ fn server_config(deploy: &deploy_config::DeployConfig) -> anyhow::Result<yg_api:
 /// cache, and object storage (Shards land there) — no bootstrap token.
 async fn workers(
     deploy: &deploy_config::DeployConfig,
+    metrics: &yg_api::Metrics,
 ) -> anyhow::Result<(yg_sync::SyncWorker, yg_index::IndexWorker)> {
-    let control = yg_control::ControlPlane::connect_and_migrate(&deploy.database_url).await?;
+    let control = yg_control::ControlPlane::connect_and_migrate_with_metrics(
+        &deploy.database_url,
+        metrics.control(),
+    )
+    .await?;
     let store = deploy.object_store.connect()?;
     // Fail at boot, not on every index job: connect() never touches the
     // network, so this probe is the first thing that would notice a
@@ -1089,7 +1113,11 @@ async fn workers(
         .await
         .context("object storage unreachable at worker boot")?;
     Ok((
-        yg_sync::SyncWorker::new(control.clone(), &deploy.git_cache),
+        yg_sync::SyncWorker::with_metrics(
+            control.clone(),
+            &deploy.git_cache,
+            metrics.sync_worker(),
+        ),
         yg_index::IndexWorker::new(control, store, &deploy.git_cache),
     ))
 }

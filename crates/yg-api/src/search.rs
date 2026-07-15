@@ -110,6 +110,7 @@ pub(crate) async fn verb_search(
     State(state): State<Arc<AppState>>,
     WireJson(req): WireJson<yg_verbs::SearchRequest>,
 ) -> Result<Response, ApiError> {
+    let _timer = state.engine.metrics().timer(yg_verbs::Verb::Search);
     let cursor = req
         .cursor
         .as_deref()

@@ -12,6 +12,7 @@ mod config;
 mod error;
 mod health;
 mod mcp;
+mod metrics;
 mod search;
 mod verbs;
 mod wire;
@@ -28,6 +29,7 @@ use yg_control::ControlPlane;
 
 pub use config::{ObjectStoreConfig, RunningServer, ServerConfig, probe_object_store};
 pub use health::UPTIME_HEADER;
+pub use metrics::Metrics;
 
 use error::ApiError;
 use verbs::ShardAccess;
@@ -37,6 +39,7 @@ pub(crate) struct AppState {
     store: Arc<dyn ObjectStore>,
     shards: Arc<yg_shard::ShardCache>,
     engine: yg_verbs::Engine<ShardAccess>,
+    metrics: Metrics,
     bootstrap_token: String,
     started: std::time::Instant,
 }
@@ -44,19 +47,48 @@ pub(crate) struct AppState {
 /// Boot the Index Server: connect to the control plane, verify object
 /// storage, and start serving.
 pub async fn serve(config: ServerConfig) -> anyhow::Result<RunningServer> {
-    let control = ControlPlane::connect_and_migrate(&config.database_url).await?;
+    serve_with_metrics(config, Metrics::new(), MetricsAccess::Admin).await
+}
+
+/// Whether Prometheus exposition participates in the Admin auth policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetricsAccess {
+    /// Require the bootstrap Admin bearer token.
+    Admin,
+    /// Expose without HTTP authentication for a network-restricted scraper.
+    Unauthenticated,
+}
+
+/// Boot the Index Server with collectors supplied by the process composition
+/// root, allowing an `all` role to expose worker and API observations together.
+pub async fn serve_with_metrics(
+    config: ServerConfig,
+    metrics: Metrics,
+    metrics_access: MetricsAccess,
+) -> anyhow::Result<RunningServer> {
+    let control =
+        ControlPlane::connect_and_migrate_with_metrics(&config.database_url, metrics.control())
+            .await?;
 
     let store = config.object_store.connect()?;
     probe_object_store(store.as_ref())
         .await
         .context("object storage unreachable at boot")?;
 
-    let shards = Arc::new(yg_shard::ShardCache::new(store.clone(), config.shard_cache));
+    let shards = Arc::new(yg_shard::ShardCache::with_metrics(
+        store.clone(),
+        config.shard_cache,
+        metrics.shard_cache(),
+    ));
     let state = Arc::new(AppState {
-        engine: yg_verbs::Engine::new(ShardAccess::new(control.clone(), shards.clone())),
+        engine: yg_verbs::Engine::with_metrics(
+            ShardAccess::new(control.clone(), shards.clone()),
+            metrics.verbs(),
+        ),
         control,
         shards,
         store,
+        metrics,
         bootstrap_token: config.bootstrap_token,
         started: std::time::Instant::now(),
     });
@@ -112,12 +144,22 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<RunningServer> {
     // fallback, so even nonexistent paths answer 401 to unauthenticated
     // callers. `/healthz` is added *after* the layer: its exemption is
     // structural, not a path comparison inside the middleware.
-    let app = Router::new()
+    let authenticated = Router::new()
         .nest("/v1", member_routes.nest("/admin", admin_routes))
         // Unknown paths leave in the same `{"error": …}` shape as every
         // other error, and — being registered before the auth layer —
         // still answer 401 to unauthenticated callers.
-        .fallback(async || ApiError::not_found("not found"))
+        .fallback(async || ApiError::not_found("not found"));
+    let authenticated = match metrics_access {
+        MetricsAccess::Admin => authenticated.merge(
+            Router::new()
+                .route("/metrics", get(metrics::metrics))
+                .method_not_allowed_fallback(wire::method_not_allowed)
+                .route_layer(middleware::from_fn(auth::require_admin)),
+        ),
+        MetricsAccess::Unauthenticated => authenticated,
+    };
+    let app = authenticated
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth::authenticate,
@@ -125,8 +167,16 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<RunningServer> {
         .route("/healthz", get(health::healthz))
         // For /healthz only: the /v1 routers carry their own (auth-
         // wrapped) method fallbacks, set before nesting.
-        .method_not_allowed_fallback(wire::method_not_allowed)
-        .with_state(state);
+        .method_not_allowed_fallback(wire::method_not_allowed);
+    let app = match metrics_access {
+        MetricsAccess::Admin => app,
+        MetricsAccess::Unauthenticated => app.merge(
+            Router::new()
+                .route("/metrics", get(metrics::metrics))
+                .method_not_allowed_fallback(wire::method_not_allowed),
+        ),
+    }
+    .with_state(state);
 
     let listener = TcpListener::bind(config.listen)
         .await

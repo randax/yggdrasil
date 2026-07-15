@@ -52,6 +52,7 @@ never connects — cannot report it:
 |---|---|---|
 | `YG_BOOTSTRAP_TOKEN` | — (required for api/all) | Bootstrap Admin bearer token |
 | `YG_LISTEN` | `127.0.0.1:7311` | Server bind address |
+| `YG_METRICS_UNAUTHENTICATED` | `false` | Expose `GET /metrics` without a bearer token for scraper convenience |
 | `YG_DATABASE_URL` | dev compose Postgres | Control-plane database |
 | `YG_S3_ENDPOINT` | `http://localhost:9000` | Object storage endpoint |
 | `YG_S3_BUCKET` | `yggdrasil` | Shard bucket |
@@ -110,6 +111,11 @@ cargo run -p yg-cli -- admin status   # synced commit, then Shard revision + cou
 anonymous callers); every `/v1` route requires
 `Authorization: Bearer $YG_TOKEN`. Member tokens reach the Verbs, MCP, and
 the read-only `/v1/status`; `/v1/admin/*` requires the Admin token.
+`GET /metrics` serves Prometheus text exposition and requires the Admin token
+by default; set `YG_METRICS_UNAUTHENTICATED=true` only when the scrape endpoint
+is protected by the deployment network boundary. Metrics are process-local:
+`serve --role=all` exposes both API and worker observations; in a split-role
+deployment the API endpoint cannot aggregate the separate worker process.
 
 ## Checks
 

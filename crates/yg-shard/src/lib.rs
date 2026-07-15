@@ -5,6 +5,10 @@
 //! storage under `shards/<repo-id>/<revision>/` and never mutated
 //! afterwards.
 
+pub mod metrics;
+
+pub use metrics::Metrics;
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -732,6 +736,7 @@ pub struct ShardCache {
     manifests: std::sync::Mutex<std::collections::HashMap<String, Arc<Manifest>>>,
     /// Checksums whose on-disk file this process has already verified.
     verified: std::sync::Mutex<std::collections::HashSet<String>>,
+    metrics: Metrics,
 }
 
 /// A revision whose manifest is not in object storage — distinct from
@@ -779,11 +784,21 @@ impl std::error::Error for SchemaOutdated {}
 
 impl ShardCache {
     pub fn new(store: Arc<dyn ObjectStore>, dir: impl Into<std::path::PathBuf>) -> Self {
+        Self::with_metrics(store, dir, Metrics::unregistered())
+    }
+
+    /// Build a cache using the supplied hit, miss, and eviction collectors.
+    pub fn with_metrics(
+        store: Arc<dyn ObjectStore>,
+        dir: impl Into<std::path::PathBuf>,
+        metrics: Metrics,
+    ) -> Self {
         Self {
             store,
             dir: dir.into(),
             manifests: Default::default(),
             verified: Default::default(),
+            metrics,
         }
     }
 
@@ -806,6 +821,7 @@ impl ShardCache {
         // The lock guards only the set lookup/insert — never I/O — so a
         // cold fetch of one revision cannot stall queries for others.
         if self.is_verified(&sha) {
+            self.metrics.hit(metrics::Artifact::Graph);
             return Ok(path);
         }
         self.fetch_verify_into(
@@ -813,7 +829,7 @@ impl ShardCache {
             &sha,
             &path,
             graph_segment_key(repo_id, revision),
-            "graph segment",
+            metrics::Artifact::Graph,
         )
         .await?;
         self.mark_verified(sha);
@@ -853,11 +869,24 @@ impl ShardCache {
         sha: &str,
         local: &std::path::Path,
         object_key: String,
-        what: &str,
+        artifact: metrics::Artifact,
     ) -> anyhow::Result<()> {
+        let what = artifact.description();
         let on_disk = match tokio::fs::read(local).await {
-            Ok(bytes) => digest_off_thread(bytes).await?.1 == sha,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Ok(bytes) => {
+                if digest_off_thread(bytes).await?.1 == sha {
+                    self.metrics.hit(artifact);
+                    true
+                } else {
+                    self.metrics.miss(artifact);
+                    self.metrics.eviction(artifact);
+                    false
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.metrics.miss(artifact);
+                false
+            }
             Err(e) => return Err(e).with_context(|| format!("reading the cached {what}")),
         };
         if on_disk {
@@ -940,6 +969,7 @@ impl ShardCache {
 
         // Warm: this process already verified the archive and unpacked it.
         if self.is_verified(&sha) && tokio::fs::try_exists(&unpacked).await.unwrap_or(false) {
+            self.metrics.hit(metrics::Artifact::Fts);
             return Ok(unpacked);
         }
 
@@ -954,7 +984,7 @@ impl ShardCache {
             &sha,
             &archive_path,
             fts_segment_key(repo_id, revision),
-            "fts segment",
+            metrics::Artifact::Fts,
         )
         .await?;
 
@@ -1028,8 +1058,14 @@ impl ShardCache {
             .get(&key)
             .cloned();
         let manifest = match cached {
-            Some(manifest) => manifest,
-            None => self.fetch_and_cache_manifest(&key, revision).await?,
+            Some(manifest) => {
+                self.metrics.hit(metrics::Artifact::Manifest);
+                manifest
+            }
+            None => {
+                self.metrics.miss(metrics::Artifact::Manifest);
+                self.fetch_and_cache_manifest(&key, revision).await?
+            }
         };
         // Gate after the cache lookup so cache hits are screened too:
         // this binary cannot read another schema version's segment, and

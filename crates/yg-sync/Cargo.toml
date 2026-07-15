@@ -10,6 +10,7 @@ rust-version.workspace = true
 [dependencies]
 anyhow = "1.0.102"
 base64 = "0.22.1"
+prometheus-client.workspace = true
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json"] }
 serde = { version = "1.0.228", features = ["derive"] }
 thiserror = "2"

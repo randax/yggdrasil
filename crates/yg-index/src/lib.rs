@@ -148,6 +148,7 @@ impl IndexWorker {
         let Some(job) = self.control.claim_due_index(INDEX_LEASE).await? else {
             return Ok(false);
         };
+        let timer = self.control.start_job(yg_control::JobKind::Index);
         // A cold self-healing clone plus a long parse outlives the base
         // lease; the heartbeat keeps the job ours while the work is alive.
         let renew = async || self.control.renew_index(&job, INDEX_LEASE).await;
@@ -170,16 +171,20 @@ impl IndexWorker {
                     .await?;
                 if applied {
                     tracing::info!(slug = %job.slug, revision = %shard.revision, "indexed");
+                    timer.finish(yg_control::JobOutcome::Success);
                 } else {
                     tracing::warn!(slug = %job.slug, "lease lapsed mid-index; result discarded");
+                    timer.finish(yg_control::JobOutcome::Discarded);
                 }
             }
             Err(e) => {
                 let error = format!("{e:#}");
                 if self.control.fail_index(&job, &error).await? {
                     tracing::warn!(slug = %job.slug, attempt = job.attempts + 1, error, "index failed");
+                    timer.finish(yg_control::JobOutcome::Failure);
                 } else {
                     tracing::warn!(slug = %job.slug, "lease lapsed mid-index; failure discarded");
+                    timer.finish(yg_control::JobOutcome::Discarded);
                 }
             }
         }

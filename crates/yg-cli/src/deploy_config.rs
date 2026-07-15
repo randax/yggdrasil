@@ -33,6 +33,8 @@ pub struct DeployConfig {
     pub database_url: String,
     /// Required for roles that serve the API (`api`, `all`).
     pub bootstrap_token: Option<String>,
+    /// Whether `/metrics` bypasses Admin authentication for scrapers.
+    pub metrics_unauthenticated: bool,
     pub shard_cache: std::path::PathBuf,
     pub git_cache: std::path::PathBuf,
     pub object_store: ObjectStoreConfig,
@@ -67,20 +69,49 @@ pub struct Setting {
 
 /// Everything wrong with the environment, reported together so an
 /// Admin fixes one deploy, not one variable per boot attempt.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug)]
 pub enum ConfigError {
-    #[error(
-        "{var}: {value:?} does not parse as IP:port \
-         (hostnames are not resolved), e.g. 127.0.0.1:7311"
-    )]
-    InvalidListenAddr { var: &'static str, value: String },
-    #[error("{var}: {value:?} must be a whole number of seconds, 1..={MAX_DURATION_SECS}")]
-    InvalidDurationSecs { var: &'static str, value: String },
-    #[error(
-        "{var} must be set to a non-empty token; the server refuses to boot without an Admin token"
-    )]
-    MissingBootstrapToken { var: &'static str },
+    InvalidListenAddr {
+        var: &'static str,
+        value: String,
+    },
+    /// An invalid scalar setting. The variant name predates boolean settings;
+    /// its rendered message is selected by `var` so callers retain the stable
+    /// error vocabulary without weakening validation.
+    InvalidDurationSecs {
+        var: &'static str,
+        value: String,
+    },
+    MissingBootstrapToken {
+        var: &'static str,
+    },
 }
+
+impl std::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidListenAddr { var, value } => write!(
+                f,
+                "{var}: {value:?} does not parse as IP:port (hostnames are not resolved), \
+                 e.g. 127.0.0.1:7311"
+            ),
+            Self::InvalidDurationSecs { var, value } if *var == "YG_METRICS_UNAUTHENTICATED" => {
+                write!(f, "{var}: {value:?} must be `true` or `false`")
+            }
+            Self::InvalidDurationSecs { var, value } => write!(
+                f,
+                "{var}: {value:?} must be a whole number of seconds, 1..={MAX_DURATION_SECS}"
+            ),
+            Self::MissingBootstrapToken { var } => write!(
+                f,
+                "{var} must be set to a non-empty token; the server refuses to boot without an \
+                 Admin token"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ConfigError {}
 
 /// The outcome of resolving the environment: the settings report (for
 /// `config-check`), every validation error, and — when there are no
@@ -143,6 +174,7 @@ pub fn resolve(role: Role, lookup: impl Fn(&str) -> Option<String>) -> Resolutio
     let config = DeployConfig {
         listen,
         bootstrap_token,
+        metrics_unauthenticated: r.boolean(api, "YG_METRICS_UNAUTHENTICATED", false),
         database_url: r.database_url("YG_DATABASE_URL", yg_control::DEFAULT_DATABASE_URL),
         shard_cache: if api {
             r.string("YG_SHARD_CACHE", "./data/shard-cache")
@@ -213,6 +245,27 @@ impl Resolver<'_> {
                 self.record(var, shown(default), Source::Default);
                 default.to_string()
             }
+        }
+    }
+
+    fn boolean(&mut self, enabled: bool, var: &'static str, default: bool) -> bool {
+        if !enabled {
+            return default;
+        }
+        match self.raw(var) {
+            Some(value) => {
+                self.record(var, value.clone(), Source::Env);
+                match value.as_str() {
+                    "true" => true,
+                    "false" => false,
+                    _ => {
+                        self.errors
+                            .push(ConfigError::InvalidDurationSecs { var, value });
+                        default
+                    }
+                }
+            }
+            None => default,
         }
     }
 
