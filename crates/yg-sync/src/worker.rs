@@ -83,7 +83,13 @@ impl SyncWorker {
         &self,
         shutdown: Option<Shutdown>,
     ) -> anyhow::Result<bool> {
-        let Some(job) = self.control.claim_due_fetch(FETCH_LEASE).await? else {
+        let Some(job) = claim_due_fetch_with_optional_shutdown(
+            shutdown.as_ref(),
+            self.control.claim_due_fetch(FETCH_LEASE),
+            async |job| self.control.release_fetch(job).await,
+        )
+        .await?
+        else {
             return Ok(false);
         };
         let clone_url = join_clone_url(&job.base_url, &job.slug);
@@ -328,6 +334,22 @@ impl SyncWorker {
     }
 }
 
+async fn claim_due_fetch_with_optional_shutdown<T>(
+    shutdown: Option<&Shutdown>,
+    claim: impl Future<Output = anyhow::Result<Option<T>>>,
+    release: impl AsyncFnOnce(&T) -> anyhow::Result<bool>,
+) -> anyhow::Result<Option<T>> {
+    let Some(job) = claim.await? else {
+        return Ok(None);
+    };
+    if shutdown.is_some_and(|shutdown| shutdown.request().is_some()) {
+        let released = release(&job).await?;
+        tracing::info!(released, "released fresh fetch claim for shutdown");
+        return Ok(None);
+    }
+    Ok(Some(job))
+}
+
 /// How the poll loop is paced: the default interval between a repo's
 /// default-branch head checks, and the jitter spread (a fraction of the
 /// interval) that keeps a forge's repos from polling in lockstep. A
@@ -354,4 +376,38 @@ fn in_flight_fetch_repoll(due: &yg_control::DuePoll, cfg: &PollConfig) -> Durati
     repo_interval
         .min(FETCH_IN_FLIGHT_REPOLL_MAX)
         .max(Duration::from_secs(1))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use tokio::time::Instant;
+
+    use super::claim_due_fetch_with_optional_shutdown;
+    use crate::{ShutdownCause, shutdown_channel};
+
+    #[tokio::test]
+    async fn fetch_claim_completing_after_shutdown_is_released_before_work_starts() {
+        let (trigger, shutdown) = shutdown_channel();
+        let released_job = AtomicUsize::new(0);
+        let claim = async {
+            assert!(trigger.request(
+                Instant::now() + Duration::from_secs(30),
+                ShutdownCause::Signal,
+            ));
+            Ok(Some(41_usize))
+        };
+
+        let claimed = claim_due_fetch_with_optional_shutdown(Some(&shutdown), claim, async |job| {
+            released_job.store(*job, Ordering::SeqCst);
+            Ok(true)
+        })
+        .await
+        .expect("post-claim shutdown check");
+
+        assert!(claimed.is_none(), "shutdown claims must not start work");
+        assert_eq!(released_job.load(Ordering::SeqCst), 41);
+    }
 }
