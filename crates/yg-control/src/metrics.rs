@@ -113,13 +113,15 @@ impl Metrics {
             .observe(seconds);
     }
 
-    /// Start timing a claimed job. Dropping the timer does not emit a
-    /// partial observation; callers finish it with a typed outcome.
+    /// Start timing a claimed job. Callers finish it with a typed
+    /// outcome or disarm it; a timer dropped by an early error return
+    /// records a failure.
     pub fn start_job(&self, kind: JobKind) -> JobTimer {
         JobTimer {
             metrics: self.clone(),
             kind,
             started: Instant::now(),
+            recorded: false,
         }
     }
 
@@ -158,13 +160,36 @@ pub struct JobTimer {
     metrics: Metrics,
     kind: JobKind,
     started: Instant,
+    recorded: bool,
 }
 
 impl JobTimer {
     /// Record the duration and terminal outcome exactly once.
-    pub fn finish(self, outcome: JobOutcome) {
+    pub fn finish(mut self, outcome: JobOutcome) {
+        self.recorded = true;
         self.metrics
             .observe_job(self.kind, outcome, self.started.elapsed().as_secs_f64());
+    }
+
+    /// Consume the timer without recording anything: the claim was
+    /// released untouched, so there is no job attempt to report.
+    pub fn disarm(mut self) {
+        self.recorded = true;
+    }
+}
+
+/// A timer dropped by an early error return still reports the attempt:
+/// an unsettled escape from the run path is a failure, not a gap in the
+/// series.
+impl Drop for JobTimer {
+    fn drop(&mut self) {
+        if !self.recorded {
+            self.metrics.observe_job(
+                self.kind,
+                JobOutcome::Failure,
+                self.started.elapsed().as_secs_f64(),
+            );
+        }
     }
 }
 

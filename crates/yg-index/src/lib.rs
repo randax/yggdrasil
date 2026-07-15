@@ -255,7 +255,7 @@ impl IndexWorker {
             ShutdownClaim::Released { timer } => {
                 // The job was released untouched for a healthy retry: no
                 // work happened, so no outcome is recorded.
-                drop(timer);
+                timer.disarm();
                 return Ok(true);
             }
         };

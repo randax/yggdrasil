@@ -20,8 +20,6 @@ pub(crate) enum Artifact {
 }
 
 impl Artifact {
-    const ALL: [Self; 3] = [Self::Manifest, Self::Graph, Self::Fts];
-
     const fn label(self) -> &'static str {
         match self {
             Self::Manifest => "manifest",
@@ -76,18 +74,11 @@ impl Metrics {
 
     /// Create collectors without registering them for exposition.
     pub fn unregistered() -> Self {
-        let metrics = Self {
+        Self {
             hits: Family::default(),
             misses: Family::default(),
             evictions: Family::default(),
-        };
-        for artifact in Artifact::ALL {
-            let labels = ArtifactLabels { artifact };
-            let _ = metrics.hits.get_or_create(&labels);
-            let _ = metrics.misses.get_or_create(&labels);
-            let _ = metrics.evictions.get_or_create(&labels);
         }
-        metrics
     }
 
     pub(crate) fn hit(&self, artifact: Artifact) {

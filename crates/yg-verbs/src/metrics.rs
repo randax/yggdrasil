@@ -63,13 +63,9 @@ impl Metrics {
 
     /// Create collectors without registering them for exposition.
     pub fn unregistered() -> Self {
-        let metrics = Self {
+        Self {
             request_duration: Family::new_with_constructor(new_histogram as fn() -> Histogram),
-        };
-        for verb in Verb::ALL {
-            let _ = metrics.request_duration.get_or_create(&VerbLabels { verb });
         }
-        metrics
     }
 }
 
