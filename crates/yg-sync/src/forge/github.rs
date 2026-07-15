@@ -191,7 +191,22 @@ struct Pagination {
 
 impl Pagination {
     fn begin_page(&mut self, url: &str) -> bool {
-        if self.pages >= GITHUB_ORG_PAGE_LIMIT || !self.visited.insert(url.to_string()) {
+        if self.pages >= GITHUB_ORG_PAGE_LIMIT {
+            tracing::warn!(
+                pages = self.pages,
+                url,
+                "org listing truncated at the pagination cap; later repositories \
+                 were not discovered"
+            );
+            return false;
+        }
+        if !self.visited.insert(url.to_string()) {
+            tracing::warn!(
+                pages = self.pages,
+                url,
+                "org listing terminated on a repeated next-link; the listing may \
+                 be incomplete"
+            );
             return false;
         }
         self.pages += 1;
