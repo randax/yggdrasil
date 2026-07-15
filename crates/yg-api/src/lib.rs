@@ -12,6 +12,7 @@ mod config;
 mod error;
 mod health;
 mod mcp;
+mod metrics;
 mod search;
 mod verbs;
 mod wire;
@@ -29,6 +30,7 @@ use yg_control::ControlPlane;
 
 pub use config::{ObjectStoreConfig, RunningServer, ServerConfig, probe_object_store};
 pub use health::UPTIME_HEADER;
+pub use metrics::Metrics;
 
 use error::ApiError;
 use verbs::ShardAccess;
@@ -37,25 +39,60 @@ pub(crate) struct AppState {
     control: ControlPlane,
     store: Arc<dyn ObjectStore>,
     engine: yg_verbs::Engine<ShardAccess>,
+    metrics: Metrics,
     bootstrap_token: String,
     started: std::time::Instant,
+}
+
+pub(crate) struct MetricsServerState {
+    metrics: Metrics,
+    bootstrap_token: String,
 }
 
 /// Boot the Index Server: connect to the control plane, verify object
 /// storage, and start serving.
 pub async fn serve(config: ServerConfig) -> anyhow::Result<RunningServer> {
-    let control = ControlPlane::connect_and_migrate(&config.database_url).await?;
+    serve_with_metrics(config, Metrics::new(), MetricsAccess::Admin).await
+}
+
+/// Whether Prometheus exposition participates in the Admin auth policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetricsAccess {
+    /// Require the bootstrap Admin bearer token.
+    Admin,
+    /// Expose without HTTP authentication for a network-restricted scraper.
+    Unauthenticated,
+}
+
+/// Boot the Index Server with collectors supplied by the process composition
+/// root, allowing an `all` role to expose worker and API observations together.
+pub async fn serve_with_metrics(
+    config: ServerConfig,
+    metrics: Metrics,
+    metrics_access: MetricsAccess,
+) -> anyhow::Result<RunningServer> {
+    let control =
+        ControlPlane::connect_and_migrate_with_metrics(&config.database_url, metrics.control())
+            .await?;
 
     let store = config.object_store.connect()?;
     probe_object_store(store.as_ref())
         .await
         .context("object storage unreachable at boot")?;
 
-    let shards = Arc::new(yg_shard::ShardCache::new(store.clone(), config.shard_cache));
+    let shards = Arc::new(yg_shard::ShardCache::with_metrics(
+        store.clone(),
+        config.shard_cache,
+        metrics.shard_cache(),
+    ));
     let state = Arc::new(AppState {
-        engine: yg_verbs::Engine::new(ShardAccess::new(control.clone(), shards.clone())),
+        engine: yg_verbs::Engine::with_metrics(
+            ShardAccess::new(control.clone(), shards.clone()),
+            metrics.verbs(),
+        ),
         control,
         store,
+        metrics,
         bootstrap_token: config.bootstrap_token,
         started: std::time::Instant::now(),
     });
@@ -111,12 +148,22 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<RunningServer> {
     // fallback, so even nonexistent paths answer 401 to unauthenticated
     // callers. `/healthz` is added *after* the layer: its exemption is
     // structural, not a path comparison inside the middleware.
-    let app = Router::new()
+    let authenticated = Router::new()
         .nest("/v1", member_routes.nest("/admin", admin_routes))
         // Unknown paths leave in the same `{"error": …}` shape as every
         // other error, and — being registered before the auth layer —
         // still answer 401 to unauthenticated callers.
-        .fallback(async || ApiError::not_found("not found"))
+        .fallback(async || ApiError::not_found("not found"));
+    let authenticated = match metrics_access {
+        MetricsAccess::Admin => authenticated.merge(
+            Router::new()
+                .route("/metrics", get(metrics::metrics))
+                .method_not_allowed_fallback(wire::method_not_allowed)
+                .route_layer(middleware::from_fn(auth::require_admin)),
+        ),
+        MetricsAccess::Unauthenticated => authenticated,
+    };
+    let app = authenticated
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth::authenticate,
@@ -124,8 +171,16 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<RunningServer> {
         .route("/healthz", get(health::healthz))
         // For /healthz only: the /v1 routers carry their own (auth-
         // wrapped) method fallbacks, set before nesting.
-        .method_not_allowed_fallback(wire::method_not_allowed)
-        .with_state(state);
+        .method_not_allowed_fallback(wire::method_not_allowed);
+    let app = match metrics_access {
+        MetricsAccess::Admin => app,
+        MetricsAccess::Unauthenticated => app.merge(
+            Router::new()
+                .route("/metrics", get(metrics::metrics))
+                .method_not_allowed_fallback(wire::method_not_allowed),
+        ),
+    }
+    .with_state(state);
 
     let listener = TcpListener::bind(config.listen)
         .await
@@ -144,6 +199,59 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<RunningServer> {
         result
     });
 
+    Ok(RunningServer {
+        local_addr,
+        handle,
+        shutdown: Some(shutdown),
+    })
+}
+
+/// Bind a worker-only Prometheus listener with the same access-policy choice
+/// as the API server. This server owns no database or application routes: a
+/// scrape only encodes the supplied process-local registry.
+pub async fn serve_metrics(
+    listen: std::net::SocketAddr,
+    metrics: Metrics,
+    metrics_access: MetricsAccess,
+    bootstrap_token: Option<String>,
+) -> anyhow::Result<RunningServer> {
+    let bootstrap_token = match metrics_access {
+        MetricsAccess::Admin => bootstrap_token
+            .context("a bootstrap Admin token is required for an authenticated metrics listener")?,
+        MetricsAccess::Unauthenticated => String::new(),
+    };
+    let state = Arc::new(MetricsServerState {
+        metrics,
+        bootstrap_token,
+    });
+    let app = Router::new()
+        .route("/metrics", get(metrics::standalone_metrics))
+        .method_not_allowed_fallback(wire::method_not_allowed);
+    let app = match metrics_access {
+        MetricsAccess::Admin => app.route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::authenticate_metrics_admin,
+        )),
+        MetricsAccess::Unauthenticated => app,
+    }
+    .with_state(state);
+
+    let listener = TcpListener::bind(listen)
+        .await
+        .with_context(|| format!("binding worker metrics listener {listen}"))?;
+    let local_addr = listener.local_addr()?;
+    let (shutdown, shutdown_requested) = oneshot::channel::<config::ServerShutdown>();
+    let handle = tokio::spawn(async move {
+        let result = axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_requested.await;
+            })
+            .await;
+        if let Err(error) = &result {
+            tracing::error!("worker metrics server exited: {error}");
+        }
+        result
+    });
     Ok(RunningServer {
         local_addr,
         handle,

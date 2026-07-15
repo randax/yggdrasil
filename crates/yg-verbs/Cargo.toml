@@ -13,6 +13,7 @@ base64 = "0.22.1"
 # Parsing the `history` Verb's RFC3339 `since` and rendering commit dates.
 # No clock needed — disable the default `now`/`clock` features.
 chrono = { version = "0.4.45", default-features = false, features = ["std"] }
+prometheus-client.workspace = true
 rusqlite = { version = "0.39", features = ["bundled"] }
 schemars = { version = "1.0.4", features = ["derive"] }
 serde = { version = "1.0.228", features = ["derive"] }

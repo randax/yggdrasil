@@ -6,9 +6,15 @@ use std::sync::Arc;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use yg_sync::RepoLocator;
 use yg_sync::forge::Forge;
+use yg_verbs::admin::{
+    AddForgeResponse, AddRepoResponse, AddRuleResponse, AdminRepoStatus, AdminStatusResponse,
+    DiscoverForgeResponse, DiscoveryState, ForgeBaseUrl, ForgeKind, IssueTokenResponse, JobState,
+    JobStatus, MemberName, OrgName, RepoSlug, RepoVisibility, RevokeTokenResponse, RuleAction,
+    RuleResponse, RulesResponse, ShardStatus, TokenId, VisibilityCounts,
+};
 
 use crate::AppState;
 use crate::error::ApiError;
@@ -23,28 +29,12 @@ pub(crate) struct AddRepoRequest {
     poll_interval: Option<i32>,
 }
 
-#[derive(Serialize)]
-struct AddRepoResponse {
-    slug: String,
-    created: bool,
-    /// False when a fetch was already pending — nothing new was queued.
-    fetch_queued: bool,
-}
-
 #[derive(Deserialize)]
 pub(crate) struct AddForgeRequest {
     kind: String,
     org: String,
     base_url: Option<String>,
     token_env: Option<String>,
-}
-
-#[derive(Serialize)]
-struct AddForgeResponse {
-    kind: String,
-    org: String,
-    base_url: String,
-    created: bool,
 }
 
 pub(crate) async fn admin_forge_add(
@@ -68,6 +58,7 @@ pub(crate) async fn admin_forge_add(
             api_root: forge.default_api_root(&base_url).as_deref(),
         })
         .await?;
+    let kind = stored_forge_kind(outcome.forge_kind.as_str())?;
     Ok((
         if outcome.created {
             StatusCode::CREATED
@@ -75,9 +66,9 @@ pub(crate) async fn admin_forge_add(
             StatusCode::OK
         },
         Wire(AddForgeResponse {
-            kind: forge.kind().to_string(),
-            org,
-            base_url,
+            kind,
+            org: OrgName::new(org),
+            base_url: ForgeBaseUrl::new(base_url),
             created: outcome.created,
         }),
     )
@@ -136,14 +127,6 @@ pub(crate) struct DiscoverForgeRequest {
     base_url: Option<String>,
 }
 
-#[derive(Serialize)]
-struct DiscoverForgeResponse {
-    kind: String,
-    org: String,
-    base_url: String,
-    queued: bool,
-}
-
 pub(crate) async fn admin_forge_discover(
     State(state): State<Arc<AppState>>,
     WireJson(req): WireJson<DiscoverForgeRequest>,
@@ -152,18 +135,24 @@ pub(crate) async fn admin_forge_discover(
     let kind = forge.kind();
     let org = github_org_slug(&req.org).map_err(ApiError::bad_request)?;
     let base_url = github_base_url(req.base_url.as_deref()).map_err(ApiError::bad_request)?;
-    if !state.control.request_discovery(&base_url, &org).await? {
+    let Some(stored_kind) = state.control.request_discovery(&base_url, &org).await? else {
         return Err(ApiError::not_found(format!(
             "{kind} org {org} is not connected; run yg admin forge add first"
         )));
-    }
+    };
     Ok(Wire(DiscoverForgeResponse {
-        kind: kind.to_string(),
-        org,
-        base_url,
+        kind: stored_forge_kind(stored_kind.as_str())?,
+        org: OrgName::new(org),
+        base_url: ForgeBaseUrl::new(base_url),
         queued: true,
     })
     .into_response())
+}
+
+fn stored_forge_kind(kind: &str) -> Result<ForgeKind, ApiError> {
+    ForgeKind::parse(kind).ok_or_else(|| {
+        ApiError::internal(anyhow::anyhow!("unsupported stored forge kind {kind:?}"))
+    })
 }
 
 #[derive(Deserialize)]
@@ -174,24 +163,13 @@ pub(crate) struct AddRuleRequest {
     private: Option<bool>,
 }
 
-#[derive(Serialize)]
-struct AddRuleResponse {
-    forge: String,
-    pattern: String,
-    action: String,
-    applies_to_private: bool,
-    created: bool,
-    repos_reconsidered: u64,
-    fetches_queued: u64,
-}
-
 pub(crate) async fn admin_rules_add(
     State(state): State<Arc<AppState>>,
     WireJson(req): WireJson<AddRuleRequest>,
 ) -> Result<Response, ApiError> {
-    let action = match req.action.as_str() {
-        "include" => yg_control::RuleAction::Include,
-        "exclude" => yg_control::RuleAction::Exclude,
+    let (action, wire_action) = match req.action.as_str() {
+        "include" => (yg_control::RuleAction::Include, RuleAction::Include),
+        "exclude" => (yg_control::RuleAction::Exclude, RuleAction::Exclude),
         other => {
             return Err(ApiError::bad_request(format!(
                 "rule action must be include or exclude, got {other:?}"
@@ -228,9 +206,9 @@ pub(crate) async fn admin_rules_add(
             StatusCode::OK
         },
         Wire(AddRuleResponse {
-            forge,
+            forge: ForgeBaseUrl::new(forge),
             pattern: pattern.to_string(),
-            action: req.action,
+            action: wire_action,
             applies_to_private: req.private.unwrap_or(false),
             created: outcome.created,
             repos_reconsidered: outcome.repos_reconsidered,
@@ -240,35 +218,28 @@ pub(crate) async fn admin_rules_add(
         .into_response())
 }
 
-#[derive(Serialize)]
-struct RulesResponse {
-    rules: Vec<RuleResponse>,
-}
-
-#[derive(Serialize)]
-struct RuleResponse {
-    forge: String,
-    pattern: String,
-    action: String,
-    applies_to_private: bool,
-}
-
 pub(crate) async fn admin_rules_list(
     State(state): State<Arc<AppState>>,
 ) -> Result<Response, ApiError> {
     let rules = state.control.rules().await?;
-    Ok(Wire(RulesResponse {
-        rules: rules
-            .into_iter()
-            .map(|rule| RuleResponse {
-                forge: rule.forge,
+    let rules = rules
+        .into_iter()
+        .map(|rule| {
+            let action = RuleAction::parse(&rule.action).ok_or_else(|| {
+                ApiError::internal(anyhow::anyhow!(
+                    "stored discovery rule has unknown action {:?}",
+                    rule.action
+                ))
+            })?;
+            Ok(RuleResponse {
+                forge: ForgeBaseUrl::new(rule.forge),
                 pattern: rule.pattern,
-                action: rule.action,
+                action,
                 applies_to_private: rule.applies_to_private,
             })
-            .collect(),
-    })
-    .into_response())
+        })
+        .collect::<Result<Vec<_>, ApiError>>()?;
+    Ok(Wire(RulesResponse { rules }).into_response())
 }
 
 pub(crate) async fn admin_repo_add(
@@ -336,7 +307,7 @@ pub(crate) async fn admin_repo_add(
             StatusCode::OK
         },
         Wire(AddRepoResponse {
-            slug: locator.slug,
+            slug: RepoSlug::new(locator.slug),
             created: outcome.created,
             fetch_queued: outcome.fetch_queued,
         }),
@@ -347,13 +318,6 @@ pub(crate) async fn admin_repo_add(
 #[derive(Deserialize)]
 pub(crate) struct IssueTokenRequest {
     member: String,
-}
-
-#[derive(Serialize)]
-struct IssueTokenResponse {
-    id: String,
-    member: String,
-    token: String,
 }
 
 pub(crate) async fn admin_token_issue(
@@ -368,18 +332,12 @@ pub(crate) async fn admin_token_issue(
     Ok((
         StatusCode::CREATED,
         Wire(IssueTokenResponse {
-            id: issued.id,
-            member: issued.member,
+            id: TokenId::new(issued.id),
+            member: MemberName::new(issued.member),
             token: issued.token,
         }),
     )
         .into_response())
-}
-
-#[derive(Serialize)]
-struct RevokeTokenResponse {
-    id: String,
-    revoked: bool,
 }
 
 pub(crate) async fn admin_token_revoke(
@@ -396,115 +354,83 @@ pub(crate) async fn admin_token_revoke(
             "no active member token {id:?}"
         )));
     }
-    Ok(Wire(RevokeTokenResponse { id, revoked: true }).into_response())
+    Ok(Wire(RevokeTokenResponse {
+        id: TokenId::new(id),
+        revoked: true,
+    })
+    .into_response())
 }
 
-#[derive(Serialize)]
-struct AdminStatusResponse {
-    repos: Vec<AdminRepoStatus>,
-    visibility_counts: VisibilityCounts,
-}
-
-#[derive(Default, Serialize)]
-struct VisibilityCounts {
-    public: usize,
-    internal: usize,
-    private: usize,
-}
-
-impl VisibilityCounts {
-    fn record(&mut self, visibility: yg_control::RepoVisibility) {
-        match visibility {
-            yg_control::RepoVisibility::Public => self.public += 1,
-            yg_control::RepoVisibility::Internal => self.internal += 1,
-            yg_control::RepoVisibility::Private => self.private += 1,
-        }
+fn record_visibility(counts: &mut VisibilityCounts, visibility: yg_control::RepoVisibility) {
+    match visibility {
+        yg_control::RepoVisibility::Public => counts.public += 1,
+        yg_control::RepoVisibility::Internal => counts.internal += 1,
+        yg_control::RepoVisibility::Private => counts.private += 1,
     }
-}
-
-#[derive(Serialize)]
-struct AdminRepoStatus {
-    slug: String,
-    forge: String,
-    visibility: &'static str,
-    discovery_state: String,
-    last_synced_commit: Option<String>,
-    sync: JobStatus,
-    index: JobStatus,
-    /// The repo's current Shard; null until first indexed.
-    shard: Option<ShardStatus>,
-}
-
-/// One pipeline stage's position, as admin status reports it for both
-/// sync and index.
-#[derive(Serialize)]
-struct JobStatus {
-    state: &'static str,
-    attempts: i32,
-    last_error: Option<String>,
-}
-
-#[derive(Serialize)]
-struct ShardStatus {
-    revision: String,
-    nodes: i64,
-    edges: i64,
 }
 
 pub(crate) async fn admin_status(State(state): State<Arc<AppState>>) -> Result<Response, ApiError> {
     let repos = state.control.admin_status().await?;
     let mut visibility_counts = VisibilityCounts::default();
     for repo in &repos {
-        visibility_counts.record(repo.visibility);
+        record_visibility(&mut visibility_counts, repo.visibility);
     }
     let repos = repos
         .into_iter()
-        .map(|r| AdminRepoStatus {
-            sync: JobStatus {
-                state: job_state(
-                    r.job_state.as_deref(),
-                    r.attempts,
-                    r.last_synced_commit.is_some(),
-                    StageWords {
-                        active: "syncing",
-                        done: "synced",
-                        never_ran: "registered",
-                    },
-                ),
-                attempts: r.attempts,
-                last_error: r.last_error,
-            },
-            index: JobStatus {
-                state: job_state(
-                    r.index_job_state.as_deref(),
-                    r.index_attempts,
-                    r.shard_revision.is_some(),
-                    StageWords {
-                        active: "indexing",
-                        done: "indexed",
-                        never_ran: "pending",
-                    },
-                ),
-                attempts: r.index_attempts,
-                last_error: r.index_last_error,
-            },
-            shard: r.shard_revision.map(|revision| ShardStatus {
-                revision,
-                // Set together with the revision when a Shard is recorded.
-                nodes: r.shard_node_count.unwrap_or(0),
-                edges: r.shard_edge_count.unwrap_or(0),
-            }),
-            slug: r.slug,
-            forge: r.forge,
-            visibility: match r.visibility {
-                yg_control::RepoVisibility::Public => "public",
-                yg_control::RepoVisibility::Internal => "internal",
-                yg_control::RepoVisibility::Private => "private",
-            },
-            discovery_state: r.discovery_state,
-            last_synced_commit: r.last_synced_commit,
+        .map(|r| {
+            let discovery_state = DiscoveryState::parse(&r.discovery_state).ok_or_else(|| {
+                ApiError::internal(anyhow::anyhow!(
+                    "repository has unknown discovery state {:?}",
+                    r.discovery_state
+                ))
+            })?;
+            Ok(AdminRepoStatus {
+                sync: JobStatus {
+                    state: job_state(
+                        r.job_state.as_deref(),
+                        r.attempts,
+                        r.last_synced_commit.is_some(),
+                        StageWords {
+                            active: JobState::Syncing,
+                            done: JobState::Synced,
+                            never_ran: JobState::Registered,
+                        },
+                    ),
+                    attempts: r.attempts,
+                    last_error: r.last_error,
+                },
+                index: JobStatus {
+                    state: job_state(
+                        r.index_job_state.as_deref(),
+                        r.index_attempts,
+                        r.shard_revision.is_some(),
+                        StageWords {
+                            active: JobState::Indexing,
+                            done: JobState::Indexed,
+                            never_ran: JobState::Pending,
+                        },
+                    ),
+                    attempts: r.index_attempts,
+                    last_error: r.index_last_error,
+                },
+                shard: r.shard_revision.map(|revision| ShardStatus {
+                    revision,
+                    // Set together with the revision when a Shard is recorded.
+                    nodes: r.shard_node_count.unwrap_or(0),
+                    edges: r.shard_edge_count.unwrap_or(0),
+                }),
+                slug: RepoSlug::new(r.slug),
+                forge: ForgeBaseUrl::new(r.forge),
+                visibility: match r.visibility {
+                    yg_control::RepoVisibility::Public => RepoVisibility::Public,
+                    yg_control::RepoVisibility::Internal => RepoVisibility::Internal,
+                    yg_control::RepoVisibility::Private => RepoVisibility::Private,
+                },
+                discovery_state,
+                last_synced_commit: r.last_synced_commit,
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>, ApiError>>()?;
     Ok(Wire(AdminStatusResponse {
         repos,
         visibility_counts,
@@ -515,9 +441,9 @@ pub(crate) async fn admin_status(State(state): State<Arc<AppState>>) -> Result<R
 /// The stage-specific words [`job_state`] fills in: what to call a
 /// leased job, a stage that finished, and one that never ran.
 struct StageWords {
-    active: &'static str,
-    done: &'static str,
-    never_ran: &'static str,
+    active: JobState,
+    done: JobState,
+    never_ran: JobState,
 }
 
 /// Collapse a pipeline stage's queue position into the one word
@@ -529,13 +455,39 @@ fn job_state(
     attempts: i32,
     has_output: bool,
     words: StageWords,
-) -> &'static str {
+) -> JobState {
     match (job_state, attempts, has_output) {
         (Some("leased"), ..) => words.active,
-        (Some("queued"), 0, _) => "queued",
-        (Some("queued"), ..) => "retrying",
-        (Some(_), ..) => "unknown",
+        (Some("queued"), 0, _) => JobState::Queued,
+        (Some("queued"), ..) => JobState::Retrying,
+        (Some(_), ..) => JobState::Unknown,
         (None, _, true) => words.done,
         (None, _, false) => words.never_ran,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stored_non_github_forge_kind_remains_typed_in_the_response_path() {
+        let kind = stored_forge_kind("git").expect("git is a stored forge kind");
+        let response = AddForgeResponse {
+            kind,
+            org: OrgName::new("acme".to_string()),
+            base_url: ForgeBaseUrl::new("https://git.example".to_string()),
+            created: false,
+        };
+
+        assert_eq!(
+            serde_json::to_value(response).expect("forge response serialization"),
+            serde_json::json!({
+                "kind": "git",
+                "org": "acme",
+                "base_url": "https://git.example",
+                "created": false,
+            })
+        );
     }
 }

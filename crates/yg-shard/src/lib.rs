@@ -5,6 +5,10 @@
 //! storage under `shards/<repo-id>/<revision>/` and never mutated
 //! afterwards.
 
+pub mod metrics;
+
+pub use metrics::Metrics;
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -57,7 +61,8 @@ pub const SYNTACTIC_PASS: &str = "syntactic";
 
 /// How a graph edge was derived (ADR 0002, CONTEXT.md). Carried by every
 /// edge from day one, even while only syntactic values exist.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Provenance {
     /// Compiler-grade indexer (SCIP) — arrives with the M1 precise pass.
     Precise,
@@ -86,6 +91,10 @@ impl Provenance {
             Provenance::Extracted => "extracted",
             Provenance::Inferred => "inferred",
         }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|item| item.as_str() == value)
     }
 }
 
@@ -170,7 +179,8 @@ impl NodeKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum EdgeKind {
     Defines,
     Calls,
@@ -225,6 +235,13 @@ impl EdgeKind {
             EdgeKind::Touches => "TOUCHES",
             EdgeKind::Authored => "AUTHORED",
         }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|item| item.as_str() == value)
     }
 }
 
@@ -820,6 +837,7 @@ pub struct ShardCache {
     manifests: std::sync::Mutex<std::collections::HashMap<String, Arc<Manifest>>>,
     /// Checksums whose on-disk file this process has already verified.
     verified: std::sync::Mutex<std::collections::HashSet<String>>,
+    metrics: Metrics,
 }
 
 /// A revision whose manifest is not in object storage — distinct from
@@ -882,11 +900,21 @@ impl std::error::Error for SegmentNeedsManifestRefresh {}
 
 impl ShardCache {
     pub fn new(store: Arc<dyn ObjectStore>, dir: impl Into<std::path::PathBuf>) -> Self {
+        Self::with_metrics(store, dir, Metrics::unregistered())
+    }
+
+    /// Build a cache using the supplied hit, miss, and eviction collectors.
+    pub fn with_metrics(
+        store: Arc<dyn ObjectStore>,
+        dir: impl Into<std::path::PathBuf>,
+        metrics: Metrics,
+    ) -> Self {
         Self {
             store,
             dir: dir.into(),
             manifests: Default::default(),
             verified: Default::default(),
+            metrics,
         }
     }
 
@@ -929,6 +957,7 @@ impl ShardCache {
         // The lock guards only the set lookup/insert — never I/O — so a
         // cold fetch of one revision cannot stall queries for others.
         if self.is_verified(&sha) {
+            self.metrics.hit(metrics::Artifact::Graph);
             return Ok(path);
         }
         self.fetch_verify_into(
@@ -936,7 +965,7 @@ impl ShardCache {
             &sha,
             &path,
             graph_segment_key(repo_id, revision),
-            "graph segment",
+            metrics::Artifact::Graph,
         )
         .await?;
         self.mark_verified(sha);
@@ -976,11 +1005,24 @@ impl ShardCache {
         sha: &str,
         local: &std::path::Path,
         object_key: String,
-        what: &str,
+        artifact: metrics::Artifact,
     ) -> anyhow::Result<()> {
+        let what = artifact.description();
         let on_disk = match tokio::fs::read(local).await {
-            Ok(bytes) => digest_off_thread(bytes).await?.1 == sha,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Ok(bytes) => {
+                if digest_off_thread(bytes).await?.1 == sha {
+                    self.metrics.hit(artifact);
+                    true
+                } else {
+                    self.metrics.miss(artifact);
+                    self.metrics.eviction(artifact);
+                    false
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.metrics.miss(artifact);
+                false
+            }
             Err(e) => return Err(e).with_context(|| format!("reading the cached {what}")),
         };
         if on_disk {
@@ -1037,9 +1079,14 @@ impl ShardCache {
         if let Err(e) = tokio::fs::rename(&tmp, local).await {
             // On platforms where rename cannot replace (Windows), the
             // loser of a cold-fetch race lands here with the winner's
-            // identical, verified bytes already committed — success, not
-            // an error.
-            let committed = tokio::fs::try_exists(local).await.unwrap_or(false);
+            // identical, verified bytes already committed. That is only
+            // success if the destination actually holds the expected
+            // bytes — a stale mismatched file (the very thing this fetch
+            // replaces) must not be blessed by a failed rename.
+            let committed = match tokio::fs::read(local).await {
+                Ok(bytes) => digest_off_thread(bytes).await?.1 == sha,
+                Err(_) => false,
+            };
             let _ = tokio::fs::remove_file(&tmp).await;
             if !committed {
                 return Err(e).with_context(|| format!("committing the {what} into the cache"));
@@ -1089,6 +1136,7 @@ impl ShardCache {
 
         // Warm: this process already verified the archive and unpacked it.
         if self.is_verified(&sha) && tokio::fs::try_exists(&unpacked).await.unwrap_or(false) {
+            self.metrics.hit(metrics::Artifact::Fts);
             return Ok(unpacked);
         }
 
@@ -1103,7 +1151,7 @@ impl ShardCache {
             &sha,
             &archive_path,
             fts_segment_key(repo_id, revision),
-            "fts segment",
+            metrics::Artifact::Fts,
         )
         .await?;
 
@@ -1186,8 +1234,14 @@ impl ShardCache {
             .get(&key)
             .cloned();
         let manifest = match cached {
-            Some(manifest) => manifest,
-            None => self.fetch_and_cache_manifest(&key, revision).await?,
+            Some(manifest) => {
+                self.metrics.hit(metrics::Artifact::Manifest);
+                manifest
+            }
+            None => {
+                self.metrics.miss(metrics::Artifact::Manifest);
+                self.fetch_and_cache_manifest(&key, revision).await?
+            }
         };
         // Gate after the cache lookup so cache hits are screened too:
         // this binary cannot read another schema version's segment, and

@@ -8,7 +8,7 @@
 //! encode the typed result or the sanitized [`VerbError`].
 
 use anyhow::Context;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::cursor::{self, HistoryCursor, NeighborsCursor};
 use crate::search::{RepoQualifier, SearchResponse, SearchTarget};
@@ -148,7 +148,8 @@ fn resolve_error(qualifier: &str, from_cursor: bool, e: ResolveError) -> VerbErr
 
 /// The `neighbors` answer as every transport serves it: one page plus
 /// the opaque cursor.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NeighborsResponse {
     pub nodes: Vec<NodeView>,
     pub edges: Vec<GraphEdge>,
@@ -159,17 +160,102 @@ pub struct NeighborsResponse {
 /// display-ready date — the engine owns rendering (like search
 /// snippets), so clients print it verbatim instead of each re-deriving
 /// a format from `committed_at`.
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct HistoryCommitView {
-    #[serde(flatten)]
     pub commit: HistoryCommit,
     /// `committed_at` as RFC3339 UTC (`2024-01-01T00:00:00Z`).
     pub date: String,
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HistoryCommitViewWire {
+    commit: String,
+    sha: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    subject: Option<String>,
+    committed_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    author: Option<crate::HistoryAuthor>,
+    date: String,
+}
+
+impl From<&HistoryCommitView> for HistoryCommitViewWire {
+    fn from(view: &HistoryCommitView) -> Self {
+        let HistoryCommitView {
+            commit:
+                HistoryCommit {
+                    commit,
+                    sha,
+                    subject,
+                    committed_at,
+                    author,
+                },
+            date,
+        } = view;
+        Self {
+            commit: commit.clone(),
+            sha: sha.clone(),
+            subject: subject.clone(),
+            committed_at: *committed_at,
+            author: author.as_ref().map(|author| {
+                let crate::HistoryAuthor { id, name, email } = author;
+                crate::HistoryAuthor {
+                    id: id.clone(),
+                    name: name.clone(),
+                    email: email.clone(),
+                }
+            }),
+            date: date.clone(),
+        }
+    }
+}
+
+impl From<HistoryCommitViewWire> for HistoryCommitView {
+    fn from(wire: HistoryCommitViewWire) -> Self {
+        let HistoryCommitViewWire {
+            commit,
+            sha,
+            subject,
+            committed_at,
+            author,
+            date,
+        } = wire;
+        Self {
+            commit: HistoryCommit {
+                commit,
+                sha,
+                subject,
+                committed_at,
+                author,
+            },
+            date,
+        }
+    }
+}
+
+impl Serialize for HistoryCommitView {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        HistoryCommitViewWire::from(self).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for HistoryCommitView {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        HistoryCommitViewWire::deserialize(deserializer).map(Into::into)
+    }
+}
+
 /// The `history` answer as every transport serves it: one page of
 /// commits plus the opaque cursor.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HistoryResponse {
     pub commits: Vec<HistoryCommitView>,
     pub next_cursor: Option<String>,
@@ -210,17 +296,30 @@ fn parse_since(raw: &str) -> Result<i64, String> {
 /// and CLI — this is the one implementation that makes it structural).
 pub struct Engine<R> {
     resolver: std::sync::Arc<R>,
+    metrics: crate::Metrics,
 }
 
 impl<R: ShardResolver + 'static> Engine<R> {
     pub fn new(resolver: R) -> Self {
+        Self::with_metrics(resolver, crate::Metrics::unregistered())
+    }
+
+    /// Build an engine using the supplied Verb latency collectors.
+    pub fn with_metrics(resolver: R, metrics: crate::Metrics) -> Self {
         Self {
             resolver: std::sync::Arc::new(resolver),
+            metrics,
         }
+    }
+
+    /// The metrics handle shared with API-owned Verbs such as `search`.
+    pub fn metrics(&self) -> &crate::Metrics {
+        &self.metrics
     }
 
     /// The `node` Verb, end to end: parse, resolve, read.
     pub async fn node(&self, req: NodeRequest) -> Result<NodeResponse, VerbError> {
+        let _timer = self.metrics.timer(crate::Verb::Node);
         let id = VerbId::parse(&req.id).map_err(VerbError::BadRequest)?;
         let shard = self
             .resolver
@@ -240,6 +339,7 @@ impl<R: ShardResolver + 'static> Engine<R> {
     /// validation, resolve (pinned by the cursor where present), read,
     /// cursor encode.
     pub async fn neighbors(&self, req: NeighborsRequest) -> Result<NeighborsResponse, VerbError> {
+        let _timer = self.metrics.timer(crate::Verb::Neighbors);
         let cursor = req
             .cursor
             .as_deref()
@@ -311,6 +411,7 @@ impl<R: ShardResolver + 'static> Engine<R> {
     /// `since` normalization, validation, resolve (pinned by the cursor
     /// where present), read, cursor encode, date rendering.
     pub async fn history(&self, req: HistoryRequest) -> Result<HistoryResponse, VerbError> {
+        let _timer = self.metrics.timer(crate::Verb::History);
         let cursor = req
             .cursor
             .as_deref()
