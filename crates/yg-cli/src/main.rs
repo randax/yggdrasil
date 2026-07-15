@@ -946,12 +946,13 @@ async fn admin_status(json: bool) -> anyhow::Result<()> {
         println!("{}", serde_json::to_string(&body)?);
         return Ok(());
     }
-    print_visibility_counts(&body);
+    let visibility_counts = parse_visibility_counts(&body)?;
     let repos = body["repos"].as_array().map(Vec::as_slice).unwrap_or(&[]);
     if repos.is_empty() {
         println!("no repositories registered — add one with: yg admin repo add <url>");
         return Ok(());
     }
+    print_visibility_counts(visibility_counts);
     for repo in repos {
         let slug = repo["slug"].as_str().unwrap_or("?");
         let state = repo["sync"]["state"].as_str().unwrap_or("?");
@@ -984,15 +985,54 @@ async fn admin_status(json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn print_visibility_counts(body: &serde_json::Value) {
-    let counts = &body["visibility_counts"];
+#[derive(serde::Deserialize)]
+struct AdminStatusSummary {
+    visibility_counts: VisibilityCounts,
+}
+
+#[derive(serde::Deserialize)]
+struct VisibilityCounts {
+    public: u64,
+    internal: u64,
+    private: u64,
+}
+
+fn parse_visibility_counts(body: &serde_json::Value) -> anyhow::Result<VisibilityCounts> {
+    serde_json::from_value::<AdminStatusSummary>(body.clone())
+        .map(|status| status.visibility_counts)
+        .context("parsing visibility counts from /v1/admin/status")
+}
+
+fn print_visibility_counts(counts: VisibilityCounts) {
     println!(
-        "visibility: public={} internal={} private={} unknown={}",
-        counts["public"].as_u64().unwrap_or(0),
-        counts["internal"].as_u64().unwrap_or(0),
-        counts["private"].as_u64().unwrap_or(0),
-        counts["unknown"].as_u64().unwrap_or(0),
+        "visibility: public={} internal={} private={}",
+        counts.public, counts.internal, counts.private,
     );
+}
+
+#[cfg(test)]
+mod admin_status_tests {
+    use super::*;
+
+    #[test]
+    fn visibility_counts_are_required_and_typed() {
+        for body in [
+            serde_json::json!({}),
+            serde_json::json!({
+                "visibility_counts": {"public": "1", "internal": 0, "private": 0},
+            }),
+        ] {
+            let error = parse_visibility_counts(&body)
+                .err()
+                .expect("missing or malformed counts must fail");
+            assert!(
+                error
+                    .to_string()
+                    .contains("parsing visibility counts from /v1/admin/status"),
+                "unexpected error: {error:#}"
+            );
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]

@@ -1724,8 +1724,9 @@ async fn admin_status_summarizes_mixed_repository_visibility() {
         .assert()
         .success();
     let stdout = String::from_utf8(status.get_output().stdout.clone()).unwrap();
-    assert!(
-        stdout.contains("visibility: public=1 internal=1 private=1 unknown=0"),
+    assert_eq!(
+        stdout.lines().find(|line| line.starts_with("visibility:")),
+        Some("visibility: public=1 internal=1 private=1"),
         "human status must summarize visibility counts, got:\n{stdout}"
     );
 
@@ -1744,7 +1745,6 @@ async fn admin_status_summarizes_mixed_repository_visibility() {
             "public": 1,
             "internal": 1,
             "private": 1,
-            "unknown": 0,
         })
     );
 }

@@ -410,7 +410,6 @@ struct VisibilityCounts {
     public: usize,
     internal: usize,
     private: usize,
-    unknown: usize,
 }
 
 impl VisibilityCounts {
