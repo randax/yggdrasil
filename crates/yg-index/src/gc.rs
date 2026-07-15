@@ -3,17 +3,18 @@
 use std::time::Duration;
 
 use anyhow::Context;
-
-use crate::worker::IndexWorker;
+use object_store::ObjectStore;
+use yg_control::ControlPlane;
 
 pub(crate) async fn collect_superseded(
-    worker: &IndexWorker,
+    control: &ControlPlane,
+    store: &dyn ObjectStore,
     grace: Duration,
 ) -> anyhow::Result<u64> {
-    let stale = worker.control.superseded_shards_past_grace(grace).await?;
+    let stale = control.superseded_shards_past_grace(grace).await?;
     let mut collected = 0;
     for shard in &stale {
-        match collect_shard(worker, shard).await {
+        match collect_shard(control, store, shard).await {
             Ok(true) => collected += 1,
             Ok(false) => {}
             Err(error) => tracing::warn!(
@@ -31,11 +32,10 @@ pub(crate) async fn collect_superseded(
 }
 
 pub(crate) async fn retire_terminal_jobs(
-    worker: &IndexWorker,
+    control: &ControlPlane,
     retention: Duration,
 ) -> anyhow::Result<u64> {
-    let deleted = worker
-        .control
+    let deleted = control
         .delete_terminal_jobs_past_retention(retention)
         .await?;
     if deleted > 0 {
@@ -45,17 +45,14 @@ pub(crate) async fn retire_terminal_jobs(
 }
 
 async fn collect_shard(
-    worker: &IndexWorker,
+    control: &ControlPlane,
+    store: &dyn ObjectStore,
     shard: &yg_control::SupersededShard,
 ) -> anyhow::Result<bool> {
-    if !worker
-        .control
-        .delete_superseded_shard(shard.shard_id)
-        .await?
-    {
+    if !control.delete_superseded_shard(shard.shard_id).await? {
         return Ok(false);
     }
-    yg_shard::delete_shard(worker.store.as_ref(), shard.repo_id, &shard.revision)
+    yg_shard::delete_shard(store, shard.repo_id, &shard.revision)
         .await
         .context("deleting the Shard's object-storage segments")?;
     Ok(true)

@@ -21,8 +21,8 @@ const INDEX_LEASE: Duration = Duration::from_secs(30 * 60);
 /// An indexing worker: drains the index queue, running the syntactic
 /// pass over synced checkouts and publishing Shards.
 pub struct IndexWorker {
-    pub(crate) control: ControlPlane,
-    pub(crate) store: Arc<dyn ObjectStore>,
+    control: ControlPlane,
+    store: Arc<dyn ObjectStore>,
     git_cache: PathBuf,
 }
 
@@ -67,7 +67,7 @@ impl IndexWorker {
     /// fails is logged as orphaned rather than blocking the rest. Returns
     /// how many Shards were collected.
     pub async fn gc_once(&self, grace: Duration) -> anyhow::Result<u64> {
-        crate::gc::collect_superseded(self, grace).await
+        crate::gc::collect_superseded(&self.control, self.store.as_ref(), grace).await
     }
 
     /// Remove terminal job rows finished longer ago than `retention`
@@ -77,7 +77,7 @@ impl IndexWorker {
     /// [`Self::gc_once`] on the GC cadence. Returns how many rows were
     /// removed.
     pub async fn retire_terminal_jobs(&self, retention: Duration) -> anyhow::Result<u64> {
-        crate::gc::retire_terminal_jobs(self, retention).await
+        crate::gc::retire_terminal_jobs(&self.control, retention).await
     }
 
     /// Claim and run one due index job. Returns whether there was work.
