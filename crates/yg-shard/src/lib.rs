@@ -1037,9 +1037,14 @@ impl ShardCache {
         if let Err(e) = tokio::fs::rename(&tmp, local).await {
             // On platforms where rename cannot replace (Windows), the
             // loser of a cold-fetch race lands here with the winner's
-            // identical, verified bytes already committed — success, not
-            // an error.
-            let committed = tokio::fs::try_exists(local).await.unwrap_or(false);
+            // identical, verified bytes already committed. That is only
+            // success if the destination actually holds the expected
+            // bytes — a stale mismatched file (the very thing this fetch
+            // replaces) must not be blessed by a failed rename.
+            let committed = match tokio::fs::read(local).await {
+                Ok(bytes) => digest_off_thread(bytes).await?.1 == sha,
+                Err(_) => false,
+            };
             let _ = tokio::fs::remove_file(&tmp).await;
             if !committed {
                 return Err(e).with_context(|| format!("committing the {what} into the cache"));

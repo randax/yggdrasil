@@ -810,3 +810,34 @@ async fn a_stale_revision_is_fetched_at_most_once_per_process() {
         store.fetched()
     );
 }
+
+/// A failed commit rename must not bless whatever occupies the
+/// destination: if the cached path holds something other than the
+/// verified bytes (here: a directory, which also forces the rename to
+/// fail), the fetch errors instead of reporting the artifact cached.
+#[tokio::test]
+async fn a_failed_commit_rename_does_not_bless_a_mismatched_destination() {
+    let store = Arc::new(InMemory::new());
+    let revision = publish_fixture_shard(store.as_ref(), 21, "rename-fence").await;
+
+    // Learn the content-addressed file name from a clean fetch.
+    let clean = tempfile::tempdir().unwrap();
+    let clean_cache = ShardCache::new(store.clone(), clean.path());
+    let cached = clean_cache.graph_path(21, &revision).await.unwrap();
+    let file_name = cached.file_name().unwrap().to_owned();
+
+    // Occupy the destination with a directory: the rename fails and the
+    // destination's contents cannot digest-match the manifest.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join(&file_name)).unwrap();
+    let cache = ShardCache::new(store, dir.path());
+    let err = cache
+        .graph_path(21, &revision)
+        .await
+        .expect_err("an unverifiable destination must never be blessed");
+    let rendered = format!("{err:#}");
+    assert!(
+        rendered.contains("reading the cached") || rendered.contains("committing the"),
+        "unexpected error: {rendered}"
+    );
+}
