@@ -15,20 +15,22 @@ use std::time::Duration;
 /// it to the same per-Forge cooldown used by polling.
 #[derive(Debug, thiserror::Error)]
 #[error("forge returned {status} and requested a {retry_after:?} cooldown")]
-pub(crate) struct ForgeRateLimit {
+pub struct ForgeRateLimit {
     status: reqwest::StatusCode,
     retry_after: Duration,
 }
 
 impl ForgeRateLimit {
-    pub(crate) fn new(status: reqwest::StatusCode, retry_after: Duration) -> Self {
+    /// Create a Forge-wide cooldown signal for an API response.
+    pub fn new(status: reqwest::StatusCode, retry_after: Duration) -> Self {
         Self {
             status,
             retry_after,
         }
     }
 
-    pub(crate) fn retry_after(&self) -> Duration {
+    /// The duration the Forge-wide request bucket must remain paused.
+    pub fn retry_after(&self) -> Duration {
         self.retry_after
     }
 }
@@ -133,7 +135,8 @@ pub trait Forge: Send + Sync {
 
 /// Listing an org's repositories through a forge's API.
 pub trait OrgDiscovery: Send + Sync {
-    /// List every repository of `org`, following pagination.
+    /// List every repository of `org`, following pagination. Return
+    /// [`ForgeRateLimit`] to request a Forge-wide cooldown.
     fn list_org_repos<'a>(
         &'a self,
         client: &'a reqwest::Client,
@@ -145,7 +148,8 @@ pub trait OrgDiscovery: Send + Sync {
     /// List every repository while charging each discovery operation to
     /// the worker's Forge request budget. The default covers adapters
     /// whose listing is one request; paginated adapters override this
-    /// and take a token before every page.
+    /// and take a token before every page. Return [`ForgeRateLimit`] to
+    /// request a Forge-wide cooldown.
     fn list_org_repos_budgeted<'a>(
         &'a self,
         client: &'a reqwest::Client,

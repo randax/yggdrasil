@@ -20,6 +20,7 @@ const GITHUB_ORG_PAGE_LIMIT: usize = 1_000;
 const MIN_RETRY_AFTER: Duration = Duration::from_secs(1);
 /// Largest server-requested cooldown honored for a GitHub API rate limit.
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(60 * 60);
+const SECONDARY_RATE_LIMIT_MESSAGE: &str = "you have exceeded a secondary rate limit";
 
 pub(crate) struct GitHubForge;
 
@@ -136,9 +137,7 @@ fn list_org_repos<'a>(
         let mut repos = Vec::new();
         let mut pagination = Pagination::default();
         while let Some(url) = next.take() {
-            if !pagination.begin_page(&url) {
-                break;
-            }
+            pagination.begin_page(&url)?;
             if let Some(budget) = budget {
                 acquire_forge_request(budget).await;
             }
@@ -158,18 +157,33 @@ fn list_org_repos<'a>(
                 .get(reqwest::header::LINK)
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_string);
-            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                let retry_after = retry_after_or_default(
-                    response
-                        .headers()
-                        .get(reqwest::header::RETRY_AFTER)
-                        .and_then(|value| value.to_str().ok()),
-                    SystemTime::now(),
-                );
+            let headers = response.headers();
+            let has_retry_after = headers.contains_key(reqwest::header::RETRY_AFTER);
+            let retry_after_header = headers
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
+            let remaining_exhausted = headers
+                .get("x-ratelimit-remaining")
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.trim() == "0");
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                || (status == reqwest::StatusCode::FORBIDDEN
+                    && (has_retry_after || remaining_exhausted))
+            {
+                let retry_after =
+                    retry_after_or_default(retry_after_header.as_deref(), SystemTime::now());
                 return Err(ForgeRateLimit::new(status, retry_after).into());
             }
             if !status.is_success() {
                 let text = response.text().await.unwrap_or_default();
+                if status == reqwest::StatusCode::FORBIDDEN
+                    && is_secondary_rate_limit_message(&text)
+                {
+                    let retry_after =
+                        retry_after_or_default(retry_after_header.as_deref(), SystemTime::now());
+                    return Err(ForgeRateLimit::new(status, retry_after).into());
+                }
                 anyhow::bail!("GitHub repo discovery for {org} returned {status}: {text}");
             }
             let page: Vec<GitHubRepo> = response
@@ -189,8 +203,16 @@ struct Pagination {
     visited: HashSet<String>,
 }
 
+#[derive(Debug, thiserror::Error)]
+enum GitHubPaginationError {
+    #[error("GitHub org listing exceeded its {limit}-page limit")]
+    PageLimit { limit: usize },
+    #[error("GitHub org listing repeated next-link {url}")]
+    Cycle { url: String },
+}
+
 impl Pagination {
-    fn begin_page(&mut self, url: &str) -> bool {
+    fn begin_page(&mut self, url: &str) -> Result<(), GitHubPaginationError> {
         if self.pages >= GITHUB_ORG_PAGE_LIMIT {
             tracing::warn!(
                 pages = self.pages,
@@ -198,7 +220,9 @@ impl Pagination {
                 "org listing truncated at the pagination cap; later repositories \
                  were not discovered"
             );
-            return false;
+            return Err(GitHubPaginationError::PageLimit {
+                limit: GITHUB_ORG_PAGE_LIMIT,
+            });
         }
         if !self.visited.insert(url.to_string()) {
             tracing::warn!(
@@ -207,10 +231,12 @@ impl Pagination {
                 "org listing terminated on a repeated next-link; the listing may \
                  be incomplete"
             );
-            return false;
+            return Err(GitHubPaginationError::Cycle {
+                url: url.to_string(),
+            });
         }
         self.pages += 1;
-        true
+        Ok(())
     }
 }
 
@@ -255,6 +281,11 @@ fn retry_after_or_default(value: Option<&str>, now: SystemTime) -> Duration {
     value
         .and_then(|value| parse_retry_after(value, now))
         .unwrap_or(RATE_LIMIT_COOLDOWN)
+}
+
+fn is_secondary_rate_limit_message(body: &str) -> bool {
+    body.to_ascii_lowercase()
+        .contains(SECONDARY_RATE_LIMIT_MESSAGE)
 }
 
 /// Parse the IMF-fixdate form emitted by modern HTTP servers, for example
@@ -357,17 +388,24 @@ mod tests {
     fn github_pagination_stops_at_the_named_page_limit() {
         let mut pagination = Pagination::default();
         let first_page = "https://example.test/page/0";
-        assert!(pagination.begin_page(first_page));
-        assert!(
-            !pagination.begin_page(first_page),
-            "a self-referencing next link terminates immediately"
-        );
+        pagination.begin_page(first_page).unwrap();
+        assert!(matches!(
+            pagination.begin_page(first_page),
+            Err(GitHubPaginationError::Cycle { url }) if url == first_page
+        ));
 
         let mut pagination = Pagination::default();
         for page in 0..GITHUB_ORG_PAGE_LIMIT {
-            assert!(pagination.begin_page(&format!("https://example.test/page/{page}")));
+            pagination
+                .begin_page(&format!("https://example.test/page/{page}"))
+                .unwrap();
         }
-        assert!(!pagination.begin_page("https://example.test/page/overflow"));
+        assert!(matches!(
+            pagination.begin_page("https://example.test/page/overflow"),
+            Err(GitHubPaginationError::PageLimit {
+                limit: GITHUB_ORG_PAGE_LIMIT
+            })
+        ));
     }
 
     #[test]
@@ -422,7 +460,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn github_org_listing_stops_on_a_self_referencing_next_link() {
+    async fn github_org_listing_rejects_a_self_referencing_next_link() {
         let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
             Ok(listener) => listener,
             Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
@@ -431,6 +469,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let api_root = format!("http://{addr}");
         let first_page = format!("{api_root}/orgs/acme/repos?per_page={GITHUB_PAGE_SIZE}&type=all");
+        let fixture_next_link = first_page.clone();
         let server = tokio::spawn(async move {
             let (socket, _) = listener.accept().await.unwrap();
             let mut buf = [0; 1024];
@@ -438,31 +477,78 @@ mod tests {
             let _ = socket.try_read(&mut buf);
             let body = "[]";
             let response = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nlink: <{first_page}>; rel=\"next\"\r\ncontent-length: {}\r\n\r\n{body}",
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nlink: <{fixture_next_link}>; rel=\"next\"\r\ncontent-length: {}\r\n\r\n{body}",
                 body.len()
             );
             socket.writable().await.unwrap();
             socket.try_write(response.as_bytes()).unwrap();
         });
 
-        let repos = GitHubForge
+        let error = GitHubForge
             .list_org_repos(&discovery_client(), &api_root, "acme", None)
             .await
-            .unwrap();
+            .expect_err("a repeated next-link must fail the incomplete listing");
         server.await.unwrap();
 
-        assert!(repos.is_empty());
+        assert!(matches!(
+            error.downcast_ref::<GitHubPaginationError>(),
+            Some(GitHubPaginationError::Cycle { url }) if url == &first_page
+        ));
     }
 
-    async fn retry_after_from_429_fixture(value: &str) -> Option<Duration> {
+    #[tokio::test]
+    async fn github_403_with_retry_after_requests_a_forge_cooldown() {
+        let Some(signal) =
+            rate_limit_from_fixture("HTTP/1.1 403 Forbidden", "retry-after: 120\r\n", "").await
+        else {
+            return;
+        };
+
+        assert_eq!(signal.retry_after(), Duration::from_secs(120));
+    }
+
+    #[tokio::test]
+    async fn github_403_with_exhausted_primary_limit_requests_a_forge_cooldown() {
+        let Some(signal) =
+            rate_limit_from_fixture("HTTP/1.1 403 Forbidden", "x-ratelimit-remaining: 0\r\n", "")
+                .await
+        else {
+            return;
+        };
+
+        assert_eq!(signal.retry_after(), RATE_LIMIT_COOLDOWN);
+    }
+
+    #[tokio::test]
+    async fn github_403_with_secondary_limit_message_requests_a_forge_cooldown() {
+        let body = r#"{"message":"You have exceeded a secondary rate limit. Please wait before retrying."}"#;
+        let Some(signal) = rate_limit_from_fixture(
+            "HTTP/1.1 403 Forbidden",
+            "content-type: application/json\r\n",
+            body,
+        )
+        .await
+        else {
+            return;
+        };
+
+        assert_eq!(signal.retry_after(), RATE_LIMIT_COOLDOWN);
+    }
+
+    async fn rate_limit_from_fixture(
+        status_line: &str,
+        headers: &str,
+        body: &str,
+    ) -> Option<ForgeRateLimit> {
         let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
             Ok(listener) => listener,
             Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return None,
-            Err(error) => panic!("binding Retry-After fixture server: {error}"),
+            Err(error) => panic!("binding rate-limit fixture server: {error}"),
         };
         let addr = listener.local_addr().unwrap();
         let response = format!(
-            "HTTP/1.1 429 Too Many Requests\r\nretry-after: {value}\r\ncontent-length: 0\r\n\r\n"
+            "{status_line}\r\n{headers}content-length: {}\r\n\r\n{body}",
+            body.len()
         );
         let server = tokio::spawn(async move {
             let (socket, _) = listener.accept().await.unwrap();
@@ -476,14 +562,23 @@ mod tests {
         let error = GitHubForge
             .list_org_repos(&discovery_client(), &format!("http://{addr}"), "acme", None)
             .await
-            .expect_err("the fixture returns 429");
+            .expect_err("the fixture returns a rate limit");
         server.await.unwrap();
         Some(
             error
-                .downcast_ref::<ForgeRateLimit>()
-                .expect("429 is surfaced as a typed rate-limit signal")
-                .retry_after(),
+                .downcast::<ForgeRateLimit>()
+                .expect("rate-limited responses surface the public cooldown signal"),
         )
+    }
+
+    async fn retry_after_from_429_fixture(value: &str) -> Option<Duration> {
+        rate_limit_from_fixture(
+            "HTTP/1.1 429 Too Many Requests",
+            &format!("retry-after: {value}\r\n"),
+            "",
+        )
+        .await
+        .map(|signal| signal.retry_after())
     }
 
     #[tokio::test]
