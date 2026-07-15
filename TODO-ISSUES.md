@@ -25,7 +25,7 @@ Critical path: **#59 → {#60, #62, #64} → {#63, #65, #66}**.
 
 ### Verb-engine seam (#59)
 
-- [ ] **#60** Shared `Serialize + Deserialize` wire DTOs; typed CLI parsing (kill `unwrap_or("?")` fallbacks).
+- [x] **#60** Shared `Serialize + Deserialize` wire DTOs; typed CLI parsing (kill `unwrap_or("?")` fallbacks).
 - [ ] **#61** Fuzzy node ids with ranked candidates (no-such-symbol vs ambiguous).
 - [ ] **#62** MCP tools call the Verb engine directly (remove 50MB re-buffer and flattened error strings).
 
