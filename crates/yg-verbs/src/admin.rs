@@ -2,6 +2,114 @@
 
 use serde::{Deserialize, Serialize};
 
+/// A repository slug validated by the control-plane boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RepoSlug(String);
+
+impl RepoSlug {
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for RepoSlug {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// A forge organization name validated by the control-plane boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct OrgName(String);
+
+impl OrgName {
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for OrgName {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// A non-empty forge base URL supplied by the control-plane boundary.
+///
+/// This type intentionally does not parse or fully validate URLs; issue #79 owns
+/// typed URL validation for control-plane boundary structs.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ForgeBaseUrl(String);
+
+impl ForgeBaseUrl {
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for ForgeBaseUrl {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// A stable member-token identifier validated by the control-plane boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TokenId(String);
+
+impl TokenId {
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for TokenId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// A member name validated by the control-plane boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct MemberName(String);
+
+impl MemberName {
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for MemberName {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ForgeKind {
@@ -148,7 +256,7 @@ impl std::fmt::Display for JobState {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AddRepoResponse {
-    pub slug: String,
+    pub slug: RepoSlug,
     pub created: bool,
     pub fetch_queued: bool,
 }
@@ -157,8 +265,8 @@ pub struct AddRepoResponse {
 #[serde(deny_unknown_fields)]
 pub struct AddForgeResponse {
     pub kind: ForgeKind,
-    pub org: String,
-    pub base_url: String,
+    pub org: OrgName,
+    pub base_url: ForgeBaseUrl,
     pub created: bool,
 }
 
@@ -166,15 +274,15 @@ pub struct AddForgeResponse {
 #[serde(deny_unknown_fields)]
 pub struct DiscoverForgeResponse {
     pub kind: ForgeKind,
-    pub org: String,
-    pub base_url: String,
+    pub org: OrgName,
+    pub base_url: ForgeBaseUrl,
     pub queued: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AddRuleResponse {
-    pub forge: String,
+    pub forge: ForgeBaseUrl,
     pub pattern: String,
     pub action: RuleAction,
     pub applies_to_private: bool,
@@ -192,7 +300,7 @@ pub struct RulesResponse {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuleResponse {
-    pub forge: String,
+    pub forge: ForgeBaseUrl,
     pub pattern: String,
     pub action: RuleAction,
     pub applies_to_private: bool,
@@ -201,15 +309,15 @@ pub struct RuleResponse {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IssueTokenResponse {
-    pub id: String,
-    pub member: String,
+    pub id: TokenId,
+    pub member: MemberName,
     pub token: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RevokeTokenResponse {
-    pub id: String,
+    pub id: TokenId,
     pub revoked: bool,
 }
 
@@ -231,8 +339,8 @@ pub struct VisibilityCounts {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AdminRepoStatus {
-    pub slug: String,
-    pub forge: String,
+    pub slug: RepoSlug,
+    pub forge: ForgeBaseUrl,
     pub visibility: RepoVisibility,
     pub discovery_state: DiscoveryState,
     pub last_synced_commit: Option<String>,

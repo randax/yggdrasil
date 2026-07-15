@@ -11,9 +11,9 @@ use yg_sync::RepoLocator;
 use yg_sync::forge::Forge;
 use yg_verbs::admin::{
     AddForgeResponse, AddRepoResponse, AddRuleResponse, AdminRepoStatus, AdminStatusResponse,
-    DiscoverForgeResponse, DiscoveryState, ForgeKind, IssueTokenResponse, JobState, JobStatus,
-    RepoVisibility, RevokeTokenResponse, RuleAction, RuleResponse, RulesResponse, ShardStatus,
-    VisibilityCounts,
+    DiscoverForgeResponse, DiscoveryState, ForgeBaseUrl, ForgeKind, IssueTokenResponse, JobState,
+    JobStatus, MemberName, OrgName, RepoSlug, RepoVisibility, RevokeTokenResponse, RuleAction,
+    RuleResponse, RulesResponse, ShardStatus, TokenId, VisibilityCounts,
 };
 
 use crate::AppState;
@@ -66,8 +66,8 @@ pub(crate) async fn admin_forge_add(
         },
         Wire(AddForgeResponse {
             kind: ForgeKind::Github,
-            org,
-            base_url,
+            org: OrgName::new(org),
+            base_url: ForgeBaseUrl::new(base_url),
             created: outcome.created,
         }),
     )
@@ -141,8 +141,8 @@ pub(crate) async fn admin_forge_discover(
     }
     Ok(Wire(DiscoverForgeResponse {
         kind: ForgeKind::Github,
-        org,
-        base_url,
+        org: OrgName::new(org),
+        base_url: ForgeBaseUrl::new(base_url),
         queued: true,
     })
     .into_response())
@@ -199,7 +199,7 @@ pub(crate) async fn admin_rules_add(
             StatusCode::OK
         },
         Wire(AddRuleResponse {
-            forge,
+            forge: ForgeBaseUrl::new(forge),
             pattern: pattern.to_string(),
             action: wire_action,
             applies_to_private: req.private.unwrap_or(false),
@@ -225,7 +225,7 @@ pub(crate) async fn admin_rules_list(
                 ))
             })?;
             Ok(RuleResponse {
-                forge: rule.forge,
+                forge: ForgeBaseUrl::new(rule.forge),
                 pattern: rule.pattern,
                 action,
                 applies_to_private: rule.applies_to_private,
@@ -300,7 +300,7 @@ pub(crate) async fn admin_repo_add(
             StatusCode::OK
         },
         Wire(AddRepoResponse {
-            slug: locator.slug,
+            slug: RepoSlug::new(locator.slug),
             created: outcome.created,
             fetch_queued: outcome.fetch_queued,
         }),
@@ -325,8 +325,8 @@ pub(crate) async fn admin_token_issue(
     Ok((
         StatusCode::CREATED,
         Wire(IssueTokenResponse {
-            id: issued.id,
-            member: issued.member,
+            id: TokenId::new(issued.id),
+            member: MemberName::new(issued.member),
             token: issued.token,
         }),
     )
@@ -347,7 +347,11 @@ pub(crate) async fn admin_token_revoke(
             "no active member token {id:?}"
         )));
     }
-    Ok(Wire(RevokeTokenResponse { id, revoked: true }).into_response())
+    Ok(Wire(RevokeTokenResponse {
+        id: TokenId::new(id),
+        revoked: true,
+    })
+    .into_response())
 }
 
 fn record_visibility(counts: &mut VisibilityCounts, visibility: yg_control::RepoVisibility) {
@@ -408,8 +412,8 @@ pub(crate) async fn admin_status(State(state): State<Arc<AppState>>) -> Result<R
                     nodes: r.shard_node_count.unwrap_or(0),
                     edges: r.shard_edge_count.unwrap_or(0),
                 }),
-                slug: r.slug,
-                forge: r.forge,
+                slug: RepoSlug::new(r.slug),
+                forge: ForgeBaseUrl::new(r.forge),
                 visibility: match r.visibility {
                     yg_control::RepoVisibility::Public => RepoVisibility::Public,
                     yg_control::RepoVisibility::Internal => RepoVisibility::Internal,

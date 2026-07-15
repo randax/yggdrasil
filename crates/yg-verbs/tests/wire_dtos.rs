@@ -1,6 +1,32 @@
 use serde_json::json;
 
 #[test]
+fn admin_identifier_newtypes_preserve_bare_string_wire_values() {
+    use yg_verbs::admin::{ForgeBaseUrl, MemberName, OrgName, RepoSlug, TokenId};
+
+    macro_rules! assert_transparent_string {
+        ($type:ty, $value:expr) => {{
+            let typed = <$type>::new($value.into());
+            assert_eq!(
+                serde_json::to_value(&typed).expect("newtype serialization"),
+                json!($value)
+            );
+            assert_eq!(typed.as_str(), $value);
+            assert_eq!(typed.to_string(), $value);
+            let decoded: $type =
+                serde_json::from_value(json!($value)).expect("newtype deserialization");
+            assert_eq!(decoded.as_str(), $value);
+        }};
+    }
+
+    assert_transparent_string!(RepoSlug, "acme/widgets");
+    assert_transparent_string!(OrgName, "acme");
+    assert_transparent_string!(ForgeBaseUrl, "https://github.com");
+    assert_transparent_string!(TokenId, "mtok_0123456789abcdefABCDEF01");
+    assert_transparent_string!(MemberName, "Ada");
+}
+
+#[test]
 fn optional_field_renames_are_rejected_instead_of_becoming_absent() {
     let node = json!({
         "node": {
