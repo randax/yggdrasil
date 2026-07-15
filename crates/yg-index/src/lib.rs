@@ -217,27 +217,6 @@ impl IndexWorker {
     /// resulting Shard.
     async fn index(&self, job: &yg_control::LeasedIndex) -> anyhow::Result<IndexAttempt> {
         let revision = yg_shard::syntactic_revision(&job.commit);
-        let operation = self
-            .control
-            .lock_shard_operation(job.repo_id, &revision)
-            .await
-            .context("locking the Shard revision for publication")?;
-        if self.control.shard_state(job.repo_id, &revision).await?
-            == Some(yg_control::ShardState::Reclaiming)
-        {
-            return Ok(IndexAttempt::ReclamationInProgress { operation });
-        }
-        // Revisions are deterministic per commit: when this one is
-        // already published (a re-add, a retried job, another worker got
-        // there first), answer from storage without touching git.
-        if let Some(published) =
-            yg_shard::published_shard(self.store.as_ref(), job.repo_id, &job.commit).await?
-        {
-            return Ok(IndexAttempt::Published {
-                shard: published,
-                operation,
-            });
-        }
         let checkout = tempfile::tempdir().context("creating a scratch checkout dir")?;
         // Materialize the checkout and walk the git history while the
         // mirror is locked: both read mirror objects, so a concurrent
@@ -276,14 +255,34 @@ impl IndexWorker {
         // Fold history in once the syntactic File nodes exist — they are
         // the ground truth for which TOUCHES edges may keep their target.
         merge_history(&mut graph, history);
-        let shard = yg_shard::write_shard(
-            self.store.as_ref(),
-            job.repo_id,
-            &job.commit,
-            graph,
-            search_docs,
-        )
-        .await?;
+        let prepared = yg_shard::prepare_shard(graph, search_docs).await?;
+        // Parsing and segment construction are deliberately outside the
+        // Shard-operation lock. Only publication needs serialization: after
+        // taking the lock, re-check reclamation and existing publication
+        // before the first object write.
+        let operation = self
+            .control
+            .lock_shard_operation(job.repo_id, &revision)
+            .await
+            .context("locking the Shard revision for publication")?;
+        if self.control.shard_state(job.repo_id, &revision).await?
+            == Some(yg_control::ShardState::Reclaiming)
+        {
+            return Ok(IndexAttempt::ReclamationInProgress { operation });
+        }
+        // Revisions are deterministic per commit: a publisher that won while
+        // this worker parsed lets us reuse its artifact without object writes.
+        if let Some(published) =
+            yg_shard::published_shard(self.store.as_ref(), job.repo_id, &job.commit).await?
+        {
+            return Ok(IndexAttempt::Published {
+                shard: published,
+                operation,
+            });
+        }
+        let shard =
+            yg_shard::publish_shard(self.store.as_ref(), job.repo_id, &job.commit, prepared)
+                .await?;
         Ok(IndexAttempt::Published { shard, operation })
     }
 

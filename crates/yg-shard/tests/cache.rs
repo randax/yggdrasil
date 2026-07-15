@@ -333,7 +333,7 @@ async fn a_partial_reclamation_is_fully_republished_and_served() {
 }
 
 #[tokio::test]
-async fn a_warm_cache_refreshes_a_manifest_after_same_revision_republish() {
+async fn a_cold_fts_segment_refreshes_a_warm_manifest_after_same_revision_republish() {
     let store = Arc::new(InMemory::new());
     let commit = "warm-repair";
     let revision = publish_fixture_shard(store.as_ref(), 11, commit).await;

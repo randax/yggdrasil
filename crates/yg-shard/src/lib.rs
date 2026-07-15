@@ -606,25 +606,24 @@ pub async fn published_shard(
     }))
 }
 
-/// Write a syntactic-pass Shard for `commit` of repo `repo_id`: the
-/// graph segment, the full-text segment, then the manifest. The manifest
-/// goes last — its presence marks a complete Shard, so a write that dies
-/// half-way leaves garbage, never a torn artifact. Published Shards are
-/// immutable: every put is create-only (If-None-Match), so even a stale
-/// lease holder racing a fresh one can never overwrite published objects,
-/// and an already-published revision is returned as-is.
-pub async fn write_shard(
-    store: &dyn ObjectStore,
-    repo_id: i64,
-    commit: &str,
+/// Fully built Shard segments ready for object-store publication. Its bytes
+/// stay private so callers cannot publish a partially prepared artifact.
+pub struct PreparedShard {
+    graph_bytes: Vec<u8>,
+    graph_segment: Segment,
+    fts_bytes: Vec<u8>,
+    fts_segment: Segment,
+    counts: Counts,
+}
+
+/// Build and digest a syntactic Shard's graph and full-text segments without
+/// touching object storage. Publishers can do this expensive CPU work before
+/// entering their short publication critical section.
+pub async fn prepare_shard(
     graph: Graph,
     search_docs: Vec<SearchDoc>,
-) -> anyhow::Result<PublishedShard> {
-    let revision = syntactic_revision(commit);
-    let manifest_key = manifest_key(repo_id, &revision);
-    let graph_key = object_store::path::Path::from(graph_segment_key(repo_id, &revision));
-    let fts_key = object_store::path::Path::from(fts_segment_key(repo_id, &revision));
-    let local_counts = Counts {
+) -> anyhow::Result<PreparedShard> {
+    let counts = Counts {
         nodes: graph.nodes.len() as i64,
         edges: graph.edges.len() as i64,
     };
@@ -632,7 +631,7 @@ pub async fn write_shard(
     // Build and digest both segments off the runtime threads: building a
     // tantivy index and hashing a large artifact are as blocking as the
     // graph build.
-    let (graph_bytes, local_segment, fts_bytes, local_fts_segment) = tokio::task::spawn_blocking(
+    let (graph_bytes, graph_segment, fts_bytes, fts_segment) = tokio::task::spawn_blocking(
         move || -> anyhow::Result<(Vec<u8>, Segment, Vec<u8>, Segment)> {
             let graph_bytes = build_graph_sqlite(&graph)?;
             let graph_segment = Segment {
@@ -649,6 +648,39 @@ pub async fn write_shard(
     )
     .await
     .context("shard segment build task panicked")??;
+    Ok(PreparedShard {
+        graph_bytes,
+        graph_segment,
+        fts_bytes,
+        fts_segment,
+        counts,
+    })
+}
+
+/// Publish prepared segments for `commit` of repo `repo_id`: the graph
+/// segment, the full-text segment, then the manifest. The manifest goes last —
+/// its presence marks a complete Shard, so a write that dies half-way leaves
+/// garbage, never a torn artifact. Published Shards are immutable: every put
+/// is create-only (If-None-Match), so even a stale lease holder racing a fresh
+/// one can never overwrite published objects, and an already-published
+/// revision is returned as-is.
+pub async fn publish_shard(
+    store: &dyn ObjectStore,
+    repo_id: i64,
+    commit: &str,
+    prepared: PreparedShard,
+) -> anyhow::Result<PublishedShard> {
+    let revision = syntactic_revision(commit);
+    let manifest_key = manifest_key(repo_id, &revision);
+    let graph_key = object_store::path::Path::from(graph_segment_key(repo_id, &revision));
+    let fts_key = object_store::path::Path::from(fts_segment_key(repo_id, &revision));
+    let PreparedShard {
+        graph_bytes,
+        graph_segment: local_segment,
+        fts_bytes,
+        fts_segment: local_fts_segment,
+        counts: local_counts,
+    } = prepared;
     let create_only = PutOptions {
         mode: PutMode::Create,
         ..Default::default()
@@ -747,7 +779,7 @@ pub async fn write_shard(
         Err(object_store::Error::AlreadyExists { .. }) => {
             return published_shard(store, repo_id, commit)
                 .await?
-                .context("a manifest that just existed has vanished");
+                .context("the manifest vanished or one of its listed segments is missing");
         }
         Err(e) => return Err(e).context("uploading the manifest"),
     }
@@ -760,13 +792,28 @@ pub async fn write_shard(
     })
 }
 
+/// Build and publish a syntactic-pass Shard. Callers that serialize only the
+/// publication phase should use [`prepare_shard`] before taking their fence,
+/// then call [`publish_shard`] while it is held.
+pub async fn write_shard(
+    store: &dyn ObjectStore,
+    repo_id: i64,
+    commit: &str,
+    graph: Graph,
+    search_docs: Vec<SearchDoc>,
+) -> anyhow::Result<PublishedShard> {
+    let prepared = prepare_shard(graph, search_docs).await?;
+    publish_shard(store, repo_id, commit, prepared).await
+}
+
 /// The query side's local Shard tier (RFC 0001 §6): graph segments are
 /// materialized once into `dir` under their checksum and reused for
 /// every later query, so warm queries never touch object storage.
 ///
 /// Segments are immutable by checksum. Manifests normally stay cached by
 /// key, but same-revision repair may replace one; a missing or mismatched
-/// segment evicts the cached manifest and retries once against storage.
+/// cold, not-yet-process-verified segment evicts the cached manifest and
+/// retries once against storage.
 /// Pointer swaps are picked up because the *caller* resolves the current
 /// revision per query and only then asks this cache.
 pub struct ShardCache {

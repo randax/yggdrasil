@@ -17,18 +17,28 @@ pub struct ControlPlane {
 }
 
 /// Exclusive ownership of one Shard revision's object/control-plane
-/// transition. Session advisory locks make publication and reclamation
-/// mutually exclusive across worker processes. Cancellation closes the
-/// checked-out connection, which makes Postgres release the lock.
+/// transition. Session advisory locks make the publication critical section
+/// and reclamation mutually exclusive across worker processes. Cancellation
+/// closes the checked-out connection, which makes Postgres release the lock.
 pub struct ShardOperationGuard {
     connection: Option<PoolConnection<sqlx::Postgres>>,
+    key: i64,
 }
 
 impl ShardOperationGuard {
-    /// Release the advisory lock by closing its dedicated session.
+    /// Release the advisory lock and return its dedicated connection to the
+    /// pool. A failed unlock closes the connection instead, so a session lock
+    /// can never leak back into the pool.
     pub async fn release(mut self) {
-        if let Some(connection) = self.connection.take() {
-            let _ = connection.close().await;
+        if let Some(connection) = self.connection.as_mut() {
+            let unlocked = sqlx::query_scalar::<_, bool>("SELECT pg_advisory_unlock($1)")
+                .bind(self.key)
+                .fetch_one(&mut **connection)
+                .await;
+            if matches!(unlocked, Ok(true)) {
+                // Disarm Drop so the unlocked session returns to the pool.
+                self.connection.take();
+            }
         }
     }
 }
@@ -161,8 +171,8 @@ pub enum ShardState {
     Reclaiming,
 }
 
-#[cfg(test)]
 impl ShardState {
+    #[cfg(test)]
     const ALL: [Self; 2] = [Self::Published, Self::Reclaiming];
 
     fn as_str(self) -> &'static str {
@@ -477,10 +487,19 @@ struct RuleRow {
 }
 
 impl ControlPlane {
-    /// Serialize object publication and reclamation for one deterministic
-    /// revision across every worker process. The caller must hold the
-    /// returned guard until its object-store work and control transition
-    /// have both finished.
+    /// Serialize the object publication critical section and reclamation for
+    /// one deterministic revision across every worker process. Publishers do
+    /// fetch, checkout, and parsing before taking this lock, then hold it while
+    /// re-checking Shard state and existing publication, writing objects, and
+    /// completing the control-plane transition. Reclaimers hold it through
+    /// their object deletion and control-plane transition.
+    ///
+    /// This session advisory lock is coordination, not a hard object-store
+    /// fence: if its Postgres session drops, the server releases the lock even
+    /// while the Rust future may still be running. That residual race is
+    /// accepted here because publication's locked section is short, puts are
+    /// create-only, and revision identities are deterministic. A true hard
+    /// fence would require an object-store-visible fencing-token design.
     pub async fn lock_shard_operation(
         &self,
         repo_id: i64,
@@ -490,19 +509,25 @@ impl ControlPlane {
 
         let digest = sha2::Sha256::digest(format!("{repo_id}\0{revision}").as_bytes());
         let key = i64::from_be_bytes(digest[..8].try_into().expect("sha256 has eight bytes"));
-        let mut connection = self.pool.acquire().await?;
+        let connection = self.pool.acquire().await?;
         // A cancelled waiter must close its session: Postgres may grant a
         // blocking advisory-lock request just as the Rust future drops.
         // Returning that session to the pool could strand an ownerless
         // lock indefinitely.
-        connection.close_on_drop();
+        let mut operation = ShardOperationGuard {
+            connection: Some(connection),
+            key,
+        };
         sqlx::query("SELECT pg_advisory_lock($1)")
             .bind(key)
-            .execute(&mut *connection)
+            .execute(
+                &mut **operation
+                    .connection
+                    .as_mut()
+                    .expect("Shard operation guard owns its connection"),
+            )
             .await?;
-        Ok(ShardOperationGuard {
-            connection: Some(connection),
-        })
+        Ok(operation)
     }
 
     /// State of a deterministic Shard revision. Callers coordinating
@@ -524,20 +549,8 @@ impl ControlPlane {
     /// Return a leased index job to the queue without recording a
     /// failure. Used when its deterministic revision is being reclaimed.
     pub async fn defer_index_for_reclamation(&self, job: &LeasedIndex) -> anyhow::Result<bool> {
-        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
-
         let mut tx = self.pool.begin().await?;
-        let deferred = settle_leased_job(&mut tx, job.job_id, &job.lease_token, false).await?;
-        if deferred {
-            sqlx::query(
-                "UPDATE jobs SET run_after = now() + make_interval(secs => $2)
-                 WHERE id = $1 AND state = 'queued'",
-            )
-            .bind(job.job_id)
-            .bind(RETRY_DELAY.as_secs_f64())
-            .execute(&mut *tx)
-            .await?;
-        }
+        let deferred = defer_leased_index_for_reclamation(&mut tx, job).await?;
         tx.commit().await?;
         Ok(deferred)
     }
@@ -1317,7 +1330,7 @@ impl ControlPlane {
         .fetch_optional(&mut *tx)
         .await?;
         if !shard_accepts_publication(existing_state) {
-            settle_leased_job(&mut tx, job.job_id, &job.lease_token, false).await?;
+            defer_leased_index_for_reclamation(&mut tx, job).await?;
             tx.commit().await?;
             return Ok(false);
         }
@@ -1442,8 +1455,10 @@ impl ControlPlane {
         &self,
         grace: std::time::Duration,
     ) -> anyhow::Result<Vec<SupersededShard>> {
-        let rows = sqlx::query_as(SUPERSEDED_SHARDS_PAST_GRACE_SQL)
+        let rows = sqlx::query_as(SUPERSEDED_SHARDS_PAST_GRACE_QUERY)
             .bind(grace.as_secs_f64())
+            .bind(ShardState::Reclaiming.as_str())
+            .bind(ShardState::Published.as_str())
             .fetch_all(&self.pool)
             .await?;
         Ok(rows)
@@ -1461,12 +1476,14 @@ impl ControlPlane {
     /// again and its object-storage segments must be left alone.
     pub async fn delete_superseded_shard(&self, shard_id: i64) -> anyhow::Result<bool> {
         let claimed = sqlx::query(
-            "UPDATE shards s SET state = 'reclaiming'
+            "UPDATE shards s SET state = $2
              WHERE s.id = $1
-               AND s.state IN ('published', 'reclaiming')
+               AND s.state IN ($3, $2)
                AND NOT EXISTS (SELECT 1 FROM repos r WHERE r.current_shard_id = s.id)",
         )
         .bind(shard_id)
+        .bind(ShardState::Reclaiming.as_str())
+        .bind(ShardState::Published.as_str())
         .execute(&self.pool)
         .await?
         .rows_affected()
@@ -1481,10 +1498,11 @@ impl ControlPlane {
         let reaped = sqlx::query(
             "DELETE FROM shards s
              WHERE s.id = $1
-               AND s.state = 'reclaiming'
+               AND s.state = $2
                AND NOT EXISTS (SELECT 1 FROM repos r WHERE r.current_shard_id = s.id)",
         )
         .bind(shard_id)
+        .bind(ShardState::Reclaiming.as_str())
         .execute(&self.pool)
         .await?
         .rows_affected()
@@ -1632,12 +1650,19 @@ fn hex_bytes(bytes: &[u8]) -> String {
     out
 }
 
-/// The GC sweep's eligibility scan (see
-/// [`ControlPlane::superseded_shards_past_grace`]): every Shard no repo
-/// points at, superseded (or published, for one that never became
-/// current) longer ago than `$1` seconds. The pointer anti-join is
-/// served by the partial index `repos_current_shard` (migration 0011);
-/// public so the e2e plan tests can EXPLAIN the exact production query.
+const SUPERSEDED_SHARDS_PAST_GRACE_QUERY: &str =
+    "SELECT s.id AS shard_id, s.repo_id, s.revision, s.state FROM shards s
+     WHERE NOT EXISTS (SELECT 1 FROM repos r WHERE r.current_shard_id = s.id)
+       AND (s.state = $2
+            OR (s.state = $3
+                AND coalesce(s.superseded_at, s.published_at)
+                    < now() - make_interval(secs => $1)))
+     ORDER BY s.id";
+
+/// A plan-equivalent rendering of the superseded-Shard eligibility query for
+/// e2e `EXPLAIN` tests, which substitute its sole `$1` grace parameter. The
+/// production query binds the state vocabulary from [`ShardState`]; the unit
+/// drift guard pins these test-only literals to that vocabulary.
 pub const SUPERSEDED_SHARDS_PAST_GRACE_SQL: &str =
     "SELECT s.id AS shard_id, s.repo_id, s.revision, s.state FROM shards s
      WHERE NOT EXISTS (SELECT 1 FROM repos r WHERE r.current_shard_id = s.id)
@@ -1822,6 +1847,26 @@ fn shard_accepts_publication(state: Option<ShardState>) -> bool {
     !matches!(state, Some(ShardState::Reclaiming))
 }
 
+const RECLAMATION_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
+
+async fn defer_leased_index_for_reclamation(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    job: &LeasedIndex,
+) -> anyhow::Result<bool> {
+    let deferred = settle_leased_job(tx, job.job_id, &job.lease_token, false).await?;
+    if deferred {
+        sqlx::query(
+            "UPDATE jobs SET run_after = now() + make_interval(secs => $2)
+             WHERE id = $1 AND state = 'queued'",
+        )
+        .bind(job.job_id)
+        .bind(RECLAMATION_RETRY_DELAY.as_secs_f64())
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(deferred)
+}
+
 /// Queue a job for the repo unless one of its kind is already in flight
 /// — jobs_one_in_flight_per_repo_kind dedups in-flight work. Returns
 /// whether a new job was queued.
@@ -1881,8 +1926,9 @@ async fn settle_leased_job(
 #[cfg(test)]
 mod tests {
     use super::{
-        JobKind, REPO_QUALIFIER_SQL, RepoVisibility, RuleRow, ShardState, discovery_state_for,
-        glob_matches, member_token_id_is_valid, repo_qualifier, shard_accepts_publication,
+        JobKind, REPO_QUALIFIER_SQL, RepoVisibility, RuleRow, SUPERSEDED_SHARDS_PAST_GRACE_QUERY,
+        SUPERSEDED_SHARDS_PAST_GRACE_SQL, ShardState, discovery_state_for, glob_matches,
+        member_token_id_is_valid, repo_qualifier, shard_accepts_publication,
     };
 
     const HYGIENE_MIGRATION: &str = include_str!("../migrations/0011_job_queue_hygiene.sql");
@@ -1927,6 +1973,13 @@ mod tests {
         assert!(
             SHARD_STATE_MIGRATION.contains(&clause),
             "migration 0013 must constrain Shard state to {clause}"
+        );
+        let rendered_query = SUPERSEDED_SHARDS_PAST_GRACE_QUERY
+            .replace("$2", &format!("'{}'", ShardState::Reclaiming.as_str()))
+            .replace("$3", &format!("'{}'", ShardState::Published.as_str()));
+        assert_eq!(
+            rendered_query, SUPERSEDED_SHARDS_PAST_GRACE_SQL,
+            "the e2e query fixture must exactly render the production query's state bindings"
         );
     }
 
