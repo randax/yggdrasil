@@ -12,12 +12,6 @@ mod java;
 mod python;
 mod rust;
 
-use ecmascript::extract_ecmascript;
-use go::extract_go;
-use java::extract_java;
-use python::extract_python;
-use rust::extract_rust;
-
 /// Cap on the text indexed per file. Oversized content remains searchable by
 /// file name and is truncated on a character boundary.
 const MAX_BODY_BYTES: usize = 512 * 1024;
@@ -87,43 +81,43 @@ const LANGUAGE_PACKS: &[LanguagePack] = &[
     LanguagePack {
         extensions: &[".go"],
         grammar: || tree_sitter_go::LANGUAGE.into(),
-        extractor: extract_go,
+        extractor: go::extract_go,
         grammar_name: "Go",
     },
     LanguagePack {
         extensions: &[".ts", ".mts", ".cts"],
         grammar: || tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-        extractor: extract_ecmascript,
+        extractor: ecmascript::extract_ecmascript,
         grammar_name: "TypeScript",
     },
     LanguagePack {
         extensions: &[".tsx", ".jsx"],
         grammar: || tree_sitter_typescript::LANGUAGE_TSX.into(),
-        extractor: extract_ecmascript,
+        extractor: ecmascript::extract_ecmascript,
         grammar_name: "TSX",
     },
     LanguagePack {
         extensions: &[".js", ".mjs", ".cjs"],
         grammar: || tree_sitter_javascript::LANGUAGE.into(),
-        extractor: extract_ecmascript,
+        extractor: ecmascript::extract_ecmascript,
         grammar_name: "JavaScript",
     },
     LanguagePack {
         extensions: &[".py"],
         grammar: || tree_sitter_python::LANGUAGE.into(),
-        extractor: extract_python,
+        extractor: python::extract_python,
         grammar_name: "Python",
     },
     LanguagePack {
         extensions: &[".rs"],
         grammar: || tree_sitter_rust::LANGUAGE.into(),
-        extractor: extract_rust,
+        extractor: rust::extract_rust,
         grammar_name: "Rust",
     },
     LanguagePack {
         extensions: &[".java"],
         grammar: || tree_sitter_java::LANGUAGE.into(),
-        extractor: extract_java,
+        extractor: java::extract_java,
         grammar_name: "Java",
     },
 ];
