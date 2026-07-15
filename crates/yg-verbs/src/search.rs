@@ -1,6 +1,7 @@
 //! Engine-owned orchestration for the `search` Verb: cursor policy,
 //! target resolution, bounded fan-out, deterministic merge, and snippets.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -26,7 +27,7 @@ const MAX_SEARCH_TARGETS: usize = 1000;
 /// Maximum number of repository indexes opened and ranked at once.
 /// This bounds blocking-pool pressure while allowing independent Shards
 /// to search concurrently.
-pub const MAX_CONCURRENT_SEARCH_FANOUT: usize = 8;
+const MAX_CONCURRENT_SEARCH_FANOUT: usize = 8;
 
 /// A typed repository qualifier on the search resolver seam.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -166,12 +167,12 @@ pub struct SearchHit {
     pub snippet: Option<SearchSnippet>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct SearchResponse {
     /// The requested page in deterministic merged rank order.
     pub hits: Vec<SearchHit>,
-    /// Resume token for the next page, or `None` when exhausted.
-    pub next_cursor: Option<String>,
+    /// Typed continuation for the next page, or `None` when exhausted.
+    pub next: Option<SearchCursor>,
 }
 
 fn serialize_verb_id<S: serde::Serializer>(id: &VerbId, serializer: S) -> Result<S::Ok, S::Error> {
@@ -209,15 +210,24 @@ fn clamped_page_limit(offset: usize, limit: usize) -> usize {
 /// revisions and the same constant per-repo fetch sees exactly the pages
 /// one uninterrupted read would have. `has_more` reports whether the
 /// merged ranking holds anything past this page.
-fn merge_paginate(mut all: Vec<SearchHit>, offset: usize, limit: usize) -> (Vec<SearchHit>, bool) {
-    all.sort_by(|a, b| {
+fn merge_paginate(all: Vec<SearchHit>, offset: usize, limit: usize) -> (Vec<SearchHit>, bool) {
+    let mut keyed: Vec<_> = all
+        .into_iter()
+        .map(|hit| (hit.id.external(), hit))
+        .collect();
+    keyed.sort_by(|(a_id, a), (b_id, b)| {
         b.score
             .total_cmp(&a.score)
             .then_with(|| a.repo.as_str().cmp(b.repo.as_str()))
-            .then_with(|| a.id.external().cmp(&b.id.external()))
+            .then_with(|| a_id.cmp(b_id))
     });
-    let has_more = all.len() > offset + limit;
-    let page = all.into_iter().skip(offset).take(limit).collect();
+    let has_more = keyed.len() > offset + limit;
+    let page = keyed
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(|(_, hit)| hit)
+        .collect();
     (page, has_more)
 }
 
@@ -317,7 +327,7 @@ pub(crate) async fn search<R: ShardResolver + 'static>(
     if targets.is_empty() {
         return Ok(SearchResponse {
             hits: vec![],
-            next_cursor: None,
+            next: None,
         });
     }
 
@@ -330,30 +340,32 @@ pub(crate) async fn search<R: ShardResolver + 'static>(
     // revisions, so a missing/outdated one is the cursor's to hear about.
     //
     let from_cursor = req.cursor.is_some();
-    let mut ranked =
-        rank_targets(resolver, targets.clone(), query.clone(), kinds, from_cursor).await?;
+    let ranked = rank_targets(resolver, targets.clone(), query.clone(), kinds, from_cursor).await?;
     let mut all = Vec::new();
-    for repo in &mut ranked {
-        all.append(&mut repo.hits);
+    let mut indexes = Vec::with_capacity(ranked.len());
+    for RankedRepo {
+        qualifier,
+        index,
+        hits,
+    } in ranked
+    {
+        all.extend(hits);
+        indexes.push((qualifier, index));
     }
 
     let (mut page, has_more) = merge_paginate(all, offset, page_limit);
-    hydrate_snippets(ranked, &query, &mut page).await;
+    let indexes = retain_page_indexes(indexes, &page);
+    hydrate_snippets(indexes, &query, &mut page).await;
     // Offer a next page only while one is both available and reachable
     // (paging stops at the window).
-    let next_cursor = (has_more && offset + page_limit < MAX_SEARCH_WINDOW).then(|| {
-        cursor::encode(&SearchCursor {
-            query,
-            kinds: kind_strings,
-            mode,
-            targets,
-            offset: offset + page_limit,
-        })
+    let next = (has_more && offset + page_limit < MAX_SEARCH_WINDOW).then(|| SearchCursor {
+        query,
+        kinds: kind_strings,
+        mode,
+        targets,
+        offset: offset + page_limit,
     });
-    Ok(SearchResponse {
-        hits: page,
-        next_cursor,
-    })
+    Ok(SearchResponse { hits: page, next })
 }
 
 struct RankedRepo {
@@ -459,16 +471,29 @@ fn spawn_rank_task<R: ShardResolver + 'static>(
     });
 }
 
-/// Fill snippets for final-page hits using the exact index handles ranking
-/// opened. Repositories without a surviving hit are dropped unopened again.
-async fn hydrate_snippets(ranked: Vec<RankedRepo>, query: &str, page: &mut [SearchHit]) {
+/// Keep only the index handles needed to hydrate the final page, dropping
+/// every non-page repository before snippet hydration starts.
+fn retain_page_indexes<I>(
+    mut indexes: Vec<(RepoQualifier, I)>,
+    page: &[SearchHit],
+) -> Vec<(RepoQualifier, I)> {
+    let page_repos: HashSet<&RepoQualifier> = page.iter().map(|hit| &hit.repo).collect();
+    indexes.retain(|(qualifier, _)| page_repos.contains(qualifier));
+    indexes
+}
+
+async fn hydrate_snippets(
+    indexes: Vec<(RepoQualifier, yg_shard::FtsIndex)>,
+    query: &str,
+    page: &mut [SearchHit],
+) {
     use std::collections::HashMap;
     let mut by_repo: HashMap<RepoQualifier, Vec<usize>> = HashMap::new();
     for (i, hit) in page.iter().enumerate() {
         by_repo.entry(hit.repo.clone()).or_default().push(i);
     }
-    for ranked in ranked {
-        let Some(indices) = by_repo.remove(&ranked.qualifier) else {
+    for (qualifier, index) in indexes {
+        let Some(indices) = by_repo.remove(&qualifier) else {
             continue;
         };
         let local_ids: Vec<String> = indices
@@ -483,7 +508,7 @@ async fn hydrate_snippets(ranked: Vec<RankedRepo>, query: &str, page: &mut [Sear
             .collect();
         let query = query.to_string();
         let snippets = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-            yg_shard::snippets_for(&ranked.index, &query, &local_ids)
+            yg_shard::snippets_for(&index, &query, &local_ids)
         })
         .await;
         // Snippets are a non-critical enhancement: the ranked hits and their
@@ -794,6 +819,55 @@ mod tests {
         assert!(!more);
     }
 
+    #[test]
+    fn merge_paginate_preserves_external_id_order_across_node_kinds() {
+        let corpus = vec![
+            test_hit("a", "sym:a:z", 2.0),
+            test_hit("a", "repo:a", 2.0),
+            test_hit("a", "pkg:a:z", 2.0),
+        ];
+
+        let (page, more) = merge_paginate(corpus, 0, 3);
+        assert_eq!(page_ids(page), ["pkg:a:z", "repo:a", "sym:a:z"]);
+        assert!(!more);
+    }
+
+    #[test]
+    fn non_page_indexes_drop_before_hydration() {
+        struct DropSpy(Arc<AtomicUsize>);
+
+        impl Drop for DropSpy {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let drops = Arc::new(AtomicUsize::new(0));
+        let page = vec![test_hit("page", "sym:page:x", 1.0)];
+        let indexes = vec![
+            (
+                RepoQualifier::new("page".to_string()),
+                DropSpy(drops.clone()),
+            ),
+            (
+                RepoQualifier::new("off-page".to_string()),
+                DropSpy(drops.clone()),
+            ),
+        ];
+
+        let indexes = retain_page_indexes(indexes, &page);
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            1,
+            "the off-page handle drops before hydration can start"
+        );
+        assert_eq!(indexes.len(), 1);
+        assert_eq!(indexes[0].0.as_str(), "page");
+
+        drop(indexes);
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
+    }
+
     /// A page is clamped to the pagination window so a `limit` that doesn't
     /// divide it never strands reachable hits behind a rejected cursor: the
     /// last page is short, and `offset + page_limit` lands exactly on the
@@ -1059,13 +1133,22 @@ mod tests {
             std::process::id(),
             TEMP_ID.fetch_add(1, Ordering::Relaxed)
         ));
-        let packed = yg_shard::build_fts(&[yg_shard::SearchDoc {
-            node_id: "file:README.md".to_string(),
-            kind: yg_shard::NodeKind::File,
-            name: Some("README.md".to_string()),
-            path: Some("README.md".to_string()),
-            content: "this project applies a rate limit".to_string(),
-        }])
+        let packed = yg_shard::build_fts(&[
+            yg_shard::SearchDoc {
+                node_id: "file:README.md".to_string(),
+                kind: yg_shard::NodeKind::File,
+                name: Some("README.md".to_string()),
+                path: Some("README.md".to_string()),
+                content: "this project applies a rate limit".to_string(),
+            },
+            yg_shard::SearchDoc {
+                node_id: "file:GUIDE.md".to_string(),
+                kind: yg_shard::NodeKind::File,
+                name: Some("GUIDE.md".to_string()),
+                path: Some("GUIDE.md".to_string()),
+                content: "configure the rate limit".to_string(),
+            },
+        ])
         .expect("build fixture FTS");
         yg_shard::unpack_fts(&packed, &temp).expect("unpack fixture FTS");
 
@@ -1081,13 +1164,23 @@ mod tests {
                     kinds: None,
                     repos: None,
                     mode: None,
-                    limit: None,
+                    limit: Some(1),
                     cursor: None,
                 },
             ))
             .expect("search succeeds");
         assert_eq!(response.hits.len(), 1);
         assert!(response.hits[0].snippet.is_some(), "snippet was hydrated");
+        let next = response
+            .next
+            .as_ref()
+            .expect("the engine returns a typed continuation");
+        let encoded = cursor::encode(next);
+        let decoded: SearchCursor = cursor::decode(&encoded).expect("typed continuation encodes");
+        assert_eq!(decoded.query, "rate limit");
+        assert_eq!(decoded.mode, "lexical");
+        assert_eq!(decoded.offset, 1);
+        assert_eq!(decoded.targets.len(), 1);
         assert_eq!(
             resolver.resolutions.load(Ordering::SeqCst),
             1,

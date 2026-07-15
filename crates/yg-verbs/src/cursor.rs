@@ -122,19 +122,19 @@ pub(crate) struct HistoryCursor {
 /// pinned fan-out set, plus how many hits have already been returned.
 /// The field names and types are the compatibility contract for cursors
 /// minted before search orchestration moved into the engine.
-#[derive(Serialize, Deserialize)]
-pub(crate) struct SearchCursor {
-    pub query: String,
-    pub kinds: Option<Vec<String>>,
-    pub mode: String,
-    pub targets: Vec<SearchTarget>,
-    pub offset: usize,
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SearchCursor {
+    pub(crate) query: String,
+    pub(crate) kinds: Option<Vec<String>>,
+    pub(crate) mode: String,
+    pub(crate) targets: Vec<SearchTarget>,
+    pub(crate) offset: usize,
 }
 
 impl SearchCursor {
     /// A resumed search may repeat its pinned query shape in an equivalent
     /// spelling or omit it. Only page size may actually change.
-    pub fn agrees_with(&self, req: &SearchRequest) -> Result<(), String> {
+    pub(crate) fn agrees_with(&self, req: &SearchRequest) -> Result<(), String> {
         fn str_set(items: &[String]) -> std::collections::HashSet<&str> {
             items.iter().map(String::as_str).collect()
         }

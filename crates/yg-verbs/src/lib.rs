@@ -46,8 +46,8 @@ pub use engine::{
     ShardResolver, VerbError,
 };
 pub use search::{
-    MAX_CONCURRENT_SEARCH_FANOUT, RepoQualifier, SearchHit, SearchNodeName, SearchPath,
-    SearchResponse, SearchSnippet, SearchTarget, ShardRevision,
+    RepoQualifier, SearchHit, SearchNodeName, SearchPath, SearchResponse, SearchSnippet,
+    SearchTarget, ShardRevision,
 };
 
 pub const DEFAULT_NEIGHBORS_DEPTH: u32 = 1;
