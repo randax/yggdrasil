@@ -221,13 +221,56 @@ impl IndexWorker {
     /// A failed run is recorded (with backoff) rather than returned as an
     /// error — `Err` means the control plane itself is unreachable.
     pub async fn run_once(&self) -> anyhow::Result<bool> {
-        let Some(job) = self.control.claim_due_index(INDEX_LEASE).await? else {
+        self.run_once_with_optional_shutdown(None).await
+    }
+
+    /// Claim and run one due job while observing process shutdown. New
+    /// claims stop immediately; an active index gets until the shared
+    /// work cutoff to settle normally, then its lease is returned fresh
+    /// to the queue before the work future is dropped.
+    pub async fn run_once_with_shutdown(
+        &self,
+        shutdown: yg_sync::Shutdown,
+    ) -> anyhow::Result<bool> {
+        if shutdown.deadline().is_some() {
+            return Ok(false);
+        }
+        self.run_once_with_optional_shutdown(Some(shutdown)).await
+    }
+
+    async fn run_once_with_optional_shutdown(
+        &self,
+        shutdown: Option<yg_sync::Shutdown>,
+    ) -> anyhow::Result<bool> {
+        let Some(job) = claim_due_index_with_optional_shutdown(
+            shutdown.as_ref(),
+            self.control.claim_due_index(INDEX_LEASE),
+            async |job| self.control.release_index(job).await,
+        )
+        .await?
+        else {
             return Ok(false);
         };
         // A cold self-healing clone plus a long parse outlives the base
         // lease; the heartbeat keeps the job ours while the work is alive.
         let renew = async || self.control.renew_index(&job, INDEX_LEASE).await;
-        let indexed = yg_sync::with_lease_heartbeat(INDEX_LEASE, renew, self.index(&job)).await;
+        let indexed = if let Some(shutdown) = shutdown {
+            let release = async || self.control.release_index(&job).await;
+            match yg_sync::with_lease_heartbeat_until_shutdown(
+                INDEX_LEASE,
+                renew,
+                release,
+                shutdown,
+                self.index(&job),
+            )
+            .await?
+            {
+                yg_sync::LeaseShutdown::Finished(indexed) => indexed,
+                yg_sync::LeaseShutdown::Released => return Ok(true),
+            }
+        } else {
+            yg_sync::with_lease_heartbeat(INDEX_LEASE, renew, self.index(&job)).await
+        };
         match indexed {
             Ok(IndexAttempt::Published { shard, operation }) => {
                 let applied = yg_control::finish_shard_operation(
@@ -413,6 +456,22 @@ impl IndexWorker {
         }
         Ok(mirror)
     }
+}
+
+async fn claim_due_index_with_optional_shutdown<T>(
+    shutdown: Option<&yg_sync::Shutdown>,
+    claim: impl Future<Output = anyhow::Result<Option<T>>>,
+    release: impl AsyncFnOnce(&T) -> anyhow::Result<bool>,
+) -> anyhow::Result<Option<T>> {
+    let Some(job) = claim.await? else {
+        return Ok(None);
+    };
+    if shutdown.is_some_and(|shutdown| shutdown.request().is_some()) {
+        let released = release(&job).await?;
+        tracing::info!(released, "released fresh index claim for shutdown");
+        return Ok(None);
+    }
+    Ok(Some(job))
 }
 
 /// Whether `commit` is present in the (possibly absent) bare mirror.
@@ -2952,6 +3011,11 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<FileEntry>) -> anyhow::R
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use tokio::time::Instant;
+
     use super::*;
     use yg_control::ShardOperationFence;
 
@@ -3078,6 +3142,29 @@ mod tests {
             preparation_runs.load(std::sync::atomic::Ordering::SeqCst),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn index_claim_completing_after_shutdown_is_released_before_work_starts() {
+        let (trigger, shutdown) = yg_sync::shutdown_channel();
+        let released_job = AtomicUsize::new(0);
+        let claim = async {
+            assert!(trigger.request(
+                Instant::now() + Duration::from_secs(30),
+                yg_sync::ShutdownCause::Signal,
+            ));
+            Ok(Some(43_usize))
+        };
+
+        let claimed = claim_due_index_with_optional_shutdown(Some(&shutdown), claim, async |job| {
+            released_job.store(*job, Ordering::SeqCst);
+            Ok(true)
+        })
+        .await
+        .expect("post-claim shutdown check");
+
+        assert!(claimed.is_none(), "shutdown claims must not start work");
+        assert_eq!(released_job.load(Ordering::SeqCst), 43);
     }
 
     /// Folding history into the syntactic graph keeps a TOUCHES only when

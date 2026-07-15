@@ -9,9 +9,10 @@ use yg_control::ControlPlane;
 
 use crate::forge::{Forge, ForgeRegistry, github::discovery_client};
 use crate::git::{GitFetcher, forge_token, lock_mirror, remote_head_commit};
-use crate::lease::with_lease_heartbeat;
+use crate::lease::{LeaseShutdown, with_lease_heartbeat, with_lease_heartbeat_until_shutdown};
 use crate::locator::join_clone_url;
 use crate::rate::{RATE_LIMIT_COOLDOWN, TokenBucket};
+use crate::shutdown::Shutdown;
 
 /// How long a worker may hold a fetch job before a crashed run becomes
 /// claimable again. Generous: a cold full-history clone of a large repo.
@@ -64,7 +65,31 @@ impl SyncWorker {
     /// failed fetch is recorded (with backoff) rather than returned as an
     /// error — `Err` means the control plane itself is unreachable.
     pub async fn run_once(&self) -> anyhow::Result<bool> {
-        let Some(job) = self.control.claim_due_fetch(FETCH_LEASE).await? else {
+        self.run_once_with_optional_shutdown(None).await
+    }
+
+    /// Claim and run one due job while observing process shutdown. New
+    /// claims stop immediately; an active fetch gets until the shared
+    /// work cutoff to settle normally, then its lease is returned fresh
+    /// to the queue before the work future is dropped.
+    pub async fn run_once_with_shutdown(&self, shutdown: Shutdown) -> anyhow::Result<bool> {
+        if shutdown.deadline().is_some() {
+            return Ok(false);
+        }
+        self.run_once_with_optional_shutdown(Some(shutdown)).await
+    }
+
+    async fn run_once_with_optional_shutdown(
+        &self,
+        shutdown: Option<Shutdown>,
+    ) -> anyhow::Result<bool> {
+        let Some(job) = claim_due_fetch_with_optional_shutdown(
+            shutdown.as_ref(),
+            self.control.claim_due_fetch(FETCH_LEASE),
+            async |job| self.control.release_fetch(job).await,
+        )
+        .await?
+        else {
             return Ok(false);
         };
         let clone_url = join_clone_url(&job.base_url, &job.slug);
@@ -82,7 +107,23 @@ impl SyncWorker {
         // A cold clone of a large repo outlives the base lease; the
         // heartbeat keeps the job ours for as long as the work is alive.
         let renew = async || self.control.renew_fetch(&job, FETCH_LEASE).await;
-        let synced = with_lease_heartbeat(FETCH_LEASE, renew, work).await;
+        let synced = if let Some(shutdown) = shutdown {
+            let release = async || self.control.release_fetch(&job).await;
+            match with_lease_heartbeat_until_shutdown(
+                FETCH_LEASE,
+                renew,
+                release,
+                shutdown.clone(),
+                work,
+            )
+            .await?
+            {
+                LeaseShutdown::Finished(synced) => synced,
+                LeaseShutdown::Released => return Ok(true),
+            }
+        } else {
+            with_lease_heartbeat(FETCH_LEASE, renew, work).await
+        };
         match synced {
             Ok(commit) => {
                 if self.control.complete_fetch(&job, &commit).await? {
@@ -293,6 +334,22 @@ impl SyncWorker {
     }
 }
 
+async fn claim_due_fetch_with_optional_shutdown<T>(
+    shutdown: Option<&Shutdown>,
+    claim: impl Future<Output = anyhow::Result<Option<T>>>,
+    release: impl AsyncFnOnce(&T) -> anyhow::Result<bool>,
+) -> anyhow::Result<Option<T>> {
+    let Some(job) = claim.await? else {
+        return Ok(None);
+    };
+    if shutdown.is_some_and(|shutdown| shutdown.request().is_some()) {
+        let released = release(&job).await?;
+        tracing::info!(released, "released fresh fetch claim for shutdown");
+        return Ok(None);
+    }
+    Ok(Some(job))
+}
+
 /// How the poll loop is paced: the default interval between a repo's
 /// default-branch head checks, and the jitter spread (a fraction of the
 /// interval) that keeps a forge's repos from polling in lockstep. A
@@ -319,4 +376,38 @@ fn in_flight_fetch_repoll(due: &yg_control::DuePoll, cfg: &PollConfig) -> Durati
     repo_interval
         .min(FETCH_IN_FLIGHT_REPOLL_MAX)
         .max(Duration::from_secs(1))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use tokio::time::Instant;
+
+    use super::claim_due_fetch_with_optional_shutdown;
+    use crate::{ShutdownCause, shutdown_channel};
+
+    #[tokio::test]
+    async fn fetch_claim_completing_after_shutdown_is_released_before_work_starts() {
+        let (trigger, shutdown) = shutdown_channel();
+        let released_job = AtomicUsize::new(0);
+        let claim = async {
+            assert!(trigger.request(
+                Instant::now() + Duration::from_secs(30),
+                ShutdownCause::Signal,
+            ));
+            Ok(Some(41_usize))
+        };
+
+        let claimed = claim_due_fetch_with_optional_shutdown(Some(&shutdown), claim, async |job| {
+            released_job.store(*job, Ordering::SeqCst);
+            Ok(true)
+        })
+        .await
+        .expect("post-claim shutdown check");
+
+        assert!(claimed.is_none(), "shutdown claims must not start work");
+        assert_eq!(released_job.load(Ordering::SeqCst), 41);
+    }
 }

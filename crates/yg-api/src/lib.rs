@@ -24,6 +24,7 @@ use axum::middleware;
 use axum::routing::{get, post};
 use object_store::ObjectStore;
 use tokio::net::TcpListener;
+use tokio::sync::oneshot;
 use yg_control::ControlPlane;
 
 pub use config::{ObjectStoreConfig, RunningServer, ServerConfig, probe_object_store};
@@ -130,15 +131,24 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<RunningServer> {
         .await
         .with_context(|| format!("binding {}", config.listen))?;
     let local_addr = listener.local_addr()?;
+    let (shutdown, shutdown_requested) = oneshot::channel::<config::ServerShutdown>();
     let handle = tokio::spawn(async move {
-        let result = axum::serve(listener, app).await;
+        let result = axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_requested.await;
+            })
+            .await;
         if let Err(e) = &result {
             tracing::error!("server exited: {e}");
         }
         result
     });
 
-    Ok(RunningServer { local_addr, handle })
+    Ok(RunningServer {
+        local_addr,
+        handle,
+        shutdown: Some(shutdown),
+    })
 }
 
 #[cfg(test)]

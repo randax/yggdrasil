@@ -1127,6 +1127,13 @@ impl ControlPlane {
             .await
     }
 
+    /// Return a fetch claim to the immediately-due queue without
+    /// recording a failed attempt. The lease token fences shutdown from
+    /// releasing a job that a healthy worker has already reclaimed.
+    pub async fn release_fetch(&self, job: &LeasedFetch) -> anyhow::Result<bool> {
+        self.release_leased_job(job.job_id, &job.lease_token).await
+    }
+
     /// Extend a fetch job's lease so work that outlives the base lease —
     /// a cold full-history clone — is not reclaimed mid-run. Lease-fenced
     /// like completion: `false` means the job was reclaimed and this
@@ -1545,6 +1552,23 @@ impl ControlPlane {
     pub async fn fail_index(&self, job: &LeasedIndex, error: &str) -> anyhow::Result<bool> {
         self.fail_leased_job(job.job_id, &job.lease_token, error)
             .await
+    }
+
+    /// Return an index claim to the immediately-due queue without
+    /// recording a failed attempt. See [`Self::release_fetch`].
+    pub async fn release_index(&self, job: &LeasedIndex) -> anyhow::Result<bool> {
+        self.release_leased_job(job.job_id, &job.lease_token).await
+    }
+
+    async fn release_leased_job(
+        &self,
+        job_id: i64,
+        lease_token: &LeaseToken,
+    ) -> anyhow::Result<bool> {
+        let mut tx = self.pool.begin().await?;
+        let released = settle_leased_job(&mut tx, job_id, lease_token, false).await?;
+        tx.commit().await?;
+        Ok(released)
     }
 
     /// Re-queue a leased job with exponential backoff (30s doubling per
