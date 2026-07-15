@@ -157,6 +157,7 @@ struct DeletionSeamStore {
     deletions: Arc<std::sync::Mutex<Vec<String>>>,
     delete_count: Arc<AtomicUsize>,
     fail_at: Option<usize>,
+    fail_listing: bool,
 }
 
 impl DeletionSeamStore {
@@ -166,6 +167,14 @@ impl DeletionSeamStore {
             deletions: Arc::new(std::sync::Mutex::new(Vec::new())),
             delete_count: Arc::new(AtomicUsize::new(0)),
             fail_at,
+            fail_listing: false,
+        }
+    }
+
+    fn with_listing_failure() -> Self {
+        Self {
+            fail_listing: true,
+            ..Self::new(None)
         }
     }
 
@@ -244,6 +253,15 @@ impl ObjectStore for DeletionSeamStore {
         &self,
         prefix: Option<&object_store::path::Path>,
     ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        if self.fail_listing {
+            return futures::stream::once(futures::future::ready(Err(
+                object_store::Error::NotFound {
+                    path: "simulated listing page".into(),
+                    source: Box::new(std::io::Error::other("simulated listing failure")),
+                },
+            )))
+            .boxed();
+        }
         self.inner.list(prefix)
     }
 
@@ -288,6 +306,22 @@ async fn deletion_removes_the_manifest_before_every_segment() {
             "manifest deletion must precede {segment}: {deletions:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn deletion_does_not_mistake_a_listing_not_found_for_an_idempotent_object_delete() {
+    let store = DeletionSeamStore::with_listing_failure();
+
+    let error = delete_shard(&store, 7, "listing-failure")
+        .await
+        .expect_err("a listing failure must abort reclamation");
+
+    assert!(
+        error
+            .chain()
+            .any(|cause| cause.to_string().contains("simulated listing page")),
+        "listing error provenance must be retained: {error:#}"
+    );
 }
 
 #[tokio::test]

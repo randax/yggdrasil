@@ -433,24 +433,20 @@ pub async fn delete_shard(
     use futures::{StreamExt, TryStreamExt};
     let prefix = object_store::path::Path::from(format!("shards/{repo_id}/{revision}/"));
     let manifest = object_store::path::Path::from(manifest_key(repo_id, revision));
-    let locations = store
-        .list(Some(&prefix))
-        .map_ok(|object| object.location)
-        .try_collect::<Vec<_>>()
-        .await
-        .with_context(|| format!("listing Shard objects under {prefix}"))?;
 
     delete_if_present(store, &manifest)
         .await
         .context("deleting the Shard manifest before its segments")?;
     let manifest_for_filter = manifest.clone();
-    let locations = futures::stream::iter(
-        locations
-            .into_iter()
-            .filter(move |location| location != &manifest_for_filter)
-            .map(Ok),
-    )
-    .boxed();
+    let locations = store
+        .list(Some(&prefix))
+        .map_err(|error| object_store::Error::Generic {
+            store: "Shard object listing",
+            source: Box::new(error),
+        })
+        .map_ok(|object| object.location)
+        .try_filter(move |location| futures::future::ready(location != &manifest_for_filter))
+        .boxed();
     store
         .delete_stream(locations)
         .filter_map(|deleted| async {
@@ -460,7 +456,7 @@ pub async fn delete_shard(
                 Err(e) => Some(Err(e)),
             }
         })
-        .try_collect::<Vec<_>>()
+        .try_for_each(|_| futures::future::ready(Ok(())))
         .await
         .with_context(|| format!("deleting Shard objects under {prefix}"))?;
 
