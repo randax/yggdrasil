@@ -5,6 +5,8 @@ use std::time::Duration;
 use anyhow::Context;
 use yg_shard::{Edge, EdgeKind, Graph, Node, NodeKind, Provenance};
 
+use crate::commit::{CommitSha, is_valid_commit_sha};
+
 /// The git-history layer (RFC 0001 §4): walk every commit reachable from
 /// `commit` and distill it into Commit and Contributor nodes plus AUTHORED
 /// (Contributor→Commit) and TOUCHES (Commit→File) edges. Contributors are
@@ -34,6 +36,14 @@ use yg_shard::{Edge, EdgeKind, Graph, Node, NodeKind, Provenance};
 /// mid-walk. `--git-dir`, never `-C`: repository discovery must not climb
 /// out of a missing mirror into an enclosing checkout.
 pub async fn extract_history(git_dir: &Path, commit: &str) -> anyhow::Result<Graph> {
+    let commit = CommitSha::try_from(commit)?;
+    extract_history_for_commit(git_dir, &commit).await
+}
+
+pub(crate) async fn extract_history_for_commit(
+    git_dir: &Path,
+    commit: &CommitSha,
+) -> anyhow::Result<Graph> {
     let log = git_log_history(git_dir, commit).await?;
     // Walk the log off the runtime threads: every other CPU-bound pass
     // (syntactic_pass, extract_tree, the segment builds in write_shard)
@@ -91,7 +101,7 @@ fn parse_history(log: &str) -> anyhow::Result<Graph> {
         // Defense in depth: NUL framing already prevents forged records, but
         // a misframed record (a future git output change) would desync —
         // skip anything whose first field isn't a real sha.
-        if !is_hex_sha(sha) {
+        if !is_valid_commit_sha(sha) {
             continue;
         }
         let Ok(committed_at) = ct.parse::<i64>() else {
@@ -134,13 +144,6 @@ fn parse_history(log: &str) -> anyhow::Result<Graph> {
         }
     }
     Ok(graph)
-}
-
-/// Whether `s` is a full git object name — 40 (SHA-1) or 64 (SHA-256) hex
-/// digits. The `%H` format always emits one; anything else marks a desynced
-/// record the parser should drop.
-fn is_hex_sha(s: &str) -> bool {
-    matches!(s.len(), 40 | 64) && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// Fold an extracted [`extract_history`] graph into the syntactic `graph`,
@@ -195,12 +198,12 @@ const HISTORY_LOG_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// pass that fails forever identically. (Paths are kept literal via
 /// `core.quotePath=false` so they match the File-node ids the checkout
 /// walk built; any that still don't are pruned by `merge_history`.)
-async fn git_log_history(git_dir: &Path, commit: &str) -> anyhow::Result<String> {
+async fn git_log_history(git_dir: &Path, commit: &CommitSha) -> anyhow::Result<String> {
     let mut cmd = tokio::process::Command::new("git");
     cmd.arg("--git-dir")
         .arg(git_dir)
         .args(["-c", "core.quotePath=false"])
-        .args(["log", commit, "--no-renames", "--name-only", "-z"])
+        .args(["log", commit.as_str(), "--no-renames", "--name-only", "-z"])
         .arg("--pretty=format:%H%x00%ct%x00%an%x00%ae%x00%s%x00")
         .env("GIT_TERMINAL_PROMPT", "0")
         .kill_on_drop(true);

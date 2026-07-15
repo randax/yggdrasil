@@ -6,7 +6,8 @@ use anyhow::Context;
 use object_store::ObjectStore;
 use yg_control::ControlPlane;
 
-use crate::history::{extract_history, merge_history};
+use crate::commit::CommitSha;
+use crate::history::{extract_history_for_commit, merge_history};
 use crate::pass::syntactic_pass;
 
 /// How long a worker may hold an index job before a crashed run becomes
@@ -131,11 +132,12 @@ impl IndexWorker {
         &self,
         job: &yg_control::LeasedIndex,
     ) -> anyhow::Result<yg_shard::PublishedShard> {
+        let commit = commit_for_job(&job.commit)?;
         // Revisions are deterministic per commit: when this one is
         // already published (a re-add, a retried job, another worker got
         // there first), answer from storage without touching git.
         if let Some(published) =
-            yg_shard::published_shard(self.store.as_ref(), job.repo_id, &job.commit).await?
+            yg_shard::published_shard(self.store.as_ref(), job.repo_id, commit.as_str()).await?
         {
             return Ok(published);
         }
@@ -151,8 +153,7 @@ impl IndexWorker {
         let history = {
             let _serialize_same_mirror =
                 yg_sync::lock_mirror(&self.git_cache, job.repo_id, INDEX_LEASE).await?;
-            let mirror = self.ensure_mirror_has(job).await?;
-            let commit = job.commit.clone();
+            let mirror = self.ensure_mirror_has(job, &commit).await?;
             // The checkout extraction is blocking (archive | tar); run it
             // off the runtime threads, under the lock.
             {
@@ -166,7 +167,7 @@ impl IndexWorker {
             // The history walk runs its own (timeout- and kill-guarded) git
             // log, still under the mirror lock so a concurrent prune can't
             // GC objects mid-walk.
-            extract_history(&mirror, &commit).await?
+            extract_history_for_commit(&mirror, &commit).await?
         };
         let (mut graph, search_docs) = {
             let dest = checkout.path().to_path_buf();
@@ -180,7 +181,7 @@ impl IndexWorker {
         yg_shard::write_shard(
             self.store.as_ref(),
             job.repo_id,
-            &job.commit,
+            commit.as_str(),
             graph,
             search_docs,
         )
@@ -191,9 +192,13 @@ impl IndexWorker {
     /// cache is worker-local while the queue is not: a job can land on a
     /// host whose cache never saw the repo (or saw an older commit), so
     /// an indexing worker fetches the mirror itself when it must.
-    async fn ensure_mirror_has(&self, job: &yg_control::LeasedIndex) -> anyhow::Result<PathBuf> {
+    async fn ensure_mirror_has(
+        &self,
+        job: &yg_control::LeasedIndex,
+        commit: &CommitSha,
+    ) -> anyhow::Result<PathBuf> {
         let mirror = yg_sync::mirror_path(&self.git_cache, job.repo_id);
-        if commit_available(&mirror, &job.commit).await {
+        if commit_available(&mirror, commit).await {
             return Ok(mirror);
         }
         let clone_url = yg_sync::join_clone_url(&job.base_url, &job.slug);
@@ -209,24 +214,31 @@ impl IndexWorker {
         // necessarily the job's commit: a shallow depth override prunes
         // older commits, and rewritten history drops them entirely. Say
         // so instead of letting git archive fail cryptically downstream.
-        if !commit_available(&mirror, &job.commit).await {
+        if !commit_available(&mirror, commit).await {
             anyhow::bail!(
                 "commit {} is still missing after fetching {clone_url} — \
                  a shallow fetch depth that no longer reaches it, or \
                  rewritten history; re-adding the repo queues a fresh \
                  fetch whose newer commit supersedes this job",
-                job.commit
+                commit
             );
         }
         Ok(mirror)
     }
 }
 
+/// Parse the untyped control-plane payload before the worker performs storage,
+/// filesystem, network, or subprocess work. Every git helper below requires
+/// the resulting type, so an invalid queue value cannot reach `git`.
+fn commit_for_job(commit: &str) -> anyhow::Result<CommitSha> {
+    Ok(CommitSha::try_from(commit)?)
+}
+
 /// Whether `commit` is present in the (possibly absent) bare mirror.
 /// `--git-dir`, not `-C`: discovery would climb out of a missing
 /// mirror into whatever repository encloses the cache dir and answer
 /// for the wrong repo.
-async fn commit_available(mirror: &Path, commit: &str) -> bool {
+async fn commit_available(mirror: &Path, commit: &CommitSha) -> bool {
     let mut cmd = tokio::process::Command::new("git");
     cmd.arg("--git-dir")
         .arg(mirror)
@@ -237,7 +249,7 @@ async fn commit_available(mirror: &Path, commit: &str) -> bool {
 
 /// Materialize `commit`'s tree from a bare mirror into `dest`, without
 /// touching the mirror: `git archive` piped through `tar`.
-fn extract_tree(mirror: &Path, commit: &str, dest: &Path) -> anyhow::Result<()> {
+fn extract_tree(mirror: &Path, commit: &CommitSha, dest: &Path) -> anyhow::Result<()> {
     use std::io::Read;
     use std::process::{Command, Stdio};
     let mut archive = Command::new("git")
@@ -312,4 +324,16 @@ fn extract_tree(mirror: &Path, commit: &str, dest: &Path) -> anyhow::Result<()> 
         anyhow::bail!("git archive {commit} failed: {}", archive_stderr.trim());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn malformed_commit_is_rejected_at_worker_boundary_before_git_can_spawn() {
+        let error = commit_for_job("--exec=x").expect_err("option-like commit must be rejected");
+
+        assert_eq!(error.to_string(), "invalid commit sha \"--exec=x\"");
+    }
 }

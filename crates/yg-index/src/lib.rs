@@ -1,5 +1,6 @@
 //! Tree-sitter syntactic indexing, history ingestion, and worker orchestration.
 
+mod commit;
 mod gc;
 mod history;
 mod pass;
