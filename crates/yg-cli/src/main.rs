@@ -1265,7 +1265,7 @@ where
             if let Err(error) = signal {
                 tracing::error!(error = format!("{error:#}"), "shutdown signal listener failed");
             } else {
-                tracing::warn!("second shutdown signal received; forcing exit");
+                tracing::warn!("shutdown signal received during drain; forcing exit");
             }
             std::process::exit(shutdown_exit_code(cause, true))
         }
@@ -1354,10 +1354,18 @@ impl ShutdownSignals {
     fn install() -> anyhow::Result<Self> {
         let (sender, interrupt) = tokio::sync::mpsc::channel(1);
         tokio::spawn(async move {
-            let result = tokio::signal::ctrl_c()
-                .await
-                .context("installing interrupt handler");
-            let _ = sender.send(result).await;
+            // Persistent: each interrupt is forwarded so a second signal
+            // during the drain still reaches the drain's listener instead
+            // of the stream ending after the first delivery.
+            loop {
+                let result = tokio::signal::ctrl_c()
+                    .await
+                    .context("installing interrupt handler");
+                let failed = result.is_err();
+                if sender.send(result).await.is_err() || failed {
+                    break;
+                }
+            }
         });
         Ok(Self { interrupt })
     }
