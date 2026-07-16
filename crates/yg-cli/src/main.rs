@@ -1827,17 +1827,23 @@ async fn run_workers(
         drain_queue(shutdown.clone(), || sync.poll_once(&poll)),
     );
     let gc = supervise_worker_loop(
-        shutdown_trigger,
+        shutdown_trigger.clone(),
         gc_loop(
             &index,
             &control,
             deploy.gc_grace,
             deploy.job_retention,
             deploy.gc_interval,
-            shutdown,
+            shutdown.clone(),
         ),
     );
-    let joined = async { tokio::join!(discover, fetch, indexing, polling, gc) };
+    let orphan_reconcile = supervise_worker_loop(
+        shutdown_trigger,
+        orphan_reconcile_loop(deploy.orphan_reconcile_interval, shutdown, || {
+            index.reconcile_orphans_once()
+        }),
+    );
+    let joined = async { tokio::join!(discover, fetch, indexing, polling, gc, orphan_reconcile) };
     let mut joined = std::pin::pin!(joined);
     let results = tokio::select! {
         results = &mut joined => results,
@@ -1856,7 +1862,8 @@ async fn run_workers(
     results.1?;
     results.2?;
     results.3?;
-    results.4
+    results.4?;
+    results.5
 }
 
 async fn supervise_worker_loop<F>(
@@ -1966,6 +1973,35 @@ async fn gc_loop(
     }
 }
 
+/// Reconcile rowless object-storage prefixes on a cadence independent of
+/// superseded-Shard GC. Failures are best-effort and retried on the next tick;
+/// shutdown prevents a new sweep and interrupts the cadence sleep.
+async fn orphan_reconcile_loop<F, Fut>(
+    interval: std::time::Duration,
+    mut shutdown: yg_sync::Shutdown,
+    mut reconcile_once: F,
+) -> anyhow::Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<u64>>,
+{
+    loop {
+        if shutdown.deadline().is_some() {
+            return Ok(());
+        }
+        if let Err(e) = reconcile_once().await {
+            tracing::warn!(
+                error = format!("{e:#}"),
+                "orphaned Shard reconciliation failed; retrying next interval"
+            );
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {}
+            _ = shutdown.requested() => return Ok(()),
+        }
+    }
+}
+
 async fn status(json: bool) -> anyhow::Result<()> {
     let (server, _) = client_env()?;
     let response = server_request::<yg_verbs::status::StatusResponse>(
@@ -2053,6 +2089,30 @@ mod shutdown_tests {
         assert_eq!(request.cause(), yg_sync::ShutdownCause::Failure);
         assert!(request.work_deadline() >= earliest_expected_deadline);
         assert!(request.work_deadline() <= latest_expected_deadline);
+    }
+
+    #[tokio::test]
+    async fn orphan_reconcile_cadence_invokes_its_own_worker_seam() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::Duration;
+
+        let (trigger, shutdown) = yg_sync::shutdown_channel();
+        let reconciliations = Arc::new(AtomicU64::new(0));
+        let observed = reconciliations.clone();
+
+        orphan_reconcile_loop(Duration::from_secs(60), shutdown, move || {
+            observed.fetch_add(1, Ordering::Relaxed);
+            trigger.request(
+                tokio::time::Instant::now() + Duration::from_secs(1),
+                yg_sync::ShutdownCause::Signal,
+            );
+            async { Ok(0) }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(reconciliations.load(Ordering::Relaxed), 1);
     }
 }
 

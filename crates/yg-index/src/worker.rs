@@ -153,6 +153,18 @@ impl IndexWorker {
         crate::gc::retire_terminal_jobs(&self.control, retention).await
     }
 
+    /// Reclaim rowless Shard object prefixes left behind when a prior GC
+    /// committed its row deletion but crashed before deleting the objects.
+    /// This sweep has its own worker cadence and conservative object-age
+    /// fence, independent of superseded-Shard GC.
+    pub async fn reconcile_orphans_once(&self) -> anyhow::Result<u64> {
+        Ok(
+            crate::reconcile::reconcile_orphans(&self.control, self.store.as_ref())
+                .await?
+                .reclaimed,
+        )
+    }
+
     /// Claim and run one due index job. Returns whether there was work.
     /// A failed run is recorded (with backoff) rather than returned as an
     /// error — `Err` means the control plane itself is unreachable.
