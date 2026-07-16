@@ -844,13 +844,10 @@ impl ControlPlane {
     ) -> anyhow::Result<AddRepoOutcome> {
         let mut tx = self.pool.begin().await?;
         // DO UPDATE (rather than DO NOTHING) so RETURNING yields the id
-        // on conflict too. The existing kind always wins: the URL
-        // locator can only recognize well-known hosts, so a repo add on
-        // a GitHub Enterprise forge arrives as generic `git` — letting
-        // it overwrite the row `forge add` registered as `github` would
-        // silently disable the org's discovery. token_env and api_root
-        // only backfill missing values — an explicit per-forge value is
-        // never clobbered by a re-add.
+        // on conflict too. The existing kind always wins so a concurrent
+        // Forge configuration cannot be reclassified by repo registration.
+        // token_env and api_root only backfill missing values — an explicit
+        // per-forge value is never clobbered by a re-add.
         let (forge_id,): (i64,) = sqlx::query_as(
             "INSERT INTO forges (kind, base_url, token_env, api_root) VALUES ($1, $2, $3, $4)
              ON CONFLICT (base_url) DO UPDATE
@@ -1189,6 +1186,18 @@ impl ControlPlane {
             .fetch_optional(&self.pool)
             .await?;
         Ok(row.map(|(id,)| id))
+    }
+
+    /// The configured Forge kind for an exact clone root, if registered.
+    pub async fn forge_kind_by_base_url(
+        &self,
+        base_url: &ForgeUrl,
+    ) -> anyhow::Result<Option<StoredForgeKind>> {
+        let row: Option<(String,)> = sqlx::query_as("SELECT kind FROM forges WHERE base_url = $1")
+            .bind(base_url.as_str())
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|(kind,)| StoredForgeKind::new(kind)))
     }
 
     pub async fn request_discovery(

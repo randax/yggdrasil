@@ -41,7 +41,8 @@ pub(crate) async fn admin_forge_add(
     State(state): State<Arc<AppState>>,
     WireJson(req): WireJson<AddForgeRequest>,
 ) -> Result<Response, ApiError> {
-    let forge = discovery_capable_forge(&req.kind).map_err(ApiError::bad_request)?;
+    let forge =
+        discovery_capable_forge(&state.forge_registry, &req.kind).map_err(ApiError::bad_request)?;
     let org = github_org_slug(&req.org).map_err(ApiError::bad_request)?;
     let base_url = github_base_url(req.base_url.as_deref())
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
@@ -83,8 +84,11 @@ pub(crate) async fn admin_forge_add(
 
 /// Resolve a requested forge kind to a registered adapter that can
 /// discover org repositories.
-fn discovery_capable_forge(kind: &str) -> Result<&'static dyn Forge, String> {
-    yg_sync::forge::builtin()
+fn discovery_capable_forge<'a>(
+    registry: &'a yg_sync::forge::ForgeRegistry,
+    kind: &str,
+) -> Result<&'a dyn Forge, String> {
+    registry
         .by_kind(kind.trim().to_ascii_lowercase().as_str())
         .filter(|forge| forge.discovery().is_some())
         .ok_or_else(|| format!("forge kind {kind:?} has no discovery adapter in this release"))
@@ -150,7 +154,8 @@ pub(crate) async fn admin_forge_discover(
     State(state): State<Arc<AppState>>,
     WireJson(req): WireJson<DiscoverForgeRequest>,
 ) -> Result<Response, ApiError> {
-    let forge = discovery_capable_forge(&req.kind).map_err(ApiError::bad_request)?;
+    let forge =
+        discovery_capable_forge(&state.forge_registry, &req.kind).map_err(ApiError::bad_request)?;
     let kind = forge.kind();
     let org = github_org_slug(&req.org).map_err(ApiError::bad_request)?;
     let base_url = github_base_url(req.base_url.as_deref())
@@ -281,12 +286,29 @@ pub(crate) async fn admin_repo_add(
             "poll_interval must be a positive number of seconds (got {interval})"
         )));
     }
-    // The typed parse error renders to its human-facing form here, at
-    // the I/O edge.
-    let locator = RepoLocator::parse(&req.url).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    // Parse URL structure first so an exact configured Forge root can select
+    // its adapter before host claims are considered.
+    let unclassified = RepoLocator::parse_unclassified(&req.url)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let lookup_base = yg_control::ForgeUrl::parse(unclassified.base_url().to_string())
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let configured_kind = state.control.forge_kind_by_base_url(&lookup_base).await?;
+    let locator = if let Some(kind) = configured_kind.as_ref() {
+        let forge = state.forge_registry.by_kind(kind.as_str()).ok_or_else(|| {
+            ApiError::internal(anyhow::anyhow!(
+                "configured forge kind {:?} has no registered adapter",
+                kind.as_str()
+            ))
+        })?;
+        unclassified.resolve(forge)
+    } else {
+        unclassified.resolve_with_registry(&state.forge_registry)
+    }
+    .map_err(|error| ApiError::bad_request(error.to_string()))?;
     let base_url = yg_control::ForgeUrl::parse(locator.base_url)
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    let forge = yg_sync::forge::builtin()
+    let forge = state
+        .forge_registry
         .by_kind(locator.kind)
         .ok_or_else(|| ApiError::internal(anyhow::anyhow!("locator kind without an adapter")))?;
     // Every node id this repo will ever mint embeds its qualifier
