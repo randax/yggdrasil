@@ -302,10 +302,16 @@ pub(crate) async fn admin_repo_add(
     // its adapter before host claims are considered.
     let unclassified = RepoLocator::parse_unclassified(&req.url)
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let input_base_url = unclassified
+        .input_base_url()
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
     let lookup_base = unclassified
         .configured_lookup_base_url()
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    let configured_kind = state.control.forge_kind_by_base_url(&lookup_base).await?;
+    let configured_kind = state
+        .control
+        .configured_forge_kind_by_base_url(&lookup_base)
+        .await?;
     let locator = if let Some(kind) = configured_kind.as_ref() {
         let forge = state.forge_registry.by_kind(kind.as_str()).ok_or_else(|| {
             ApiError::internal(anyhow::anyhow!(
@@ -347,6 +353,7 @@ pub(crate) async fn admin_repo_add(
         .add_validated_repo(yg_control::ValidatedAddRepo {
             forge_kind: locator.kind,
             base_url: &base_url,
+            registration_base_url: &input_base_url,
             token_env: forge.default_token_env(),
             api_root: api_root.as_ref(),
             slug: &locator.slug,

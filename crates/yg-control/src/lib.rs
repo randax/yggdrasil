@@ -284,6 +284,7 @@ pub struct AddRepo<'a> {
 pub struct ValidatedAddRepo<'a> {
     pub forge_kind: &'a str,
     pub base_url: &'a ForgeUrl,
+    pub registration_base_url: &'a ForgeUrl,
     pub token_env: Option<&'a str>,
     pub api_root: Option<&'a ForgeUrl>,
     pub slug: &'a str,
@@ -828,6 +829,7 @@ impl ControlPlane {
         self.add_validated_repo(ValidatedAddRepo {
             forge_kind: repo.forge_kind,
             base_url: &base_url,
+            registration_base_url: &base_url,
             token_env: repo.token_env,
             api_root: api_root.as_ref(),
             slug: repo.slug,
@@ -868,28 +870,36 @@ impl ControlPlane {
         // slug), so the upsert never changes it; a unique violation on
         // it means the same qualifier arrived via a different forge row.
         let qualifier = repo_qualifier(repo.base_url.as_str(), repo.slug);
-        let inserted: Result<(i64, bool), sqlx::Error> = sqlx::query_as(
-            "INSERT INTO repos (forge_id, slug, fetch_depth, qualifier, poll_interval_seconds)
-             VALUES ($1, $2, $3, $4, $5)
+        let inserted: Result<(i64, bool, bool), sqlx::Error> = sqlx::query_as(
+            "INSERT INTO repos
+                 (forge_id, slug, fetch_depth, qualifier, poll_interval_seconds,
+                  registration_base_url)
+             VALUES ($1, $2, $3, $4, $5, $6)
              ON CONFLICT (forge_id, slug) DO UPDATE
              SET fetch_depth = excluded.fetch_depth,
                  poll_interval_seconds = excluded.poll_interval_seconds
-             RETURNING id, (xmax = 0)",
+             RETURNING id, (xmax = 0),
+                       coalesce(registration_base_url, $7) = $6",
         )
         .bind(forge_id)
         .bind(repo.slug)
         .bind(repo.fetch_depth)
         .bind(&qualifier)
         .bind(repo.poll_interval_seconds)
+        .bind(repo.registration_base_url.as_str())
+        .bind(repo.base_url.as_str())
         .fetch_one(&mut *tx)
         .await;
-        let (repo_id, created) = match inserted {
+        let (repo_id, created, same_registration_base_url) = match inserted {
             Ok(row) => row,
             Err(sqlx::Error::Database(e)) if e.constraint() == Some("repos_qualifier") => {
                 return Err(anyhow::Error::new(QualifierConflict { qualifier }));
             }
             Err(e) => return Err(e.into()),
         };
+        if !created && !same_registration_base_url {
+            return Err(anyhow::Error::new(QualifierConflict { qualifier }));
+        }
         let rules = rules_for_forge(&mut tx, forge_id).await?;
         let (visibility,): (RepoVisibility,) =
             sqlx::query_as("SELECT visibility FROM repos WHERE id = $1 FOR UPDATE")
@@ -1061,8 +1071,9 @@ impl ControlPlane {
                 None => {
                     let inserted: Option<(i64,)> = sqlx::query_as(
                         "INSERT INTO repos
-                            (forge_id, slug, visibility, discovery_state, fetch_depth, qualifier)
-                         VALUES ($1, $2, $3, $4, $5, $6)
+                            (forge_id, slug, visibility, discovery_state, fetch_depth, qualifier,
+                             registration_base_url)
+                         VALUES ($1, $2, $3, $4, $5, $6, $7)
                          ON CONFLICT (forge_id, slug) DO NOTHING
                          RETURNING id",
                     )
@@ -1072,6 +1083,7 @@ impl ControlPlane {
                     .bind(state)
                     .bind(repo.fetch_depth)
                     .bind(&qualifier)
+                    .bind(base_url.as_str())
                     .fetch_optional(&mut *tx)
                     .await
                     .map_err(|e| match e {
@@ -1188,15 +1200,24 @@ impl ControlPlane {
         Ok(row.map(|(id,)| id))
     }
 
-    /// The configured Forge kind for an exact clone root, if registered.
-    pub async fn forge_kind_by_base_url(
+    /// The explicitly configured Forge kind for an exact clone root, if any.
+    ///
+    /// Repository registration also creates Forge rows. Those incidental rows
+    /// must not participate in configured-Forge classification: doing so would
+    /// turn a second-scheme registration into an idempotent re-add instead of
+    /// the pinned repo-qualifier conflict.
+    pub async fn configured_forge_kind_by_base_url(
         &self,
         base_url: &ForgeUrl,
     ) -> anyhow::Result<Option<StoredForgeKind>> {
-        let row: Option<(String,)> = sqlx::query_as("SELECT kind FROM forges WHERE base_url = $1")
-            .bind(base_url.as_str())
-            .fetch_optional(&self.pool)
-            .await?;
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT f.kind FROM forges f
+             WHERE f.base_url = $1
+               AND EXISTS (SELECT 1 FROM forge_orgs o WHERE o.forge_id = f.id)",
+        )
+        .bind(base_url.as_str())
+        .fetch_optional(&self.pool)
+        .await?;
         Ok(row.map(|(kind,)| StoredForgeKind::new(kind)))
     }
 

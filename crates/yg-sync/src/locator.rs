@@ -158,6 +158,12 @@ impl RepoLocator {
 }
 
 impl UnclassifiedRepoLocator {
+    /// The normalized Forge root as the caller spelled it, before adapter
+    /// classification changes its scheme.
+    pub fn input_base_url(&self) -> Result<yg_control::ForgeUrl, yg_control::ForgeUrlParseError> {
+        yg_control::ForgeUrl::parse(self.base_url.clone())
+    }
+
     /// The canonical root spelling used only to query configured Forge records.
     ///
     /// Forge administration stores HTTP-capable Forge roots as HTTPS. Preserve
