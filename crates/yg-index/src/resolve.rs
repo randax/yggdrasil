@@ -114,13 +114,13 @@ pub(crate) struct SimpleFileFacts {
     pub(crate) declarations: Vec<(String, String)>,
 }
 
-/// One of the six non-Go syntactic language packs. Resolution never crosses
-/// these boundaries, even when two languages use the same spelling.
+/// A logical resolution family for the non-Go syntactic language packs.
+/// Resolution never crosses these boundaries, even when two languages use the
+/// same spelling. ECMAScript grammars share one family so mixed TS/TSX/JS
+/// repositories resolve calls across file extensions.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum SimpleLanguageTag {
-    TypeScript,
-    Tsx,
-    JavaScript,
+    EcmaScript,
     Python,
     Rust,
     Java,

@@ -4,7 +4,8 @@
 
 use std::collections::BTreeSet;
 
-use yg_shard::{EdgeKind, Graph, NodeKind, SearchDoc};
+use object_store::memory::InMemory;
+use yg_shard::{EdgeKind, Graph, NodeKind, SearchDoc, write_shard};
 
 /// Run the pass over an in-memory tree laid out in a tempdir, returning
 /// the graph and the full-text documents it extracts.
@@ -420,6 +421,32 @@ def build_widget():
             && e.dst == "sym:pkg/widget.py#Widget"),
         "constructor use of a repo-declared class must become a CALLS edge"
     );
+}
+
+#[tokio::test]
+async fn repeated_python_import_indexes_as_one_edge() {
+    let (graph, search_docs) = pass_full(&[("app.py", "import os, os\n")]);
+    let extracted_imports = graph
+        .edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::Imports)
+        .count();
+    assert_eq!(
+        extracted_imports, 2,
+        "the fixture must exercise identical facts emitted for one import statement"
+    );
+
+    let published = write_shard(
+        &InMemory::new(),
+        1,
+        "repeated-python-import",
+        graph,
+        search_docs,
+    )
+    .await
+    .expect("repeated identical import facts must not fail shard indexing");
+
+    assert_eq!(published.edge_count, 1, "only one IMPORTS edge is stored");
 }
 
 #[test]

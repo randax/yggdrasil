@@ -18,14 +18,7 @@ pub(super) fn extract_typescript(
     source: &[u8],
     graph: &mut Graph,
 ) -> Option<ExtractedFacts> {
-    extract_ecmascript(
-        root,
-        path,
-        file_id,
-        source,
-        graph,
-        SimpleLanguageTag::TypeScript,
-    )
+    extract_ecmascript(root, path, file_id, source, graph)
 }
 
 pub(super) fn extract_tsx(
@@ -35,7 +28,7 @@ pub(super) fn extract_tsx(
     source: &[u8],
     graph: &mut Graph,
 ) -> Option<ExtractedFacts> {
-    extract_ecmascript(root, path, file_id, source, graph, SimpleLanguageTag::Tsx)
+    extract_ecmascript(root, path, file_id, source, graph)
 }
 
 pub(super) fn extract_javascript(
@@ -45,14 +38,7 @@ pub(super) fn extract_javascript(
     source: &[u8],
     graph: &mut Graph,
 ) -> Option<ExtractedFacts> {
-    extract_ecmascript(
-        root,
-        path,
-        file_id,
-        source,
-        graph,
-        SimpleLanguageTag::JavaScript,
-    )
+    extract_ecmascript(root, path, file_id, source, graph)
 }
 
 fn extract_ecmascript(
@@ -61,7 +47,6 @@ fn extract_ecmascript(
     file_id: &str,
     source: &[u8],
     graph: &mut Graph,
-    language: SimpleLanguageTag,
 ) -> Option<ExtractedFacts> {
     extract_simple_language(
         root,
@@ -69,7 +54,7 @@ fn extract_ecmascript(
         file_id,
         source,
         graph,
-        language,
+        SimpleLanguageTag::EcmaScript,
         SimpleLanguage {
             imports: extract_ecmascript_imports,
             collect: |declaration, context: &mut SimpleExtractionCtx<'_, '_>| {

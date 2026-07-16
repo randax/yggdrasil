@@ -17,6 +17,12 @@ struct LanguageFixture {
     nested_call_count: usize,
 }
 
+impl LanguageFixture {
+    fn is_ecmascript(&self) -> bool {
+        matches!(self.extension, "ts" | "tsx" | "js")
+    }
+}
+
 const SIMPLE_LANGUAGES: &[LanguageFixture] = &[
     LanguageFixture {
         name: "TypeScript",
@@ -130,10 +136,12 @@ fn target_paths<'a>(graph: &'a Graph, calls: &[&Edge]) -> Vec<&'a str> {
 }
 
 #[test]
-fn calls_never_cross_any_simple_language_pair() {
+fn calls_cross_only_within_the_ecmascript_family() {
     for caller_language in SIMPLE_LANGUAGES {
         for target_language in SIMPLE_LANGUAGES {
-            if caller_language.name == target_language.name {
+            if caller_language.name == target_language.name
+                || (caller_language.is_ecmascript() && target_language.is_ecmascript())
+            {
                 continue;
             }
             let caller_path = format!("caller.{}", caller_language.extension);
@@ -149,6 +157,55 @@ fn calls_never_cross_any_simple_language_pair() {
                 target_language.name
             );
         }
+    }
+}
+
+#[test]
+fn ecmascript_grammars_share_directory_and_repository_resolution_tiers() {
+    let cases = [("tsx", "ts"), ("js", "ts"), ("jsx", "js")];
+    for (caller_extension, target_extension) in cases {
+        let caller_path = format!("scope/caller.{caller_extension}");
+        let caller = "export function caller() { target(); return null; }\n";
+        let declaration = "export function target() { return null; }\n";
+
+        let same_directory = pass_over(&[
+            (caller_path.clone(), caller.to_string()),
+            (
+                format!("scope/target.{target_extension}"),
+                declaration.to_string(),
+            ),
+            (
+                format!("remote/target.{target_extension}"),
+                declaration.to_string(),
+            ),
+        ]);
+        let calls = calls_from(&same_directory, &caller_path, "caller");
+        assert_eq!(
+            target_paths(&same_directory, &calls),
+            vec![format!("scope/target.{target_extension}")],
+            "{caller_extension} must resolve into {target_extension} and prefer its directory"
+        );
+
+        let repository = pass_over(&[
+            (caller_path.clone(), caller.to_string()),
+            (
+                format!("blue/target.{target_extension}"),
+                declaration.to_string(),
+            ),
+            (
+                format!("red/target.{target_extension}"),
+                declaration.to_string(),
+            ),
+        ]);
+        let calls = calls_from(&repository, &caller_path, "caller");
+        assert_eq!(
+            target_paths(&repository, &calls),
+            vec![
+                format!("blue/target.{target_extension}"),
+                format!("red/target.{target_extension}"),
+            ],
+            "{caller_extension} must retain repository-tier {target_extension} ambiguity"
+        );
     }
 }
 

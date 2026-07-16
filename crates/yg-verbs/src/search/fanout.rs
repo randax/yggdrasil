@@ -15,6 +15,9 @@ pub(super) struct RankedRepo {
 /// so raw scores from differently sized repositories are not directly
 /// comparable. Dividing every score by that repository's maximum preserves
 /// its local ranking and makes its best match `1.0` before cross-repo merge.
+/// Consequently, a repository whose only hit is weak still normalizes that hit
+/// to `1.0`; this is the deliberately accepted degenerate case of standard
+/// max-normalized federated interleaving.
 fn normalize_repo_scores(hits: &mut [yg_shard::LocalHit]) {
     let max_score = hits
         .iter()

@@ -11,7 +11,7 @@ pub mod metrics;
 pub use cache::{CacheCapacity, CacheLease, LeasedPath};
 pub use metrics::Metrics;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -646,41 +646,58 @@ pub struct PreparedShard {
 /// touching object storage. Publishers can do this expensive CPU work before
 /// entering their short publication critical section.
 pub async fn prepare_shard(
-    graph: Graph,
+    mut graph: Graph,
     search_docs: Vec<SearchDoc>,
 ) -> anyhow::Result<PreparedShard> {
-    let counts = Counts {
-        nodes: graph.nodes.len() as i64,
-        edges: graph.edges.len() as i64,
-    };
-
     // Build and digest both segments off the runtime threads: building a
     // tantivy index and hashing a large artifact are as blocking as the
     // graph build.
-    let (graph_bytes, graph_segment, fts_bytes, fts_segment) = tokio::task::spawn_blocking(
-        move || -> anyhow::Result<(Vec<u8>, Segment, Vec<u8>, Segment)> {
-            let graph_bytes = build_graph_sqlite(&graph)?;
-            let graph_segment = Segment {
-                sha256: sha256_hex(&graph_bytes),
-                bytes: graph_bytes.len() as u64,
-            };
-            let fts_bytes = build_fts(&search_docs)?;
-            let fts_segment = Segment {
-                sha256: sha256_hex(&fts_bytes),
-                bytes: fts_bytes.len() as u64,
-            };
-            Ok((graph_bytes, graph_segment, fts_bytes, fts_segment))
-        },
-    )
-    .await
-    .context("shard segment build task panicked")??;
-    Ok(PreparedShard {
-        graph_bytes,
-        graph_segment,
-        fts_bytes,
-        fts_segment,
-        counts,
+    tokio::task::spawn_blocking(move || -> anyhow::Result<PreparedShard> {
+        deduplicate_identical_edges(&mut graph);
+        let counts = Counts {
+            nodes: graph.nodes.len() as i64,
+            edges: graph.edges.len() as i64,
+        };
+        let graph_bytes = build_graph_sqlite(&graph)?;
+        let graph_segment = Segment {
+            sha256: sha256_hex(&graph_bytes),
+            bytes: graph_bytes.len() as u64,
+        };
+        let fts_bytes = build_fts(&search_docs)?;
+        let fts_segment = Segment {
+            sha256: sha256_hex(&fts_bytes),
+            bytes: fts_bytes.len() as u64,
+        };
+        Ok(PreparedShard {
+            graph_bytes,
+            graph_segment,
+            fts_bytes,
+            fts_segment,
+            counts,
+        })
     })
+    .await
+    .context("shard segment build task panicked")?
+}
+
+/// Drop facts repeated byte-for-byte by an extractor before SQLite insertion.
+///
+/// The artifact's unique indexes intentionally identify an edge without its
+/// provenance or confidence. Keeping those fields in this deduplication key
+/// means conflicting derivations still reach SQLite and fail loudly instead of
+/// being mistaken for harmless extractor repetition.
+fn deduplicate_identical_edges(graph: &mut Graph) {
+    let mut seen = BTreeSet::new();
+    graph.edges.retain(|edge| {
+        seen.insert((
+            edge.src.clone(),
+            edge.dst.clone(),
+            edge.kind.as_str(),
+            edge.provenance.as_str(),
+            edge.confidence.to_bits(),
+            edge.location.clone(),
+        ))
+    });
 }
 
 /// Publish prepared segments for `commit` of repo `repo_id`: the graph
@@ -2092,14 +2109,36 @@ mod tests {
     }
 
     #[test]
-    fn graph_build_rejects_duplicate_edges_without_locations() {
-        let edge = test_edge(EdgeKind::Authored, 1.0, None);
-        let graph = Graph {
+    fn graph_build_rejects_conflicting_duplicate_edges_without_locations() {
+        let mut graph = Graph {
+            nodes: Vec::new(),
+            edges: vec![
+                test_edge(EdgeKind::Authored, 1.0, None),
+                test_edge(EdgeKind::Authored, 0.9, None),
+            ],
+        };
+        deduplicate_identical_edges(&mut graph);
+
+        assert_eq!(
+            graph.edges.len(),
+            2,
+            "conflicting facts are not deduplicated"
+        );
+        build_graph_sqlite(&graph)
+            .expect_err("conflicting duplicate AUTHORED edges must fail the build");
+    }
+
+    #[test]
+    fn writer_deduplicates_only_identical_edges() {
+        let edge = test_edge(EdgeKind::Imports, 0.9, Some("app.py:1:1"));
+        let mut graph = Graph {
             nodes: Vec::new(),
             edges: vec![edge.clone(), edge],
         };
 
-        build_graph_sqlite(&graph).expect_err("duplicate AUTHORED edges must fail the build");
+        deduplicate_identical_edges(&mut graph);
+
+        assert_eq!(graph.edges.len(), 1);
     }
 
     #[test]
