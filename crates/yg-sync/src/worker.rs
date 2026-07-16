@@ -6,8 +6,8 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use yg_control::{
-    ControlPlane, ForgeBudgetTake, JobKind, JobOutcome, PollHeadObservation, PollRecordOutcome,
-    PollValidators,
+    ControlPlane, ForgeBudgetTake, ForgeUrl, JobKind, JobOutcome, PollHeadObservation,
+    PollRecordOutcome, PollValidators,
 };
 
 use crate::forge::{
@@ -343,8 +343,10 @@ impl SyncWorker {
         self.metrics
             .observe_poll_lag(due.base_url.as_str(), due.poll_lag_seconds);
         let forge = self.registry.for_kind(&due.forge_kind);
-        if let Some(poller) = forge.repo_poller() {
-            return self.poll_repo_api(poller, &due, cfg).await;
+        if let RepoPollRoute::Http { poller, api_root } =
+            repo_poll_route(forge, due.api_root.as_ref())
+        {
+            return self.poll_repo_api(poller, api_root, &due, cfg).await;
         }
         // Spend a rate-budget token; over budget, reschedule the repo for
         // when one frees up and back off (no head check this cycle).
@@ -390,16 +392,10 @@ impl SyncWorker {
     async fn poll_repo_api(
         &self,
         poller: &dyn RepoPoller,
+        api_root: &ForgeUrl,
         due: &yg_control::DuePoll,
         cfg: &PollConfig,
     ) -> anyhow::Result<bool> {
-        let Some(api_root) = due.api_root.as_ref() else {
-            tracing::warn!(
-                slug = %due.slug,
-                "Forge HTTP polling is unavailable because its API root is missing"
-            );
-            return Ok(true);
-        };
         let slug = match RepoSlug::parse(due.slug.clone()) {
             Ok(slug) => slug,
             Err(error) => {
@@ -569,6 +565,21 @@ impl SyncWorker {
             cooldown,
         )
         .await
+    }
+}
+
+enum RepoPollRoute<'a> {
+    Http {
+        poller: &'a dyn RepoPoller,
+        api_root: &'a ForgeUrl,
+    },
+    Git,
+}
+
+fn repo_poll_route<'a>(forge: &'a dyn Forge, api_root: Option<&'a ForgeUrl>) -> RepoPollRoute<'a> {
+    match (forge.repo_poller(), api_root) {
+        (Some(poller), Some(api_root)) => RepoPollRoute::Http { poller, api_root },
+        _ => RepoPollRoute::Git,
     }
 }
 

@@ -225,6 +225,48 @@ async fn a_pushed_commit_becomes_queryable_after_a_poll() {
 }
 
 #[tokio::test]
+async fn an_api_capable_forge_without_an_api_root_polls_through_git() {
+    let h = Harness::boot().await;
+    h.add_repo().await;
+    h.sync_and_index().await;
+
+    let forge = Arc::new(FakeHttpForge::new([]));
+    sqlx::query("UPDATE forges SET kind = 'fake-http', api_root = NULL")
+        .execute(&h.pool().await)
+        .await
+        .unwrap();
+    let worker = yg_sync::SyncWorker::with_registry(
+        control_plane(&h.db_name).await,
+        h.cache.join("missing-api-root-cache"),
+        yg_sync::forge::ForgeRegistry::builtin().register(forge.clone()),
+    );
+
+    h.push_commit(
+        "move head without an API root",
+        &[("fallback.go", "package main\n\nfunc Fallback() {}\n")],
+    );
+
+    assert!(
+        worker.poll_once(&poll_config()).await.unwrap(),
+        "a due API-capable repo without an API root must still check its head"
+    );
+    assert_eq!(
+        forge.calls.load(Ordering::Relaxed),
+        0,
+        "the unavailable HTTP route must not be invoked"
+    );
+    assert!(
+        control_plane(&h.db_name)
+            .await
+            .claim_due_fetch(Duration::from_secs(60))
+            .await
+            .unwrap()
+            .is_some(),
+        "the generic git fallback must detect the moved head and queue a fetch"
+    );
+}
+
+#[tokio::test]
 async fn a_poll_that_races_an_existing_fetch_retries_soon_if_that_fetch_was_stale() {
     let h = Harness::boot().await;
     h.add_repo().await;

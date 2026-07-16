@@ -142,6 +142,51 @@ async fn a_refunded_shared_reservation_is_immediately_available() {
 }
 
 #[tokio::test]
+async fn a_refund_accrues_with_the_live_forge_rate() {
+    let db_name = create_test_db().await;
+    let control = control_plane(&db_name).await;
+    let (pool, forge_id) = low_budget_forge(&db_name).await;
+
+    sqlx::query(
+        "INSERT INTO forge_rate_budgets
+             (forge_id, tokens, refill_per_second, updated_at)
+         VALUES ($1, 0, 1, clock_timestamp() - interval '30 seconds')",
+    )
+    .bind(forge_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE forges SET rate_budget = 120 WHERE id = $1")
+        .bind(forge_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    control
+        .refund_forge_budget(forge_id, NonZeroU32::MIN)
+        .await
+        .unwrap();
+
+    let (tokens, refill_per_second): (f64, f64) = sqlx::query_as(
+        "SELECT tokens, refill_per_second
+         FROM forge_rate_budgets
+         WHERE forge_id = $1",
+    )
+    .bind(forge_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        (60.5..=120.0).contains(&tokens),
+        "the live 2/s rate must accrue at least 60 tokens without exceeding capacity; got {tokens}"
+    );
+    assert_eq!(
+        refill_per_second, 2.0,
+        "the persisted refill rate must match the rate used for accrual"
+    );
+}
+
+#[tokio::test]
 async fn a_reservation_larger_than_capacity_is_rejected_without_spending() {
     let db_name = create_test_db().await;
     let control = control_plane(&db_name).await;

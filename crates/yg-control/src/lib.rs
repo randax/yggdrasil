@@ -1000,6 +1000,7 @@ pub struct DuePoll {
     poll_etag: Option<PollEtag>,
     poll_last_modified: Option<PollLastModified>,
     poll_observed_head: Option<PollHeadSha>,
+    poll_observed_head_was_invalid: bool,
 }
 
 impl DuePoll {
@@ -2137,9 +2138,12 @@ impl ControlPlane {
         jitter_fraction: f64,
     ) -> anyhow::Result<Option<DuePoll>> {
         let mut tx = self.pool.begin().await?;
-        let row = sqlx::query_as(
+        let row: Option<DuePoll> = sqlx::query_as(
             "WITH due AS (
                  SELECT r.id,
+                        r.poll_observed_head IS NOT NULL
+                            AND r.poll_observed_head !~ '^[0-9A-Fa-f]{40}$'
+                            AS poll_observed_head_was_invalid,
                         greatest(extract(epoch FROM now() - r.next_poll_at), 0)::float8
                             AS poll_lag_seconds
                  FROM repos r
@@ -2153,7 +2157,11 @@ impl ControlPlane {
              UPDATE repos r
              SET next_poll_at = now()
                  + make_interval(secs => coalesce(r.poll_interval_seconds, $1)
-                                         * (1 + $2 * random()))
+                                         * (1 + $2 * random())),
+                 poll_observed_head = CASE
+                     WHEN due.poll_observed_head_was_invalid THEN NULL
+                     ELSE r.poll_observed_head
+                 END
              FROM due, forges f
              WHERE r.id = due.id AND f.id = r.forge_id
              RETURNING r.id AS repo_id, r.slug, f.id AS forge_id,
@@ -2161,12 +2169,20 @@ impl ControlPlane {
                        r.poll_interval_seconds,
                        r.last_synced_commit AS synced_commit, f.rate_budget,
                        due.poll_lag_seconds, r.poll_etag, r.poll_last_modified,
-                       r.poll_observed_head",
+                       r.poll_observed_head, due.poll_observed_head_was_invalid",
         )
         .bind(default_interval.as_secs_f64())
         .bind(jitter_fraction)
         .fetch_optional(&mut *tx)
         .await?;
+        if let Some(due) = row.as_ref()
+            && due.poll_observed_head_was_invalid
+        {
+            eprintln!(
+                "warning: discarded invalid persisted poll head for repository {} ({})",
+                due.repo_id, due.slug
+            );
+        }
         tx.commit().await?;
         Ok(row)
     }
@@ -2303,8 +2319,8 @@ impl ControlPlane {
                          least(
                              b.tokens + greatest(
                                  extract(epoch FROM clock_timestamp() - b.updated_at), 0
-                             ) * b.refill_per_second,
-                             b.refill_per_second * 60.0
+                             ) * (f.rate_budget::double precision / 60.0),
+                             f.rate_budget::double precision
                          ) + $2
                      )
                  END,
@@ -2411,13 +2427,28 @@ impl ControlPlane {
             PollHeadObservation::NotModified => None,
             PollHeadObservation::Head(head) => Some(head.as_str()),
         };
-        let row: Option<(bool, Option<PollHeadSha>, Option<String>)> = sqlx::query_as(
-            "UPDATE repos
+        let row: Option<(bool, Option<PollHeadSha>, Option<String>, bool)> = sqlx::query_as(
+            "WITH target AS (
+                 SELECT id,
+                        poll_observed_head IS NOT NULL
+                            AND poll_observed_head !~ '^[0-9A-Fa-f]{40}$'
+                            AS poll_observed_head_was_invalid
+                 FROM repos
+                 WHERE id = $1
+                 FOR UPDATE
+             )
+             UPDATE repos r
              SET poll_etag = $2,
                  poll_last_modified = $3,
-                 poll_observed_head = coalesce($4, poll_observed_head)
-             WHERE id = $1
-             RETURNING discovery_state = 'included', poll_observed_head, last_synced_commit",
+                 poll_observed_head = CASE
+                     WHEN $4 IS NOT NULL THEN $4
+                     WHEN target.poll_observed_head_was_invalid THEN NULL
+                     ELSE r.poll_observed_head
+                 END
+             FROM target
+             WHERE r.id = target.id
+             RETURNING r.discovery_state = 'included', r.poll_observed_head,
+                       r.last_synced_commit, target.poll_observed_head_was_invalid",
         )
         .bind(repo_id)
         .bind(validators.etag.as_ref().map(PollEtag::as_bytes))
@@ -2430,10 +2461,13 @@ impl ControlPlane {
         .bind(observed_head)
         .fetch_optional(&mut *tx)
         .await?;
-        let Some((included, observed_head, synced_commit)) = row else {
+        let Some((included, observed_head, synced_commit, observed_head_was_invalid)) = row else {
             tx.commit().await?;
             return Ok(PollRecordOutcome::Unchanged);
         };
+        if observed_head_was_invalid {
+            eprintln!("warning: discarded invalid persisted poll head for repository {repo_id}");
+        }
         let moved = observed_head
             .as_ref()
             .zip(synced_commit.as_deref())

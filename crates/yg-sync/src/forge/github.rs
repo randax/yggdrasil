@@ -18,7 +18,7 @@ const GITHUB_PAGE_SIZE: usize = 100;
 /// size this permits 100,000 repositories while bounding malformed pagination.
 const GITHUB_ORG_PAGE_LIMIT: usize = 1_000;
 /// Smallest server-requested cooldown honored for a GitHub API rate limit.
-const MIN_RETRY_AFTER: Duration = Duration::from_secs(1);
+const MIN_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(5);
 const SECONDARY_RATE_LIMIT_MESSAGE: &str = "you have exceeded a secondary rate limit";
 
 /// Parsed `X-RateLimit-Remaining` request count.
@@ -341,7 +341,12 @@ fn parse_rate_limit_reset_header(
                 })
         })
         .transpose()?
-        .map(|reset| reset.duration_since(now).unwrap_or(Duration::ZERO))
+        .map(|reset| {
+            reset
+                .duration_since(now)
+                .unwrap_or(Duration::ZERO)
+                .max(MIN_RATE_LIMIT_COOLDOWN)
+        })
         .map(RateLimitReset))
 }
 
@@ -615,7 +620,7 @@ fn parse_retry_after(value: &str, now: SystemTime) -> Option<Duration> {
             let deadline = parse_imf_fixdate(value.trim())?;
             Some(deadline.duration_since(now).unwrap_or(Duration::ZERO))
         })?;
-    let duration = duration.max(MIN_RETRY_AFTER);
+    let duration = duration.max(MIN_RATE_LIMIT_COOLDOWN);
     std::time::Instant::now()
         .checked_add(duration)
         .map(|_| duration)
@@ -869,6 +874,21 @@ mod tests {
     }
 
     #[test]
+    fn exhausted_primary_limit_with_past_reset_uses_minimum_cooldown() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-ratelimit-remaining", "0".parse().unwrap());
+        headers.insert("x-ratelimit-reset", "99".parse().unwrap());
+        let observation =
+            parse_rate_observation(&headers, SystemTime::UNIX_EPOCH + Duration::from_secs(100))
+                .unwrap();
+
+        assert_eq!(
+            observation.exhausted_retry_after(),
+            Some(MIN_RATE_LIMIT_COOLDOWN)
+        );
+    }
+
+    #[test]
     fn a_later_primary_reset_wins_over_retry_after() {
         let retry = rate_limit_retry_after(
             Some(RetryAfter(Duration::from_secs(17))),
@@ -1003,7 +1023,7 @@ mod tests {
             Some("Wed, 21 Oct 2015 07:28:00 GMT"),
             deadline + Duration::from_secs(1),
         );
-        assert_eq!(expired, MIN_RETRY_AFTER);
+        assert_eq!(expired, MIN_RATE_LIMIT_COOLDOWN);
     }
 
     #[tokio::test]
@@ -1023,14 +1043,14 @@ mod tests {
     }
 
     #[test]
-    fn unusable_retry_after_falls_back_and_zero_is_raised_to_one_second() {
+    fn unusable_retry_after_falls_back_and_zero_uses_minimum_cooldown() {
         assert_eq!(
             retry_after_or_default(Some("not-a-date"), SystemTime::UNIX_EPOCH),
             RATE_LIMIT_COOLDOWN
         );
         assert_eq!(
             retry_after_or_default(Some("0"), SystemTime::UNIX_EPOCH),
-            MIN_RETRY_AFTER
+            MIN_RATE_LIMIT_COOLDOWN
         );
         assert_eq!(
             retry_after_or_default(Some("86400"), SystemTime::UNIX_EPOCH),
