@@ -187,7 +187,8 @@ pub struct NeighborsResponse {
     pub nodes: Vec<NodeView>,
     pub edges: Vec<GraphEdge>,
     pub next_cursor: Option<String>,
-    /// Present and true only when an edge cap made the response incomplete.
+    /// Whether this page is incomplete because a cap omitted edges or discovery-time nodes;
+    /// callers must OR this flag across pages.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub truncated: bool,
 }

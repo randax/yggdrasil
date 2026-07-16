@@ -785,7 +785,7 @@ async fn neighbors(
         }
     };
     if body.truncated {
-        eprintln!("warning: neighborhood truncated at the server's edge caps");
+        eprintln!("warning: neighborhood truncated at the server's safety limits");
     }
     if body.nodes.is_empty() {
         println!("no neighbors");

@@ -52,7 +52,9 @@ pub fn decode<T: DeserializeOwned>(cursor: &str) -> Result<T, String> {
 /// truncated, pages of one traversal union to the full induced subgraph)
 /// only holds when every page is computed with identical origin and
 /// filters: a replay that contradicts its cursor is rejected, never
-/// silently served from a different traversal.
+/// silently served from a different traversal. The truncation flag is
+/// page-local, so callers must OR it across all pages when deciding
+/// whether that union is complete.
 #[derive(Serialize, Deserialize)]
 pub(crate) struct NeighborsCursor {
     pub rev: String,

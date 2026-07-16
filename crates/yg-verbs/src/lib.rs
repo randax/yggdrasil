@@ -70,6 +70,8 @@ pub const MAX_NEIGHBORS_LIMIT: usize = 1000;
 pub const MAX_NEIGHBORS_EDGES_PER_NODE: usize = 1000;
 /// Maximum graph edges returned in one neighborhood page.
 pub const MAX_NEIGHBORS_EDGES_PER_PAGE: usize = 10_000;
+/// Maximum edges examined while discovering nodes for one neighborhood page.
+pub const MAX_TRAVERSAL_EDGES: usize = 10_000;
 pub const DEFAULT_SEARCH_LIMIT: usize = 20;
 pub const MAX_SEARCH_LIMIT: usize = 100;
 pub const DEFAULT_HISTORY_LIMIT: usize = 50;
@@ -635,7 +637,8 @@ pub struct GraphEdge {
 pub struct NeighborsPage {
     pub nodes: Vec<NodeView>,
     pub edges: Vec<GraphEdge>,
-    /// Whether an edge-loading cap made this page incomplete.
+    /// Whether this page is incomplete because a cap omitted edges or discovery-time nodes;
+    /// callers must OR this flag across pages.
     pub truncated: bool,
     #[serde(skip)]
     pub next: Option<(u32, String)>,
@@ -804,6 +807,8 @@ pub fn neighbors(
     let mut rank: std::collections::HashMap<String, usize> =
         std::collections::HashMap::from([(local.clone(), 0)]);
     let mut frontier: Vec<String> = vec![local.clone()];
+    let mut edges_examined = 0;
+    let mut traversal_budget_exhausted = false;
     // The window starts after the cursor position. A position that
     // isn't in the traversal (a cursor replayed with different filters,
     // say) degrades gracefully: the search's insertion point resumes at
@@ -822,6 +827,11 @@ pub fn neighbors(
                 memo.edges_of(conn, near, options.edge_kinds.as_deref())?;
             truncated |= node_truncated;
             for edge in incident {
+                if edges_examined == MAX_TRAVERSAL_EDGES {
+                    traversal_budget_exhausted = true;
+                    break;
+                }
+                edges_examined += 1;
                 if !follows(edge, near, options.direction) {
                     continue;
                 }
@@ -830,6 +840,9 @@ pub fn neighbors(
                     rank.insert(far.to_string(), usize::MAX); // placed below
                     discovered.push((id.qualify(far), far.to_string()));
                 }
+            }
+            if traversal_budget_exhausted {
+                break;
             }
         }
         // Sorted by *external* id — the order the cursor's binary search
@@ -841,6 +854,10 @@ pub fn neighbors(
             order.push((depth, external.clone(), far.clone()));
         }
         frontier = discovered.into_iter().map(|(_, local)| local).collect();
+        if traversal_budget_exhausted {
+            truncated = true;
+            break;
+        }
         if frontier.is_empty() {
             break;
         }
@@ -894,30 +911,36 @@ pub fn neighbors(
         });
         Ok(true)
     };
-    if start == 0 {
-        let (incident, node_truncated) =
-            memo.edges_of(conn, local, options.edge_kinds.as_deref())?;
-        truncated |= node_truncated;
-        for edge in incident {
-            if edge.src == edge.dst && !push_edge(edge)? {
-                page_edges_truncated = true;
-                break;
+    // Once discovery exhausts its aggregate budget, do not let edge assembly
+    // recreate the same unbounded scan through uncached page nodes. The page's
+    // discovered nodes remain deterministic; its truncation marker discloses
+    // that their induced edges were conservatively omitted.
+    if !traversal_budget_exhausted {
+        if start == 0 {
+            let (incident, node_truncated) =
+                memo.edges_of(conn, local, options.edge_kinds.as_deref())?;
+            truncated |= node_truncated;
+            for edge in incident {
+                if edge.src == edge.dst && !push_edge(edge)? {
+                    page_edges_truncated = true;
+                    break;
+                }
             }
         }
-    }
-    'page_nodes: for (_, _, local) in page {
-        let my_rank = rank[local];
-        let (incident, node_truncated) =
-            memo.edges_of(conn, local, options.edge_kinds.as_deref())?;
-        truncated |= node_truncated;
-        for edge in incident {
-            let qualifies = edge.src == edge.dst
-                || rank
-                    .get(edge.other_end(local))
-                    .is_some_and(|&far_rank| far_rank < my_rank);
-            if qualifies && !push_edge(edge)? {
-                page_edges_truncated = true;
-                break 'page_nodes;
+        'page_nodes: for (_, _, local) in page {
+            let my_rank = rank[local];
+            let (incident, node_truncated) =
+                memo.edges_of(conn, local, options.edge_kinds.as_deref())?;
+            truncated |= node_truncated;
+            for edge in incident {
+                let qualifies = edge.src == edge.dst
+                    || rank
+                        .get(edge.other_end(local))
+                        .is_some_and(|&far_rank| far_rank < my_rank);
+                if qualifies && !push_edge(edge)? {
+                    page_edges_truncated = true;
+                    break 'page_nodes;
+                }
             }
         }
     }
@@ -1031,17 +1054,14 @@ fn incident_edges(
     // ORDER BY ... LIMIT` plan built a temporary B-tree from every incident
     // edge before applying LIMIT, leaving hub latency proportional to degree.
     // Within a fixed indexed endpoint SQLite stores entries by rowid, so each
-    // side can stop after cap + 1 rows. Merge by rowid for deterministic cap
-    // selection, then restore the legacy response ordering for retained edges.
-    let mut edges = incident_edges_at(conn, EDGE_SRC, local)?;
-    edges.extend(incident_edges_at(conn, EDGE_DST, local)?);
+    // side can stop after cap + 1 matching rows. Merge by rowid for deterministic
+    // cap selection, then restore the legacy response ordering for retained edges.
+    let mut edges = incident_edges_at(conn, EDGE_SRC, local, edge_kinds)?;
+    edges.extend(incident_edges_at(conn, EDGE_DST, local, edge_kinds)?);
     edges.sort_unstable_by_key(|edge| edge.rowid);
     edges.dedup_by_key(|edge| edge.rowid);
     let truncated = edges.len() > MAX_NEIGHBORS_EDGES_PER_NODE;
     edges.truncate(MAX_NEIGHBORS_EDGES_PER_NODE);
-    if let Some(kinds) = edge_kinds {
-        edges.retain(|edge| kinds.iter().any(|kind| kind == &edge.kind));
-    }
     edges.sort_by(|left, right| {
         (&left.src, &left.dst, &left.kind, &left.location, left.rowid).cmp(&(
             &right.src,
@@ -1060,15 +1080,27 @@ fn incident_edges_at(
     conn: &rusqlite::Connection,
     end: &str,
     local: &str,
+    edge_kinds: Option<&[String]>,
 ) -> anyhow::Result<Vec<RawEdge>> {
     let mut params: Vec<&dyn rusqlite::ToSql> = vec![&local as &dyn rusqlite::ToSql];
+    let kind_filter = match edge_kinds {
+        Some([]) => " AND 0".to_string(),
+        Some(kinds) => {
+            params.extend(kinds.iter().map(|kind| kind as &dyn rusqlite::ToSql));
+            format!(
+                " AND {EDGE_KIND} IN ({})",
+                vec!["?"; kinds.len()].join(", ")
+            )
+        }
+        None => String::new(),
+    };
     let limit = i64::try_from(MAX_NEIGHBORS_EDGES_PER_NODE + 1)
         .expect("the per-node edge cap fits SQLite's LIMIT");
     params.push(&limit);
     let mut stmt = conn.prepare(&format!(
         "SELECT rowid, {EDGE_SRC}, {EDGE_DST}, {EDGE_KIND}, {EDGE_PROVENANCE}, {EDGE_CONFIDENCE}, \
          {EDGE_LOCATION} FROM {EDGES}
-         WHERE {end} = ?
+         WHERE {end} = ?{kind_filter}
          ORDER BY rowid LIMIT ?"
     ))?;
     stmt.query_map(rusqlite::params_from_iter(params), |row| {
@@ -1496,8 +1528,19 @@ mod tests {
     }
 
     #[test]
-    fn neighbors_caps_raw_hub_edges_before_a_selective_kind_filter() {
+    fn neighbors_caps_matching_hub_edges_after_a_selective_kind_filter() {
         let conn = graph_connection(MAX_NEIGHBORS_EDGES_PER_NODE + 2, false);
+        for ordinal in 1..=5 {
+            conn.execute(
+                &format!(
+                    "INSERT INTO {EDGES} ({EDGE_SRC}, {EDGE_DST}, {EDGE_KIND}, {EDGE_PROVENANCE}, \
+                     {EDGE_CONFIDENCE}, {EDGE_LOCATION}) VALUES (?1, ?2, 'CALLS', \
+                     'syntactic', 1.0, NULL)"
+                ),
+                rusqlite::params!["file:hub.rs", format!("sym:hub.rs#leaf{ordinal:04}")],
+            )
+            .unwrap();
+        }
         let page = neighbors(
             &conn,
             &hub_id(),
@@ -1510,8 +1553,37 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        assert!(page.nodes.is_empty());
+        assert_eq!(page.nodes.len(), 5);
+        assert_eq!(page.edges.len(), 5);
+        assert!(page.edges.iter().all(|edge| edge.kind == EdgeKind::Calls));
+        assert!(!page.truncated);
+    }
+
+    #[test]
+    fn neighbors_caps_aggregate_edges_examined_during_discovery() {
+        let node_count = 102;
+        let degree = node_count - 1;
+        let discovery_examinations = degree + degree * degree;
+        let returned_edges = node_count * (node_count - 1) / 2;
+        assert!(degree < MAX_NEIGHBORS_EDGES_PER_NODE);
+        assert!(discovery_examinations > MAX_TRAVERSAL_EDGES);
+        assert!(returned_edges < MAX_NEIGHBORS_EDGES_PER_PAGE);
+        let conn = graph_connection(node_count, true);
+        let page = neighbors(
+            &conn,
+            &hub_id(),
+            &NeighborsOptions {
+                depth: 2,
+                limit: MAX_NEIGHBORS_LIMIT,
+                ..NeighborsOptions::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(page.nodes.len(), degree);
         assert!(page.edges.is_empty());
+        assert_eq!(page.next, None);
         assert!(page.truncated);
     }
 
