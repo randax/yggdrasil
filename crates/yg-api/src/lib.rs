@@ -43,6 +43,20 @@ pub use metrics::Metrics;
 use error::ApiError;
 use verbs::ShardAccess;
 
+fn search_execution_error(error: search_limit::SearchExecutionError) -> yg_verbs::VerbError {
+    match error {
+        search_limit::SearchExecutionError::Timeout => {
+            yg_verbs::VerbError::Unavailable("search execution timed out".to_owned())
+        }
+        search_limit::SearchExecutionError::TaskFailed(error) => {
+            tracing::error!(?error, "limited search task failed");
+            yg_verbs::VerbError::Internal(
+                anyhow::Error::new(error).context("limited search task failed"),
+            )
+        }
+    }
+}
+
 pub(crate) struct AppState {
     control: ControlPlane,
     forge_registry: yg_sync::forge::ForgeRegistry,
@@ -71,9 +85,7 @@ impl AppState {
         self.search_limiter
             .run(move || async move { engine.search(request).await })
             .await
-            .map_err(|_| {
-                yg_verbs::VerbError::Unavailable("search execution timed out".to_owned())
-            })?
+            .map_err(search_execution_error)?
     }
 }
 

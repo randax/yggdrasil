@@ -10,7 +10,10 @@ use tokio::sync::Semaphore;
 const SEARCH_EXECUTION_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug)]
-pub(crate) struct SearchExecutionTimeout;
+pub(crate) enum SearchExecutionError {
+    Timeout,
+    TaskFailed(tokio::task::JoinError),
+}
 
 #[derive(Clone)]
 pub(crate) struct SearchLimiter {
@@ -38,7 +41,7 @@ impl SearchLimiter {
     pub(crate) async fn run<T, Work, WorkFuture>(
         &self,
         work: Work,
-    ) -> Result<T, SearchExecutionTimeout>
+    ) -> Result<T, SearchExecutionError>
     where
         T: Send + 'static,
         Work: FnOnce() -> WorkFuture + Send + 'static,
@@ -52,7 +55,7 @@ impl SearchLimiter {
         &self,
         execution_timeout: Duration,
         work: Work,
-    ) -> Result<T, SearchExecutionTimeout>
+    ) -> Result<T, SearchExecutionError>
     where
         T: Send + 'static,
         Work: FnOnce() -> WorkFuture + Send + 'static,
@@ -73,12 +76,12 @@ impl SearchLimiter {
                         ?execution_timeout,
                         "search execution timed out; releasing concurrency permit"
                     );
-                    Err(SearchExecutionTimeout)
+                    Err(SearchExecutionError::Timeout)
                 }
             }
         })
         .await
-        .expect("limited search task must not panic")
+        .map_err(SearchExecutionError::TaskFailed)?
     }
 }
 
@@ -178,5 +181,30 @@ mod tests {
         })
         .await
         .expect("timed-out work releases its permit");
+    }
+
+    #[tokio::test]
+    async fn panicked_search_returns_an_error_and_releases_its_permit() {
+        let limiter = SearchLimiter::new(NonZeroUsize::new(1).expect("one is nonzero"));
+
+        let result: Result<(), SearchExecutionError> = limiter
+            .run(|| async {
+                panic!("fixture search panic");
+            })
+            .await;
+        let error = result.expect_err("the panicked task returns a typed error");
+        assert!(matches!(
+            &error,
+            SearchExecutionError::TaskFailed(error) if error.is_panic()
+        ));
+        assert!(matches!(
+            crate::search_execution_error(error),
+            yg_verbs::VerbError::Internal(_)
+        ));
+
+        tokio::time::timeout(Duration::from_millis(100), limiter.run(|| async {}))
+            .await
+            .expect("replacement search acquires the released permit")
+            .expect("replacement search completes");
     }
 }
