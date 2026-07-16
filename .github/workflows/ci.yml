@@ -5,7 +5,8 @@ on:
   push:
     branches: [main]
 
-# All jobs only read the checkout; nothing needs a writable token.
+# All jobs only read the checkout; the one exception is the image job,
+# which grants itself actions-cache write access for BuildKit layers.
 permissions:
   contents: read
 
@@ -45,6 +46,11 @@ jobs:
     # the compose stack, so a formatting or lint failure never spends it.
     needs: checks
     runs-on: ubuntu-latest
+    # BuildKit's type=gha cache export needs actions-cache write access;
+    # the workflow default stays read-only.
+    permissions:
+      contents: read
+      actions: write
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
@@ -54,6 +60,9 @@ jobs:
           context: .
           file: Dockerfile
           push: false
+          # Load into the runner's daemon so the smoke step can run the
+          # deployment profile against exactly this build.
+          load: true
           tags: yggdrasil:ci
           # Honest scope: this caches the base/apt layers only. The cargo
           # build layer is invalidated by any crates/ change (the RUN
@@ -61,6 +70,8 @@ jobs:
           # exported), so code PRs pay a cold release compile.
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      - name: Smoke the deployment profile from the image
+        run: YG_IMAGE=yggdrasil:ci scripts/deployment-smoke.sh
 
   # The e2e suites exercise real server processes against the compose
   # Postgres + MinIO stack. Gated on the cheap job so a formatting or

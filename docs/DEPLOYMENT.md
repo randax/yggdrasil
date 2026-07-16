@@ -47,6 +47,11 @@ Compose network and publishes the API at `http://127.0.0.1:7311`. Override the
 host port with `YG_SERVER_PORT`. To use a prebuilt image rather than the local
 build, set `YG_IMAGE` to its immutable tag or digest and use `--no-build`.
 
+CI exercises this exact path on every change: `scripts/deployment-smoke.sh`
+boots the profile from the freshly built image, registers a public
+repository, waits for it to index, and asserts a search Verb answers.
+Run it against any image with `YG_IMAGE=<tag> scripts/deployment-smoke.sh`.
+
 > **Network boundary:** this profile intentionally reuses the unchanged local
 > development services. Their existing port mappings publish Postgres 5432,
 > the MinIO API 9000, and the MinIO console 9001 on all host interfaces with
