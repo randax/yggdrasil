@@ -69,6 +69,15 @@ impl ForgeUrl {
                 ),
             });
         }
+        // Credentials belong in Forge token records, never persisted
+        // inside a stored URL where they would propagate into derived
+        // clone URLs, logs, and metrics labels.
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            return Err(ForgeUrlParseError {
+                value,
+                reason: ForgeUrlParseReason::Syntax("forge URLs must not embed credentials"),
+            });
+        }
         Ok(Self(value))
     }
 
@@ -2334,6 +2343,8 @@ mod tests {
             "ssh:git@host/repo",
             "https://git.example?mirror=1",
             "https://git.example#frag",
+            "https://token@git.example",
+            "https://user:pass@git.example",
         ] {
             let error = ForgeUrl::parse(value).expect_err("malformed URL must be rejected");
             assert!(error.to_string().contains("invalid absolute forge URL"));

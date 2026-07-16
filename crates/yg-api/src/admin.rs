@@ -43,7 +43,8 @@ pub(crate) async fn admin_forge_add(
 ) -> Result<Response, ApiError> {
     let forge = discovery_capable_forge(&req.kind).map_err(ApiError::bad_request)?;
     let org = github_org_slug(&req.org).map_err(ApiError::bad_request)?;
-    let base_url = github_base_url(req.base_url.as_deref()).map_err(ApiError::bad_request)?;
+    let base_url = github_base_url(req.base_url.as_deref())
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
     let token_env = req
         .token_env
         .as_deref()
@@ -104,14 +105,27 @@ fn github_org_slug(org: &str) -> Result<String, &'static str> {
     }
 }
 
-fn github_base_url(base_url: Option<&str>) -> Result<yg_control::ForgeUrl, String> {
+/// Why a supplied GitHub forge root was rejected. Typed so callers can
+/// distinguish the failure; rendered to the human message only at the
+/// HTTP boundary.
+#[derive(Debug, thiserror::Error)]
+enum GithubBaseUrlError {
+    #[error("github forge base_url must start with https://")]
+    NotHttps,
+    #[error("github forge base_url must be a clone root like https://github.com")]
+    NotCloneRoot,
+    #[error(transparent)]
+    Invalid(#[from] yg_control::ForgeUrlParseError),
+}
+
+fn github_base_url(base_url: Option<&str>) -> Result<yg_control::ForgeUrl, GithubBaseUrlError> {
     let base_url = base_url
         .unwrap_or("https://github.com")
         .trim()
         .trim_end_matches('/');
     let base_url = base_url.to_ascii_lowercase();
     let Some(rest) = base_url.strip_prefix("https://") else {
-        return Err("github forge base_url must start with https://".to_string());
+        return Err(GithubBaseUrlError::NotHttps);
     };
     if rest.is_empty()
         || rest.contains('/')
@@ -120,11 +134,9 @@ fn github_base_url(base_url: Option<&str>) -> Result<yg_control::ForgeUrl, Strin
         || rest.contains('#')
         || rest.bytes().any(|b| b.is_ascii_whitespace())
     {
-        return Err(
-            "github forge base_url must be a clone root like https://github.com".to_string(),
-        );
+        return Err(GithubBaseUrlError::NotCloneRoot);
     }
-    yg_control::ForgeUrl::parse(base_url).map_err(|error| error.to_string())
+    Ok(yg_control::ForgeUrl::parse(base_url)?)
 }
 
 #[derive(Deserialize)]
@@ -141,7 +153,8 @@ pub(crate) async fn admin_forge_discover(
     let forge = discovery_capable_forge(&req.kind).map_err(ApiError::bad_request)?;
     let kind = forge.kind();
     let org = github_org_slug(&req.org).map_err(ApiError::bad_request)?;
-    let base_url = github_base_url(req.base_url.as_deref()).map_err(ApiError::bad_request)?;
+    let base_url = github_base_url(req.base_url.as_deref())
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
     let Some(stored_kind) = state.control.request_discovery(&base_url, &org).await? else {
         return Err(ApiError::not_found(format!(
             "{kind} org {org} is not connected; run yg admin forge add first"
@@ -187,7 +200,8 @@ pub(crate) async fn admin_rules_add(
     if pattern.is_empty() {
         return Err(ApiError::bad_request("rule pattern must not be empty"));
     }
-    let forge = github_base_url(req.forge.as_deref()).map_err(ApiError::bad_request)?;
+    let forge = github_base_url(req.forge.as_deref())
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
     let forge_id = state
         .control
         .forge_id_by_base_url(&forge)
@@ -488,7 +502,7 @@ mod tests {
     fn github_admin_urls_report_real_parse_failures() {
         let error = github_base_url(Some("https://github.com:bad"))
             .expect_err("an invalid port must not pass URL validation");
-        assert!(error.contains("invalid absolute forge URL"));
+        assert!(error.to_string().contains("invalid absolute forge URL"));
     }
 
     #[test]
