@@ -104,6 +104,7 @@ pub fn test_config(db_name: &str) -> ServerConfig {
         // another test's segments; content-addressing would make sharing
         // safe, but isolation keeps the tests honest.
         shard_cache: std::env::temp_dir().join(format!("yg-shard-cache-{db_name}")),
+        shard_cache_capacity: yg_api::CacheCapacity::DEFAULT,
     }
 }
 

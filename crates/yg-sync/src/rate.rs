@@ -93,6 +93,13 @@ impl TokenBucket {
         self.cooldown_until.is_some_and(|until| now < until)
     }
 
+    /// The remaining explicit cooldown, without including token-refill time.
+    pub(crate) fn cooldown_retry_after(&self, now: Instant) -> Option<Duration> {
+        self.cooldown_until
+            .filter(|until| now < *until)
+            .map(|until| until.saturating_duration_since(now))
+    }
+
     /// How long until this bucket would next grant a token: the longer of
     /// the remaining cooldown and the time to refill one token. The repo
     /// that was denied is rescheduled by this, so it retries no sooner.

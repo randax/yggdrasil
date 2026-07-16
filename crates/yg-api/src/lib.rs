@@ -32,9 +32,10 @@ use tokio::sync::oneshot;
 use yg_control::ControlPlane;
 
 pub use config::{
-    DEFAULT_MCP_BATCH_SIZE_LIMIT, DEFAULT_REQUEST_TIMEOUT, DEFAULT_SEARCH_CONCURRENCY_LIMIT,
-    DEFAULT_TOKEN_RATE_LIMIT_REQUESTS, DEFAULT_TOKEN_RATE_LIMIT_WINDOW, ObjectStoreConfig,
-    ProtectionConfig, RunningServer, ServerConfig, TokenRateLimitConfig, probe_object_store,
+    CacheCapacity, DEFAULT_MCP_BATCH_SIZE_LIMIT, DEFAULT_REQUEST_TIMEOUT,
+    DEFAULT_SEARCH_CONCURRENCY_LIMIT, DEFAULT_TOKEN_RATE_LIMIT_REQUESTS,
+    DEFAULT_TOKEN_RATE_LIMIT_WINDOW, ObjectStoreConfig, ProtectionConfig, RunningServer,
+    ServerConfig, TokenRateLimitConfig, probe_object_store,
 };
 pub use health::UPTIME_HEADER;
 pub use metrics::Metrics;
@@ -172,10 +173,11 @@ async fn serve_with_metrics_registry_and_protection(
         .await
         .context("object storage unreachable at boot")?;
 
-    let shards = Arc::new(yg_shard::ShardCache::with_metrics(
+    let shards = Arc::new(yg_shard::ShardCache::with_metrics_and_capacity(
         store.clone(),
         config.shard_cache,
         metrics.shard_cache(),
+        config.shard_cache_capacity,
     ));
     let state = Arc::new(AppState {
         engine: Arc::new(yg_verbs::Engine::with_metrics(

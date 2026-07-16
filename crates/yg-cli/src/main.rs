@@ -1724,6 +1724,7 @@ fn server_config(deploy: &deploy_config::DeployConfig) -> anyhow::Result<yg_api:
             .clone()
             .context("YG_BOOTSTRAP_TOKEN must be set for API-serving roles")?,
         shard_cache: deploy.shard_cache.clone(),
+        shard_cache_capacity: deploy.shard_cache_capacity,
     })
 }
 

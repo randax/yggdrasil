@@ -15,7 +15,7 @@ pub(super) fn retain_page_repos(
     ranked
 }
 
-/// Hydrate snippets, reusing retained handles and reopening only handles that exceeded the cap.
+/// Hydrate snippets by resolving a fresh leased handle for every selected repository.
 pub(super) async fn hydrate_snippets<R: ShardResolver + 'static>(
     resolver: Arc<R>,
     ranked: Vec<RankedRepo>,
@@ -32,41 +32,42 @@ pub(super) async fn hydrate_snippets<R: ShardResolver + 'static>(
         let Some(indices) = by_repo.remove(&qualifier) else {
             continue;
         };
-        let index = match repo.index {
-            Some(index) => index,
-            None => {
-                let path = match resolver.resolve_fts(&repo.target).await {
-                    Ok(path) => path,
-                    Err(error) => {
-                        tracing::warn!(
-                            "fts path resolution failed during snippet hydration; returning hits unhighlighted: {error:#}"
-                        );
-                        continue;
-                    }
-                };
-                match tokio::task::spawn_blocking(move || yg_shard::open_fts(&path)).await {
-                    Ok(Ok(index)) => index,
-                    Ok(Err(error)) => {
-                        tracing::warn!(
-                            "fts reopen failed during snippet hydration; returning hits unhighlighted: {error:#}"
-                        );
-                        continue;
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            "fts reopen task panicked; returning hits unhighlighted: {error}"
-                        );
-                        continue;
-                    }
-                }
+        let resolved = match resolver.resolve_fts(&repo.target).await {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                tracing::warn!(
+                    "fts path resolution failed during snippet hydration; returning hits unhighlighted: {error:#}"
+                );
+                continue;
             }
         };
-        hydrate_repo(index, query, &indices, page).await;
+        let path = resolved.path;
+        let cache_lease = resolved.cache_lease;
+        let (index, cache_lease) = match tokio::task::spawn_blocking(move || {
+            let index = yg_shard::open_fts(&path)?;
+            Ok::<_, anyhow::Error>((index, cache_lease))
+        })
+        .await
+        {
+            Ok(Ok(opened)) => opened,
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    "fts reopen failed during snippet hydration; returning hits unhighlighted: {error:#}"
+                );
+                continue;
+            }
+            Err(error) => {
+                tracing::warn!("fts reopen task panicked; returning hits unhighlighted: {error}");
+                continue;
+            }
+        };
+        hydrate_repo(index, cache_lease, query, &indices, page).await;
     }
 }
 
 async fn hydrate_repo(
     index: yg_shard::FtsIndex,
+    cache_lease: Option<yg_shard::CacheLease>,
     query: &str,
     indices: &[usize],
     page: &mut [SearchHit],
@@ -82,9 +83,15 @@ async fn hydrate_repo(
         })
         .collect();
     let query = query.to_string();
-    let snippets =
-        tokio::task::spawn_blocking(move || yg_shard::snippets_for(&index, &query, &local_ids))
-            .await;
+    let snippets = tokio::task::spawn_blocking(move || {
+        let snippets = yg_shard::snippets_for(&index, &query, &local_ids);
+        // Handle before lease: eviction is pin-gated, so the index must
+        // close before its artifact becomes evictable.
+        drop(index);
+        drop(cache_lease);
+        snippets
+    })
+    .await;
     let snippets = match snippets {
         Ok(Ok(snippets)) => snippets,
         Ok(Err(error)) => {
@@ -142,9 +149,12 @@ mod tests {
         async fn resolve_fts(
             &self,
             _target: &SearchTarget,
-        ) -> Result<std::path::PathBuf, ResolveError> {
+        ) -> Result<crate::ResolvedFts, ResolveError> {
             self.resolutions.fetch_add(1, Ordering::SeqCst);
-            Ok(self.path.clone())
+            Ok(crate::ResolvedFts {
+                path: self.path.clone(),
+                cache_lease: None,
+            })
         }
     }
 
@@ -192,7 +202,6 @@ mod tests {
         });
         let ranked = vec![RankedRepo {
             target,
-            index: None,
             hits: vec![],
         }];
         let mut page = vec![hit];
@@ -211,40 +220,7 @@ mod tests {
     }
 
     #[test]
-    fn retained_page_handle_is_reused_without_another_resolution() {
-        let (path, target, hit) = fixture();
-        let index = yg_shard::open_fts(&path).expect("open retained fixture handle");
-        let resolver = Arc::new(ReopenResolver {
-            path: path.clone(),
-            target: target.clone(),
-            resolutions: AtomicUsize::new(0),
-        });
-        let ranked = vec![RankedRepo {
-            target,
-            index: Some(index),
-            hits: vec![],
-        }];
-        let mut page = vec![hit];
-        tokio::runtime::Builder::new_current_thread()
-            .build()
-            .expect("runtime")
-            .block_on(hydrate_snippets(
-                resolver.clone(),
-                ranked,
-                "rate limit",
-                &mut page,
-            ));
-        assert!(page[0].snippet.is_some());
-        assert_eq!(
-            resolver.resolutions.load(Ordering::SeqCst),
-            0,
-            "hydration reuses the retained ranking handle"
-        );
-        std::fs::remove_dir_all(path).expect("remove fixture");
-    }
-
-    #[test]
-    fn search_reuses_the_ranked_page_handle_end_to_end() {
+    fn search_reopens_the_ranked_page_with_a_fresh_resolution() {
         let (path, target, _) = fixture();
         let resolver = Arc::new(ReopenResolver {
             path: path.clone(),
@@ -272,8 +248,8 @@ mod tests {
         assert!(response.hits[0].snippet.is_some());
         assert_eq!(
             resolver.resolutions.load(Ordering::SeqCst),
-            1,
-            "ranking resolves once and hydration reuses that open index"
+            2,
+            "ranking and hydration each hold a lease for their complete index use"
         );
         std::fs::remove_dir_all(path).expect("remove fixture");
     }

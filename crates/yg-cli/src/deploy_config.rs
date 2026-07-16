@@ -13,7 +13,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use yg_api::ObjectStoreConfig;
+use yg_api::{CacheCapacity, ObjectStoreConfig};
 
 use crate::Role;
 
@@ -40,6 +40,8 @@ pub struct DeployConfig {
     /// Whether `/metrics` bypasses Admin authentication for scrapers.
     pub metrics_unauthenticated: bool,
     pub shard_cache: std::path::PathBuf,
+    /// Maximum bytes retained in the server-local Shard cache.
+    pub shard_cache_capacity: CacheCapacity,
     pub git_cache: std::path::PathBuf,
     pub object_store: ObjectStoreConfig,
     /// Resource bounds applied by API-serving roles.
@@ -92,6 +94,10 @@ pub enum ConfigError {
         var: &'static str,
         value: String,
     },
+    InvalidByteCount {
+        var: &'static str,
+        value: String,
+    },
     MissingBootstrapToken {
         var: &'static str,
     },
@@ -114,6 +120,12 @@ impl std::fmt::Display for ConfigError {
             ),
             Self::InvalidPositiveInteger { var, value } => {
                 write!(f, "{var}: {value:?} must be a positive whole number")
+            }
+            Self::InvalidByteCount { var, value } => {
+                write!(
+                    f,
+                    "{var}: {value:?} must be a positive whole number of bytes"
+                )
             }
             Self::MissingBootstrapToken { var } => write!(
                 f,
@@ -231,6 +243,11 @@ pub fn resolve(role: Role, lookup: impl Fn(&str) -> Option<String>) -> Resolutio
             "./data/shard-cache".to_string()
         }
         .into(),
+        shard_cache_capacity: if api {
+            r.cache_capacity("YG_SHARD_CACHE_MAX_BYTES", CacheCapacity::DEFAULT)
+        } else {
+            CacheCapacity::DEFAULT
+        },
         git_cache: if worker {
             r.string("YG_GIT_CACHE", "./data/git")
         } else {
@@ -488,6 +505,34 @@ impl Resolver<'_> {
             }
         }
     }
+
+    /// A positive byte count used to bound a local cache. Zero is rejected:
+    /// deployments that do not want a local tier should still configure a
+    /// small explicit capacity rather than select contradictory cache
+    /// semantics through this size knob.
+    fn cache_capacity(&mut self, var: &'static str, default: CacheCapacity) -> CacheCapacity {
+        let Some(value) = self.raw(var) else {
+            self.record(var, default.bytes().to_string(), Source::Default);
+            return default;
+        };
+        match value
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .and_then(CacheCapacity::new)
+        {
+            Some(capacity) => {
+                self.record(var, capacity.bytes().to_string(), Source::Env);
+                capacity
+            }
+            None => {
+                self.record(var, value.clone(), Source::Env);
+                self.errors
+                    .push(ConfigError::InvalidByteCount { var, value });
+                default
+            }
+        }
+    }
 }
 
 /// What the settings report shows in place of any credential.
@@ -561,6 +606,7 @@ mod tests {
             config.shard_cache,
             std::path::Path::new("./data/shard-cache")
         );
+        assert_eq!(config.shard_cache_capacity, CacheCapacity::DEFAULT);
         assert_eq!(config.git_cache, std::path::Path::new("./data/git"));
         assert_eq!(config.object_store.endpoint, "http://localhost:9000");
         assert_eq!(config.object_store.bucket, "yggdrasil");
@@ -584,6 +630,7 @@ mod tests {
                 ("YG_BOOTSTRAP_TOKEN", " ygt_admin \n"),
                 ("YG_DATABASE_URL", "postgres://db.example.test/yg"),
                 ("YG_SHARD_CACHE", "/var/cache/yg-shards"),
+                ("YG_SHARD_CACHE_MAX_BYTES", "1048576"),
                 ("YG_GIT_CACHE", "/var/cache/yg-git"),
                 ("YG_S3_ENDPOINT", "https://s3.example.test"),
                 ("YG_S3_BUCKET", "prod-shards"),
@@ -608,6 +655,7 @@ mod tests {
             config.shard_cache,
             std::path::Path::new("/var/cache/yg-shards")
         );
+        assert_eq!(config.shard_cache_capacity.bytes(), 1_048_576);
         assert_eq!(config.git_cache, std::path::Path::new("/var/cache/yg-git"));
         assert_eq!(config.object_store.endpoint, "https://s3.example.test");
         assert_eq!(config.object_store.bucket, "prod-shards");
@@ -746,6 +794,7 @@ mod tests {
                 ("YG_POLL_INTERVAL", "soon"),
                 ("YG_GC_GRACE", "0"),
                 ("YG_GC_INTERVAL", "99999999999999999999"),
+                ("YG_SHARD_CACHE_MAX_BYTES", "0"),
             ]),
         );
         let errored: Vec<&'static str> = resolution
@@ -755,6 +804,7 @@ mod tests {
                 ConfigError::InvalidListenAddr { var, .. }
                 | ConfigError::InvalidDurationSecs { var, .. }
                 | ConfigError::InvalidPositiveInteger { var, .. }
+                | ConfigError::InvalidByteCount { var, .. }
                 | ConfigError::MissingBootstrapToken { var } => *var,
             })
             .collect();
@@ -763,6 +813,7 @@ mod tests {
             [
                 "YG_LISTEN",
                 "YG_BOOTSTRAP_TOKEN",
+                "YG_SHARD_CACHE_MAX_BYTES",
                 "YG_POLL_INTERVAL",
                 "YG_GC_GRACE",
                 "YG_GC_INTERVAL"
@@ -770,6 +821,7 @@ mod tests {
         );
         let message = format!("{:#}", resolution.into_config().unwrap_err());
         assert!(message.contains("YG_LISTEN"), "{message}");
+        assert!(message.contains("YG_SHARD_CACHE_MAX_BYTES"), "{message}");
         assert!(message.contains("YG_POLL_INTERVAL"), "{message}");
     }
 
@@ -781,13 +833,18 @@ mod tests {
         // not clutter its report.
         let worker = resolve(
             Role::Worker,
-            env(&[("YG_LISTEN", "not-an-address"), ("YG_SHARD_CACHE", "/x")]),
+            env(&[
+                ("YG_LISTEN", "not-an-address"),
+                ("YG_SHARD_CACHE", "/x"),
+                ("YG_SHARD_CACHE_MAX_BYTES", "invalid"),
+            ]),
         );
         assert!(worker.errors.is_empty(), "{:?}", worker.errors);
         let worker_vars: Vec<&str> = worker.settings.iter().map(|s| s.var).collect();
         assert!(!worker_vars.contains(&"YG_LISTEN"));
         assert!(!worker_vars.contains(&"YG_BOOTSTRAP_TOKEN"));
         assert!(!worker_vars.contains(&"YG_SHARD_CACHE"));
+        assert!(!worker_vars.contains(&"YG_SHARD_CACHE_MAX_BYTES"));
         assert!(worker_vars.contains(&"YG_GIT_CACHE"));
         assert!(worker_vars.contains(&"YG_DATABASE_URL"));
         assert!(worker_vars.contains(&"YG_WORKER_METRICS_ADDR"));
@@ -806,6 +863,7 @@ mod tests {
         assert!(!api_vars.contains(&"YG_GIT_CACHE"));
         assert!(api_vars.contains(&"YG_LISTEN"));
         assert!(api_vars.contains(&"YG_SHARD_CACHE"));
+        assert!(api_vars.contains(&"YG_SHARD_CACHE_MAX_BYTES"));
     }
 
     #[test]
@@ -942,6 +1000,7 @@ mod tests {
                 "YG_REQUEST_TIMEOUT",
                 "YG_DATABASE_URL",
                 "YG_SHARD_CACHE",
+                "YG_SHARD_CACHE_MAX_BYTES",
                 "YG_GIT_CACHE",
                 "YG_S3_ENDPOINT",
                 "YG_S3_BUCKET",

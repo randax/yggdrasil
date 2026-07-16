@@ -12,7 +12,6 @@
 //! this one schema definition, so they cannot drift.
 
 use std::collections::HashSet;
-use std::io::Read;
 use std::path::Path;
 
 use anyhow::Context;
@@ -354,8 +353,19 @@ fn pack_dir(dir: &Path) -> anyhow::Result<Vec<u8>> {
 /// inverse of [`build_fts`]'s packing, run by the cache tier once per
 /// checksum.
 pub fn unpack_fts(bytes: &[u8], dest: &Path) -> anyhow::Result<()> {
+    unpack_fts_reader(std::io::Cursor::new(bytes), dest)
+}
+
+/// Unpack a full-text segment directly from its cached archive without
+/// loading the archive or its entries into a process-sized byte buffer.
+pub(crate) fn unpack_fts_file(archive: &Path, dest: &Path) -> anyhow::Result<()> {
+    let file = std::fs::File::open(archive).context("opening the cached fts segment archive")?;
+    unpack_fts_reader(file, dest)
+}
+
+fn unpack_fts_reader(reader: impl std::io::Read, dest: &Path) -> anyhow::Result<()> {
     std::fs::create_dir_all(dest).context("creating the fts segment directory")?;
-    let mut archive = tar::Archive::new(std::io::Cursor::new(bytes));
+    let mut archive = tar::Archive::new(reader);
     for entry in archive
         .entries()
         .context("reading the fts segment archive")?
@@ -369,11 +379,9 @@ pub fn unpack_fts(bytes: &[u8], dest: &Path) -> anyhow::Result<()> {
             .filter(|n| Path::new(n) == path.as_ref())
             .context("an fts segment entry has an unexpected path")?
             .to_owned();
-        let mut bytes = Vec::new();
-        entry
-            .read_to_end(&mut bytes)
-            .context("reading an fts segment entry")?;
-        std::fs::write(dest.join(&name), &bytes).context("writing an fts segment file")?;
+        let mut output =
+            std::fs::File::create(dest.join(&name)).context("creating an fts segment file")?;
+        std::io::copy(&mut entry, &mut output).context("writing an fts segment file")?;
     }
     Ok(())
 }

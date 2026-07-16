@@ -10,7 +10,7 @@ use tokio::task::JoinHandle;
 
 // Server config embeds the object-store half owned by yg-shard; clients
 // of this crate keep addressing it as `yg_api::ObjectStoreConfig`.
-pub use yg_shard::{ObjectStoreConfig, probe_object_store};
+pub use yg_shard::{CacheCapacity, ObjectStoreConfig, probe_object_store};
 
 pub const DEFAULT_TOKEN_RATE_LIMIT_REQUESTS: u32 = 120;
 pub const DEFAULT_TOKEN_RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
@@ -65,6 +65,8 @@ pub struct ServerConfig {
     /// Local tier for Shard segments (RFC 0001 §6): warm Verb queries
     /// read from here instead of object storage.
     pub shard_cache: std::path::PathBuf,
+    /// Maximum bytes retained in the local Shard segment tier.
+    pub shard_cache_capacity: CacheCapacity,
 }
 
 /// A booted Index Server with an explicit graceful-drain trigger.

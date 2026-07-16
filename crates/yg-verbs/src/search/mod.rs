@@ -25,12 +25,6 @@ const MAX_SEARCH_TARGETS: usize = 1000;
 /// Maximum number of repository indexes opened and ranked at once.
 const MAX_CONCURRENT_SEARCH_FANOUT: usize = 8;
 
-/// Maximum completed FTS handles retained between ranking and snippet hydration.
-///
-/// Page repositories beyond this bound are reopened from their already-materialized
-/// local FTS paths, keeping worst-case descriptor use independent of fan-out width.
-const MAX_RETAINED_FTS_HANDLES: usize = 64;
-
 /// Run `search` end to end behind the engine seam.
 pub(crate) async fn search<R: ShardResolver + 'static>(
     resolver: Arc<R>,
@@ -165,7 +159,7 @@ mod tests {
         async fn resolve_fts(
             &self,
             _: &SearchTarget,
-        ) -> Result<std::path::PathBuf, crate::ResolveError> {
+        ) -> Result<crate::ResolvedFts, crate::ResolveError> {
             Err(crate::ResolveError::UnknownRepo)
         }
     }
