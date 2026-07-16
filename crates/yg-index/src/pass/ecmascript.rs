@@ -2,14 +2,46 @@ use std::collections::HashMap;
 
 use yg_shard::Graph;
 
-use crate::resolve::{SimpleCall, SimpleExtractionCtx, SimpleFileFacts, SimpleImport, site};
-
-use super::{
-    ExtractedFacts, SimpleLanguage, SimpleWalk, descendants_of_kind, extract_simple_language,
-    field_text, mint_symbol, simple_expression_name,
+use crate::resolve::{
+    SimpleCall, SimpleExtractionCtx, SimpleFileFacts, SimpleImport, SimpleLanguageTag, site,
 };
 
-pub(super) fn extract_ecmascript(
+use super::{
+    ExtractedFacts, SimpleLanguage, descendants_of_kind, descendants_of_kind_before,
+    extract_simple_language, field_text, mint_symbol, simple_expression_name,
+};
+
+pub(super) fn extract_typescript(
+    root: tree_sitter::Node<'_>,
+    path: &str,
+    file_id: &str,
+    source: &[u8],
+    graph: &mut Graph,
+) -> Option<ExtractedFacts> {
+    extract_ecmascript(root, path, file_id, source, graph)
+}
+
+pub(super) fn extract_tsx(
+    root: tree_sitter::Node<'_>,
+    path: &str,
+    file_id: &str,
+    source: &[u8],
+    graph: &mut Graph,
+) -> Option<ExtractedFacts> {
+    extract_ecmascript(root, path, file_id, source, graph)
+}
+
+pub(super) fn extract_javascript(
+    root: tree_sitter::Node<'_>,
+    path: &str,
+    file_id: &str,
+    source: &[u8],
+    graph: &mut Graph,
+) -> Option<ExtractedFacts> {
+    extract_ecmascript(root, path, file_id, source, graph)
+}
+
+fn extract_ecmascript(
     root: tree_sitter::Node<'_>,
     path: &str,
     file_id: &str,
@@ -22,9 +54,9 @@ pub(super) fn extract_ecmascript(
         file_id,
         source,
         graph,
+        SimpleLanguageTag::EcmaScript,
         SimpleLanguage {
             imports: extract_ecmascript_imports,
-            walk: SimpleWalk::TopLevel,
             collect: |declaration, context: &mut SimpleExtractionCtx<'_, '_>| {
                 collect_ecmascript_top_level_declaration(
                     declaration,
@@ -49,15 +81,6 @@ fn collect_ecmascript_top_level_declaration(
     id_uses: &mut HashMap<String, u32>,
     facts: &mut SimpleFileFacts,
 ) {
-    if declaration.kind() == "export_statement" {
-        let mut cursor = declaration.walk();
-        for child in declaration.children(&mut cursor) {
-            collect_ecmascript_top_level_declaration(
-                child, source, path, file_id, graph, id_uses, facts,
-            );
-        }
-        return;
-    }
     match declaration.kind() {
         "function_declaration"
         | "generator_function_declaration"
@@ -91,7 +114,8 @@ fn collect_ecmascript_top_level_declaration(
                 return;
             };
             let id = mint_symbol(path, file_id, name, id_uses, graph);
-            facts.declarations.push((name.to_string(), id));
+            facts.declarations.push((name.to_string(), id.clone()));
+            collect_ecmascript_calls(declaration, source, &id, path, &mut facts.calls);
             let mut ctx = SimpleExtractionCtx {
                 source,
                 path,
@@ -103,7 +127,14 @@ fn collect_ecmascript_top_level_declaration(
             collect_ecmascript_class_methods(declaration, name, &mut ctx);
         }
         "lexical_declaration" | "variable_declaration" => {
-            for declarator in descendants_of_kind(declaration, "variable_declarator") {
+            if has_ecmascript_variable_owner_ancestor(declaration) {
+                return;
+            }
+            let mut cursor = declaration.walk();
+            for declarator in declaration
+                .named_children(&mut cursor)
+                .filter(|child| child.kind() == "variable_declarator")
+            {
                 let Some(name_node) = declarator
                     .child_by_field_name("name")
                     .filter(|n| n.kind() == "identifier")
@@ -206,7 +237,11 @@ fn collect_ecmascript_calls(
     path: &str,
     calls: &mut Vec<SimpleCall>,
 ) {
-    for call in descendants_of_kind(declaration, "call_expression") {
+    for call in descendants_of_kind_before(
+        declaration,
+        "call_expression",
+        is_ecmascript_declaration_boundary,
+    ) {
         let Some(function) = call.child_by_field_name("function") else {
             continue;
         };
@@ -219,7 +254,11 @@ fn collect_ecmascript_calls(
             location: site(path, call),
         });
     }
-    for call in descendants_of_kind(declaration, "new_expression") {
+    for call in descendants_of_kind_before(
+        declaration,
+        "new_expression",
+        is_ecmascript_declaration_boundary,
+    ) {
         let Some(constructor) = call.child_by_field_name("constructor") else {
             continue;
         };
@@ -232,6 +271,53 @@ fn collect_ecmascript_calls(
             location: site(path, call),
         });
     }
+}
+
+fn is_ecmascript_declaration_boundary(node: tree_sitter::Node<'_>) -> bool {
+    match node.kind() {
+        "function_declaration"
+        | "generator_function_declaration"
+        | "type_alias_declaration"
+        | "enum_declaration"
+        | "class_declaration"
+        | "abstract_class_declaration"
+        | "method_definition" => true,
+        "variable_declarator" => {
+            node.child_by_field_name("name")
+                .is_some_and(|name| name.kind() == "identifier")
+                && !has_ecmascript_variable_owner_ancestor(node)
+        }
+        _ => false,
+    }
+}
+
+fn has_ecmascript_variable_owner_ancestor(node: tree_sitter::Node<'_>) -> bool {
+    let mut ancestor = node.parent();
+    while let Some(node) = ancestor {
+        match node.kind() {
+            "function_declaration"
+            | "generator_function_declaration"
+            | "function_expression"
+            | "generator_function"
+            | "arrow_function"
+            | "type_alias_declaration"
+            | "enum_declaration"
+            | "interface_declaration"
+            | "class_declaration"
+            | "abstract_class_declaration"
+            | "class"
+            | "method_definition" => return true,
+            "variable_declarator"
+                if node
+                    .child_by_field_name("name")
+                    .is_some_and(|name| name.kind() == "identifier") =>
+            {
+                return true;
+            }
+            _ => ancestor = node.parent(),
+        }
+    }
+    false
 }
 
 fn ecmascript_callee_name<'a>(

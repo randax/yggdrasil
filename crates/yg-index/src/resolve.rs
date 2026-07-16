@@ -106,10 +106,24 @@ pub(crate) struct GoType {
 /// Minimal facts for syntactic language packs whose M0 contract is
 /// Symbols, DEFINES, package IMPORTS, and name-based CALLS.
 pub(crate) struct SimpleFileFacts {
+    pub(crate) language: SimpleLanguageTag,
     pub(crate) file_id: String,
+    pub(crate) dir: String,
     pub(crate) imports: Vec<SimpleImport>,
     pub(crate) calls: Vec<SimpleCall>,
     pub(crate) declarations: Vec<(String, String)>,
+}
+
+/// A logical resolution family for the non-Go syntactic language packs.
+/// Resolution never crosses these boundaries, even when two languages use the
+/// same spelling. ECMAScript grammars share one family so mixed TS/TSX/JS
+/// repositories resolve calls across file extensions.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum SimpleLanguageTag {
+    EcmaScript,
+    Python,
+    Rust,
+    Java,
 }
 
 pub(crate) struct SimpleImport {
@@ -136,15 +150,15 @@ pub(crate) struct SimpleExtractionCtx<'a, 'b> {
 pub(crate) struct InterfaceShape {
     /// Method names declared directly in the interface body.
     pub(crate) direct_methods: BTreeSet<String>,
-    /// Whether `direct_methods` is the interface's *whole* method set.
-    /// False when the interface embeds another interface (whose methods
-    /// we can't resolve syntactically) or carries a type constraint
-    /// (`A | B`, `~int` — a generic constraint, not a regular
-    /// interface). An incomplete set must not drive IMPLEMENTS: matching
-    /// on a subset of the required methods would emit false edges for
-    /// types that satisfy only the directly-named methods. M1's precise
-    /// pass resolves embedded method sets; until then, honest silence.
-    pub(crate) complete: bool,
+    /// Number of lone named type elements that phase 2 must resolve as
+    /// embedded interfaces. Keeping the syntactic count lets resolution
+    /// reject a malformed embed that phase 1 could not turn into a
+    /// typed reference instead of silently treating it as absent.
+    pub(crate) embedded_count: usize,
+    /// Whether the body contains a union, approximation, or other type
+    /// element that is a generic constraint rather than an interface
+    /// embed. Constraint interfaces do not drive IMPLEMENTS edges.
+    pub(crate) has_type_constraints: bool,
 }
 
 /// Everything the repo declares, by the name a reference would spell.
@@ -172,9 +186,15 @@ pub(crate) struct SymbolIndex {
     pub(crate) import_dirs: HashMap<String, Vec<String>>,
 }
 
+struct SimpleSymbol {
+    id: String,
+    file_id: String,
+    dir: String,
+}
+
 #[derive(Default)]
 pub(crate) struct SimpleSymbolIndex {
-    pub(crate) symbols: HashMap<String, Vec<String>>,
+    symbols: HashMap<SimpleLanguageTag, HashMap<String, Vec<SimpleSymbol>>>,
 }
 
 impl SimpleSymbolIndex {
@@ -184,21 +204,46 @@ impl SimpleSymbolIndex {
             for (name, id) in &file.declarations {
                 index
                     .symbols
+                    .entry(file.language)
+                    .or_default()
                     .entry(name.clone())
                     .or_default()
-                    .push(id.clone());
+                    .push(SimpleSymbol {
+                        id: id.clone(),
+                        file_id: file.file_id.clone(),
+                        dir: file.dir.clone(),
+                    });
             }
         }
         index
     }
 
-    fn resolve(&self, name: &str) -> Vec<&str> {
-        self.symbols
-            .get(name)
+    fn resolve(&self, file: &SimpleFileFacts, name: &str) -> Vec<&str> {
+        let candidates = self
+            .symbols
+            .get(&file.language)
+            .and_then(|symbols| symbols.get(name))
             .map(Vec::as_slice)
-            .unwrap_or(&[])
+            .unwrap_or(&[]);
+        let same_file = candidates
             .iter()
-            .map(String::as_str)
+            .filter(|candidate| candidate.file_id == file.file_id)
+            .map(|candidate| candidate.id.as_str())
+            .collect::<Vec<_>>();
+        if !same_file.is_empty() {
+            return same_file;
+        }
+        let same_directory = candidates
+            .iter()
+            .filter(|candidate| candidate.dir == file.dir)
+            .map(|candidate| candidate.id.as_str())
+            .collect::<Vec<_>>();
+        if !same_directory.is_empty() {
+            return same_directory;
+        }
+        candidates
+            .iter()
+            .map(|candidate| candidate.id.as_str())
             .collect()
     }
 }
@@ -519,19 +564,114 @@ fn emit_extends_edges(file: &GoFileFacts, index: &SymbolIndex, graph: &mut Graph
 }
 
 /// IMPLEMENTS edges (phase 2): a type whose method names cover an
-/// interface's directly declared method names IMPLEMENTS it (RFC 0001
+/// interface's resolved transitive method names IMPLEMENTS it (RFC 0001
 /// §5), repo-wide — Go interfaces are satisfied across package
 /// boundaries. Matching is by name only (signatures are invisible to a
 /// reasonable syntactic pass), so confidence is capped at
-/// NAME_ONLY_MATCH however unique the match; an interface with no
-/// direct methods (`any`, `interface{}`, embeddings only) matches
-/// nothing — everything satisfies it, so edges to it would be noise.
+/// NAME_ONLY_MATCH however unique the match; an interface whose resolved
+/// transitive method set is empty (`any`, `interface{}`) matches nothing
+/// — everything satisfies it, so edges to it would be noise.
 /// No location: the relationship has no single site.
 ///
 /// Candidates come from an inverted method-name index, seeded by each
 /// interface's rarest method, so cost tracks actual near-matches
 /// instead of types × interfaces.
-fn emit_implements_edges(files: &[GoFileFacts], graph: &mut Graph) {
+struct PendingInterfaceMethods {
+    methods: BTreeSet<String>,
+    embeds: Vec<String>,
+    expected_embeds: usize,
+    observed_embeds: usize,
+    blocked: bool,
+}
+
+/// Resolve interface method sets by monotone fixed point. Each pass only
+/// resolves interfaces whose uniquely identified embeds were resolved by
+/// an earlier pass. At most one new dependency level settles per pass, so
+/// `interface_count` passes cover every acyclic in-repo chain; cycles and
+/// dependencies on missing, ambiguous, or constrained interfaces remain
+/// absent from the result without recursion or an unbounded loop.
+fn resolve_interface_methods(
+    files: &[GoFileFacts],
+    index: &SymbolIndex,
+) -> HashMap<String, BTreeSet<String>> {
+    let mut pending = HashMap::new();
+    for file in files {
+        for declared in &file.types {
+            let Some(shape) = &declared.interface else {
+                continue;
+            };
+            pending.insert(
+                declared.id.clone(),
+                PendingInterfaceMethods {
+                    methods: shape.direct_methods.clone(),
+                    embeds: Vec::with_capacity(shape.embedded_count),
+                    expected_embeds: shape.embedded_count,
+                    observed_embeds: 0,
+                    blocked: shape.has_type_constraints,
+                },
+            );
+        }
+    }
+
+    for file in files {
+        let allow_repo_wide = !file.has_dot_import;
+        for embed in &file.embeds {
+            let Some(methods) = pending.get_mut(&embed.subject_id) else {
+                continue;
+            };
+            methods.observed_embeds += 1;
+            let mut candidates = index.resolve_type(&embed.reference, &file.dir, allow_repo_wide);
+            candidates.retain(|id| index.interface_ids.contains(*id));
+            if let [target] = candidates.as_slice() {
+                methods.embeds.push((*target).to_string());
+            } else {
+                methods.blocked = true;
+            }
+        }
+    }
+    for methods in pending.values_mut() {
+        if methods.observed_embeds != methods.expected_embeds {
+            methods.blocked = true;
+        }
+    }
+
+    let interface_count = pending.len();
+    let mut resolved: HashMap<String, BTreeSet<String>> = HashMap::with_capacity(interface_count);
+    for _ in 0..interface_count {
+        let mut progress = Vec::new();
+        for file in files {
+            for declared in &file.types {
+                if resolved.contains_key(&declared.id) {
+                    continue;
+                }
+                let Some(methods) = pending.get(&declared.id) else {
+                    continue;
+                };
+                if methods.blocked || !methods.embeds.iter().all(|id| resolved.contains_key(id)) {
+                    continue;
+                }
+                let mut transitive = methods.methods.clone();
+                for embedded_id in &methods.embeds {
+                    transitive.extend(
+                        resolved
+                            .get(embedded_id)
+                            .expect("all embedded interfaces are resolved")
+                            .iter()
+                            .cloned(),
+                    );
+                }
+                progress.push((declared.id.clone(), transitive));
+            }
+        }
+        if progress.is_empty() {
+            break;
+        }
+        resolved.extend(progress);
+    }
+    resolved
+}
+
+fn emit_implements_edges(files: &[GoFileFacts], index: &SymbolIndex, graph: &mut Graph) {
     // Method sets per (package dir, receiver type name) — Go only
     // permits methods in the receiver type's own package, so the pair
     // identifies the type. Slot-indexed so everything downstream
@@ -572,20 +712,18 @@ fn emit_implements_edges(files: &[GoFileFacts], graph: &mut Graph) {
             }
         }
     }
+    let interface_methods = resolve_interface_methods(files, index);
     for file in files {
         for declared in &file.types {
-            // Only interfaces whose *whole* method set is known here can
-            // be matched: an interface that embeds another (or is a
-            // generic constraint) would match on a subset and emit false
-            // edges (see `InterfaceShape::complete`). Empty interfaces
-            // (`any`) match nothing — everything satisfies them.
-            let Some(shape) = &declared.interface else {
+            // Only interfaces whose transitive method set resolved can
+            // be matched. Empty interfaces (`any`) match nothing —
+            // everything satisfies them, so those edges would be noise.
+            let Some(needed) = interface_methods.get(&declared.id) else {
                 continue;
             };
-            if !shape.complete || shape.direct_methods.is_empty() {
+            if needed.is_empty() {
                 continue;
             }
-            let needed = &shape.direct_methods;
             // Every needed method must have declarers at all; then the
             // rarest one's posting list seeds the candidate set.
             let postings: Option<Vec<&Vec<usize>>> = needed
@@ -676,7 +814,7 @@ fn emit_import(
 
 fn emit_simple_call_edges(file: &SimpleFileFacts, index: &SimpleSymbolIndex, graph: &mut Graph) {
     for call in &file.calls {
-        let candidates = index.resolve(&call.callee);
+        let candidates = index.resolve(file, &call.callee);
         push_candidate_edges(
             graph,
             &call.caller_id,
@@ -700,7 +838,7 @@ pub(super) fn emit_edges(
         emit_call_edges(file, &index, graph);
         emit_extends_edges(file, &index, graph);
     }
-    emit_implements_edges(go_files, graph);
+    emit_implements_edges(go_files, &index, graph);
 
     let simple_index = SimpleSymbolIndex::build(simple_files);
     for file in simple_files {

@@ -4,7 +4,9 @@ use std::path::Path;
 use anyhow::Context;
 use yg_shard::{Edge, EdgeKind, Graph, Node, NodeKind, Provenance, SearchDoc};
 
-use crate::resolve::{self, GoFileFacts, SimpleExtractionCtx, SimpleFileFacts, SimpleImport};
+use crate::resolve::{
+    self, GoFileFacts, SimpleExtractionCtx, SimpleFileFacts, SimpleImport, SimpleLanguageTag,
+};
 
 mod ecmascript;
 mod go;
@@ -12,9 +14,23 @@ mod java;
 mod python;
 mod rust;
 
+#[cfg(test)]
+mod tests;
+
 /// Cap on the text indexed per file. Oversized content remains searchable by
 /// file name and is truncated on a character boundary.
 const MAX_BODY_BYTES: usize = 512 * 1024;
+
+/// Maximum file size read by the syntactic pass. Larger files retain their
+/// File node but skip parsing and body indexing so one blob cannot dominate
+/// an index job's memory.
+const MAX_SOURCE_FILE_BYTES: u64 = 1024 * 1024;
+
+enum FileDegradation {
+    Stat(std::io::Error),
+    Oversized { bytes: u64 },
+    Read(std::io::Error),
+}
 
 type Grammar = fn() -> tree_sitter::Language;
 type Extractor = for<'tree> fn(
@@ -87,19 +103,19 @@ const LANGUAGE_PACKS: &[LanguagePack] = &[
     LanguagePack {
         extensions: &[".ts", ".mts", ".cts"],
         grammar: || tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-        extractor: ecmascript::extract_ecmascript,
+        extractor: ecmascript::extract_typescript,
         grammar_name: "TypeScript",
     },
     LanguagePack {
         extensions: &[".tsx", ".jsx"],
         grammar: || tree_sitter_typescript::LANGUAGE_TSX.into(),
-        extractor: ecmascript::extract_ecmascript,
+        extractor: ecmascript::extract_tsx,
         grammar_name: "TSX",
     },
     LanguagePack {
         extensions: &[".js", ".mjs", ".cjs"],
         grammar: || tree_sitter_javascript::LANGUAGE.into(),
-        extractor: ecmascript::extract_ecmascript,
+        extractor: ecmascript::extract_javascript,
         grammar_name: "JavaScript",
     },
     LanguagePack {
@@ -134,6 +150,50 @@ const LANGUAGE_PACKS: &[LanguagePack] = &[
 /// Phase 2 resolves the facts repo-wide; it cannot run until every file
 /// is parsed.
 pub fn syntactic_pass(root: &Path) -> anyhow::Result<(Graph, Vec<SearchDoc>)> {
+    syntactic_pass_with_degradations(root, |path, degradation| match degradation {
+        FileDegradation::Stat(error) => {
+            tracing::warn!(path = %path.display(), error = %error, "unable to stat file; skipping contents");
+        }
+        FileDegradation::Oversized { bytes } => {
+            tracing::warn!(
+                path = %path.display(),
+                bytes,
+                cap = MAX_SOURCE_FILE_BYTES,
+                "file exceeds the syntactic-pass size cap; skipping contents"
+            );
+        }
+        FileDegradation::Read(error) => {
+            tracing::warn!(path = %path.display(), error = %error, "unable to read file; skipping contents");
+        }
+    })
+}
+
+fn syntactic_pass_with_degradations<F>(
+    root: &Path,
+    report_degradation: F,
+) -> anyhow::Result<(Graph, Vec<SearchDoc>)>
+where
+    F: FnMut(&Path, &FileDegradation),
+{
+    syntactic_pass_with_io(
+        root,
+        report_degradation,
+        |path: &Path| std::fs::metadata(path),
+        |path: &Path| std::fs::read(path),
+    )
+}
+
+fn syntactic_pass_with_io<F, M, R>(
+    root: &Path,
+    mut report_degradation: F,
+    mut metadata: M,
+    mut read: R,
+) -> anyhow::Result<(Graph, Vec<SearchDoc>)>
+where
+    F: FnMut(&Path, &FileDegradation),
+    M: FnMut(&Path) -> std::io::Result<std::fs::Metadata>,
+    R: FnMut(&Path) -> std::io::Result<Vec<u8>>,
+{
     let mut graph = Graph::default();
     let mut paths = Vec::new();
     collect_files(root, root, &mut paths)?;
@@ -164,8 +224,30 @@ pub fn syntactic_pass(root: &Path) -> anyhow::Result<(Graph, Vec<SearchDoc>)> {
         // Read once: the bytes feed both the Go parse and the full-text
         // body. Other passes read only Go and go.mod, but the segment
         // indexes every file's text (code and markdown alike).
-        let bytes = std::fs::read(root.join(&path))
-            .with_context(|| format!("reading {path} from the checkout"))?;
+        let full_path = root.join(&path);
+        let metadata = match metadata(&full_path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                report_degradation(Path::new(&path), &FileDegradation::Stat(error));
+                continue;
+            }
+        };
+        if metadata.len() > MAX_SOURCE_FILE_BYTES {
+            report_degradation(
+                Path::new(&path),
+                &FileDegradation::Oversized {
+                    bytes: metadata.len(),
+                },
+            );
+            continue;
+        }
+        let bytes = match read(&full_path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                report_degradation(Path::new(&path), &FileDegradation::Read(error));
+                continue;
+            }
+        };
         if let Some(pack) = packs.iter_mut().find(|pack| pack.handles(&path)) {
             match pack.extract(&path, &file_id, &bytes, &mut graph) {
                 Some(ExtractedFacts::Go(facts)) => files.push(facts),
@@ -177,7 +259,7 @@ pub fn syntactic_pass(root: &Path) -> anyhow::Result<(Graph, Vec<SearchDoc>)> {
             // file named go.mod must cost module resolution at worst —
             // a failed pass would retry forever, identically.
             if let Some(module) = go_mod_module(&String::from_utf8_lossy(&bytes)) {
-                modules.push((package_dir(&path).to_string(), module));
+                modules.push((file_dir(&path).to_string(), module));
             }
         }
         if let Ok(text) = String::from_utf8(bytes) {
@@ -270,14 +352,8 @@ fn go_mod_module(contents: &str) -> Option<String> {
     })
 }
 
-enum SimpleWalk {
-    TopLevel,
-    Descendants,
-}
-
 struct SimpleLanguage<I, C> {
     imports: I,
-    walk: SimpleWalk,
     collect: C,
 }
 
@@ -287,6 +363,7 @@ fn extract_simple_language<'tree, I, C>(
     file_id: &str,
     source: &[u8],
     graph: &mut Graph,
+    language_tag: SimpleLanguageTag,
     language: SimpleLanguage<I, C>,
 ) -> Option<ExtractedFacts>
 where
@@ -295,11 +372,12 @@ where
 {
     let SimpleLanguage {
         imports: extract_imports,
-        walk,
         mut collect,
     } = language;
     let mut facts = SimpleFileFacts {
+        language: language_tag,
         file_id: file_id.to_string(),
+        dir: file_dir(path).to_string(),
         imports: extract_imports(root, path, source),
         calls: Vec::new(),
         declarations: Vec::new(),
@@ -313,29 +391,19 @@ where
         id_uses: &mut id_uses,
         facts: &mut facts,
     };
-    match walk {
-        SimpleWalk::TopLevel => {
-            let mut cursor = root.walk();
-            for declaration in root.children(&mut cursor) {
-                collect(declaration, &mut context);
-            }
-        }
-        SimpleWalk::Descendants => {
-            let mut cursor = root.walk();
+    let mut cursor = root.walk();
+    if cursor.goto_first_child() {
+        loop {
+            collect(cursor.node(), &mut context);
             if cursor.goto_first_child() {
-                loop {
-                    collect(cursor.node(), &mut context);
-                    if cursor.goto_first_child() {
-                        continue;
-                    }
-                    loop {
-                        if cursor.goto_next_sibling() {
-                            break;
-                        }
-                        if !cursor.goto_parent() || cursor.node() == root {
-                            return Some(ExtractedFacts::Simple(facts));
-                        }
-                    }
+                continue;
+            }
+            loop {
+                if cursor.goto_next_sibling() {
+                    break;
+                }
+                if !cursor.goto_parent() || cursor.node() == root {
+                    return Some(ExtractedFacts::Simple(facts));
                 }
             }
         }
@@ -377,17 +445,28 @@ fn simple_expression_name<'a>(
     }
 }
 
-/// The directory holding a repo-relative file path — Go's package
-/// boundary for scoping purposes (one package per directory, with rare
-/// exceptions like `_test` packages that heuristic resolution accepts
-/// conflating).
-fn package_dir(path: &str) -> &str {
+/// The directory holding a repo-relative file path.
+fn file_dir(path: &str) -> &str {
     path.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("")
 }
 
 /// Every descendant of `node` (excluding itself) with the given kind,
 /// in document order — one cursor walk, no per-node allocation.
 fn descendants_of_kind<'t>(node: tree_sitter::Node<'t>, kind: &str) -> Vec<tree_sitter::Node<'t>> {
+    descendants_of_kind_before(node, kind, |_| false)
+}
+
+/// Descendants of `node` with the requested kind, without entering a nested
+/// declaration boundary. The root is excluded, so a declaration can collect
+/// its own body while leaving nested declarations to their own symbols.
+fn descendants_of_kind_before<'t, B>(
+    node: tree_sitter::Node<'t>,
+    kind: &str,
+    boundary: B,
+) -> Vec<tree_sitter::Node<'t>>
+where
+    B: Fn(tree_sitter::Node<'t>) -> bool,
+{
     let mut found = Vec::new();
     let mut cursor = node.walk();
     if !cursor.goto_first_child() {
@@ -397,7 +476,7 @@ fn descendants_of_kind<'t>(node: tree_sitter::Node<'t>, kind: &str) -> Vec<tree_
         if cursor.node().kind() == kind {
             found.push(cursor.node());
         }
-        if cursor.goto_first_child() {
+        if !boundary(cursor.node()) && cursor.goto_first_child() {
             continue;
         }
         loop {

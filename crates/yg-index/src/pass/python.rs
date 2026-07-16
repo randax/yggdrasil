@@ -2,11 +2,13 @@ use std::collections::HashMap;
 
 use yg_shard::Graph;
 
-use crate::resolve::{SimpleCall, SimpleExtractionCtx, SimpleFileFacts, SimpleImport, site};
+use crate::resolve::{
+    SimpleCall, SimpleExtractionCtx, SimpleFileFacts, SimpleImport, SimpleLanguageTag, site,
+};
 
 use super::{
-    ExtractedFacts, SimpleLanguage, SimpleWalk, descendants_of_kind, extract_simple_language,
-    field_text, first_of_kind, mint_symbol,
+    ExtractedFacts, SimpleLanguage, descendants_of_kind, descendants_of_kind_before,
+    extract_simple_language, field_text, first_of_kind, mint_symbol,
 };
 
 pub(super) fn extract_python(
@@ -22,9 +24,9 @@ pub(super) fn extract_python(
         file_id,
         source,
         graph,
+        SimpleLanguageTag::Python,
         SimpleLanguage {
             imports: extract_python_imports,
-            walk: SimpleWalk::TopLevel,
             collect: |declaration, context: &mut SimpleExtractionCtx<'_, '_>| {
                 collect_python_top_level_declaration(
                     declaration,
@@ -49,15 +51,6 @@ fn collect_python_top_level_declaration(
     id_uses: &mut HashMap<String, u32>,
     facts: &mut SimpleFileFacts,
 ) {
-    if declaration.kind() == "expression_statement" {
-        let mut cursor = declaration.walk();
-        for child in declaration.children(&mut cursor) {
-            collect_python_top_level_declaration(
-                child, source, path, file_id, graph, id_uses, facts,
-            );
-        }
-        return;
-    }
     match declaration.kind() {
         "class_definition" => {
             let Some(name) = field_text(declaration, "name", source) else {
@@ -65,25 +58,20 @@ fn collect_python_top_level_declaration(
             };
             let id = mint_symbol(path, file_id, name, id_uses, graph);
             facts.declarations.push((name.to_string(), id));
-            let mut ctx = SimpleExtractionCtx {
-                source,
-                path,
-                file_id,
-                graph,
-                id_uses,
-                facts,
-            };
-            collect_python_class_methods(declaration, name, &mut ctx);
         }
         "function_definition" => {
             let Some(name) = field_text(declaration, "name", source) else {
                 return;
             };
-            let id = mint_symbol(path, file_id, name, id_uses, graph);
+            let symbol_name = python_function_symbol_name(declaration, source, name);
+            let id = mint_symbol(path, file_id, &symbol_name, id_uses, graph);
             facts.declarations.push((name.to_string(), id.clone()));
             collect_python_calls(declaration, source, &id, path, &mut facts.calls);
         }
         "assignment" => {
+            if has_python_declaration_ancestor(declaration) {
+                return;
+            }
             let Some(left) = declaration
                 .child_by_field_name("left")
                 .filter(|n| n.kind() == "identifier")
@@ -101,27 +89,36 @@ fn collect_python_top_level_declaration(
     }
 }
 
-fn collect_python_class_methods(
-    class_definition: tree_sitter::Node<'_>,
-    class_name: &str,
-    ctx: &mut SimpleExtractionCtx<'_, '_>,
-) {
-    let Some(body) = class_definition.child_by_field_name("body") else {
-        return;
-    };
-    let mut cursor = body.walk();
-    for item in body.children(&mut cursor) {
-        if item.kind() != "function_definition" {
-            continue;
+fn python_function_symbol_name(
+    function: tree_sitter::Node<'_>,
+    source: &[u8],
+    name: &str,
+) -> String {
+    let mut ancestor = function.parent();
+    while let Some(node) = ancestor {
+        match node.kind() {
+            "function_definition" | "lambda" => break,
+            "class_definition" => {
+                if let Some(class_name) = field_text(node, "name", source) {
+                    return format!("{class_name}.{name}");
+                }
+                break;
+            }
+            _ => ancestor = node.parent(),
         }
-        let Some(name) = field_text(item, "name", ctx.source) else {
-            continue;
-        };
-        let qualified = format!("{class_name}.{name}");
-        let id = mint_symbol(ctx.path, ctx.file_id, &qualified, ctx.id_uses, ctx.graph);
-        ctx.facts.declarations.push((name.to_string(), id.clone()));
-        collect_python_calls(item, ctx.source, &id, ctx.path, &mut ctx.facts.calls);
     }
+    name.to_string()
+}
+
+fn has_python_declaration_ancestor(node: tree_sitter::Node<'_>) -> bool {
+    let mut ancestor = node.parent();
+    while let Some(node) = ancestor {
+        if matches!(node.kind(), "function_definition" | "class_definition") {
+            return true;
+        }
+        ancestor = node.parent();
+    }
+    false
 }
 
 fn extract_python_imports(
@@ -169,7 +166,9 @@ fn collect_python_calls(
     path: &str,
     calls: &mut Vec<SimpleCall>,
 ) {
-    for call in descendants_of_kind(declaration, "call") {
+    for call in descendants_of_kind_before(declaration, "call", |node| {
+        matches!(node.kind(), "function_definition" | "class_definition")
+    }) {
         let Some(function) = call.child_by_field_name("function") else {
             continue;
         };

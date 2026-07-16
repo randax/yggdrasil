@@ -207,7 +207,7 @@ fn insert_any_of(schema: &mut Value, value: Value) {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct NodeRequest {
     /// Node id, or a bare symbol name matched byte-for-byte and case-sensitively.
-    /// Bare names without a safely searchable term set are un-addressable.
+    /// Names shared by too many declarations are un-addressable.
     pub id: String,
     /// Repo qualifier when `id` is a bare symbol name.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -234,7 +234,7 @@ pub struct NeighborsRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct TraversalShape {
     /// Node id to traverse from, or a bare symbol name matched byte-for-byte
-    /// and case-sensitively. Bare names without a safely searchable term set are
+    /// and case-sensitively. Names shared by too many declarations are
     /// un-addressable.
     pub id: String,
     /// Repo qualifier when `id` is a bare symbol name.
@@ -279,7 +279,7 @@ pub struct SearchRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct HistoryRequest {
     /// File or Symbol node id, or a bare symbol name matched byte-for-byte and
-    /// case-sensitively. Bare names without a safely searchable term set are
+    /// case-sensitively. Names shared by too many declarations are
     /// un-addressable.
     pub id: String,
     /// Repo qualifier when `id` is a bare symbol name.
@@ -1820,7 +1820,7 @@ mod tests {
     }
 
     #[test]
-    fn node_address_schema_documents_exact_matching_and_zero_term_names() {
+    fn node_address_schema_documents_exact_matching_and_bounded_ambiguity() {
         for verb in [Verb::Node, Verb::Neighbors, Verb::History] {
             let schema = verb.tool().input_schema();
             let description = schema["properties"]["id"]["description"]
@@ -1829,7 +1829,7 @@ mod tests {
             assert!(
                 description.contains("byte-for-byte")
                     && description.contains("case-sensitively")
-                    && description.contains("safely searchable term set")
+                    && description.contains("too many declarations")
                     && description.contains("un-addressable"),
                 "{} id docs are honest: {description}",
                 verb.label()

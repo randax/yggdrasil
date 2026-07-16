@@ -96,6 +96,13 @@ Twelve Verbs, identical schemas across REST (`POST /v1/verbs/<name>`), MCP tools
 | `history` | node, since? | commits/CRs touching it, Contributors |
 | `impact` | symbol\|file, depth | affected Symbols→Files→Repos, grouped, provenance-annotated |
 
+Lexical search ranks with BM25 inside each repository, then divides every
+score by that repository's maximum score before the cross-repository merge.
+This maps each repository's best hit to `1.0`, preserves its internal score
+ratios, and avoids comparing corpus-dependent raw BM25 scales. The final merge
+is deterministic: normalized score descending, then repository and node id
+ascending.
+
 Verb additions are minor-version events; removals are major. The Skill is versioned against this table.
 
 ## 8. API, auth, clients

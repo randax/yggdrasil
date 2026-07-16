@@ -1,12 +1,10 @@
-use std::collections::HashMap;
-
 use yg_shard::Graph;
 
-use crate::resolve::{SimpleCall, SimpleExtractionCtx, SimpleFileFacts, SimpleImport, site};
+use crate::resolve::{SimpleCall, SimpleExtractionCtx, SimpleImport, SimpleLanguageTag, site};
 
 use super::{
-    ExtractedFacts, SimpleLanguage, SimpleWalk, descendants_of_kind, extract_simple_language,
-    field_text, first_of_kind, mint_symbol, simple_expression_name,
+    ExtractedFacts, SimpleLanguage, descendants_of_kind, descendants_of_kind_before,
+    extract_simple_language, field_text, first_of_kind, mint_symbol, simple_expression_name,
 };
 
 pub(super) fn extract_rust(
@@ -22,9 +20,9 @@ pub(super) fn extract_rust(
         file_id,
         source,
         graph,
+        SimpleLanguageTag::Rust,
         SimpleLanguage {
             imports: extract_rust_imports,
-            walk: SimpleWalk::TopLevel,
             collect: |declaration: tree_sitter::Node<'_>,
                       context: &mut SimpleExtractionCtx<'_, '_>| {
                 match declaration.kind() {
@@ -33,10 +31,12 @@ pub(super) fn extract_rust(
                         let Some(name) = field_text(declaration, "name", context.source) else {
                             return;
                         };
+                        let symbol_name =
+                            rust_declaration_symbol_name(declaration, context.source, name);
                         let id = mint_symbol(
                             context.path,
                             context.file_id,
-                            name,
+                            &symbol_name,
                             context.id_uses,
                             context.graph,
                         );
@@ -52,15 +52,6 @@ pub(super) fn extract_rust(
                             &mut context.facts.calls,
                         );
                     }
-                    "impl_item" => collect_rust_impl_item(
-                        declaration,
-                        context.source,
-                        context.path,
-                        context.file_id,
-                        context.graph,
-                        context.id_uses,
-                        context.facts,
-                    ),
                     _ => {}
                 }
             },
@@ -68,37 +59,30 @@ pub(super) fn extract_rust(
     )
 }
 
-fn collect_rust_impl_item(
-    impl_item: tree_sitter::Node<'_>,
+fn rust_declaration_symbol_name(
+    declaration: tree_sitter::Node<'_>,
     source: &[u8],
-    path: &str,
-    file_id: &str,
-    graph: &mut Graph,
-    id_uses: &mut HashMap<String, u32>,
-    facts: &mut SimpleFileFacts,
-) {
-    let Some(receiver) = impl_item
-        .child_by_field_name("type")
-        .and_then(|node| rust_type_name(node, source))
-    else {
-        return;
-    };
-    let Some(body) = impl_item.child_by_field_name("body") else {
-        return;
-    };
-    let mut cursor = body.walk();
-    for item in body.children(&mut cursor) {
-        if item.kind() != "function_item" {
-            continue;
+    name: &str,
+) -> String {
+    if declaration.kind() == "function_item" {
+        let mut ancestor = declaration.parent();
+        while let Some(node) = ancestor {
+            match node.kind() {
+                "function_item" => break,
+                "impl_item" => {
+                    if let Some(receiver) = node
+                        .child_by_field_name("type")
+                        .and_then(|node| rust_type_name(node, source))
+                    {
+                        return format!("{receiver}.{name}");
+                    }
+                    break;
+                }
+                _ => ancestor = node.parent(),
+            }
         }
-        let Some(name) = field_text(item, "name", source) else {
-            continue;
-        };
-        let qualified = format!("{receiver}.{name}");
-        let id = mint_symbol(path, file_id, &qualified, id_uses, graph);
-        facts.declarations.push((name.to_string(), id.clone()));
-        collect_rust_calls(item, source, &id, path, &mut facts.calls);
     }
+    name.to_string()
 }
 
 fn rust_type_name<'a>(node: tree_sitter::Node<'_>, source: &'a [u8]) -> Option<&'a str> {
@@ -162,7 +146,9 @@ fn collect_rust_calls(
     path: &str,
     calls: &mut Vec<SimpleCall>,
 ) {
-    for call in descendants_of_kind(declaration, "call_expression") {
+    for call in
+        descendants_of_kind_before(declaration, "call_expression", is_rust_declaration_boundary)
+    {
         let Some(function) = call.child_by_field_name("function") else {
             continue;
         };
@@ -175,6 +161,20 @@ fn collect_rust_calls(
             location: site(path, call),
         });
     }
+}
+
+fn is_rust_declaration_boundary(node: tree_sitter::Node<'_>) -> bool {
+    matches!(
+        node.kind(),
+        "function_item"
+            | "struct_item"
+            | "enum_item"
+            | "trait_item"
+            | "const_item"
+            | "static_item"
+            | "type_item"
+            | "impl_item"
+    )
 }
 
 fn rust_callee_name<'a>(expression: tree_sitter::Node<'_>, source: &'a [u8]) -> Option<&'a str> {

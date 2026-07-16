@@ -1,10 +1,10 @@
 use yg_shard::Graph;
 
-use crate::resolve::{SimpleCall, SimpleExtractionCtx, SimpleImport, site};
+use crate::resolve::{SimpleCall, SimpleExtractionCtx, SimpleImport, SimpleLanguageTag, site};
 
 use super::{
-    ExtractedFacts, SimpleLanguage, SimpleWalk, descendants_of_kind, extract_simple_language,
-    field_text, mint_symbol, simple_expression_name,
+    ExtractedFacts, SimpleLanguage, descendants_of_kind, descendants_of_kind_before,
+    extract_simple_language, field_text, mint_symbol, simple_expression_name,
 };
 
 pub(super) fn extract_java(
@@ -20,9 +20,9 @@ pub(super) fn extract_java(
         file_id,
         source,
         graph,
+        SimpleLanguageTag::Java,
         SimpleLanguage {
             imports: extract_java_imports,
-            walk: SimpleWalk::Descendants,
             collect: |declaration: tree_sitter::Node<'_>,
                       context: &mut SimpleExtractionCtx<'_, '_>| {
                 if is_java_declaration_kind(declaration.kind()) {
@@ -141,7 +141,9 @@ fn collect_java_calls(
     path: &str,
     calls: &mut Vec<SimpleCall>,
 ) {
-    for call in descendants_of_kind(declaration, "method_invocation") {
+    for call in descendants_of_kind_before(declaration, "method_invocation", |node| {
+        is_java_declaration_kind(node.kind())
+    }) {
         if let Some(object) = call.child_by_field_name("object") {
             let object = object.utf8_text(source).ok();
             if !matches!(object, Some("this" | "super")) {
@@ -157,7 +159,9 @@ fn collect_java_calls(
             location: site(path, call),
         });
     }
-    for call in descendants_of_kind(declaration, "object_creation_expression") {
+    for call in descendants_of_kind_before(declaration, "object_creation_expression", |node| {
+        is_java_declaration_kind(node.kind())
+    }) {
         let Some(created_type) = call.child_by_field_name("type") else {
             continue;
         };

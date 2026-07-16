@@ -31,9 +31,9 @@ Critical path: **#59 → {#60, #62, #64} → {#63, #65, #66}**.
 
 ### One shard schema bump (batch: one `SCHEMA_VERSION` bump, one reindex)
 
-- [ ] **#64** Code tokenizer on file bodies, indexed paths, normalized cross-repo ranking, edge integrity constraints.
-- [ ] **#43** Language-scoped syntactic resolution; per-file degradation instead of job abort (after #54).
-- [ ] **#22** Transitive in-repo interface-embed resolution for syntactic IMPLEMENTS.
+- [x] **#64** Code tokenizer on file bodies, indexed paths, normalized cross-repo ranking, edge integrity constraints.
+- [x] **#43** Language-scoped syntactic resolution; per-file degradation instead of job abort (after #54).
+- [x] **#22** Transitive in-repo interface-embed resolution for syntactic IMPLEMENTS.
 
 ### Independents
 
@@ -47,9 +47,9 @@ Critical path: **#59 → {#60, #62, #64} → {#63, #65, #66}**.
 - [ ] **#65** MCP conformance + Skill contract-version handshake (after #62).
 - [ ] **#66** CLI UX: machine-readable writes, exit-code classes, flag vocabulary (after #60).
 - [ ] **#51** Deployment vehicle: container image + compose profile.
-- [ ] **#15** Release packaging (atop #51).
+- [ ] ~~**#15** Release packaging (atop #51).~~ *Skipped per owner instruction (2026-07-16).*
 - [ ] **#68** Tokens-per-task metrics + orientation-efficiency eval (after #47; baseline after #64/#44).
-- [ ] **#29** Orphaned object-storage segment reconciler (after #40).
+- [x] **#29** Orphaned object-storage segment reconciler (after #40).
 
 ## Wave 4 — closers
 

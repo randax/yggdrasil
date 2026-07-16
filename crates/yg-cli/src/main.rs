@@ -7,7 +7,7 @@ mod http_client;
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 
-const NODE_ADDRESS_HELP: &str = "Exact node id, or a bare symbol name with --repo. Bare-name matching is byte-exact and case-sensitive; names without a safely searchable term set are un-addressable.";
+const NODE_ADDRESS_HELP: &str = "Exact node id, or a bare symbol name with --repo. Bare-name matching is byte-exact and case-sensitive; names shared by too many declarations are un-addressable.";
 
 #[derive(Parser)]
 #[command(
@@ -537,7 +537,7 @@ fn server_error_reason(text: &str) -> Option<String> {
             payload.address.repo.as_str()
         ),
         yg_verbs::NoSuchSymbolKind::UnaddressableSymbol => format!(
-            "symbol name {:?} in {} is un-addressable because it has no safely searchable term set",
+            "symbol name {:?} in {} is un-addressable because too many declarations share that exact name",
             payload.address.name.as_str(),
             payload.address.repo.as_str()
         ),
@@ -1831,17 +1831,23 @@ async fn run_workers(
         drain_queue(shutdown.clone(), || sync.poll_once(&poll)),
     );
     let gc = supervise_worker_loop(
-        shutdown_trigger,
+        shutdown_trigger.clone(),
         gc_loop(
             &index,
             &control,
             deploy.gc_grace,
             deploy.job_retention,
             deploy.gc_interval,
-            shutdown,
+            shutdown.clone(),
         ),
     );
-    let joined = async { tokio::join!(discover, fetch, indexing, polling, gc) };
+    let orphan_reconcile = supervise_worker_loop(
+        shutdown_trigger,
+        orphan_reconcile_loop(deploy.orphan_reconcile_interval, shutdown, || {
+            index.reconcile_orphans_once()
+        }),
+    );
+    let joined = async { tokio::join!(discover, fetch, indexing, polling, gc, orphan_reconcile) };
     let mut joined = std::pin::pin!(joined);
     let results = tokio::select! {
         results = &mut joined => results,
@@ -1860,7 +1866,8 @@ async fn run_workers(
     results.1?;
     results.2?;
     results.3?;
-    results.4
+    results.4?;
+    results.5
 }
 
 async fn supervise_worker_loop<F>(
@@ -1970,6 +1977,35 @@ async fn gc_loop(
     }
 }
 
+/// Reconcile rowless object-storage prefixes on a cadence independent of
+/// superseded-Shard GC. Failures are best-effort and retried on the next tick;
+/// shutdown prevents a new sweep and interrupts the cadence sleep.
+async fn orphan_reconcile_loop<F, Fut>(
+    interval: std::time::Duration,
+    mut shutdown: yg_sync::Shutdown,
+    mut reconcile_once: F,
+) -> anyhow::Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<u64>>,
+{
+    loop {
+        if shutdown.deadline().is_some() {
+            return Ok(());
+        }
+        if let Err(e) = reconcile_once().await {
+            tracing::warn!(
+                error = format!("{e:#}"),
+                "orphaned Shard reconciliation failed; retrying next interval"
+            );
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {}
+            _ = shutdown.requested() => return Ok(()),
+        }
+    }
+}
+
 async fn status(json: bool) -> anyhow::Result<()> {
     let (server, _) = client_env()?;
     let response = server_request::<yg_verbs::status::StatusResponse>(
@@ -2058,6 +2094,30 @@ mod shutdown_tests {
         assert!(request.work_deadline() >= earliest_expected_deadline);
         assert!(request.work_deadline() <= latest_expected_deadline);
     }
+
+    #[tokio::test]
+    async fn orphan_reconcile_cadence_invokes_its_own_worker_seam() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::Duration;
+
+        let (trigger, shutdown) = yg_sync::shutdown_channel();
+        let reconciliations = Arc::new(AtomicU64::new(0));
+        let observed = reconciliations.clone();
+
+        orphan_reconcile_loop(Duration::from_secs(60), shutdown, move || {
+            observed.fetch_add(1, Ordering::Relaxed);
+            trigger.request(
+                tokio::time::Instant::now() + Duration::from_secs(1),
+                yg_sync::ShutdownCause::Signal,
+            );
+            async { Ok(0) }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(reconciliations.load(Ordering::Relaxed), 1);
+    }
 }
 
 #[cfg(test)]
@@ -2065,7 +2125,7 @@ mod address_tests {
     use super::*;
 
     #[test]
-    fn node_address_help_documents_matching_and_zero_term_names() {
+    fn node_address_help_documents_matching_and_bounded_ambiguity() {
         for command in ["node", "neighbors", "history"] {
             let error = match Cli::try_parse_from(["yg", command, "--help"]) {
                 Ok(_) => panic!("--help must exit through clap's display error"),
@@ -2079,12 +2139,12 @@ mod address_tests {
     }
 
     #[test]
-    fn zero_term_symbol_404_is_not_reported_as_absent() {
+    fn overloaded_symbol_404_is_not_reported_as_absent() {
         let body = serde_json::json!({
             "error": {
                 "kind": "unaddressable_symbol",
                 "address": {
-                    "name": "::",
+                    "name": "Resolve",
                     "repo": "github.com/acme/widgets"
                 }
             }
@@ -2093,7 +2153,7 @@ mod address_tests {
         let reason = server_error_reason(&body.to_string()).expect("typed error is rendered");
 
         assert!(reason.contains("un-addressable"), "{reason}");
-        assert!(reason.contains("no safely searchable term set"), "{reason}");
+        assert!(reason.contains("too many declarations"), "{reason}");
         assert!(!reason.contains("no such symbol"), "{reason}");
     }
 }
