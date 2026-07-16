@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use yg_control::{ControlPlane, JobKind, JobOutcome};
+use yg_control::{ControlPlane, ForgeBudgetTake, JobKind, JobOutcome};
 
 use crate::forge::{
     Forge, ForgeBudgetExhausted, ForgeRateLimit, ForgeRegistry, ForgeRequestBudget, ListedRepo,
@@ -26,6 +26,14 @@ const FETCH_LEASE: Duration = Duration::from_secs(15 * 60);
 /// head before this poll observed the push. Capped so large default poll
 /// intervals do not hide the detected move for minutes.
 const FETCH_IN_FLIGHT_REPOLL_MAX: Duration = Duration::from_secs(30);
+/// Divides the configured shared Forge rate for the local continuity bucket.
+/// It is used only when the control plane cannot answer a budget operation;
+/// each isolated worker is therefore limited to at most one quarter of the
+/// configured rate (or one request/minute for already-lower budgets).
+/// No local fallback can preserve an exact fleet aggregate during a database
+/// partition; this bound favors brief continuity without matching the healthy
+/// shared rate in every process.
+const LOCAL_FALLBACK_RATE_DIVISOR: i32 = 4;
 
 /// A Sync worker: drains the fetch queue, mirroring repos into the
 /// worker-local git cache and recording each repo's synced commit.
@@ -36,9 +44,9 @@ pub struct SyncWorker {
     /// by default, injectable so tests register doubles.
     registry: ForgeRegistry,
     discovery_client: reqwest::Client,
-    /// Per-forge rate budgets, keyed by forge id. Polling and discovery
-    /// share the same in-process budget and spend one token per Forge
-    /// request. A rate-limit signal backs the whole Forge off.
+    /// Conservative per-forge continuity budgets, used only while the shared
+    /// control-plane budget is unreachable. Healthy shared grants shadow-spend
+    /// these buckets so a brief outage cannot expose a fresh local burst.
     forge_budgets: ForgeRequestBudgets,
     metrics: Metrics,
 }
@@ -217,7 +225,8 @@ impl SyncWorker {
                 .filter(|token| !token.is_empty())
         });
         let budget = DiscoveryBudget {
-            budgets: &self.forge_budgets,
+            control: &self.control,
+            fallback_budgets: &self.forge_budgets,
             forge_id: due.forge_id,
             rate_budget: due.rate_budget,
         };
@@ -332,7 +341,7 @@ impl SyncWorker {
             .observe_poll_lag(due.base_url.as_str(), due.poll_lag_seconds);
         // Spend a rate-budget token; over budget, reschedule the repo for
         // when one frees up and back off (no head check this cycle).
-        if let Err(retry) = self.take_forge_token(due.forge_id, due.rate_budget) {
+        if let Err(retry) = self.take_forge_token(due.forge_id, due.rate_budget).await {
             self.control.defer_poll(due.repo_id, retry).await?;
             return Ok(false);
         }
@@ -361,7 +370,7 @@ impl SyncWorker {
                 if forge.is_rate_limit(&detail) {
                     // The forge is pushing back: cool the whole forge down,
                     // retry this repo past the cooldown, and back off.
-                    let retry = self.cool_forge_down(due.forge_id, due.rate_budget);
+                    let retry = self.cool_forge_down(due.forge_id, due.rate_budget).await;
                     self.control.defer_poll(due.repo_id, retry).await?;
                     tracing::warn!(slug = %due.slug, "forge rate-limited the poll; backing the forge off");
                     return Ok(false);
@@ -375,30 +384,210 @@ impl SyncWorker {
     /// Spend one of this forge's rate-budget tokens. `Err(retry_after)`
     /// when none is available — the forge is over budget or cooling down
     /// — so the caller can reschedule the repo for `retry_after` out.
-    fn take_forge_token(&self, forge_id: i64, rate_budget: i32) -> Result<(), Duration> {
-        self.forge_budgets.take(forge_id, rate_budget)
+    async fn take_forge_token(&self, forge_id: i64, rate_budget: i32) -> Result<(), Duration> {
+        take_shared_or_fallback(&self.control, &self.forge_budgets, forge_id, rate_budget).await
     }
 
     /// Cool a forge down after it signalled a rate limit, returning when
     /// its next poll should be attempted (past the cooldown).
-    fn cool_forge_down(&self, forge_id: i64, rate_budget: i32) -> Duration {
+    async fn cool_forge_down(&self, forge_id: i64, rate_budget: i32) -> Duration {
         self.cool_forge_down_for(forge_id, rate_budget, RATE_LIMIT_COOLDOWN)
+            .await
     }
 
     /// Apply an adapter-provided cooldown duration to the Forge's request
     /// bucket, returning when that bucket may next grant a request.
-    fn cool_forge_down_for(&self, forge_id: i64, rate_budget: i32, cooldown: Duration) -> Duration {
-        self.forge_budgets
-            .cool_down_for(forge_id, rate_budget, cooldown)
+    async fn cool_forge_down_for(
+        &self,
+        forge_id: i64,
+        rate_budget: i32,
+        cooldown: Duration,
+    ) -> Duration {
+        report_shared_cooldown(
+            &self.control,
+            &self.forge_budgets,
+            forge_id,
+            rate_budget,
+            cooldown,
+        )
+        .await
     }
 }
 
 #[derive(Default)]
 struct ForgeRequestBudgets {
     buckets: Mutex<HashMap<i64, TokenBucket>>,
+    pending_cooldowns: Mutex<HashMap<i64, Instant>>,
+}
+
+fn fallback_rate(rate_budget: i32) -> i32 {
+    (rate_budget / LOCAL_FALLBACK_RATE_DIVISOR).max(1)
+}
+
+async fn take_shared_or_fallback(
+    control: &ControlPlane,
+    fallback_budgets: &ForgeRequestBudgets,
+    forge_id: i64,
+    rate_budget: i32,
+) -> Result<(), Duration> {
+    if let Some(retry_after) =
+        retry_pending_cooldown_with(fallback_budgets, forge_id, |remaining| {
+            control.cool_down_forge(forge_id, remaining)
+        })
+        .await
+    {
+        return Err(retry_after);
+    }
+    if let Some(retry_after) = fallback_budgets.cooldown_retry_after(forge_id) {
+        return Err(retry_after);
+    }
+    resolve_shared_take(
+        fallback_budgets,
+        forge_id,
+        rate_budget,
+        control
+            .take_forge_budget(forge_id, std::num::NonZeroU32::MIN)
+            .await,
+    )
+}
+
+async fn retry_pending_cooldown_with<Publish, Published>(
+    fallback_budgets: &ForgeRequestBudgets,
+    forge_id: i64,
+    publish: Publish,
+) -> Option<Duration>
+where
+    Publish: FnOnce(Duration) -> Published,
+    Published: Future<Output = anyhow::Result<Duration>>,
+{
+    let (pending_until, retry_after) = fallback_budgets.pending_cooldown_retry_after(forge_id)?;
+    match publish(retry_after).await {
+        Ok(shared_retry) => {
+            fallback_budgets.clear_pending_cooldown_through(forge_id, pending_until);
+            Some(shared_retry.max(retry_after))
+        }
+        Err(error) => {
+            tracing::warn!(
+                forge_id,
+                error = format!("{error:#}"),
+                "shared Forge cooldown still unavailable; retaining local cooldown"
+            );
+            Some(retry_after)
+        }
+    }
+}
+
+fn resolve_shared_take(
+    fallback_budgets: &ForgeRequestBudgets,
+    forge_id: i64,
+    rate_budget: i32,
+    shared: anyhow::Result<ForgeBudgetTake>,
+) -> Result<(), Duration> {
+    match shared {
+        Ok(ForgeBudgetTake::Granted) => {
+            if let Some(retry_after) = fallback_budgets.cooldown_retry_after(forge_id) {
+                return Err(retry_after);
+            }
+            let _ = fallback_budgets.take(forge_id, fallback_rate(rate_budget));
+            Ok(())
+        }
+        Ok(ForgeBudgetTake::RetryAfter(retry_after)) => {
+            fallback_budgets.cool_down_for(forge_id, fallback_rate(rate_budget), retry_after);
+            Err(retry_after)
+        }
+        Err(error) => {
+            tracing::warn!(
+                forge_id,
+                error = format!("{error:#}"),
+                "shared Forge budget unavailable; using conservative local fallback"
+            );
+            fallback_budgets.take(forge_id, fallback_rate(rate_budget))
+        }
+    }
+}
+
+async fn report_shared_cooldown(
+    control: &ControlPlane,
+    fallback_budgets: &ForgeRequestBudgets,
+    forge_id: i64,
+    rate_budget: i32,
+    cooldown: Duration,
+) -> Duration {
+    let pending = fallback_budgets.pending_cooldown_retry_after(forge_id);
+    let pending_retry = pending
+        .map(|(_, retry_after)| retry_after)
+        .unwrap_or(Duration::ZERO);
+    let desired_cooldown = cooldown.max(pending_retry);
+    let local_retry =
+        fallback_budgets.cool_down_for(forge_id, fallback_rate(rate_budget), desired_cooldown);
+    match control.cool_down_forge(forge_id, desired_cooldown).await {
+        Ok(shared_retry) => {
+            if let Some((pending_until, _)) = pending {
+                fallback_budgets.clear_pending_cooldown_through(forge_id, pending_until);
+            }
+            shared_retry.max(local_retry)
+        }
+        Err(error) => {
+            fallback_budgets.mark_pending_cooldown(forge_id, desired_cooldown);
+            tracing::warn!(
+                forge_id,
+                error = format!("{error:#}"),
+                "shared Forge cooldown unavailable; retaining local cooldown"
+            );
+            local_retry
+        }
+    }
 }
 
 impl ForgeRequestBudgets {
+    fn pending_cooldown_retry_after(&self, forge_id: i64) -> Option<(Instant, Duration)> {
+        let now = Instant::now();
+        let mut pending = self
+            .pending_cooldowns
+            .lock()
+            .expect("pending Forge cooldown map poisoned");
+        let until = pending.get(&forge_id).copied()?;
+        if until <= now {
+            pending.remove(&forge_id);
+            return None;
+        }
+        Some((until, until.saturating_duration_since(now)))
+    }
+
+    fn mark_pending_cooldown(&self, forge_id: i64, cooldown: Duration) {
+        let until = Instant::now() + cooldown;
+        let mut pending = self
+            .pending_cooldowns
+            .lock()
+            .expect("pending Forge cooldown map poisoned");
+        pending
+            .entry(forge_id)
+            .and_modify(|existing| *existing = (*existing).max(until))
+            .or_insert(until);
+    }
+
+    fn clear_pending_cooldown_through(&self, forge_id: i64, published_until: Instant) {
+        let mut pending = self
+            .pending_cooldowns
+            .lock()
+            .expect("pending Forge cooldown map poisoned");
+        if pending
+            .get(&forge_id)
+            .is_some_and(|until| *until <= published_until)
+        {
+            pending.remove(&forge_id);
+        }
+    }
+
+    fn cooldown_retry_after(&self, forge_id: i64) -> Option<Duration> {
+        let now = Instant::now();
+        self.buckets
+            .lock()
+            .expect("forge bucket map poisoned")
+            .get(&forge_id)
+            .and_then(|bucket| bucket.cooldown_retry_after(now))
+    }
+
     fn take(&self, forge_id: i64, rate_budget: i32) -> Result<(), Duration> {
         let now = Instant::now();
         let mut buckets = self.buckets.lock().expect("forge bucket map poisoned");
@@ -426,16 +615,24 @@ impl ForgeRequestBudgets {
 }
 
 struct DiscoveryBudget<'a> {
-    budgets: &'a ForgeRequestBudgets,
+    control: &'a ControlPlane,
+    fallback_budgets: &'a ForgeRequestBudgets,
     forge_id: i64,
     rate_budget: i32,
 }
 
 impl ForgeRequestBudget for DiscoveryBudget<'_> {
-    fn take(&self) -> Result<(), ForgeBudgetExhausted> {
-        self.budgets
-            .take(self.forge_id, self.rate_budget)
+    fn take(&self) -> crate::forge::BoxFuture<'_, Result<(), ForgeBudgetExhausted>> {
+        Box::pin(async move {
+            take_shared_or_fallback(
+                self.control,
+                self.fallback_budgets,
+                self.forge_id,
+                self.rate_budget,
+            )
+            .await
             .map_err(|retry_after| ForgeBudgetExhausted { retry_after })
+        })
     }
 }
 
@@ -453,11 +650,14 @@ async fn list_org_repos_with_budget(
     if let Err(error) = &result
         && let Some(rate_limit) = error.downcast_ref::<ForgeRateLimit>()
     {
-        budget.budgets.cool_down_for(
+        report_shared_cooldown(
+            budget.control,
+            budget.fallback_budgets,
             budget.forge_id,
             budget.rate_budget,
             rate_limit.retry_after(),
-        );
+        )
+        .await;
     }
     result
 }
@@ -534,98 +734,76 @@ mod tests {
     use super::*;
     use crate::{ShutdownCause, shutdown_channel};
 
-    struct RateLimitedDiscovery;
-
-    impl OrgDiscovery for RateLimitedDiscovery {
-        fn list_org_repos<'a>(
-            &'a self,
-            _client: &'a reqwest::Client,
-            _api_root: &'a str,
-            _org: &'a str,
-            _token: Option<&'a str>,
-        ) -> crate::forge::BoxFuture<'a, anyhow::Result<Vec<ListedRepo>>> {
-            panic!("worker discovery must not use the unbudgeted listing path")
-        }
-
-        fn list_org_repos_budgeted<'a>(
-            &'a self,
-            _client: &'a reqwest::Client,
-            _api_root: &'a str,
-            _org: &'a str,
-            _token: Option<&'a str>,
-            budget: &'a dyn ForgeRequestBudget,
-        ) -> crate::forge::BoxFuture<'a, anyhow::Result<Vec<ListedRepo>>> {
-            Box::pin(async move {
-                budget.take()?;
-                Err(ForgeRateLimit::new(
-                    reqwest::StatusCode::TOO_MANY_REQUESTS,
-                    Duration::from_secs(30),
-                )
-                .into())
-            })
-        }
+    #[test]
+    fn fallback_rate_is_a_conservative_share_of_the_fleet_budget() {
+        assert_eq!(fallback_rate(300), 75);
+        assert_eq!(fallback_rate(4), 1);
+        assert_eq!(fallback_rate(3), 1);
+        assert_eq!(fallback_rate(1), 1);
     }
 
     #[test]
-    fn discovery_and_polling_spend_the_same_forge_budget() {
+    fn control_error_uses_only_the_conservative_fallback_burst() {
+        let budgets = ForgeRequestBudgets::default();
+        for request in 0..2 {
+            assert!(
+                resolve_shared_take(&budgets, 7, 8, Err(anyhow::anyhow!("control unavailable")),)
+                    .is_ok(),
+                "quarter-rate fallback should grant request {request} from its opening burst"
+            );
+        }
+        assert!(
+            resolve_shared_take(&budgets, 7, 8, Err(anyhow::anyhow!("control unavailable")),)
+                .is_err(),
+            "an 8/min shared budget must expose only a 2-token fallback burst"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_cooldown_publication_is_retried_before_another_take() {
+        let budgets = ForgeRequestBudgets::default();
+        budgets.cool_down_for(7, fallback_rate(60), Duration::from_secs(30));
+        budgets.mark_pending_cooldown(7, Duration::from_secs(30));
+        let retry_after = retry_pending_cooldown_with(&budgets, 7, |remaining| async move {
+            assert!(remaining > Duration::from_secs(29));
+            Ok(remaining)
+        })
+        .await
+        .expect("the pending cooldown must intercept the next take");
+        assert!(retry_after > Duration::from_secs(29));
+        assert!(
+            budgets.pending_cooldown_retry_after(7).is_none(),
+            "a successful recovery publication clears the pending marker"
+        );
+        assert!(
+            resolve_shared_take(&budgets, 7, 60, Ok(ForgeBudgetTake::Granted)).is_err(),
+            "the reporting worker also retains its local cooldown"
+        );
+    }
+
+    #[test]
+    fn fallback_consumers_spend_the_same_forge_budget() {
         let budgets = ForgeRequestBudgets::default();
         assert!(
             budgets.take(7, 1).is_ok(),
             "the polling seam takes the burst token"
         );
 
-        let discovery = DiscoveryBudget {
-            budgets: &budgets,
-            forge_id: 7,
-            rate_budget: 1,
-        };
-        let exhausted = discovery
-            .take()
-            .expect_err("discovery must observe the token polling already spent");
-        assert!(exhausted.retry_after > Duration::ZERO);
+        let exhausted = budgets
+            .take(7, 1)
+            .expect_err("every fallback consumer must observe the token already spent");
+        assert!(exhausted > Duration::ZERO);
     }
 
     #[test]
-    fn adapter_cooldown_blocks_the_shared_forge_budget() {
+    fn adapter_cooldown_blocks_the_local_fallback_budget() {
         let budgets = ForgeRequestBudgets::default();
         let cooldown = Duration::from_secs(30);
         let retry_after = budgets.cool_down_for(7, 60, cooldown);
         assert!(retry_after <= cooldown);
         assert!(retry_after > Duration::from_secs(29));
 
-        let discovery = DiscoveryBudget {
-            budgets: &budgets,
-            forge_id: 7,
-            rate_budget: 60,
-        };
-        assert!(discovery.take().is_err());
-    }
-
-    #[tokio::test]
-    async fn worker_dispatches_budgeted_discovery_and_applies_its_cooldown() {
-        let budgets = ForgeRequestBudgets::default();
-        let budget = DiscoveryBudget {
-            budgets: &budgets,
-            forge_id: 7,
-            rate_budget: 60,
-        };
-
-        let error = list_org_repos_with_budget(
-            &RateLimitedDiscovery,
-            &reqwest::Client::new(),
-            "https://api.example.test",
-            "acme",
-            None,
-            &budget,
-        )
-        .await
-        .expect_err("the adapter fixture returns a typed rate limit");
-
-        assert!(error.downcast_ref::<ForgeRateLimit>().is_some());
-        assert!(
-            budget.take().is_err(),
-            "the shared Forge bucket is cooling down"
-        );
+        assert!(budgets.take(7, 60).is_err());
     }
 
     #[tokio::test]

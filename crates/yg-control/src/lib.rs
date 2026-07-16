@@ -354,7 +354,7 @@ impl StoredForgeKind {
 pub struct DueDiscovery {
     pub org_id: i64,
     pub forge_id: i64,
-    /// Maximum Forge requests per minute for this worker process.
+    /// Maximum Forge requests per minute shared by the worker fleet.
     pub rate_budget: i32,
     pub forge_kind: String,
     pub base_url: ForgeUrl,
@@ -716,6 +716,44 @@ pub struct DuePoll {
     pub rate_budget: i32,
     /// Seconds this repo was overdue when claimed for polling.
     pub poll_lag_seconds: f64,
+}
+
+/// Result of atomically charging the fleet-wide request budget for a Forge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForgeBudgetTake {
+    /// The requested tokens were reserved for the caller.
+    Granted,
+    /// The shared bucket is empty or cooling down. No token was reserved.
+    RetryAfter(std::time::Duration),
+}
+
+/// A token reservation that can never fit in the Forge bucket's configured
+/// one-minute capacity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForgeBudgetRequestTooLarge {
+    requested: u32,
+    capacity: u32,
+}
+
+impl std::fmt::Display for ForgeBudgetRequestTooLarge {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Forge budget request for {} tokens exceeds capacity {}",
+            self.requested, self.capacity
+        )
+    }
+}
+
+impl std::error::Error for ForgeBudgetRequestTooLarge {}
+
+#[derive(sqlx::FromRow)]
+struct ForgeBudgetState {
+    tokens: f64,
+    refill_per_second: f64,
+    elapsed_seconds: f64,
+    cooldown_seconds: Option<f64>,
+    rate_budget: i32,
 }
 
 /// A superseded Shard the GC sweep may reclaim: no repo points at it and
@@ -1735,6 +1773,126 @@ impl ControlPlane {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Atomically reserve `token_count` requests from one Forge's fleet-wide
+    /// token bucket. The database clock drives refill and cooldown timing, and
+    /// the locked row makes concurrent workers observe one shared balance.
+    pub async fn take_forge_budget(
+        &self,
+        forge_id: i64,
+        token_count: std::num::NonZeroU32,
+    ) -> anyhow::Result<ForgeBudgetTake> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO forge_rate_budgets
+                 (forge_id, tokens, refill_per_second, updated_at)
+             SELECT id, rate_budget::double precision,
+                    rate_budget::double precision / 60.0, clock_timestamp()
+             FROM forges
+             WHERE id = $1
+             ON CONFLICT (forge_id) DO NOTHING",
+        )
+        .bind(forge_id)
+        .execute(&mut *tx)
+        .await?;
+        let state: ForgeBudgetState = sqlx::query_as(
+            "SELECT b.tokens, b.refill_per_second,
+                    greatest(extract(epoch FROM clock_timestamp() - b.updated_at), 0)::float8
+                        AS elapsed_seconds,
+                    CASE WHEN b.cooldown_until > clock_timestamp()
+                         THEN extract(epoch FROM b.cooldown_until - clock_timestamp())::float8
+                    END AS cooldown_seconds,
+                    f.rate_budget
+             FROM forge_rate_budgets b
+             JOIN forges f ON f.id = b.forge_id
+             WHERE b.forge_id = $1
+             FOR UPDATE OF b",
+        )
+        .bind(forge_id)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        let requested_count = token_count.get();
+        let capacity_count = u32::try_from(state.rate_budget)?;
+        if requested_count > capacity_count {
+            return Err(ForgeBudgetRequestTooLarge {
+                requested: requested_count,
+                capacity: capacity_count,
+            }
+            .into());
+        }
+        let capacity = f64::from(state.rate_budget);
+        let old_capacity = state.refill_per_second * 60.0;
+        let refilled =
+            (state.tokens + state.elapsed_seconds * state.refill_per_second).min(old_capacity);
+        let available = refilled.min(capacity);
+        let requested = f64::from(requested_count);
+        let cooldown_wait = state.cooldown_seconds.unwrap_or(0.0);
+        let granted = cooldown_wait <= 0.0 && available >= requested;
+        let remaining = if granted {
+            available - requested
+        } else {
+            available
+        };
+        sqlx::query(
+            "UPDATE forge_rate_budgets
+             SET tokens = $2, refill_per_second = $3,
+                 updated_at = clock_timestamp()
+             WHERE forge_id = $1",
+        )
+        .bind(forge_id)
+        .bind(remaining)
+        .bind(capacity / 60.0)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+
+        if granted {
+            Ok(ForgeBudgetTake::Granted)
+        } else {
+            let refill_wait = ((requested - available).max(0.0) * 60.0) / capacity;
+            Ok(ForgeBudgetTake::RetryAfter(
+                std::time::Duration::from_secs_f64(cooldown_wait.max(refill_wait)),
+            ))
+        }
+    }
+
+    /// Extend one Forge's fleet-wide cooldown, never shortening a cooldown
+    /// another worker already reported. Returns the resulting remaining wait.
+    pub async fn cool_down_forge(
+        &self,
+        forge_id: i64,
+        cooldown: std::time::Duration,
+    ) -> anyhow::Result<std::time::Duration> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO forge_rate_budgets
+                 (forge_id, tokens, refill_per_second, updated_at)
+             SELECT id, rate_budget::double precision,
+                    rate_budget::double precision / 60.0, clock_timestamp()
+             FROM forges
+             WHERE id = $1
+             ON CONFLICT (forge_id) DO NOTHING",
+        )
+        .bind(forge_id)
+        .execute(&mut *tx)
+        .await?;
+        let remaining: f64 = sqlx::query_scalar(
+            "UPDATE forge_rate_budgets
+             SET cooldown_until = greatest(
+                     coalesce(cooldown_until, clock_timestamp()),
+                     clock_timestamp() + make_interval(secs => $2)
+                 )
+             WHERE forge_id = $1
+             RETURNING extract(epoch FROM cooldown_until - clock_timestamp())::float8",
+        )
+        .bind(forge_id)
+        .bind(cooldown.as_secs_f64())
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(std::time::Duration::from_secs_f64(remaining.max(0.0)))
     }
 
     /// Enqueue a fetch for a repo whose default branch the poll loop saw

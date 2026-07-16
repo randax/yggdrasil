@@ -12,9 +12,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// A Forge API response asking this process to stop making requests for a
-/// bounded period. Adapters surface this typed signal so the worker can apply
-/// it to the same per-Forge cooldown used by polling.
+/// A Forge API response asking the worker fleet to stop making requests for a
+/// bounded period. Adapters surface this typed signal so the reporting worker
+/// can publish the cooldown through the control plane.
 #[derive(Debug, thiserror::Error)]
 #[error("forge returned {status} and requested a {retry_after:?} cooldown")]
 pub struct ForgeRateLimit {
@@ -47,25 +47,25 @@ pub struct ListedRepo {
     pub visibility: yg_control::RepoVisibility,
 }
 
-/// A Forge request could not be spent from the worker's per-process
-/// budget. The duration says when the budget can next grant a request.
+/// A Forge request could not be spent from the fleet-wide budget. The
+/// duration says when the budget can next grant a request.
 #[derive(Debug, thiserror::Error)]
 #[error("Forge request budget exhausted; retry after {retry_after:?}")]
 pub struct ForgeBudgetExhausted {
     pub retry_after: Duration,
 }
 
-/// The per-process request budget presented to a Forge discovery
-/// adapter. Adapters take one token immediately before each API call.
+/// The request budget presented to a Forge discovery adapter. Adapters take
+/// one fleet-wide token immediately before each API call.
 pub trait ForgeRequestBudget: Send + Sync {
-    fn take(&self) -> Result<(), ForgeBudgetExhausted>;
+    fn take(&self) -> BoxFuture<'_, Result<(), ForgeBudgetExhausted>>;
 }
 
 /// Wait until one Forge request can be charged. Sleeping is cancellable with
 /// the surrounding discovery future, so shutdown never leaves detached work.
 pub(crate) async fn acquire_forge_request(budget: &dyn ForgeRequestBudget) {
     loop {
-        match budget.take() {
+        match budget.take().await {
             Ok(()) => return,
             Err(exhausted) => tokio::time::sleep(exhausted.retry_after).await,
         }
@@ -148,7 +148,7 @@ pub trait OrgDiscovery: Send + Sync {
     ) -> BoxFuture<'a, anyhow::Result<Vec<ListedRepo>>>;
 
     /// List every repository while charging each discovery operation to
-    /// the worker's Forge request budget. The default covers adapters
+    /// the shared Forge request budget. The default covers adapters
     /// whose listing is one request; paginated adapters override this
     /// and take a token before every page. Return [`ForgeRateLimit`] to
     /// request a Forge-wide cooldown.

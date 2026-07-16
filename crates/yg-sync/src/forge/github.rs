@@ -378,24 +378,32 @@ mod tests {
     struct CountingBudget(AtomicUsize);
 
     impl ForgeRequestBudget for CountingBudget {
-        fn take(&self) -> Result<(), super::super::ForgeBudgetExhausted> {
-            self.0.fetch_add(1, Ordering::Relaxed);
-            Ok(())
+        fn take(
+            &self,
+        ) -> super::super::BoxFuture<'_, Result<(), super::super::ForgeBudgetExhausted>> {
+            Box::pin(async move {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            })
         }
     }
 
     struct RefillingBudget(AtomicUsize);
 
     impl ForgeRequestBudget for RefillingBudget {
-        fn take(&self) -> Result<(), super::super::ForgeBudgetExhausted> {
-            let attempt = self.0.fetch_add(1, Ordering::Relaxed);
-            if attempt == 0 {
-                Err(super::super::ForgeBudgetExhausted {
-                    retry_after: Duration::from_millis(1),
-                })
-            } else {
-                Ok(())
-            }
+        fn take(
+            &self,
+        ) -> super::super::BoxFuture<'_, Result<(), super::super::ForgeBudgetExhausted>> {
+            Box::pin(async move {
+                let attempt = self.0.fetch_add(1, Ordering::Relaxed);
+                if attempt == 0 {
+                    Err(super::super::ForgeBudgetExhausted {
+                        retry_after: Duration::from_millis(1),
+                    })
+                } else {
+                    Ok(())
+                }
+            })
         }
     }
 
