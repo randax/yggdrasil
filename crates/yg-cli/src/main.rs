@@ -2,11 +2,22 @@
 
 mod client_config;
 mod deploy_config;
+mod exit_code;
 mod http_client;
+mod output;
 mod skill;
 
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
+use output::canonical_json;
+
+const EXIT_CODE_HELP: &str = "Exit codes:
+  0  success
+  1  other failure
+  2  command-line usage error
+  3  authentication or authorization failure (HTTP 401/403)
+  4  resource not found (HTTP 404)
+  5  server or transport failure (HTTP 5xx or request transport)";
 
 const NODE_ADDRESS_HELP: &str = "Exact node id, or a bare symbol name with --repo. Bare-name matching is byte-exact and case-sensitive; names shared by too many declarations are un-addressable.";
 
@@ -14,7 +25,8 @@ const NODE_ADDRESS_HELP: &str = "Exact node id, or a bare symbol name with --rep
 #[command(
     name = "yg",
     version,
-    about = "yggdrasil — Knowledge Graph Index Server"
+    about = "yggdrasil — Knowledge Graph Index Server",
+    after_help = EXIT_CODE_HELP
 )]
 struct Cli {
     #[command(subcommand)]
@@ -70,7 +82,7 @@ enum Command {
         #[arg(long)]
         direction: Option<String>,
         /// Follow only edges of this kind (repeatable), e.g. CALLS
-        #[arg(long = "kind", visible_alias = "edge-kinds")]
+        #[arg(long = "edge-kinds")]
         kinds: Vec<String>,
         /// How many hops to traverse (1-3)
         #[arg(long)]
@@ -90,7 +102,7 @@ enum Command {
         #[arg(help = "Query, e.g. \"rate limit\"")]
         query: String,
         /// Restrict to this node kind (repeatable), e.g. Symbol or File
-        #[arg(long = "kind")]
+        #[arg(long = "node-kinds")]
         kinds: Vec<String>,
         /// Restrict to this repo qualifier (repeatable), e.g.
         /// github.com/acme/widgets
@@ -193,6 +205,9 @@ enum ForgeCommand {
         /// Env var holding the Forge token
         #[arg(long)]
         token_env: Option<String>,
+        /// Emit the typed response as JSON
+        #[arg(long)]
+        json: bool,
     },
     /// Request discovery for a connected org now
     Discover {
@@ -203,6 +218,9 @@ enum ForgeCommand {
         /// Forge root (default: <https://github.com>)
         #[arg(long)]
         base_url: Option<String>,
+        /// Emit the typed response as JSON
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -220,6 +238,9 @@ enum RulesCommand {
         /// Let this rule apply to private repos
         #[arg(long = "private")]
         applies_to_private: bool,
+        /// Emit the typed response as JSON
+        #[arg(long)]
+        json: bool,
     },
     /// List discovery rules in evaluation order
     List,
@@ -234,11 +255,20 @@ enum TokenCommand {
         /// Expire the token after this many seconds; omitted means no expiry
         #[arg(long)]
         expires_in_seconds: Option<u64>,
+        /// Emit the typed response as JSON, including the one-time secret
+        #[arg(long)]
+        json: bool,
     },
     /// Revoke an active Member bearer token by id
     Revoke {
-        #[arg(help = "Token id shown by `yg admin token issue`")]
+        #[arg(
+            help = "Token id shown by `yg admin token issue`",
+            value_parser = parse_member_token_id
+        )]
         id: String,
+        /// Emit the typed response as JSON
+        #[arg(long)]
+        json: bool,
     },
     /// List Member tokens and their expiry/revocation status
     List,
@@ -251,11 +281,19 @@ enum RuleActionArg {
 }
 
 impl RuleActionArg {
-    fn as_str(self) -> &'static str {
+    fn into_wire(self) -> yg_verbs::admin::RuleAction {
         match self {
-            Self::Include => "include",
-            Self::Exclude => "exclude",
+            Self::Include => yg_verbs::admin::RuleAction::Include,
+            Self::Exclude => yg_verbs::admin::RuleAction::Exclude,
         }
+    }
+}
+
+fn parse_member_token_id(value: &str) -> Result<String, String> {
+    if yg_control::member_token_id_is_valid(value) {
+        Ok(value.to_string())
+    } else {
+        Err("member token id must look like mtok_<24 hex characters>".to_string())
     }
 }
 
@@ -273,12 +311,37 @@ enum RepoCommand {
         /// server's poll interval)
         #[arg(long, value_parser = clap::value_parser!(i32).range(1..))]
         poll_interval: Option<i32>,
+        /// Emit the typed response as JSON
+        #[arg(long)]
+        json: bool,
     },
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    match Cli::parse().command {
+async fn main() -> std::process::ExitCode {
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => {
+            let class = if error.use_stderr() {
+                exit_code::ExitClass::Usage
+            } else {
+                exit_code::ExitClass::General
+            };
+            let _ = error.print();
+            return std::process::ExitCode::from(if error.use_stderr() { class.code() } else { 0 });
+        }
+    };
+    match run(cli.command).await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("Error: {error:#}");
+            std::process::ExitCode::from(exit_code::ExitClass::for_error(&error).code())
+        }
+    }
+}
+
+async fn run(command: Command) -> anyhow::Result<()> {
+    match command {
         Command::Serve { role } => serve(role).await,
         Command::ConfigCheck { role } => config_check(role),
         Command::Status { json } => status(json).await,
@@ -327,8 +390,9 @@ async fn main() -> anyhow::Result<()> {
                         url,
                         depth,
                         poll_interval,
+                        json,
                     },
-            } => admin_repo_add(url, depth, poll_interval).await,
+            } => admin_repo_add(url, depth, poll_interval, json).await,
             AdminCommand::Forge {
                 command:
                     ForgeCommand::Add {
@@ -336,31 +400,35 @@ async fn main() -> anyhow::Result<()> {
                         org,
                         base_url,
                         token_env,
+                        json,
                     },
-            } => admin_forge_add(kind, org, base_url, token_env).await,
+            } => admin_forge_add(kind, org, base_url, token_env, json).await,
             AdminCommand::Forge {
                 command:
                     ForgeCommand::Discover {
                         kind,
                         org,
                         base_url,
+                        json,
                     },
-            } => admin_forge_discover(kind, org, base_url).await,
+            } => admin_forge_discover(kind, org, base_url, json).await,
             AdminCommand::Rules { command } => match command {
                 RulesCommand::Add {
                     pattern,
                     action,
                     forge,
                     applies_to_private,
-                } => admin_rules_add(pattern, action, forge, applies_to_private).await,
+                    json,
+                } => admin_rules_add(pattern, action, forge, applies_to_private, json).await,
                 RulesCommand::List => admin_rules_list().await,
             },
             AdminCommand::Token { command } => match command {
                 TokenCommand::Issue {
                     member,
                     expires_in_seconds,
-                } => admin_token_issue(member, expires_in_seconds).await,
-                TokenCommand::Revoke { id } => admin_token_revoke(id).await,
+                    json,
+                } => admin_token_issue(member, expires_in_seconds, json).await,
+                TokenCommand::Revoke { id, json } => admin_token_revoke(id, json).await,
                 TokenCommand::List => admin_tokens_list().await,
             },
             AdminCommand::Status { json } => admin_status(json).await,
@@ -436,23 +504,6 @@ struct ServerResponse<T> {
     body: T,
 }
 
-fn canonical_json<T: serde::Serialize>(body: &T) -> anyhow::Result<String> {
-    fn sort_keys(value: &mut serde_json::Value) {
-        match value {
-            serde_json::Value::Object(map) => {
-                map.sort_keys();
-                map.values_mut().for_each(sort_keys);
-            }
-            serde_json::Value::Array(items) => items.iter_mut().for_each(sort_keys),
-            _ => {}
-        }
-    }
-
-    let mut value = serde_json::to_value(body)?;
-    sort_keys(&mut value);
-    Ok(serde_json::to_string(&value)?)
-}
-
 async fn server_json<T>(
     method: reqwest::Method,
     path: &str,
@@ -481,21 +532,22 @@ where
     if let Some(body) = body {
         request = request.json(&body);
     }
-    let resp = request
-        .send()
-        .await
-        .with_context(|| format!("requesting {server}{path}"))?;
+    let resp = request.send().await.map_err(|source| {
+        exit_code::RequestError::transport(format!("requesting {server}{path}"), source)
+    })?;
     let status = resp.status();
     let headers = resp.headers().clone();
-    let text = resp.text().await.context("reading the server's response")?;
+    let text = resp.text().await.map_err(|source| {
+        exit_code::RequestError::transport("reading the server's response", source)
+    })?;
     if !status.is_success() {
         // Prefer the server's {"error": …} shape, but a proxy or crash
         // can answer with anything — show whatever came back.
         let reason = server_error_reason(&text).unwrap_or(text);
-        bail!("the server answered {path} with {status}: {reason}");
+        return Err(exit_code::RequestError::status(path, status, reason).into());
     }
     let body = serde_json::from_str(&text)
-        .with_context(|| format!("parsing the typed response from {path}"))?;
+        .map_err(|source| exit_code::RequestError::invalid_response(path, source))?;
     Ok(ServerResponse { headers, body })
 }
 
@@ -554,9 +606,16 @@ async fn mcp_proxy() -> anyhow::Result<()> {
             .body(body)
             .send()
             .await
-            .with_context(|| format!("posting MCP request to {endpoint}"))?;
+            .map_err(|source| {
+                exit_code::RequestError::transport(
+                    format!("posting MCP request to {endpoint}"),
+                    source,
+                )
+            })?;
         let status = resp.status();
-        let text = resp.text().await.context("reading MCP HTTP response")?;
+        let text = resp.text().await.map_err(|source| {
+            exit_code::RequestError::transport("reading MCP HTTP response", source)
+        })?;
         let parsed = serde_json::from_str::<serde_json::Value>(&text).ok();
         let Some(payload) = (if status.is_success() {
             if text.is_empty() { None } else { Some(text) }
@@ -576,7 +635,7 @@ async fn mcp_proxy() -> anyhow::Result<()> {
             // a batch has multiple ids and a notification must receive none.
             // Terminate the stdio session so the MCP client observes the
             // failed transport without an invented JSON-RPC correlation.
-            anyhow::bail!("MCP HTTP endpoint answered {status}: {reason}")
+            return Err(exit_code::RequestError::status("/v1/mcp", status, reason).into());
         }) else {
             continue;
         };
@@ -920,13 +979,22 @@ async fn admin_repo_add(
     url: String,
     depth: Option<i32>,
     poll_interval: Option<i32>,
+    json: bool,
 ) -> anyhow::Result<()> {
+    let request = yg_verbs::admin::AddRepoRequest {
+        url: yg_verbs::admin::RepoRegistrationUrl::new(url),
+        depth,
+        poll_interval,
+    };
     let response = server_json::<yg_verbs::admin::AddRepoResponse>(
         reqwest::Method::POST,
         "/v1/admin/repos",
-        Some(serde_json::json!({"url": url, "depth": depth, "poll_interval": poll_interval})),
+        Some(serde_json::to_value(request)?),
     )
     .await?;
+    if json {
+        return output::print_json(&response.body);
+    }
     let body = response.body;
     let registered = if body.created {
         format!("registered {}", body.slug)
@@ -947,18 +1015,23 @@ async fn admin_forge_add(
     org: String,
     base_url: Option<String>,
     token_env: Option<String>,
+    json: bool,
 ) -> anyhow::Result<()> {
+    let request = yg_verbs::admin::AddForgeRequest {
+        kind: yg_verbs::admin::RequestedForgeKind::new(kind),
+        org: yg_verbs::admin::OrgName::new(org),
+        base_url: base_url.map(yg_verbs::admin::ForgeBaseUrl::new),
+        token_env: token_env.map(yg_verbs::admin::ForgeTokenEnvironment::new),
+    };
     let response = server_json::<yg_verbs::admin::AddForgeResponse>(
         reqwest::Method::POST,
         "/v1/admin/forges",
-        Some(serde_json::json!({
-            "kind": kind,
-            "org": org,
-            "base_url": base_url,
-            "token_env": token_env,
-        })),
+        Some(serde_json::to_value(request)?),
     )
     .await?;
+    if json {
+        return output::print_json(&response.body);
+    }
     let body = response.body;
     if body.created {
         println!(
@@ -978,17 +1051,22 @@ async fn admin_forge_discover(
     kind: String,
     org: String,
     base_url: Option<String>,
+    json: bool,
 ) -> anyhow::Result<()> {
+    let request = yg_verbs::admin::DiscoverForgeRequest {
+        kind: yg_verbs::admin::RequestedForgeKind::new(kind),
+        org: yg_verbs::admin::OrgName::new(org),
+        base_url: base_url.map(yg_verbs::admin::ForgeBaseUrl::new),
+    };
     let response = server_json::<yg_verbs::admin::DiscoverForgeResponse>(
         reqwest::Method::POST,
         "/v1/admin/forges/discover",
-        Some(serde_json::json!({
-            "kind": kind,
-            "org": org,
-            "base_url": base_url,
-        })),
+        Some(serde_json::to_value(request)?),
     )
     .await?;
+    if json {
+        return output::print_json(&response.body);
+    }
     let body = response.body;
     println!(
         "discovery requested for {} org {} ({})",
@@ -1002,18 +1080,23 @@ async fn admin_rules_add(
     action: RuleActionArg,
     forge: String,
     applies_to_private: bool,
+    json: bool,
 ) -> anyhow::Result<()> {
+    let request = yg_verbs::admin::AddRuleRequest {
+        forge: Some(yg_verbs::admin::ForgeBaseUrl::new(forge)),
+        pattern: yg_verbs::admin::DiscoveryRulePattern::new(pattern),
+        action: action.into_wire(),
+        applies_to_private: Some(applies_to_private),
+    };
     let response = server_json::<yg_verbs::admin::AddRuleResponse>(
         reqwest::Method::POST,
         "/v1/admin/rules",
-        Some(serde_json::json!({
-            "forge": forge,
-            "pattern": pattern,
-            "action": action.as_str(),
-            "private": applies_to_private,
-        })),
+        Some(serde_json::to_value(request)?),
     )
     .await?;
+    if json {
+        return output::print_json(&response.body);
+    }
     let body = response.body;
     let scope = if body.applies_to_private {
         "private"
@@ -1052,7 +1135,11 @@ async fn admin_rules_list() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn admin_token_issue(member: String, expires_in_seconds: Option<u64>) -> anyhow::Result<()> {
+async fn admin_token_issue(
+    member: String,
+    expires_in_seconds: Option<u64>,
+    json: bool,
+) -> anyhow::Result<()> {
     let request = yg_verbs::admin::IssueTokenRequest {
         member: yg_verbs::admin::MemberName::new(member),
         expires_in_seconds: expires_in_seconds.map(yg_verbs::admin::TokenLifetimeSeconds::new),
@@ -1063,6 +1150,9 @@ async fn admin_token_issue(member: String, expires_in_seconds: Option<u64>) -> a
         Some(serde_json::to_value(request)?),
     )
     .await?;
+    if json {
+        return output::print_json(&response.body);
+    }
     let body = response.body;
     println!("id: {}", body.id);
     println!("member: {}", body.member);
@@ -1106,16 +1196,16 @@ async fn admin_tokens_list() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn admin_token_revoke(id: String) -> anyhow::Result<()> {
-    if !yg_control::member_token_id_is_valid(&id) {
-        bail!("member token id must look like mtok_<24 hex characters>");
-    }
+async fn admin_token_revoke(id: String, json: bool) -> anyhow::Result<()> {
     let response = server_json::<yg_verbs::admin::RevokeTokenResponse>(
         reqwest::Method::POST,
         &format!("/v1/admin/tokens/{id}/revoke"),
         None,
     )
     .await?;
+    if json {
+        return output::print_json(&response.body);
+    }
     println!("revoked {}", response.body.id);
     Ok(())
 }
@@ -2141,5 +2231,72 @@ mod address_tests {
         assert!(reason.contains("un-addressable"), "{reason}");
         assert!(reason.contains("too many declarations"), "{reason}");
         assert!(!reason.contains("no such symbol"), "{reason}");
+    }
+}
+
+#[cfg(test)]
+mod cli_ux_tests {
+    use super::*;
+
+    #[test]
+    fn root_help_documents_exit_code_classes() {
+        let help = match Cli::try_parse_from(["yg", "--help"]) {
+            Ok(_) => panic!("--help must be rendered by clap"),
+            Err(error) => error.to_string(),
+        };
+        for expected in [
+            "2  command-line usage error",
+            "3  authentication or authorization failure (HTTP 401/403)",
+            "4  resource not found (HTTP 404)",
+            "5  server or transport failure (HTTP 5xx or request transport)",
+        ] {
+            assert!(help.contains(expected), "help lacks {expected:?}:\n{help}");
+        }
+    }
+
+    #[test]
+    fn node_and_edge_filter_flags_are_unambiguous() {
+        let neighbors =
+            Cli::try_parse_from(["yg", "neighbors", "node-id", "--edge-kinds", "CALLS"])
+                .expect("edge filter must parse");
+        let Command::Neighbors { kinds, .. } = neighbors.command else {
+            panic!("parsed the wrong command");
+        };
+        assert_eq!(kinds, ["CALLS"]);
+
+        let search = Cli::try_parse_from(["yg", "search", "needle", "--node-kinds", "File"])
+            .expect("node filter must parse");
+        let Command::Search { kinds, .. } = search.command else {
+            panic!("parsed the wrong command");
+        };
+        assert_eq!(kinds, ["File"]);
+
+        for args in [
+            ["yg", "neighbors", "node-id", "--kind", "CALLS"],
+            ["yg", "search", "needle", "--kind", "File"],
+            ["yg", "neighbors", "node-id", "--kinds", "CALLS"],
+            ["yg", "search", "needle", "--kinds", "File"],
+        ] {
+            assert!(
+                Cli::try_parse_from(args).is_err(),
+                "ambiguous --kind must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_token_id_is_a_usage_error() {
+        let error = match Cli::try_parse_from(["yg", "admin", "token", "revoke", "nope"]) {
+            Ok(_) => panic!("malformed token id must be rejected by clap"),
+            Err(error) => error,
+        };
+        assert!(error.use_stderr());
+        // The clap error itself must carry the documented usage class, not
+        // merely coexist with it.
+        assert_eq!(
+            error.exit_code(),
+            i32::from(exit_code::ExitClass::Usage.code()),
+            "clap rejects a malformed token id with the usage exit class"
+        );
     }
 }

@@ -324,7 +324,7 @@ async fn yg_search_reports_hits_humanly_and_as_raw_json() {
 
     // The kind filter flag rides along to the server.
     let json: serde_json::Value = serde_json::from_str(
-        &h.yg_ok(&["search", "rate limit", "--kind", "File", "--json"])
+        &h.yg_ok(&["search", "rate limit", "--node-kinds", "File", "--json"])
             .await,
     )
     .expect("--json emits the raw response");
@@ -334,7 +334,7 @@ async fn yg_search_reports_hits_humanly_and_as_raw_json() {
             .unwrap()
             .iter()
             .all(|h| h["kind"] == "File"),
-        "a --kind File search yields only Files: {json}"
+        "a --node-kinds File search yields only Files: {json}"
     );
 }
 
