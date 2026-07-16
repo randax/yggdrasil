@@ -114,7 +114,8 @@ fn collect_ecmascript_top_level_declaration(
                 return;
             };
             let id = mint_symbol(path, file_id, name, id_uses, graph);
-            facts.declarations.push((name.to_string(), id));
+            facts.declarations.push((name.to_string(), id.clone()));
+            collect_ecmascript_calls(declaration, source, &id, path, &mut facts.calls);
             let mut ctx = SimpleExtractionCtx {
                 source,
                 path,
@@ -126,6 +127,9 @@ fn collect_ecmascript_top_level_declaration(
             collect_ecmascript_class_methods(declaration, name, &mut ctx);
         }
         "lexical_declaration" | "variable_declaration" => {
+            if has_ecmascript_variable_owner_ancestor(declaration) {
+                return;
+            }
             let mut cursor = declaration.walk();
             for declarator in declaration
                 .named_children(&mut cursor)
@@ -278,11 +282,42 @@ fn is_ecmascript_declaration_boundary(node: tree_sitter::Node<'_>) -> bool {
         | "class_declaration"
         | "abstract_class_declaration"
         | "method_definition" => true,
-        "variable_declarator" => node
-            .child_by_field_name("name")
-            .is_some_and(|name| name.kind() == "identifier"),
+        "variable_declarator" => {
+            node.child_by_field_name("name")
+                .is_some_and(|name| name.kind() == "identifier")
+                && !has_ecmascript_variable_owner_ancestor(node)
+        }
         _ => false,
     }
+}
+
+fn has_ecmascript_variable_owner_ancestor(node: tree_sitter::Node<'_>) -> bool {
+    let mut ancestor = node.parent();
+    while let Some(node) = ancestor {
+        match node.kind() {
+            "function_declaration"
+            | "generator_function_declaration"
+            | "function_expression"
+            | "generator_function"
+            | "arrow_function"
+            | "type_alias_declaration"
+            | "enum_declaration"
+            | "interface_declaration"
+            | "class_declaration"
+            | "abstract_class_declaration"
+            | "class"
+            | "method_definition" => return true,
+            "variable_declarator"
+                if node
+                    .child_by_field_name("name")
+                    .is_some_and(|name| name.kind() == "identifier") =>
+            {
+                return true;
+            }
+            _ => ancestor = node.parent(),
+        }
+    }
+    false
 }
 
 fn ecmascript_callee_name<'a>(

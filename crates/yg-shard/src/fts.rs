@@ -134,6 +134,11 @@ pub const FTS_SEGMENT_FILE: &str = "fts.tar";
 
 const CODE_TOKENIZER: &str = "code";
 const WHOLE_TOKENIZER: &str = "whole";
+const MAX_RAW_NAME_BYTES: usize = MAX_TOKEN_LEN;
+
+fn is_raw_name_addressable(name: &str) -> bool {
+    name.len() <= MAX_RAW_NAME_BYTES
+}
 
 /// The schema's field handles, resolved once so neither the writer nor the
 /// reader spells a field name twice.
@@ -146,8 +151,10 @@ struct Fields {
     /// (`rate limit`) never leak into what the API shows the user.
     name: Field,
     /// A Symbol's byte-exact, case-sensitive name, indexed with Tantivy's raw
-    /// tokenizer for bounded fuzzy-address lookup. Not stored: `name` is the
-    /// sole display value.
+    /// tokenizer for bounded fuzzy-address lookup. Names beyond Tantivy's hard
+    /// term limit are omitted: they remain searchable through `terms`, but
+    /// cannot be exact-name addressed. Not stored: `name` is the sole display
+    /// value.
     raw_name: Field,
     /// The matchable name text, split by the same code tokenizer as queries
     /// and boosted but not stored.
@@ -367,7 +374,7 @@ pub fn build_fts(docs: &[SearchDoc]) -> anyhow::Result<Vec<u8>> {
             td.add_text(fields.name, name);
             td.add_text(fields.terms, name);
             td.add_text(fields.terms_whole, name);
-            if doc.kind == NodeKind::Symbol {
+            if doc.kind == NodeKind::Symbol && is_raw_name_addressable(name) {
                 td.add_text(fields.raw_name, name);
             }
         }
@@ -710,6 +717,9 @@ pub fn symbols_named(
     name: &str,
     path_fragment: Option<&str>,
 ) -> anyhow::Result<Vec<LocalSymbol>> {
+    if !is_raw_name_addressable(name) {
+        return Ok(Vec::new());
+    }
     let raw_name = Term::from_field_text(index.fields.raw_name, name);
     let symbol = Term::from_field_text(index.fields.kind, NodeKind::Symbol.as_str());
     let query = BooleanQuery::new(vec![
@@ -832,7 +842,7 @@ mod tests {
     use super::{
         MAX_ADDRESS_SCAN_DOCS, MAX_QUERY_BYTES, MAX_QUERY_DEPTH, MAX_TOKEN_LEN, SearchDoc,
         SearchParams, UnaddressableSymbolName, build_fts, code_tokens, guard_query_complexity,
-        open_fts, search, snippets_for, symbols_named, unpack_fts,
+        is_raw_name_addressable, open_fts, search, snippets_for, symbols_named, unpack_fts,
     };
     use crate::NodeKind;
 
@@ -1121,6 +1131,43 @@ mod tests {
 
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0].node_id.as_str(), "sym:service.go#ResolveResolve");
+    }
+
+    #[test]
+    fn names_exceeding_the_hard_term_limit_remain_searchable_but_not_addressable() {
+        let name = format!("Searchable{}", "X".repeat(MAX_TOKEN_LEN));
+        assert!(!is_raw_name_addressable(&name));
+        let bytes = build_fts(&[SearchDoc {
+            node_id: "sym:service.go#oversized".to_string(),
+            kind: NodeKind::Symbol,
+            name: Some(name.clone()),
+            path: Some("service.go".to_string()),
+            content: String::new(),
+        }])
+        .expect("build fixture index");
+        let packed = tempfile::tempdir().expect("packed fixture dir");
+        unpack_fts(&bytes, packed.path()).expect("unpack fixture index");
+        let index = open_fts(packed.path()).expect("open fixture index");
+
+        let hits = search(
+            &index,
+            &SearchParams {
+                query: "Searchable",
+                kinds: Some(&[NodeKind::Symbol]),
+                limit: 10,
+            },
+        )
+        .expect("search oversized symbol name");
+        assert_eq!(
+            hits.first().map(|hit| hit.node_id.as_str()),
+            Some("sym:service.go#oversized")
+        );
+        assert!(
+            symbols_named(&index, &name, None)
+                .expect("oversized exact-name lookup")
+                .is_empty(),
+            "oversized names are deliberately absent from exact-name addressing"
+        );
     }
 
     #[test]

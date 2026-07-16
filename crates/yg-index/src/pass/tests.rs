@@ -374,6 +374,75 @@ fn ecmascript_nested_boundaries_preserve_exact_call_ownership() {
 }
 
 #[test]
+fn ecmascript_function_local_variables_are_not_symbols_or_call_boundaries() {
+    for language in ["js", "ts"] {
+        let path = format!("locals.{language}");
+        let graph = pass_over(&[(
+            path.clone(),
+            concat!(
+                "function target() {}\n",
+                "function outer() { const x = target(); class Inner { method() { const y = target(); } } consume(() => { const callbackLocal = target(); }); }\n",
+                "const topLevel = () => target();\n",
+                "consume(() => { const unownedArrowLocal = target(); });\n",
+                "consume(function () { const functionExpressionLocal = target(); });\n",
+                "consume(function* () { const generatorExpressionLocal = target(); });\n",
+                "class StaticOwner { static { const staticLocal = target(); } }\n",
+                "consume(class { static { const classExpressionLocal = target(); } });\n",
+            )
+            .to_string(),
+        )]);
+
+        assert!(
+            graph.nodes.iter().all(|node| {
+                node.kind != NodeKind::Symbol
+                    || node.path.as_deref() != Some(path.as_str())
+                    || !matches!(
+                        node.name.as_deref(),
+                        Some(
+                            "x" | "y"
+                                | "callbackLocal"
+                                | "unownedArrowLocal"
+                                | "functionExpressionLocal"
+                                | "generatorExpressionLocal"
+                                | "staticLocal"
+                                | "classExpressionLocal"
+                        )
+                    )
+            }),
+            "{language} function-local variable must not mint a Symbol"
+        );
+        assert!(
+            graph.nodes.iter().any(|node| {
+                node.kind == NodeKind::Symbol
+                    && node.path.as_deref() == Some(path.as_str())
+                    && node.name.as_deref() == Some("Inner")
+            }),
+            "{language} nested class declaration remains a Symbol"
+        );
+        assert_eq!(
+            calls_from(&graph, &path, "outer").len(),
+            2,
+            "{language} direct and anonymous-function initializer calls belong to the enclosing function"
+        );
+        assert_eq!(
+            calls_from(&graph, &path, "Inner.method").len(),
+            1,
+            "{language} nested class method owns its local initializer call"
+        );
+        assert_eq!(
+            calls_from(&graph, &path, "StaticOwner").len(),
+            1,
+            "{language} class owns its static-block initializer call"
+        );
+        assert_eq!(
+            calls_from(&graph, &path, "topLevel").len(),
+            1,
+            "{language} top-level arrow binding remains a Symbol and owns its call"
+        );
+    }
+}
+
+#[test]
 fn oversized_and_unreadable_files_warn_and_retain_file_nodes() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("good.rs"), "fn good() {}\n").unwrap();
