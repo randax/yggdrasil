@@ -103,7 +103,7 @@ async fn every_admin_write_emits_its_typed_response_as_json() {
     let id = issued["id"].as_str().expect("token id");
     let secret = issued["token"].as_str().expect("one-time token secret");
     assert!(id.starts_with("mtok_"));
-    assert!(secret.starts_with("ygt_"));
+    assert!(secret.starts_with("ygm_"));
     assert_eq!(
         String::from_utf8_lossy(&issued_output.stdout)
             .matches(secret)
