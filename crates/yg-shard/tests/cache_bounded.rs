@@ -26,7 +26,6 @@ struct ObservedStore {
     hold_first_target_get: AtomicBool,
     first_target_get_started: Notify,
     release_first_target_get: Notify,
-    target_get_barrier: std::sync::Mutex<Option<(Arc<tokio::sync::Barrier>, usize)>>,
     stream_target: AtomicBool,
     cache_dir: std::sync::Mutex<Option<std::path::PathBuf>>,
     peak_unstaged_bytes: Arc<AtomicUsize>,
@@ -41,7 +40,6 @@ impl ObservedStore {
             hold_first_target_get: AtomicBool::new(false),
             first_target_get_started: Notify::new(),
             release_first_target_get: Notify::new(),
-            target_get_barrier: std::sync::Mutex::new(None),
             stream_target: AtomicBool::new(false),
             cache_dir: std::sync::Mutex::new(None),
             peak_unstaged_bytes: Arc::new(AtomicUsize::new(0)),
@@ -67,13 +65,6 @@ impl ObservedStore {
 
     fn hold_first_target_get(&self) {
         self.hold_first_target_get.store(true, Ordering::SeqCst);
-    }
-
-    fn synchronize_target_gets(&self, participants: usize) {
-        *self.target_get_barrier.lock().unwrap() = Some((
-            Arc::new(tokio::sync::Barrier::new(participants)),
-            participants,
-        ));
     }
 
     fn stream_target_into(&self, cache_dir: &std::path::Path) {
@@ -131,12 +122,6 @@ impl ObjectStore for ObservedStore {
             if attempt == 0 && self.hold_first_target_get.load(Ordering::SeqCst) {
                 self.first_target_get_started.notify_one();
                 self.release_first_target_get.notified().await;
-            }
-            let barrier = self.target_get_barrier.lock().unwrap().clone();
-            if let Some((barrier, participants)) = barrier
-                && attempt < participants
-            {
-                barrier.wait().await;
             }
         }
 
@@ -420,42 +405,55 @@ async fn leased_graph_artifact_blocks_eviction_until_the_lease_drops() {
     assert!(regular_file_bytes(directory.path()) <= capacity_bytes);
 
     store.observe_only(graph_segment_key(45, &second_revision));
+    // Rendezvous at the observed store request, rather than assuming that
+    // yielding after spawning means the request has reached object storage.
+    store.hold_first_target_get();
     let first_path = leased.path.clone();
-    let waiting_started = Arc::new(tokio::sync::Barrier::new(2));
-    let task_started = waiting_started.clone();
     let waiting_cache = Arc::new(cache);
     let task_cache = waiting_cache.clone();
     let waiting_revision = second_revision.clone();
-    let waiting = tokio::spawn(async move {
-        task_started.wait().await;
-        task_cache.leased_graph_path(45, &waiting_revision).await
-    });
-    waiting_started.wait().await;
-    for _ in 0..100 {
-        tokio::task::yield_now().await;
-    }
+    let waiting =
+        tokio::spawn(async move { task_cache.leased_graph_path(45, &waiting_revision).await });
+    store.first_target_get_started.notified().await;
     assert!(
         !waiting.is_finished(),
-        "leased resolution waits for transient capacity contention"
+        "leased resolution remains pending while its fetch is held"
     );
     assert_eq!(
         store.target_gets(),
         1,
-        "capacity waiting does not repeatedly refetch the losing artifact"
+        "the losing artifact starts one fetch"
     );
 
     drop(leased);
-    for _ in 0..100 {
-        tokio::task::yield_now().await;
-    }
+    store.release_first_target_get.notify_one();
+    // Queue behind the waiter's checksum flight. This typed failure proves
+    // that the held fetch completed and entered capacity waiting while the
+    // duplicate lease was still pinned; no scheduler timing is assumed.
+    let probe_error = waiting_cache
+        .graph_path(45, &second_revision)
+        .await
+        .expect_err("the remaining lease still prevents replacement");
+    assert!(
+        probe_error
+            .downcast_ref::<CacheCapacityUnavailable>()
+            .is_some(),
+        "the post-flight capacity probe remains typed: {probe_error:#}"
+    );
     assert!(
         !waiting.is_finished(),
         "a partial reference-count decrement does not wake capacity waiters"
     );
+    // The probe above establishes the capacity-waiting phase. These yields
+    // are only adversarial scheduling opportunities: an implementation that
+    // retries instead of parking would now add another observed fetch.
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
     assert_eq!(
         store.target_gets(),
-        1,
-        "a still-pinned artifact does not trigger another losing refetch"
+        2,
+        "the waiter and the explicit post-flight probe each fetch once"
     );
     drop(duplicate_lease);
     let second = waiting.await.unwrap().unwrap();
@@ -465,6 +463,11 @@ async fn leased_graph_artifact_blocks_eviction_until_the_lease_drops() {
         "the unpinned artifact can now be evicted"
     );
     assert!(regular_file_bytes(directory.path()) <= capacity_bytes);
+    assert_eq!(
+        store.target_gets(),
+        3,
+        "the waiter retries exactly once after the final lease drops"
+    );
     drop(second);
 }
 
@@ -487,32 +490,28 @@ async fn concurrent_distinct_cold_fetches_never_return_an_evicted_leased_path() 
         CacheCapacity::new(capacity_bytes).unwrap(),
     ));
     store.observe_all(keys);
-    store.synchronize_target_gets(2);
+    // Hold the first fetch after it is counted, then let the second caller
+    // obtain its lease. Without this ordering, a legal eviction between
+    // graph_path returning and leased_graph_path pinning can require a third
+    // recovery fetch to avoid returning the now-absent first path.
+    store.hold_first_target_get();
 
     let first_cache = cache.clone();
     let first_task_revision = first_revision.clone();
-    let mut first_task = tokio::spawn(async move {
-        (
-            0,
-            first_cache
-                .leased_graph_path(48, &first_task_revision)
-                .await,
-        )
+    let first_task = tokio::spawn(async move {
+        first_cache
+            .leased_graph_path(48, &first_task_revision)
+            .await
     });
+    store.first_target_get_started.notified().await;
     let second_cache = cache.clone();
     let second_task_revision = second_revision.clone();
-    let mut second_task = tokio::spawn(async move {
-        (
-            1,
-            second_cache
-                .leased_graph_path(48, &second_task_revision)
-                .await,
-        )
+    let second_task = tokio::spawn(async move {
+        second_cache
+            .leased_graph_path(48, &second_task_revision)
+            .await
     });
-    let (winner, leased) = tokio::select! {
-        outcome = &mut first_task => outcome.unwrap(),
-        outcome = &mut second_task => outcome.unwrap(),
-    };
+    let leased = second_task.await.unwrap();
     let leased = leased.expect("one overlapping leased fetch succeeds");
     assert!(leased.path.is_file());
 
@@ -522,11 +521,7 @@ async fn concurrent_distinct_cold_fetches_never_return_an_evicted_leased_path() 
         }
         tokio::task::yield_now().await;
     }
-    let loser_pending = if winner == 0 {
-        !second_task.is_finished()
-    } else {
-        !first_task.is_finished()
-    };
+    let loser_pending = !first_task.is_finished();
     assert!(
         loser_pending,
         "the other leased fetch waits without returning a stale path"
@@ -538,37 +533,45 @@ async fn concurrent_distinct_cold_fetches_never_return_an_evicted_leased_path() 
     );
     assert!(
         regular_file_bytes(directory.path()) <= capacity_bytes,
-        "completed cold-fetch accounting removes the losing staging artifact"
+        "the pinned winner remains within capacity while the losing fetch is held"
     );
+    store.release_first_target_get.notify_one();
 
     // The losing checksum must not remain falsely verified: resolving it
     // while the winner is pinned cannot return a stale, absent path.
-    let losing_revision = if winner == 0 {
-        &second_revision
-    } else {
-        &first_revision
-    };
     let error = cache
-        .graph_path(48, losing_revision)
+        .graph_path(48, &first_revision)
         .await
         .expect_err("the other checksum cannot displace a leased winner");
     assert!(error.downcast_ref::<CacheCapacityUnavailable>().is_some());
+    // The probe establishes that the original losing flight completed.
+    // Give an illegal immediate retry time to reveal itself before the
+    // winner's lease is released and a retry becomes legitimate.
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        store.target_gets(),
+        3,
+        "the losing flight and the explicit post-flight probe each fetch once"
+    );
     assert!(leased.path.is_file());
     assert!(regular_file_bytes(directory.path()) <= capacity_bytes);
 
     let first_path = leased.path.clone();
     drop(leased);
-    let replacement = if winner == 0 {
-        second_task.await.unwrap().1.unwrap()
-    } else {
-        first_task.await.unwrap().1.unwrap()
-    };
+    let replacement = first_task.await.unwrap().unwrap();
     assert!(replacement.path.is_file());
     assert!(
         !first_path.exists(),
         "the released winner is evicted during the waiting handoff"
     );
     assert!(regular_file_bytes(directory.path()) <= capacity_bytes);
+    assert_eq!(
+        store.target_gets(),
+        4,
+        "the waiting caller retries exactly once after the winner lease drops"
+    );
     drop(replacement);
 }
 
