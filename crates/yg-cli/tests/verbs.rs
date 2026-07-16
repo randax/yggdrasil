@@ -757,45 +757,59 @@ async fn a_cursor_survives_server_restart_with_the_same_secret() {
     h.sync_and_index().await;
 
     let id = format!("file:{}:lib.go", h.qualifier());
+    let node_ids = |page: &serde_json::Value| -> std::collections::HashSet<String> {
+        page["nodes"]
+            .as_array()
+            .expect("nodes")
+            .iter()
+            .map(|node| node["id"].as_str().expect("node id").to_string())
+            .collect()
+    };
+
+    // The unpaginated set is the ground truth: the fixture's neighbor count
+    // shifts with indexing-pass changes, so the walk below is size-agnostic.
+    let full = h
+        .verb_ok("neighbors", json!({"id": id, "limit": 100}))
+        .await;
+    assert!(
+        full["next_cursor"].is_null(),
+        "the fixture fits one oversized page: {full}"
+    );
+    let full_ids = node_ids(&full);
+    assert!(
+        full_ids.len() > 2,
+        "pagination needs multiple pages: {full}"
+    );
+
     let first = h.verb_ok("neighbors", json!({"id": id, "limit": 2})).await;
-    let first_ids: std::collections::HashSet<_> = first["nodes"]
-        .as_array()
-        .expect("nodes")
-        .iter()
-        .map(|node| node["id"].as_str().expect("node id").to_string())
-        .collect();
-    let cursor = first["next_cursor"]
+    let mut seen = node_ids(&first);
+    assert_eq!(seen.len(), 2);
+    let mut cursor = first["next_cursor"]
         .as_str()
         .expect("first boot mints a continuation")
         .to_string();
 
     h.restart_server().await;
 
-    let second = h
-        .verb_ok("neighbors", json!({"id": id, "limit": 2, "cursor": cursor}))
-        .await;
-    let second_ids: std::collections::HashSet<_> = second["nodes"]
-        .as_array()
-        .expect("nodes")
-        .iter()
-        .map(|node| node["id"].as_str().expect("node id").to_string())
-        .collect();
-    assert_eq!(second_ids.len(), 2);
-    assert!(
-        first_ids.is_disjoint(&second_ids),
-        "the restarted page has no duplicate: {second}"
-    );
-    let cursor = second["next_cursor"]
-        .as_str()
-        .expect("one final continuation remains");
-    let third = h
-        .verb_ok("neighbors", json!({"id": id, "limit": 2, "cursor": cursor}))
-        .await;
-    assert_eq!(third["nodes"].as_array().expect("nodes").len(), 1);
-    assert!(
-        third["next_cursor"].is_null(),
-        "pagination terminates: {third}"
-    );
+    // Every remaining page is served by the restarted process under the
+    // same secret: no duplicates, no losses, clean termination.
+    loop {
+        let page = h
+            .verb_ok("neighbors", json!({"id": id, "limit": 2, "cursor": cursor}))
+            .await;
+        let page_ids = node_ids(&page);
+        assert!(!page_ids.is_empty(), "a continued page has nodes: {page}");
+        assert!(
+            page_ids.is_disjoint(&seen),
+            "restarted pagination repeats nothing: {page}"
+        );
+        seen.extend(page_ids);
+        match page["next_cursor"].as_str() {
+            Some(next) => cursor = next.to_string(),
+            None => break,
+        }
+    }
+    assert_eq!(seen, full_ids, "pagination loses nothing across restarts");
 }
 
 #[tokio::test]
