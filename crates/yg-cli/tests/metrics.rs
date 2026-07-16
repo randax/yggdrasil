@@ -132,6 +132,7 @@ async fn indexing_and_queries_move_prometheus_metrics() {
     );
 
     let client = reqwest::Client::new();
+    let before_verbs = scrape(&base, Some(TEST_TOKEN)).await.text().await.unwrap();
     let search = client
         .post(format!("{base}/v1/verbs/search"))
         .bearer_auth(TEST_TOKEN)
@@ -140,8 +141,10 @@ async fn indexing_and_queries_move_prometheus_metrics() {
         .await
         .unwrap();
     assert!(search.status().is_success());
-    let search: serde_json::Value = search.json().await.unwrap();
+    let search_bytes = search.bytes().await.unwrap();
+    let search: serde_json::Value = serde_json::from_slice(&search_bytes).unwrap();
     let id = search["hits"][0]["id"].as_str().unwrap();
+    let mut response_sizes = vec![("search", search_bytes.len())];
     for (verb, body) in [
         ("node", serde_json::json!({"id": id})),
         ("neighbors", serde_json::json!({"id": id})),
@@ -158,6 +161,7 @@ async fn indexing_and_queries_move_prometheus_metrics() {
             response.status().is_success(),
             "{verb} returned {response:?}"
         );
+        response_sizes.push((verb, response.bytes().await.unwrap().len()));
     }
 
     let response = scrape(&base, Some(TEST_TOKEN)).await;
@@ -182,12 +186,26 @@ async fn indexing_and_queries_move_prometheus_metrics() {
             &[&format!("kind=\"{kind}\"")],
         ));
     }
-    for verb in ["node", "neighbors", "history", "search"] {
+    for (verb, response_size) in response_sizes {
         assert!(sample_is_positive(
             &text,
             "yggdrasil_verb_request_duration_seconds_count",
             &[&format!("verb=\"{verb}\"")],
         ));
+        let label = format!("verb=\"{verb}\"");
+        let labels = [label.as_str()];
+        let count_name = "yggdrasil_verb_response_size_bytes_count";
+        let sum_name = "yggdrasil_verb_response_size_bytes_sum";
+        let count_before = sample_value(&before_verbs, count_name, &labels).unwrap();
+        let count_after = sample_value(&text, count_name, &labels).unwrap();
+        assert_eq!(count_after - count_before, 1.0, "one {verb} observation");
+        let sum_before = sample_value(&before_verbs, sum_name, &labels).unwrap();
+        let sum_after = sample_value(&text, sum_name, &labels).unwrap();
+        assert_eq!(
+            sum_after - sum_before,
+            response_size as f64,
+            "{verb} metric must count the raw REST response body"
+        );
     }
     assert!(sample_is_positive(
         &text,
