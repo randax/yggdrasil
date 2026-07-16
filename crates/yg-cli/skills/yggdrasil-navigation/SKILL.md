@@ -11,11 +11,11 @@ yggdrasil Index Server.
 
 ## Server/Verb version
 
+Verb contract version: `{{VERB_CONTRACT_VERSION}}`
+
 Written for yggdrasil M0 and the Verb contract in RFC 0001 §7.
 
 Available in M0: `search`, `node`, `neighbors`, and `history`.
-
-Expected in M1: `map`, `callers`, `callees`, and `impact`.
 
 ## Knowledge Graph vs reading files
 
@@ -43,7 +43,7 @@ branch state; the working tree currently differs here."
 
 ## Search-first orientation
 
-Start with `search` for the concept, Symbol, file, or phrase. The map Verb arrives in M1; until then, search is the orientation step.
+Start with `search` for the concept, Symbol, file, or phrase.
 
 Good first searches:
 
@@ -96,12 +96,6 @@ Use `history` when the question depends on change timing or contributors.
 
 ```sh
 yg history file:github.com/acme/widgets:src/main.rs --since 2026-01-01 --json
-```
-
-For M1 and later, use `map` before `search` when entering an unfamiliar repo.
-
-```sh
-yg map github.com/acme/widgets --json
 ```
 
 ## Failure etiquette

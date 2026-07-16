@@ -7,6 +7,7 @@ mod common;
 use std::sync::Arc;
 
 use common::*;
+use predicates::prelude::PredicateBooleanExt;
 use yg_api::{serve, serve_with_registry};
 use yg_sync::forge::{BoxFuture, Forge, ForgeRegistry, GitAuth, ListedRepo, OrgDiscovery};
 
@@ -2256,6 +2257,14 @@ async fn status_reports_version_uptime_and_repo_count_to_a_valid_token() {
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(body["repos_indexed"], 0, "fresh deployment indexes nothing");
+    assert_eq!(
+        body["verb_contract_version"],
+        serde_json::json!(yg_verbs::status::VERB_CONTRACT_VERSION)
+    );
+    assert_eq!(
+        body["verbs"],
+        serde_json::json!(["node", "neighbors", "search", "history"])
+    );
 }
 
 #[tokio::test]
@@ -2325,10 +2334,62 @@ async fn yg_status_json_emits_machine_readable_output() {
         serde_json::from_str(&stdout).expect("--json output must be valid JSON");
     assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(body["repos_indexed"], 0);
+    assert_eq!(
+        body["verb_contract_version"],
+        serde_json::json!(yg_verbs::status::VERB_CONTRACT_VERSION)
+    );
+    assert_eq!(
+        body["verbs"],
+        serde_json::json!(["node", "neighbors", "search", "history"])
+    );
     assert!(
         body["uptime_seconds"].is_u64(),
         "the CLI folds the uptime header back in for machine consumers, got: {body}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn yg_status_warns_when_the_installed_skill_contract_is_stale() {
+    let server = boot_test_server().await;
+    let home = tempfile::tempdir().unwrap();
+    assert_cmd::Command::cargo_bin("yg")
+        .unwrap()
+        .env("HOME", home.path())
+        .args(["skill", "install"])
+        .assert()
+        .success();
+
+    let path = home
+        .path()
+        .join(".claude/skills/yggdrasil-navigation/SKILL.md");
+    let current = format!(
+        "Verb contract version: `{}`",
+        yg_verbs::status::VERB_CONTRACT_VERSION
+    );
+    let stale_version = "999999";
+    let stale = format!("Verb contract version: `{stale_version}`");
+    let document = std::fs::read_to_string(&path).unwrap();
+    assert!(document.contains(&current));
+    std::fs::write(&path, document.replace(&current, &stale)).unwrap();
+
+    assert_cmd::Command::cargo_bin("yg")
+        .unwrap()
+        .env("HOME", home.path())
+        .env("YG_SERVER", format!("http://{}", server.local_addr()))
+        .env("YG_TOKEN", TEST_TOKEN)
+        .arg("status")
+        .assert()
+        .success()
+        .stderr(
+            predicates::str::contains(format!(
+                "installed yggdrasil-navigation Skill uses Verb contract {stale_version}"
+            ))
+            .and(predicates::str::contains(format!(
+                "server uses {}",
+                yg_verbs::status::VERB_CONTRACT_VERSION
+            )))
+            .and(predicates::str::contains("yg skill install")),
+        );
 }
 
 /// An internal failure (the control plane severed under a live server)

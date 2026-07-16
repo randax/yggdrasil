@@ -1,4 +1,4 @@
-//! Shared response DTOs for the administrative HTTP surface.
+//! Shared request and response DTOs for the administrative HTTP surface.
 
 use serde::{Deserialize, Serialize};
 
@@ -152,6 +152,66 @@ impl TokenLifetimeSeconds {
 impl std::fmt::Display for MemberName {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(self.as_str())
+    }
+}
+
+/// A repository URL supplied for server-side validation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RepoRegistrationUrl(String);
+
+impl RepoRegistrationUrl {
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// The environment-variable name containing a forge credential.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ForgeTokenEnvironment(String);
+
+impl ForgeTokenEnvironment {
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A forge adapter kind supplied for registry lookup.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RequestedForgeKind(String);
+
+impl RequestedForgeKind {
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A repository-slug glob supplied for discovery-rule validation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct DiscoveryRulePattern(String);
+
+impl DiscoveryRulePattern {
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -310,10 +370,29 @@ impl std::fmt::Display for JobState {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct AddRepoRequest {
+    pub url: RepoRegistrationUrl,
+    /// Shallow-clone override; omitted = full history.
+    pub depth: Option<i32>,
+    /// Per-repo poll interval in seconds; omitted = the server default.
+    pub poll_interval: Option<i32>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AddRepoResponse {
     pub slug: RepoSlug,
     pub created: bool,
     pub fetch_queued: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AddForgeRequest {
+    pub kind: RequestedForgeKind,
+    pub org: OrgName,
+    pub base_url: Option<ForgeBaseUrl>,
+    pub token_env: Option<ForgeTokenEnvironment>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -327,11 +406,29 @@ pub struct AddForgeResponse {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct DiscoverForgeRequest {
+    pub kind: RequestedForgeKind,
+    pub org: OrgName,
+    pub base_url: Option<ForgeBaseUrl>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DiscoverForgeResponse {
     pub kind: ForgeKind,
     pub org: OrgName,
     pub base_url: ForgeBaseUrl,
     pub queued: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AddRuleRequest {
+    pub forge: Option<ForgeBaseUrl>,
+    pub pattern: DiscoveryRulePattern,
+    pub action: RuleAction,
+    #[serde(rename = "private")]
+    pub applies_to_private: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

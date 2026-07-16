@@ -44,16 +44,16 @@ Critical path: **#59 → {#60, #62, #64} → {#63, #65, #66}**.
 ## Wave 3 — dependents
 
 - [x] **#63** Signed, re-validated cursors (after #59/#60 consolidate cursor infra).
-- [ ] **#65** MCP conformance + Skill contract-version handshake (after #62).
-- [ ] **#66** CLI UX: machine-readable writes, exit-code classes, flag vocabulary (after #60).
+- [x] **#65** MCP conformance + Skill contract-version handshake (after #62).
+- [x] **#66** CLI UX: machine-readable writes, exit-code classes, flag vocabulary (after #60).
 - [x] **#51** Deployment vehicle: container image + compose profile.
 - [ ] ~~**#15** Release packaging (atop #51).~~ *Skipped per owner instruction (2026-07-16).*
-- [ ] **#68** Tokens-per-task metrics + orientation-efficiency eval (after #47; baseline after #64/#44).
+- [x] **#68** Tokens-per-task metrics + orientation-efficiency eval (after #47; baseline after #64/#44).
 - [x] **#29** Orphaned object-storage segment reconciler (after #40).
 
 ## Wave 4 — closers
 
-- [ ] **#24** Document cold-cache search latency long-tail (after #45/#64 change the numbers).
+- [x] **#24** Document cold-cache search latency long-tail (after #45/#64 change the numbers).
 - [ ] **#56** Docs truth restoration — deliberately last, so docs describe the final state.
 - [ ] **#28** ETag conditional requests + rate-limit headers for GitHub polling (unblocked by #53, kept M1+).
 - [ ] **#37** Close umbrella PRD when children are done.

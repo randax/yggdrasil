@@ -88,7 +88,8 @@ pub struct VerbTool {
     pub description: &'static str,
 }
 
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Verb {
     Node,
     Neighbors,

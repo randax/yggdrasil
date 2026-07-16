@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::AppState;
 use crate::error::error_json;
+use crate::mcp_protocol::{InitializeParams, McpProtocolError};
 use crate::wire::{self, Wire};
 
 pub(crate) async fn mcp(
@@ -103,31 +104,43 @@ async fn handle_mcp_message(
             "JSON-RPC message must be an object",
         ));
     };
+    if object.get("jsonrpc").and_then(serde_json::Value::as_str) != Some("2.0") {
+        return Some(jsonrpc_error(
+            readable_request_id(object.get("id")),
+            -32600,
+            "JSON-RPC request version must be \"2.0\"",
+        ));
+    }
     let Some(method) = object.get("method").and_then(serde_json::Value::as_str) else {
         return Some(jsonrpc_error(
-            object.get("id").cloned().unwrap_or(serde_json::Value::Null),
+            readable_request_id(object.get("id")),
             -32600,
             "JSON-RPC request method must be a string",
         ));
     };
-    let id = object.get("id").cloned()?;
+    if object.get("id").is_some_and(|id| !is_valid_request_id(id)) {
+        return Some(jsonrpc_error(
+            serde_json::Value::Null,
+            -32600,
+            "MCP request id must be a string or integer",
+        ));
+    }
+    let id = match classify_message(object.get("id").cloned(), method) {
+        MessageDisposition::Notification => return None,
+        MessageDisposition::InvalidNotification(id) => {
+            return Some(protocol_error(id, McpProtocolError::NotificationHasId));
+        }
+        MessageDisposition::Request(id) => id,
+    };
     let params = object
         .get("params")
         .cloned()
         .unwrap_or(serde_json::Value::Null);
     let response = match method {
-        "initialize" => jsonrpc_success(
-            id,
-            serde_json::json!({
-                "protocolVersion": "2025-03-26",
-                "capabilities": {"tools": {}},
-                "serverInfo": {
-                    "name": "yggdrasil",
-                    "version": env!("CARGO_PKG_VERSION")
-                }
-            }),
-        ),
-        "notifications/initialized" => jsonrpc_success(id, serde_json::json!({})),
+        "initialize" => match serde_json::from_value::<InitializeParams>(params) {
+            Ok(params) => jsonrpc_success(id, crate::mcp_protocol::initialize(params)),
+            Err(error) => protocol_error(id, McpProtocolError::InvalidInitializeParams(error)),
+        },
         "tools/list" => match mcp_tools() {
             Ok(tools) => jsonrpc_success(id, serde_json::json!({"tools": tools})),
             Err((code, message)) => jsonrpc_error(id, code, message),
@@ -141,7 +154,60 @@ async fn handle_mcp_message(
     Some(response)
 }
 
-fn jsonrpc_success(id: serde_json::Value, result: serde_json::Value) -> serde_json::Value {
+#[derive(Debug, PartialEq)]
+enum MessageDisposition {
+    /// Every valid id-less JSON-RPC request object is one-way, including
+    /// unknown notification methods.
+    Notification,
+    /// MCP notification methods are not requests; attaching an id makes the
+    /// envelope invalid rather than making the method answerable.
+    InvalidNotification(serde_json::Value),
+    Request(serde_json::Value),
+}
+
+fn classify_message(id: Option<serde_json::Value>, method: &str) -> MessageDisposition {
+    match id {
+        None => MessageDisposition::Notification,
+        Some(id) if method.starts_with("notifications/") => {
+            MessageDisposition::InvalidNotification(id)
+        }
+        Some(id) => MessageDisposition::Request(id),
+    }
+}
+
+fn readable_request_id(id: Option<&serde_json::Value>) -> serde_json::Value {
+    id.filter(|id| is_valid_request_id(id))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null)
+}
+
+fn is_valid_request_id(id: &serde_json::Value) -> bool {
+    // JSON-RPC allows string and number ids; a client may serialize an
+    // integral id as `1.0` or `1e3`, so integrality is judged on the
+    // parsed value, not serde_json's internal representation.
+    id.is_string()
+        || id.as_i64().is_some()
+        || id.as_u64().is_some()
+        || id
+            .as_f64()
+            .is_some_and(|id| id.fract() == 0.0 && id.is_finite())
+}
+
+fn protocol_error(id: serde_json::Value, error: McpProtocolError) -> serde_json::Value {
+    match error {
+        McpProtocolError::NotificationHasId => {
+            jsonrpc_error(id, -32600, McpProtocolError::NotificationHasId.to_string())
+        }
+        McpProtocolError::InvalidInitializeParams(source) => {
+            tracing::debug!(error = %source, "invalid MCP initialize parameters");
+            jsonrpc_error(id, -32602, "invalid initialize parameters")
+        }
+    }
+}
+
+/// Assemble the JSON-RPC envelope — the wire boundary where a typed result
+/// becomes its serialized form.
+fn jsonrpc_success(id: serde_json::Value, result: impl Serialize) -> serde_json::Value {
     serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result})
 }
 
@@ -309,6 +375,18 @@ impl From<yg_verbs::VerbError> for McpVerbError {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
+    #[test]
+    fn integral_request_ids_are_valid_regardless_of_number_encoding() {
+        for id in [json!(1), json!(1.0), json!(1e3), json!("abc")] {
+            assert!(super::is_valid_request_id(&id), "{id} is a valid id");
+        }
+        for id in [json!(1.5), json!(true), json!(null), json!([1])] {
+            assert!(!super::is_valid_request_id(&id), "{id} is not a valid id");
+        }
+    }
+
     #[test]
     fn mcp_origin_must_match_host_when_present() {
         use axum::http::{HeaderValue, header};
@@ -334,5 +412,29 @@ mod tests {
             !super::mcp_origin_allowed(&headers),
             "cross-origin browser access is rejected"
         );
+    }
+
+    #[test]
+    fn idless_request_objects_are_always_notifications() {
+        for method in ["notifications/initialized", "tools/list", "unknown"] {
+            assert_eq!(
+                super::classify_message(None, method),
+                super::MessageDisposition::Notification
+            );
+        }
+    }
+
+    #[test]
+    fn notification_method_with_id_is_an_invalid_request() {
+        assert_eq!(
+            super::classify_message(Some(json!(7)), "notifications/initialized"),
+            super::MessageDisposition::InvalidNotification(json!(7))
+        );
+        let response = super::protocol_error(
+            json!(7),
+            crate::mcp_protocol::McpProtocolError::NotificationHasId,
+        );
+        assert_eq!(response["error"]["code"], -32600);
+        assert!(response.get("result").is_none(), "{response}");
     }
 }

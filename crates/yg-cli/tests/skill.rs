@@ -11,17 +11,14 @@ fn skill_install_places_navigation_skill_for_claude_code() {
         .success();
 
     let skill = installed_skill(home.path());
-    assert_eq!(
-        skill,
-        include_str!("../skills/yggdrasil-navigation/SKILL.md")
-    );
+    assert_skill_stamped(&skill);
     assert!(skill.contains("name: yggdrasil-navigation"));
     assert!(skill.contains("Server/Verb version"));
     assert!(skill.contains("RFC 0001 §7"));
     assert!(skill.contains("Knowledge Graph vs reading files"));
     assert!(skill.contains("Division of truth"));
     assert!(skill.contains("Search-first orientation"));
-    assert!(skill.contains("map Verb arrives in M1"));
+    assert!(!skill.contains("yg map"));
     assert!(skill.contains("Provenance trust rules"));
     assert!(skill.contains("Verb cookbook"));
     assert!(skill.contains("Failure etiquette"));
@@ -60,11 +57,7 @@ fn skill_install_falls_back_to_userprofile_when_home_is_empty() {
         .assert()
         .success();
 
-    assert_eq!(
-        installed_skill(userprofile.path()),
-        include_str!("../skills/yggdrasil-navigation/SKILL.md"),
-        "empty HOME must be ignored in favor of USERPROFILE"
-    );
+    assert_skill_stamped(&installed_skill(userprofile.path()));
 }
 
 #[test]
@@ -80,11 +73,7 @@ fn skill_install_falls_back_to_userprofile_when_home_is_missing() {
         .assert()
         .success();
 
-    assert_eq!(
-        installed_skill(userprofile.path()),
-        include_str!("../skills/yggdrasil-navigation/SKILL.md"),
-        "missing HOME must fall back to USERPROFILE"
-    );
+    assert_skill_stamped(&installed_skill(userprofile.path()));
 }
 
 #[test]
@@ -104,4 +93,15 @@ fn skill_install_requires_a_home_directory() {
 
 fn installed_skill(home: &std::path::Path) -> String {
     std::fs::read_to_string(home.join(".claude/skills/yggdrasil-navigation/SKILL.md")).unwrap()
+}
+
+fn assert_skill_stamped(skill: &str) {
+    assert!(
+        skill.contains(&format!(
+            "Verb contract version: `{}`",
+            yg_verbs::status::VERB_CONTRACT_VERSION
+        )),
+        "installed Skill must carry the current contract stamp: {skill}"
+    );
+    assert!(!skill.contains("{{VERB_CONTRACT_VERSION}}"));
 }

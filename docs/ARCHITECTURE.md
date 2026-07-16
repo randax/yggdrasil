@@ -75,7 +75,7 @@ Worker fleet math (large org): 5000 repos × ~4 worker-minutes (precise pass, ca
 
 ## Non-functional requirements
 
-Targets as in the PRD: verb p95 < 300 ms warm, search p95 < 500 ms warm, syntactic freshness p50 ≤ 8 min (poll) / ≤ 3 min (webhook), 99% SLO attainment, overnight full re-index, all derived state rebuildable from git + Forge APIs.
+Targets as in the PRD: verb p95 < 300 ms warm, search p95 < 500 ms warm, syntactic freshness p50 ≤ 8 min (poll) / ≤ 3 min (webhook), 99% SLO attainment, overnight full re-index, all derived state rebuildable from git + Forge APIs. The PRD's non-functional targets also characterize the cold-search long-tail, including its measurement conditions and non-gating smoke-test policy.
 
 ## Security model
 

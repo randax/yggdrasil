@@ -26,6 +26,8 @@ pub(crate) async fn status(State(state): State<Arc<AppState>>) -> Result<Respons
         Wire(StatusResponse {
             version: env!("CARGO_PKG_VERSION").to_string(),
             repos_indexed,
+            verb_contract_version: yg_verbs::status::VERB_CONTRACT_VERSION,
+            verbs: yg_verbs::VERB_TOOLS.iter().map(|tool| tool.verb).collect(),
         }),
     )
         .into_response())

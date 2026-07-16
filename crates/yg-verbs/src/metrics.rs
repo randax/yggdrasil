@@ -11,10 +11,28 @@ use prometheus_client::registry::Registry;
 use crate::Verb;
 
 const REQUEST_DURATION: &str = "yggdrasil_verb_request_duration_seconds";
+const RESPONSE_SIZE: &str = "yggdrasil_verb_response_size_bytes";
 // Sub-millisecond reads are common, while the upper buckets retain visibility
 // into unusually slow requests without making the family excessively large.
 const HISTOGRAM_BUCKETS: [f64; 14] = [
     0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+];
+const RESPONSE_SIZE_BUCKETS: [f64; 15] = [
+    64.0,
+    128.0,
+    256.0,
+    512.0,
+    1_024.0,
+    2_048.0,
+    4_096.0,
+    8_192.0,
+    16_384.0,
+    32_768.0,
+    65_536.0,
+    131_072.0,
+    262_144.0,
+    524_288.0,
+    1_048_576.0,
 ];
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
@@ -29,11 +47,13 @@ impl EncodeLabelValue for Verb {
 }
 
 type RequestDuration = Family<VerbLabels, Histogram, fn() -> Histogram>;
+type ResponseSize = Family<VerbLabels, Histogram, fn() -> Histogram>;
 
-/// Cloneable collectors for Verb request latency.
+/// Cloneable collectors for Verb request latency and response size.
 #[derive(Clone)]
 pub struct Metrics {
     request_duration: RequestDuration,
+    response_size: ResponseSize,
 }
 
 impl Metrics {
@@ -44,6 +64,11 @@ impl Metrics {
             REQUEST_DURATION,
             "Verb request latency in seconds.",
             metrics.request_duration.clone(),
+        );
+        registry.register(
+            RESPONSE_SIZE,
+            "Serialized successful Verb response payload size in bytes.",
+            metrics.response_size.clone(),
         );
         metrics
     }
@@ -61,13 +86,42 @@ impl Metrics {
         }
     }
 
+    /// Record the compact JSON size of one successful typed Verb response.
+    ///
+    /// The engine calls this after its final response DTO is formed, which
+    /// gives REST and MCP one shared payload measurement. Transport envelopes,
+    /// headers, and error bodies are deliberately outside this observation.
+    ///
+    /// Deliberate costs, weighed against splitting the measurement into each
+    /// transport: this is one extra compact serialization pass, bounded by
+    /// the response caps, on top of the wire layer's own canonicalization;
+    /// and it runs after the latency timer drops, so the duration histogram
+    /// keeps meaning "verb execution" rather than absorbing observability
+    /// overhead.
+    pub fn observe_response<T: serde::Serialize + ?Sized>(&self, verb: Verb, response: &T) {
+        let mut counter = ByteCounter::default();
+        match serde_json::to_writer(&mut counter, response) {
+            Ok(()) => self
+                .response_size
+                .get_or_create(&VerbLabels { verb })
+                .observe(counter.bytes as f64),
+            Err(error) => {
+                tracing::warn!(%error, verb = verb.label(), "measuring Verb response failed")
+            }
+        }
+    }
+
     /// Create collectors without registering them for exposition.
     pub fn unregistered() -> Self {
         let metrics = Self {
             request_duration: Family::new_with_constructor(new_histogram as fn() -> Histogram),
+            response_size: Family::new_with_constructor(
+                new_response_size_histogram as fn() -> Histogram,
+            ),
         };
         for verb in Verb::ALL {
             let _ = metrics.request_duration.get_or_create(&VerbLabels { verb });
+            let _ = metrics.response_size.get_or_create(&VerbLabels { verb });
         }
         metrics
     }
@@ -75,6 +129,26 @@ impl Metrics {
 
 fn new_histogram() -> Histogram {
     Histogram::new(HISTOGRAM_BUCKETS)
+}
+
+fn new_response_size_histogram() -> Histogram {
+    Histogram::new(RESPONSE_SIZE_BUCKETS)
+}
+
+#[derive(Default)]
+struct ByteCounter {
+    bytes: usize,
+}
+
+impl std::io::Write for ByteCounter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.bytes += buffer.len();
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// An in-flight Verb latency observation recorded when dropped.
@@ -105,5 +179,23 @@ mod tests {
         let mut text = String::new();
         encode(&mut text, &registry).unwrap();
         assert!(text.contains("yggdrasil_verb_request_duration_seconds_count{verb=\"search\"} 1"));
+    }
+
+    #[test]
+    fn response_size_is_labeled_by_typed_verb_and_eagerly_initialized() {
+        let mut registry = Registry::default();
+        let metrics = Metrics::registered(&mut registry);
+        metrics.observe_response(Verb::Search, &serde_json::json!({"hits": []}));
+
+        let mut text = String::new();
+        encode(&mut text, &registry).unwrap();
+        assert!(text.contains("yggdrasil_verb_response_size_bytes_count{verb=\"search\"} 1"));
+        assert!(text.contains("yggdrasil_verb_response_size_bytes_sum{verb=\"search\"} 11"));
+        for verb in Verb::ALL {
+            assert!(text.contains(&format!(
+                "yggdrasil_verb_response_size_bytes_count{{verb=\"{}\"}}",
+                verb.label()
+            )));
+        }
     }
 }

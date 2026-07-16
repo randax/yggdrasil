@@ -6,11 +6,11 @@ use std::sync::Arc;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use serde::Deserialize;
 use yg_sync::RepoLocator;
 use yg_sync::forge::Forge;
 use yg_verbs::admin::{
-    AddForgeResponse, AddRepoResponse, AddRuleResponse, AdminRepoStatus, AdminStatusResponse,
+    AddForgeRequest, AddForgeResponse, AddRepoRequest, AddRepoResponse, AddRuleRequest,
+    AddRuleResponse, AdminRepoStatus, AdminStatusResponse, DiscoverForgeRequest,
     DiscoverForgeResponse, DiscoveryQualifierConflictStatus, DiscoveryState, ForgeBaseUrl,
     ForgeKind, IssueTokenRequest, IssueTokenResponse, JobState, JobStatus, MemberName,
     MemberTokenResponse, MemberTokenStatus, MemberTokensResponse, OrgName, RepoQualifier, RepoSlug,
@@ -22,34 +22,18 @@ use crate::AppState;
 use crate::error::ApiError;
 use crate::wire::{Wire, WireJson};
 
-#[derive(Deserialize)]
-pub(crate) struct AddRepoRequest {
-    url: String,
-    /// Shallow-clone override; omitted = full history.
-    depth: Option<i32>,
-    /// Per-repo poll interval in seconds; omitted = the server default.
-    poll_interval: Option<i32>,
-}
-
-#[derive(Deserialize)]
-pub(crate) struct AddForgeRequest {
-    kind: String,
-    org: String,
-    base_url: Option<String>,
-    token_env: Option<String>,
-}
-
 pub(crate) async fn admin_forge_add(
     State(state): State<Arc<AppState>>,
     WireJson(req): WireJson<AddForgeRequest>,
 ) -> Result<Response, ApiError> {
-    let forge = discovery_capable_forge(&state.forge_registry, &req.kind)?;
-    let org = github_org_slug(&req.org).map_err(ApiError::bad_request)?;
-    let base_url = github_base_url(req.base_url.as_deref())
+    let forge = discovery_capable_forge(&state.forge_registry, req.kind.as_str())?;
+    let org = github_org_slug(req.org.as_str()).map_err(ApiError::bad_request)?;
+    let base_url = github_base_url(req.base_url.as_ref().map(ForgeBaseUrl::as_str))
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
     let token_env = req
         .token_env
-        .as_deref()
+        .as_ref()
+        .map(yg_verbs::admin::ForgeTokenEnvironment::as_str)
         .or_else(|| forge.default_token_env());
     let api_root = forge
         .default_api_root(base_url.as_str())
@@ -158,21 +142,14 @@ fn github_base_url(base_url: Option<&str>) -> Result<yg_control::ForgeUrl, Githu
     Ok(yg_control::ForgeUrl::parse(base_url)?)
 }
 
-#[derive(Deserialize)]
-pub(crate) struct DiscoverForgeRequest {
-    kind: String,
-    org: String,
-    base_url: Option<String>,
-}
-
 pub(crate) async fn admin_forge_discover(
     State(state): State<Arc<AppState>>,
     WireJson(req): WireJson<DiscoverForgeRequest>,
 ) -> Result<Response, ApiError> {
-    let forge = discovery_capable_forge(&state.forge_registry, &req.kind)?;
+    let forge = discovery_capable_forge(&state.forge_registry, req.kind.as_str())?;
     let kind = forge.kind();
-    let org = github_org_slug(&req.org).map_err(ApiError::bad_request)?;
-    let base_url = github_base_url(req.base_url.as_deref())
+    let org = github_org_slug(req.org.as_str()).map_err(ApiError::bad_request)?;
+    let base_url = github_base_url(req.base_url.as_ref().map(ForgeBaseUrl::as_str))
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
     let Some(stored_kind) = state.control.request_discovery(&base_url, &org).await? else {
         return Err(ApiError::not_found(format!(
@@ -194,32 +171,19 @@ fn stored_forge_kind(kind: &str) -> Result<ForgeKind, ApiError> {
     })
 }
 
-#[derive(Deserialize)]
-pub(crate) struct AddRuleRequest {
-    forge: Option<String>,
-    pattern: String,
-    action: String,
-    private: Option<bool>,
-}
-
 pub(crate) async fn admin_rules_add(
     State(state): State<Arc<AppState>>,
     WireJson(req): WireJson<AddRuleRequest>,
 ) -> Result<Response, ApiError> {
-    let (action, wire_action) = match req.action.as_str() {
-        "include" => (yg_control::RuleAction::Include, RuleAction::Include),
-        "exclude" => (yg_control::RuleAction::Exclude, RuleAction::Exclude),
-        other => {
-            return Err(ApiError::bad_request(format!(
-                "rule action must be include or exclude, got {other:?}"
-            )));
-        }
+    let (action, wire_action) = match req.action {
+        RuleAction::Include => (yg_control::RuleAction::Include, RuleAction::Include),
+        RuleAction::Exclude => (yg_control::RuleAction::Exclude, RuleAction::Exclude),
     };
-    let pattern = req.pattern.trim();
+    let pattern = req.pattern.as_str().trim();
     if pattern.is_empty() {
         return Err(ApiError::bad_request("rule pattern must not be empty"));
     }
-    let forge = github_base_url(req.forge.as_deref())
+    let forge = github_base_url(req.forge.as_ref().map(ForgeBaseUrl::as_str))
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
     let forge_id = state
         .control
@@ -236,7 +200,7 @@ pub(crate) async fn admin_rules_add(
             forge_id,
             pattern,
             action,
-            applies_to_private: req.private.unwrap_or(false),
+            applies_to_private: req.applies_to_private.unwrap_or(false),
         })
         .await?;
     Ok((
@@ -249,7 +213,7 @@ pub(crate) async fn admin_rules_add(
             forge: ForgeBaseUrl::from_domain(forge),
             pattern: pattern.to_string(),
             action: wire_action,
-            applies_to_private: req.private.unwrap_or(false),
+            applies_to_private: req.applies_to_private.unwrap_or(false),
             created: outcome.created,
             repos_reconsidered: outcome.repos_reconsidered,
             fetches_queued: outcome.fetches_queued,
@@ -302,7 +266,7 @@ pub(crate) async fn admin_repo_add(
     }
     // Parse URL structure first so an exact configured Forge root can select
     // its adapter before host claims are considered.
-    let unclassified = RepoLocator::parse_unclassified(&req.url)
+    let unclassified = RepoLocator::parse_unclassified(req.url.as_str())
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
     let input_base_url = unclassified
         .input_base_url()
@@ -342,7 +306,7 @@ pub(crate) async fn admin_repo_add(
             "{} maps to repo qualifier {qualifier:?}, which node ids cannot address \
              (it contains a colon outside a numeric port); \
              use a hostname-based URL without colons in its path",
-            req.url
+            req.url.as_str()
         )));
     }
     let api_root = forge

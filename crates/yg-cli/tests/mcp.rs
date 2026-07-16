@@ -145,6 +145,124 @@ async fn streamable_http_lists_and_calls_verbs_with_bearer_auth() {
 }
 
 #[tokio::test]
+async fn initialize_negotiates_versions_and_notification_methods_never_get_results() {
+    let server = boot_test_server().await;
+    let base = format!("http://{}", server.local_addr());
+
+    for (requested, expected) in [
+        ("2024-11-05", "2024-11-05"),
+        ("2025-03-26", "2025-03-26"),
+        ("2099-01-01", "2025-03-26"),
+    ] {
+        let (status, body) = mcp(
+            &base,
+            json!({
+                "jsonrpc": "2.0",
+                "id": requested,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": requested,
+                    "capabilities": {},
+                    "clientInfo": {"name": "conformance-test", "version": "1"}
+                }
+            }),
+            TEST_TOKEN,
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["result"]["protocolVersion"], expected, "{body}");
+    }
+
+    let (status, body) = mcp(
+        &base,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 16,
+            "method": "initialize",
+            "params": {"protocolVersion": "2025-03-26"}
+        }),
+        TEST_TOKEN,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["error"]["code"], -32602, "{body}");
+
+    let client = reqwest::Client::new();
+    for method in ["tools/list", "notifications/initialized"] {
+        let response = client
+            .post(format!("{base}/v1/mcp"))
+            .bearer_auth(TEST_TOKEN)
+            .json(&json!({"jsonrpc": "2.0", "method": method}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 202, "{method}");
+        assert_eq!(response.text().await.unwrap(), "", "{method}");
+    }
+
+    let (status, body) = mcp(
+        &base,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 17,
+            "method": "notifications/initialized"
+        }),
+        TEST_TOKEN,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["id"], 17);
+    assert_eq!(body["error"]["code"], -32600, "{body}");
+    assert!(body.get("result").is_none(), "{body}");
+
+    let (status, body) = mcp(
+        &base,
+        json!([
+            {"jsonrpc": "2.0", "method": "tools/list"},
+            {"jsonrpc": "2.0", "id": 18, "method": "tools/list"},
+            {"jsonrpc": "2.0", "id": 19, "method": "notifications/initialized"},
+            {"jsonrpc": "1.0", "id": 20, "method": "tools/list"},
+            {}
+        ]),
+        TEST_TOKEN,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let entries = body.as_array().expect("mixed batch response");
+    assert_eq!(
+        entries.len(),
+        4,
+        "id-less notification must be omitted: {body}"
+    );
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry["id"] == 18 && entry.get("result").is_some()),
+        "{body}"
+    );
+    assert!(
+        entries.iter().any(|entry| {
+            entry["id"] == 19 && entry["error"]["code"] == -32600 && entry.get("result").is_none()
+        }),
+        "{body}"
+    );
+    assert!(
+        entries.iter().any(|entry| {
+            entry["id"].is_null()
+                && entry["error"]["code"] == -32600
+                && entry.get("result").is_none()
+        }),
+        "malformed id-less objects are invalid requests, not notifications: {body}"
+    );
+    assert!(
+        entries.iter().any(|entry| {
+            entry["id"] == 20 && entry["error"]["code"] == -32600 && entry.get("result").is_none()
+        }),
+        "invalid JSON-RPC versions must not reach method dispatch: {body}"
+    );
+}
+
+#[tokio::test]
 async fn yg_mcp_proxies_stdio_frames_to_the_remote_server() {
     let h = Harness::boot().await;
     h.add_repo().await;
