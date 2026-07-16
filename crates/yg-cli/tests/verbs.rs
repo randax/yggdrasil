@@ -629,11 +629,12 @@ async fn package_nodes_are_addressable_and_reached_over_imports_edges() {
     assert_eq!(edges[0]["location"], "main.go:3:8");
 }
 
-/// Forge a neighbors cursor the way only a client tampering with (or
-/// outliving) one could: the wire format is opaque base64 JSON.
-fn forged_cursor(fields: serde_json::Value) -> String {
-    use base64::Engine;
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(fields.to_string())
+fn tamper_signature(cursor: &str) -> String {
+    let mut bytes = cursor.as_bytes().to_vec();
+    let signature_start = cursor.rfind('.').expect("signed cursor has a signature") + 1;
+    let first = &mut bytes[signature_start];
+    *first = if *first == b'A' { b'B' } else { b'A' };
+    String::from_utf8(bytes).expect("cursor remains ASCII")
 }
 
 #[tokio::test]
@@ -694,15 +695,29 @@ async fn a_cursor_whose_revision_is_gone_says_expired_not_server_error() {
     h.sync_and_index().await;
 
     let id = format!("file:{}:main.go", h.qualifier());
-    let cursor = forged_cursor(json!({
-        "rev": "0000000000000000000000000000000000000000-syntactic-v2",
+    let missing_revision = format!(
+        "0000000000000000000000000000000000000000-{}-v{}",
+        yg_shard::SYNTACTIC_PASS,
+        yg_shard::SCHEMA_VERSION
+    );
+    let pool = sqlx::PgPool::connect(&format!("{DEV_POSTGRES}/{}", h.db_name))
+        .await
+        .unwrap();
+    let (repo_id,): (i64,) = sqlx::query_as("SELECT repo_id FROM shards")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let payload = json!({
+        "repo_id": repo_id,
+        "rev": missing_revision,
         "id": id,
         "direction": null,
         "edge_kinds": null,
         "depth": 1,
         "after_depth": 1,
         "after": id,
-    }));
+    });
+    let cursor = signed_cursor(&payload);
     let (status, body) = h
         .verb("neighbors", json!({ "id": id, "cursor": cursor }))
         .await;
@@ -713,6 +728,73 @@ async fn a_cursor_whose_revision_is_gone_says_expired_not_server_error() {
             .unwrap_or_default()
             .contains("restart the traversal"),
         "tells the client the way forward: {body}"
+    );
+
+    use base64::Engine;
+    let unsigned = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload.to_string());
+    let tampered = tamper_signature(&cursor);
+    for invalid in [unsigned, tampered] {
+        let (status, body) = h
+            .verb("neighbors", json!({ "id": id, "cursor": invalid }))
+            .await;
+        assert_eq!(status, 400, "signature failure is a client error: {body}");
+        let message = body["error"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("invalid cursor"),
+            "clear typed error: {body}"
+        );
+        assert!(
+            !message.contains("restart the traversal") && !message.contains(&missing_revision),
+            "signature failure cannot reveal revision existence: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_cursor_survives_server_restart_with_the_same_secret() {
+    let mut h = five_symbol_harness().await;
+    h.add_repo().await;
+    h.sync_and_index().await;
+
+    let id = format!("file:{}:lib.go", h.qualifier());
+    let first = h.verb_ok("neighbors", json!({"id": id, "limit": 2})).await;
+    let first_ids: std::collections::HashSet<_> = first["nodes"]
+        .as_array()
+        .expect("nodes")
+        .iter()
+        .map(|node| node["id"].as_str().expect("node id").to_string())
+        .collect();
+    let cursor = first["next_cursor"]
+        .as_str()
+        .expect("first boot mints a continuation")
+        .to_string();
+
+    h.restart_server().await;
+
+    let second = h
+        .verb_ok("neighbors", json!({"id": id, "limit": 2, "cursor": cursor}))
+        .await;
+    let second_ids: std::collections::HashSet<_> = second["nodes"]
+        .as_array()
+        .expect("nodes")
+        .iter()
+        .map(|node| node["id"].as_str().expect("node id").to_string())
+        .collect();
+    assert_eq!(second_ids.len(), 2);
+    assert!(
+        first_ids.is_disjoint(&second_ids),
+        "the restarted page has no duplicate: {second}"
+    );
+    let cursor = second["next_cursor"]
+        .as_str()
+        .expect("one final continuation remains");
+    let third = h
+        .verb_ok("neighbors", json!({"id": id, "limit": 2, "cursor": cursor}))
+        .await;
+    assert_eq!(third["nodes"].as_array().expect("nodes").len(), 1);
+    assert!(
+        third["next_cursor"].is_null(),
+        "pagination terminates: {third}"
     );
 }
 

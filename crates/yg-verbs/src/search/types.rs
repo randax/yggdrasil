@@ -22,7 +22,7 @@ impl RepoQualifier {
 }
 
 /// A typed immutable Shard revision on the search resolver seam.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ShardRevision(String);
 
@@ -150,13 +150,13 @@ pub struct SearchWireResponse {
     pub next_cursor: Option<String>,
 }
 
-impl From<super::SearchResponse> for SearchWireResponse {
+impl super::SearchResponse {
     /// The one place the typed continuation becomes its encoded wire
     /// form, shared by every transport.
-    fn from(response: super::SearchResponse) -> Self {
-        let next_cursor = response.next.as_ref().map(crate::cursor::encode);
-        Self {
-            hits: response.hits,
+    pub(crate) fn into_wire(self, cursors: &crate::cursor::CursorCodec) -> SearchWireResponse {
+        let next_cursor = self.next.as_ref().map(|cursor| cursors.encode(cursor));
+        SearchWireResponse {
+            hits: self.hits,
             next_cursor,
         }
     }

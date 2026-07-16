@@ -310,7 +310,7 @@ mod tests {
         async fn resolve(
             &self,
             _: &str,
-            _: Option<String>,
+            _: Option<crate::PinnedShard>,
         ) -> Result<crate::ResolvedShard, ResolveError> {
             Err(ResolveError::UnknownRepo)
         }

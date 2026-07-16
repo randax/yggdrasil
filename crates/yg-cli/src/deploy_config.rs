@@ -14,6 +14,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use yg_api::{CacheCapacity, ObjectStoreConfig};
+use yg_verbs::CursorSecret;
 
 use crate::Role;
 
@@ -27,7 +28,7 @@ pub const MAX_DURATION_SECS: u64 = 10 * 365 * 24 * 3600;
 /// The whole deployment's configuration, typed. Defaults (documented on
 /// each resolver call in [`resolve`]) point at the in-repo dev compose
 /// stack; only the bootstrap Admin token has no safe default.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct DeployConfig {
     pub listen: SocketAddr,
     /// Optional worker-only Prometheus listener. A split worker exposes no
@@ -37,6 +38,9 @@ pub struct DeployConfig {
     /// Required for roles that serve the API (`api`, `all`).
     /// Also required by an authenticated worker metrics listener.
     pub bootstrap_token: Option<String>,
+    /// Required for roles that serve the API (`api`, `all`). Kept typed and
+    /// non-debuggable so config-check cannot accidentally expose it.
+    pub cursor_secret: Option<CursorSecret>,
     /// Whether `/metrics` bypasses Admin authentication for scrapers.
     pub metrics_unauthenticated: bool,
     pub shard_cache: std::path::PathBuf,
@@ -101,6 +105,13 @@ pub enum ConfigError {
     MissingBootstrapToken {
         var: &'static str,
     },
+    MissingCursorSecret {
+        var: &'static str,
+    },
+    InvalidCursorSecret {
+        var: &'static str,
+        minimum_bytes: usize,
+    },
 }
 
 impl std::fmt::Display for ConfigError {
@@ -131,6 +142,14 @@ impl std::fmt::Display for ConfigError {
                 f,
                 "{var} must be set to a non-empty token; an API or authenticated metrics \
                  listener refuses to boot without an Admin token"
+            ),
+            Self::MissingCursorSecret { var } => write!(
+                f,
+                "{var} must be set to a non-empty secret; an API refuses to boot without a stable cursor-signing key"
+            ),
+            Self::InvalidCursorSecret { var, minimum_bytes } => write!(
+                f,
+                "{var} must contain at least {minimum_bytes} bytes of high-entropy secret material"
             ),
         }
     }
@@ -206,6 +225,26 @@ pub fn resolve(role: Role, lookup: impl Fn(&str) -> Option<String>) -> Resolutio
     } else {
         None
     };
+    let cursor_secret = if api {
+        let secret = r.secret("YG_CURSOR_SECRET");
+        if secret.is_none() {
+            r.errors.push(ConfigError::MissingCursorSecret {
+                var: "YG_CURSOR_SECRET",
+            });
+        }
+        secret.and_then(|secret| match CursorSecret::new(secret.into_bytes()) {
+            Ok(secret) => Some(secret),
+            Err(_) => {
+                r.errors.push(ConfigError::InvalidCursorSecret {
+                    var: "YG_CURSOR_SECRET",
+                    minimum_bytes: yg_verbs::cursor::MIN_CURSOR_SECRET_LEN,
+                });
+                None
+            }
+        })
+    } else {
+        None
+    };
     let protection = if api {
         let defaults = yg_api::ProtectionConfig::default();
         yg_api::ProtectionConfig {
@@ -235,6 +274,7 @@ pub fn resolve(role: Role, lookup: impl Fn(&str) -> Option<String>) -> Resolutio
         listen,
         worker_metrics_addr,
         bootstrap_token,
+        cursor_secret,
         metrics_unauthenticated,
         database_url: r.database_url("YG_DATABASE_URL", yg_control::DEFAULT_DATABASE_URL),
         shard_cache: if api {
@@ -595,13 +635,20 @@ mod tests {
 
     #[test]
     fn defaults_point_at_the_dev_compose_stack() {
-        let config = resolve(Role::All, env(&[("YG_BOOTSTRAP_TOKEN", "ygt_admin")]))
-            .into_config()
-            .unwrap();
+        let config = resolve(
+            Role::All,
+            env(&[
+                ("YG_BOOTSTRAP_TOKEN", "ygt_admin"),
+                ("YG_CURSOR_SECRET", "cursor-secret-at-least-32-bytes-long"),
+            ]),
+        )
+        .into_config()
+        .unwrap();
         assert_eq!(config.listen, "127.0.0.1:7311".parse().unwrap());
         assert_eq!(config.worker_metrics_addr, None);
         assert_eq!(config.database_url, yg_control::DEFAULT_DATABASE_URL);
         assert_eq!(config.bootstrap_token.as_deref(), Some("ygt_admin"));
+        assert!(config.cursor_secret.is_some());
         assert_eq!(
             config.shard_cache,
             std::path::Path::new("./data/shard-cache")
@@ -628,6 +675,10 @@ mod tests {
             env(&[
                 ("YG_LISTEN", "0.0.0.0:8000"),
                 ("YG_BOOTSTRAP_TOKEN", " ygt_admin \n"),
+                (
+                    "YG_CURSOR_SECRET",
+                    " cursor-secret-at-least-32-bytes-long \n",
+                ),
                 ("YG_DATABASE_URL", "postgres://db.example.test/yg"),
                 ("YG_SHARD_CACHE", "/var/cache/yg-shards"),
                 ("YG_SHARD_CACHE_MAX_BYTES", "1048576"),
@@ -650,6 +701,7 @@ mod tests {
         assert_eq!(config.listen, "0.0.0.0:8000".parse().unwrap());
         // Trimmed: env files commonly leak whitespace around tokens.
         assert_eq!(config.bootstrap_token.as_deref(), Some("ygt_admin"));
+        assert!(config.cursor_secret.is_some());
         assert_eq!(config.database_url, "postgres://db.example.test/yg");
         assert_eq!(
             config.shard_cache,
@@ -676,6 +728,7 @@ mod tests {
             Role::Api,
             env(&[
                 ("YG_BOOTSTRAP_TOKEN", "ygt_admin"),
+                ("YG_CURSOR_SECRET", "cursor-secret-at-least-32-bytes-long"),
                 ("YG_TOKEN_RATE_LIMIT_REQUESTS", "7"),
                 ("YG_TOKEN_RATE_LIMIT_WINDOW", "11"),
                 ("YG_SEARCH_CONCURRENCY", "3"),
@@ -702,6 +755,7 @@ mod tests {
             Role::Api,
             env(&[
                 ("YG_BOOTSTRAP_TOKEN", "ygt_admin"),
+                ("YG_CURSOR_SECRET", "cursor-secret-at-least-32-bytes-long"),
                 ("YG_TOKEN_RATE_LIMIT_REQUESTS", "0"),
                 ("YG_SEARCH_CONCURRENCY", "0"),
                 ("YG_MCP_BATCH_SIZE", "0"),
@@ -723,7 +777,7 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_token_is_required_for_api_and_authenticated_metrics() {
+    fn api_secrets_are_required_only_by_the_roles_that_use_them() {
         for role in [Role::Api, Role::All] {
             let resolution = resolve(role, env(&[]));
             assert!(
@@ -733,9 +787,17 @@ mod tests {
                     .any(|e| matches!(e, ConfigError::MissingBootstrapToken { .. })),
                 "missing token must be an error for API-serving roles"
             );
+            assert!(
+                resolution
+                    .errors
+                    .iter()
+                    .any(|e| matches!(e, ConfigError::MissingCursorSecret { .. })),
+                "missing cursor secret must be an error for API-serving roles"
+            );
         }
         let config = resolve(Role::Worker, env(&[])).into_config().unwrap();
         assert_eq!(config.bootstrap_token, None);
+        assert!(config.cursor_secret.is_none());
 
         let protected_worker = resolve(
             Role::Worker,
@@ -772,17 +834,47 @@ mod tests {
             .find(|s| s.var == "YG_BOOTSTRAP_TOKEN")
             .unwrap();
         assert_eq!(token.source, Source::Unset);
+        let cursor_secret = resolution
+            .settings
+            .iter()
+            .find(|s| s.var == "YG_CURSOR_SECRET")
+            .unwrap();
+        assert_eq!(cursor_secret.source, Source::Unset);
     }
 
     #[test]
-    fn a_blank_bootstrap_token_counts_as_missing() {
-        let resolution = resolve(Role::All, env(&[("YG_BOOTSTRAP_TOKEN", "  \n")]));
+    fn blank_api_secrets_count_as_missing() {
+        let resolution = resolve(
+            Role::All,
+            env(&[("YG_BOOTSTRAP_TOKEN", "  \n"), ("YG_CURSOR_SECRET", " \t")]),
+        );
         assert!(
             resolution
                 .errors
                 .iter()
                 .any(|e| matches!(e, ConfigError::MissingBootstrapToken { .. }))
         );
+        assert!(
+            resolution
+                .errors
+                .iter()
+                .any(|e| matches!(e, ConfigError::MissingCursorSecret { .. }))
+        );
+
+        let resolution = resolve(
+            Role::Api,
+            env(&[
+                ("YG_BOOTSTRAP_TOKEN", "admin"),
+                ("YG_CURSOR_SECRET", "too-short"),
+            ]),
+        );
+        assert!(resolution.errors.iter().any(|error| matches!(
+            error,
+            ConfigError::InvalidCursorSecret {
+                minimum_bytes: 32,
+                ..
+            }
+        )));
     }
 
     #[test]
@@ -805,7 +897,9 @@ mod tests {
                 | ConfigError::InvalidDurationSecs { var, .. }
                 | ConfigError::InvalidPositiveInteger { var, .. }
                 | ConfigError::InvalidByteCount { var, .. }
-                | ConfigError::MissingBootstrapToken { var } => *var,
+                | ConfigError::MissingBootstrapToken { var }
+                | ConfigError::MissingCursorSecret { var }
+                | ConfigError::InvalidCursorSecret { var, .. } => *var,
             })
             .collect();
         assert_eq!(
@@ -813,13 +907,17 @@ mod tests {
             [
                 "YG_LISTEN",
                 "YG_BOOTSTRAP_TOKEN",
+                "YG_CURSOR_SECRET",
                 "YG_SHARD_CACHE_MAX_BYTES",
                 "YG_POLL_INTERVAL",
                 "YG_GC_GRACE",
                 "YG_GC_INTERVAL"
             ]
         );
-        let message = format!("{:#}", resolution.into_config().unwrap_err());
+        let message = match resolution.into_config() {
+            Ok(_) => panic!("invalid settings must fail resolution"),
+            Err(error) => format!("{error:#}"),
+        };
         assert!(message.contains("YG_LISTEN"), "{message}");
         assert!(message.contains("YG_SHARD_CACHE_MAX_BYTES"), "{message}");
         assert!(message.contains("YG_POLL_INTERVAL"), "{message}");
@@ -843,6 +941,7 @@ mod tests {
         let worker_vars: Vec<&str> = worker.settings.iter().map(|s| s.var).collect();
         assert!(!worker_vars.contains(&"YG_LISTEN"));
         assert!(!worker_vars.contains(&"YG_BOOTSTRAP_TOKEN"));
+        assert!(!worker_vars.contains(&"YG_CURSOR_SECRET"));
         assert!(!worker_vars.contains(&"YG_SHARD_CACHE"));
         assert!(!worker_vars.contains(&"YG_SHARD_CACHE_MAX_BYTES"));
         assert!(worker_vars.contains(&"YG_GIT_CACHE"));
@@ -854,6 +953,7 @@ mod tests {
             Role::Api,
             env(&[
                 ("YG_BOOTSTRAP_TOKEN", "ygt_admin"),
+                ("YG_CURSOR_SECRET", "cursor-secret-at-least-32-bytes-long"),
                 ("YG_POLL_INTERVAL", "soon"),
             ]),
         );
@@ -872,6 +972,10 @@ mod tests {
             Role::All,
             env(&[
                 ("YG_BOOTSTRAP_TOKEN", "ygt_admin_secret"),
+                (
+                    "YG_CURSOR_SECRET",
+                    "cursor_secret_value_at_least_32_bytes_long",
+                ),
                 ("YG_S3_ACCESS_KEY", "s3_access_value"),
                 ("YG_S3_SECRET_KEY", "s3_secret_value"),
             ]),
@@ -880,7 +984,10 @@ mod tests {
             assert!(
                 !setting.shown.contains("ygt_admin_secret")
                     && !setting.shown.contains("s3_access_value")
-                    && !setting.shown.contains("s3_secret_value"),
+                    && !setting.shown.contains("s3_secret_value")
+                    && !setting
+                        .shown
+                        .contains("cursor_secret_value_at_least_32_bytes_long"),
                 "{}: {} leaks a credential",
                 setting.var,
                 setting.shown
@@ -895,6 +1002,7 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(shown("YG_BOOTSTRAP_TOKEN"), REDACTED);
+        assert_eq!(shown("YG_CURSOR_SECRET"), REDACTED);
         assert_eq!(shown("YG_S3_ACCESS_KEY"), REDACTED);
         assert_eq!(shown("YG_S3_SECRET_KEY"), REDACTED);
     }
@@ -985,7 +1093,14 @@ mod tests {
 
     #[test]
     fn the_settings_report_names_every_variable_with_its_source() {
-        let resolution = resolve(Role::All, env(&[("YG_LISTEN", "0.0.0.0:80")]));
+        let resolution = resolve(
+            Role::All,
+            env(&[
+                ("YG_LISTEN", "0.0.0.0:80"),
+                ("YG_BOOTSTRAP_TOKEN", "admin"),
+                ("YG_CURSOR_SECRET", "cursor-secret-at-least-32-bytes-long"),
+            ]),
+        );
         let vars: Vec<&str> = resolution.settings.iter().map(|s| s.var).collect();
         assert_eq!(
             vars,
@@ -993,6 +1108,7 @@ mod tests {
                 "YG_LISTEN",
                 "YG_METRICS_UNAUTHENTICATED",
                 "YG_BOOTSTRAP_TOKEN",
+                "YG_CURSOR_SECRET",
                 "YG_TOKEN_RATE_LIMIT_REQUESTS",
                 "YG_TOKEN_RATE_LIMIT_WINDOW",
                 "YG_SEARCH_CONCURRENCY",
@@ -1021,7 +1137,12 @@ mod tests {
             resolution
                 .settings
                 .iter()
-                .filter(|s| !matches!(s.var, "YG_LISTEN" | "YG_BOOTSTRAP_TOKEN"))
+                .filter(|s| {
+                    !matches!(
+                        s.var,
+                        "YG_LISTEN" | "YG_BOOTSTRAP_TOKEN" | "YG_CURSOR_SECRET"
+                    )
+                })
                 .all(|s| s.source == Source::Default)
         );
     }

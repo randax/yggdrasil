@@ -79,7 +79,7 @@ impl AppState {
     async fn search(
         &self,
         request: yg_verbs::SearchRequest,
-    ) -> Result<yg_verbs::SearchResponse, yg_verbs::VerbError> {
+    ) -> Result<yg_verbs::SearchWireResponse, yg_verbs::VerbError> {
         let _timer = self.engine.metrics().timer(yg_verbs::Verb::Search);
         let engine = self.engine.clone();
         self.search_limiter
@@ -195,6 +195,7 @@ async fn serve_with_metrics_registry_and_protection(
         engine: Arc::new(yg_verbs::Engine::with_metrics(
             ShardAccess::new(control.clone(), shards.clone()),
             metrics.verbs(),
+            config.cursor_secret,
         )),
         control,
         forge_registry,

@@ -10,8 +10,8 @@
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
-use crate::cursor::{self, HistoryCursor, NeighborsCursor};
-use crate::search::{RepoQualifier, SearchResponse, SearchTarget};
+use crate::cursor::{CursorCodec, CursorError, CursorSecret, HistoryCursor, NeighborsCursor};
+use crate::search::{RepoQualifier, SearchTarget};
 use crate::{
     AddressedResponse, AmbiguousNodeAddress, AmbiguousResolution, DEFAULT_HISTORY_LIMIT,
     DEFAULT_NEIGHBORS_DEPTH, DEFAULT_NEIGHBORS_LIMIT, Direction, GraphEdge, HistoryCommit,
@@ -26,6 +26,8 @@ use crate::{
 /// response body.
 #[derive(Debug, thiserror::Error)]
 pub enum VerbError {
+    #[error(transparent)]
+    InvalidCursor(CursorError),
     #[error("{0}")]
     BadRequest(String),
     #[error("{0}")]
@@ -67,7 +69,8 @@ pub struct ResolvedShard {
     pub path: std::path::PathBuf,
     /// The immutable Shard revision the path holds — what a pagination
     /// cursor pins.
-    pub revision: String,
+    pub repo_id: i64,
+    pub revision: crate::ShardRevision,
     /// Keeps capacity eviction from unlinking the path before it is opened.
     pub cache_lease: Option<yg_shard::CacheLease>,
 }
@@ -82,9 +85,17 @@ pub struct ResolvedFts {
 /// The graph segment is resolved only after the FTS lookup identifies one id,
 /// so capacity need not accommodate both artifacts at once.
 pub struct ResolvedFuzzyShard {
+    pub repo_id: i64,
     pub fts_path: std::path::PathBuf,
     pub revision: crate::ShardRevision,
     pub fts_cache_lease: Option<yg_shard::CacheLease>,
+}
+
+/// Immutable control-plane identity carried by node-addressed cursors.
+#[derive(Clone)]
+pub struct PinnedShard {
+    pub repo_id: i64,
+    pub revision: crate::ShardRevision,
 }
 
 /// How the engine reaches Shards: resolve a repo qualifier — via the
@@ -96,7 +107,7 @@ pub trait ShardResolver: Send + Sync {
     fn resolve(
         &self,
         qualifier: &str,
-        pinned: Option<String>,
+        pinned: Option<PinnedShard>,
     ) -> impl Future<Output = Result<ResolvedShard, ResolveError>> + Send;
 
     /// Resolve one explicitly named repo to the revision a fresh search pins.
@@ -122,7 +133,7 @@ pub trait ShardResolver: Send + Sync {
     fn resolve_fuzzy(
         &self,
         _qualifier: &RepoQualifier,
-        _pinned: Option<crate::ShardRevision>,
+        _pinned: Option<PinnedShard>,
     ) -> impl Future<Output = Result<ResolvedFuzzyShard, ResolveError>> + Send {
         async {
             Err(ResolveError::Internal(anyhow::anyhow!(
@@ -145,7 +156,7 @@ fn resolve_error(qualifier: &str, from_cursor: bool, e: ResolveError) -> VerbErr
             "{qualifier} is registered but not yet indexed; try again shortly"
         )),
         // A pinned revision that storage no longer holds is a cursor
-        // outliving its Shard (GC, a forged or mistyped cursor): the
+        // outliving its Shard (GC, removal, or revision reclamation): the
         // client must restart the traversal, the server is fine. A fresh
         // query resolving a current pointer to a missing revision is an
         // unexpected server fault.
@@ -351,18 +362,20 @@ fn parse_since(raw: &str) -> Result<i64, String> {
 pub struct Engine<R> {
     resolver: std::sync::Arc<R>,
     metrics: crate::Metrics,
+    cursors: CursorCodec,
 }
 
 impl<R: ShardResolver + 'static> Engine<R> {
-    pub fn new(resolver: R) -> Self {
-        Self::with_metrics(resolver, crate::Metrics::unregistered())
+    pub fn new(resolver: R, cursor_secret: CursorSecret) -> Self {
+        Self::with_metrics(resolver, crate::Metrics::unregistered(), cursor_secret)
     }
 
     /// Build an engine using the supplied Verb latency collectors.
-    pub fn with_metrics(resolver: R, metrics: crate::Metrics) -> Self {
+    pub fn with_metrics(resolver: R, metrics: crate::Metrics, cursor_secret: CursorSecret) -> Self {
         Self {
             resolver: std::sync::Arc::new(resolver),
             metrics,
+            cursors: CursorCodec::new(cursor_secret),
         }
     }
 
@@ -390,8 +403,13 @@ impl<R: ShardResolver + 'static> Engine<R> {
 
     /// The `search` Verb, end to end: cursor policy, target resolution,
     /// bounded FTS fan-out, deterministic merge, and snippet hydration.
-    pub async fn search(&self, req: crate::SearchRequest) -> Result<SearchResponse, VerbError> {
-        crate::search::search(self.resolver.clone(), req).await
+    pub async fn search(
+        &self,
+        req: crate::SearchRequest,
+    ) -> Result<crate::SearchWireResponse, VerbError> {
+        crate::search::search(self.resolver.clone(), &self.cursors, req)
+            .await
+            .map(|response| response.into_wire(&self.cursors))
     }
 
     /// The `neighbors` Verb, end to end: cursor decode and agreement,
@@ -405,13 +423,13 @@ impl<R: ShardResolver + 'static> Engine<R> {
         let cursor = req
             .cursor
             .as_deref()
-            .map(cursor::decode::<NeighborsCursor>)
+            .map(|cursor| self.cursors.decode::<NeighborsCursor>(cursor))
             .transpose()
-            .map_err(VerbError::BadRequest)?;
+            .map_err(VerbError::InvalidCursor)?;
         if let Some(cursor) = &cursor {
             cursor
                 .agrees_with(&req.shape)
-                .map_err(VerbError::BadRequest)?;
+                .map_err(VerbError::InvalidCursor)?;
         }
         // The shape in force: the cursor's where present (it remembers
         // the original request, and agrees_with just ruled out
@@ -439,7 +457,10 @@ impl<R: ShardResolver + 'static> Engine<R> {
 
         // A cursor pins the revision its traversal started on; fresh
         // queries resolve the current pointer.
-        let pinned = cursor.as_ref().map(|c| c.rev.clone());
+        let pinned = cursor.as_ref().map(|cursor| PinnedShard {
+            repo_id: cursor.repo_id,
+            revision: cursor.rev.clone(),
+        });
         let resolved = self
             .resolve_node_address(
                 shape.id.clone(),
@@ -459,7 +480,8 @@ impl<R: ShardResolver + 'static> Engine<R> {
         .await?;
 
         let next_cursor = page.next.as_ref().map(|(after_depth, after)| {
-            cursor::encode(&NeighborsCursor {
+            self.cursors.encode(&NeighborsCursor {
+                repo_id: shard.repo_id,
                 rev: shard.revision.clone(),
                 shape: shape.clone(),
                 after_depth: *after_depth,
@@ -485,9 +507,9 @@ impl<R: ShardResolver + 'static> Engine<R> {
         let cursor = req
             .cursor
             .as_deref()
-            .map(cursor::decode::<HistoryCursor>)
+            .map(|cursor| self.cursors.decode::<HistoryCursor>(cursor))
             .transpose()
-            .map_err(VerbError::BadRequest)?;
+            .map_err(VerbError::InvalidCursor)?;
         let req_since = req
             .since
             .as_deref()
@@ -497,7 +519,7 @@ impl<R: ShardResolver + 'static> Engine<R> {
         if let Some(cursor) = &cursor {
             cursor
                 .agrees_with(&req.id, req.repo.as_ref(), req.path.as_ref(), req_since)
-                .map_err(VerbError::BadRequest)?;
+                .map_err(VerbError::InvalidCursor)?;
         }
         // The id + since in force: the cursor's where resuming (it
         // remembers the original, and agrees_with ruled out
@@ -524,7 +546,10 @@ impl<R: ShardResolver + 'static> Engine<R> {
         }
         // A cursor pins the revision its history started on; fresh
         // queries resolve the current pointer.
-        let pinned = cursor.as_ref().map(|c| c.rev.clone());
+        let pinned = cursor.as_ref().map(|cursor| PinnedShard {
+            repo_id: cursor.repo_id,
+            revision: cursor.rev.clone(),
+        });
         let resolved = self
             .resolve_node_address(id_str.clone(), repo.clone(), path.clone(), pinned)
             .await?;
@@ -543,7 +568,8 @@ impl<R: ShardResolver + 'static> Engine<R> {
         })
         .await?;
         let next_cursor = page.next.as_ref().map(|(at, sha)| {
-            cursor::encode(&HistoryCursor {
+            self.cursors.encode(&HistoryCursor {
+                repo_id: shard.repo_id,
                 rev: shard.revision.clone(),
                 id: id_str.clone(),
                 repo: repo.clone(),
@@ -579,7 +605,7 @@ impl<R: ShardResolver + 'static> Engine<R> {
         raw_id: String,
         repo: Option<RepoQualifier>,
         path: Option<crate::SearchPath>,
-        pinned: Option<String>,
+        pinned: Option<PinnedShard>,
     ) -> Result<ResolvedAddress, VerbError> {
         let address = parse_node_address(&raw_id, repo, path)?;
         let from_cursor = pinned.is_some();
@@ -596,7 +622,7 @@ impl<R: ShardResolver + 'static> Engine<R> {
                 let qualifier = address.repo.clone();
                 let resolved = self
                     .resolver
-                    .resolve_fuzzy(&qualifier, pinned.map(crate::ShardRevision::new))
+                    .resolve_fuzzy(&qualifier, pinned)
                     .await
                     .map_err(|error| resolve_error(qualifier.as_str(), from_cursor, error))?;
                 let name = address.name.as_str().to_string();
@@ -640,10 +666,15 @@ impl<R: ShardResolver + 'static> Engine<R> {
                         address,
                     })),
                     1 => {
-                        let revision = resolved.revision.as_str().to_string();
                         let shard = self
                             .resolver
-                            .resolve(qualifier.as_str(), Some(revision))
+                            .resolve(
+                                qualifier.as_str(),
+                                Some(PinnedShard {
+                                    repo_id: resolved.repo_id,
+                                    revision: resolved.revision,
+                                }),
+                            )
                             .await
                             .map_err(|error| {
                                 resolve_error(qualifier.as_str(), from_cursor, error)

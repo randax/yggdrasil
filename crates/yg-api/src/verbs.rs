@@ -10,10 +10,10 @@ use std::sync::Arc;
 
 use axum::extract::State;
 use axum::response::{IntoResponse, Response};
-use yg_control::ControlPlane;
+use yg_control::{ControlPlane, ShardState};
 use yg_verbs::{
-    RepoQualifier, ResolveError, ResolvedFts, ResolvedFuzzyShard, ResolvedShard, SearchTarget,
-    ShardResolver, ShardRevision,
+    PinnedShard, RepoQualifier, ResolveError, ResolvedFts, ResolvedFuzzyShard, ResolvedShard,
+    SearchTarget, ShardResolver, ShardRevision,
 };
 
 use crate::AppState;
@@ -24,7 +24,9 @@ use crate::wire::{Wire, WireJson};
 /// the control plane (re-resolved on every call, so a pointer swap is
 /// picked up by the next query without a restart; `pinned` — from a
 /// pagination cursor — bypasses the pointer and reads that exact
-/// immutable revision), and segments come off the local cache.
+/// immutable revision), and segments come off the local cache. Pinned
+/// revisions are admitted only while their repo remains visible and
+/// their control-plane row remains published.
 pub(crate) struct ShardAccess {
     control: ControlPlane,
     shards: Arc<yg_shard::ShardCache>,
@@ -34,30 +36,60 @@ impl ShardAccess {
     pub(crate) fn new(control: ControlPlane, shards: Arc<yg_shard::ShardCache>) -> Self {
         Self { control, shards }
     }
+
+    async fn require_published_revision(
+        &self,
+        repo_id: i64,
+        revision: &str,
+    ) -> Result<(), ResolveError> {
+        let state = self
+            .control
+            .shard_state(repo_id, revision)
+            .await
+            .map_err(ResolveError::Internal)?;
+        published_revision(state, revision)
+    }
 }
 
 impl ShardResolver for ShardAccess {
     async fn resolve(
         &self,
         qualifier: &str,
-        pinned: Option<String>,
+        pinned: Option<PinnedShard>,
     ) -> Result<ResolvedShard, ResolveError> {
         let target = self
             .control
             .verb_target(qualifier)
             .await
-            .map_err(ResolveError::Internal)?
-            .ok_or(ResolveError::UnknownRepo)?;
-        let Some(revision) = pinned.or(target.revision) else {
-            return Err(ResolveError::NotIndexed);
+            .map_err(ResolveError::Internal)?;
+        let target = match target {
+            Some(target) => target,
+            None => {
+                return Err(missing_visible_target(
+                    pinned.as_ref().map(|pinned| pinned.revision.as_str()),
+                ));
+            }
+        };
+        let revision = match pinned {
+            Some(pinned) => {
+                matching_repo_id(pinned.repo_id, target.repo_id, pinned.revision.as_str())?;
+                self.require_published_revision(target.repo_id, pinned.revision.as_str())
+                    .await?;
+                pinned.revision
+            }
+            None => match target.revision {
+                Some(revision) => ShardRevision::new(revision),
+                None => return Err(ResolveError::NotIndexed),
+            },
         };
         match self
             .shards
-            .leased_graph_path(target.repo_id, &revision)
+            .leased_graph_path(target.repo_id, revision.as_str())
             .await
         {
             Ok(leased) => Ok(ResolvedShard {
                 path: leased.path,
+                repo_id: target.repo_id,
                 revision,
                 cache_lease: Some(leased.lease),
             }),
@@ -103,6 +135,19 @@ impl ShardResolver for ShardAccess {
     }
 
     async fn resolve_fts(&self, target: &SearchTarget) -> Result<ResolvedFts, ResolveError> {
+        let visible = self
+            .control
+            .verb_target(target.qualifier().as_str())
+            .await
+            .map_err(ResolveError::Internal)?
+            .ok_or_else(|| revision_missing(target.revision().as_str()))?;
+        matching_repo_id(
+            target.repo_id(),
+            visible.repo_id,
+            target.revision().as_str(),
+        )?;
+        self.require_published_revision(target.repo_id(), target.revision().as_str())
+            .await?;
         self.shards
             .leased_fts_path(target.repo_id(), target.revision().as_str())
             .await
@@ -116,31 +161,70 @@ impl ShardResolver for ShardAccess {
     async fn resolve_fuzzy(
         &self,
         qualifier: &RepoQualifier,
-        pinned: Option<ShardRevision>,
+        pinned: Option<PinnedShard>,
     ) -> Result<ResolvedFuzzyShard, ResolveError> {
         let target = self
             .control
             .verb_target(qualifier.as_str())
             .await
-            .map_err(ResolveError::Internal)?
-            .ok_or(ResolveError::UnknownRepo)?;
-        let Some(revision) = pinned
-            .map(|revision| revision.as_str().to_string())
-            .or(target.revision)
-        else {
-            return Err(ResolveError::NotIndexed);
+            .map_err(ResolveError::Internal)?;
+        let target = match target {
+            Some(target) => target,
+            None => {
+                return Err(missing_visible_target(
+                    pinned.as_ref().map(|pinned| pinned.revision.as_str()),
+                ));
+            }
+        };
+        let revision = match pinned {
+            Some(pinned) => {
+                matching_repo_id(pinned.repo_id, target.repo_id, pinned.revision.as_str())?;
+                self.require_published_revision(target.repo_id, pinned.revision.as_str())
+                    .await?;
+                pinned.revision
+            }
+            None => match target.revision {
+                Some(revision) => ShardRevision::new(revision),
+                None => return Err(ResolveError::NotIndexed),
+            },
         };
         let fts = self
             .shards
-            .leased_fts_path(target.repo_id, &revision)
+            .leased_fts_path(target.repo_id, revision.as_str())
             .await
             .map_err(map_cache_error)?;
         Ok(ResolvedFuzzyShard {
+            repo_id: target.repo_id,
             fts_path: fts.path,
-            revision: ShardRevision::new(revision),
+            revision,
             fts_cache_lease: Some(fts.lease),
         })
     }
+}
+
+fn missing_visible_target(pinned_revision: Option<&str>) -> ResolveError {
+    pinned_revision.map_or(ResolveError::UnknownRepo, revision_missing)
+}
+
+fn matching_repo_id(expected: i64, visible: i64, revision: &str) -> Result<(), ResolveError> {
+    if expected == visible {
+        Ok(())
+    } else {
+        Err(revision_missing(revision))
+    }
+}
+
+fn published_revision(state: Option<ShardState>, revision: &str) -> Result<(), ResolveError> {
+    match state {
+        Some(ShardState::Published) => Ok(()),
+        Some(ShardState::Reclaiming) | None => Err(revision_missing(revision)),
+    }
+}
+
+fn revision_missing(revision: &str) -> ResolveError {
+    ResolveError::RevisionMissing(anyhow::Error::new(yg_shard::RevisionMissing {
+        revision: revision.to_string(),
+    }))
 }
 
 fn map_cache_error(error: anyhow::Error) -> ResolveError {
@@ -212,19 +296,23 @@ mod tests {
         async fn resolve(
             &self,
             qualifier: &str,
-            pinned: Option<String>,
+            pinned: Option<PinnedShard>,
         ) -> Result<ResolvedShard, ResolveError> {
             assert_eq!(qualifier, TEST_QUALIFIER);
             self.graph_calls.fetch_add(1, Ordering::SeqCst);
-            *self.graph_revision.lock().expect("revision lock poisoned") = pinned.clone();
-            let revision = pinned.ok_or(ResolveError::NotIndexed)?;
+            let pinned = pinned.ok_or(ResolveError::NotIndexed)?;
+            assert_eq!(pinned.repo_id, TEST_REPO_ID);
+            let revision = pinned.revision;
+            *self.graph_revision.lock().expect("revision lock poisoned") =
+                Some(revision.as_str().to_string());
             let leased = self
                 .cache
-                .leased_graph_path(TEST_REPO_ID, &revision)
+                .leased_graph_path(TEST_REPO_ID, revision.as_str())
                 .await
                 .map_err(ResolveError::Internal)?;
             Ok(ResolvedShard {
                 path: leased.path,
+                repo_id: TEST_REPO_ID,
                 revision,
                 cache_lease: Some(leased.lease),
             })
@@ -254,20 +342,24 @@ mod tests {
         async fn resolve_fuzzy(
             &self,
             qualifier: &RepoQualifier,
-            pinned: Option<ShardRevision>,
+            pinned: Option<PinnedShard>,
         ) -> Result<ResolvedFuzzyShard, ResolveError> {
             assert_eq!(qualifier.as_str(), TEST_QUALIFIER);
             let revision = pinned
-                .map(|revision| revision.as_str().to_string())
-                .unwrap_or_else(|| self.revision.clone());
+                .map(|pinned| {
+                    assert_eq!(pinned.repo_id, TEST_REPO_ID);
+                    pinned.revision
+                })
+                .unwrap_or_else(|| ShardRevision::new(self.revision.clone()));
             let leased = self
                 .cache
-                .leased_fts_path(TEST_REPO_ID, &revision)
+                .leased_fts_path(TEST_REPO_ID, revision.as_str())
                 .await
                 .map_err(ResolveError::Internal)?;
             Ok(ResolvedFuzzyShard {
+                repo_id: TEST_REPO_ID,
                 fts_path: leased.path,
-                revision: ShardRevision::new(revision),
+                revision,
                 fts_cache_lease: Some(leased.lease),
             })
         }
@@ -354,12 +446,16 @@ mod tests {
         .expect("publish fuzzy fixture");
         let directory = TestDirectory::new("fuzzy-cardinality");
         let graph_calls = Arc::new(AtomicUsize::new(0));
-        let engine = yg_verbs::Engine::new(SequencingResolver {
-            cache: Arc::new(yg_shard::ShardCache::new(store, directory.path())),
-            revision: published.revision,
-            graph_calls: graph_calls.clone(),
-            graph_revision: Arc::new(std::sync::Mutex::new(None)),
-        });
+        let engine = yg_verbs::Engine::new(
+            SequencingResolver {
+                cache: Arc::new(yg_shard::ShardCache::new(store, directory.path())),
+                revision: published.revision,
+                graph_calls: graph_calls.clone(),
+                graph_revision: Arc::new(std::sync::Mutex::new(None)),
+            },
+            yg_verbs::CursorSecret::new(b"api-verbs-test-secret-at-least-32-bytes".to_vec())
+                .expect("test secret"),
+        );
         let result = engine
             .node(yg_verbs::NodeRequest {
                 id: query.to_string(),
@@ -380,6 +476,44 @@ mod tests {
         assert!(matches!(
             map_cache_error(error),
             ResolveError::CacheCapacityUnavailable
+        ));
+    }
+
+    #[test]
+    fn only_published_pinned_revisions_are_admitted() {
+        assert!(published_revision(Some(ShardState::Published), "rev").is_ok());
+
+        for state in [None, Some(ShardState::Reclaiming)] {
+            let error = published_revision(state, "rev").expect_err("revision is unavailable");
+            let ResolveError::RevisionMissing(source) = error else {
+                panic!("unavailable revisions must use the cursor-expiry category");
+            };
+            assert_eq!(
+                source
+                    .downcast_ref::<yg_shard::RevisionMissing>()
+                    .expect("typed Shard missing source")
+                    .revision,
+                "rev"
+            );
+        }
+    }
+
+    #[test]
+    fn search_target_repo_mismatch_is_a_missing_revision() {
+        let error = matching_repo_id(45, 46, "rev").expect_err("repo id must match qualifier");
+        assert!(matches!(error, ResolveError::RevisionMissing(_)));
+        assert!(matching_repo_id(45, 45, "rev").is_ok());
+    }
+
+    #[test]
+    fn hidden_pinned_repo_is_a_missing_revision() {
+        assert!(matches!(
+            missing_visible_target(Some("rev")),
+            ResolveError::RevisionMissing(_)
+        ));
+        assert!(matches!(
+            missing_visible_target(None),
+            ResolveError::UnknownRepo
         ));
     }
 
@@ -433,12 +567,16 @@ mod tests {
         ));
         let graph_calls = Arc::new(AtomicUsize::new(0));
         let graph_revision = Arc::new(std::sync::Mutex::new(None));
-        let engine = yg_verbs::Engine::new(SequencingResolver {
-            cache,
-            revision: published.revision.clone(),
-            graph_calls: graph_calls.clone(),
-            graph_revision: graph_revision.clone(),
-        });
+        let engine = yg_verbs::Engine::new(
+            SequencingResolver {
+                cache,
+                revision: published.revision.clone(),
+                graph_calls: graph_calls.clone(),
+                graph_revision: graph_revision.clone(),
+            },
+            yg_verbs::CursorSecret::new(b"api-verbs-test-secret-at-least-32-bytes".to_vec())
+                .expect("test secret"),
+        );
 
         let response = tokio::time::timeout(
             std::time::Duration::from_secs(5),

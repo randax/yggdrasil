@@ -65,6 +65,8 @@ pub struct ServerConfig {
     pub database_url: String,
     pub object_store: ObjectStoreConfig,
     pub bootstrap_token: String,
+    /// HMAC key used to sign and verify every client-held pagination cursor.
+    pub cursor_secret: yg_verbs::CursorSecret,
     /// Local tier for Shard segments (RFC 0001 §6): warm Verb queries
     /// read from here instead of object storage.
     pub shard_cache: std::path::PathBuf,

@@ -133,7 +133,7 @@ mod tests {
         async fn resolve(
             &self,
             _qualifier: &str,
-            _pinned: Option<String>,
+            _pinned: Option<crate::PinnedShard>,
         ) -> Result<ResolvedShard, ResolveError> {
             Err(ResolveError::UnknownRepo)
         }
@@ -233,6 +233,10 @@ mod tests {
             .expect("runtime")
             .block_on(super::super::search(
                 resolver.clone(),
+                &crate::cursor::CursorCodec::new(
+                    crate::CursorSecret::new(b"hydrate-test-secret-at-least-32-bytes".to_vec())
+                        .expect("test secret is non-empty"),
+                ),
                 SearchRequest {
                     query: Some("rate limit".to_string()),
                     kinds: None,

@@ -43,7 +43,7 @@ Critical path: **#59 → {#60, #62, #64} → {#63, #65, #66}**.
 
 ## Wave 3 — dependents
 
-- [ ] **#63** Signed, re-validated cursors (after #59/#60 consolidate cursor infra).
+- [x] **#63** Signed, re-validated cursors (after #59/#60 consolidate cursor infra).
 - [ ] **#65** MCP conformance + Skill contract-version handshake (after #62).
 - [ ] **#66** CLI UX: machine-readable writes, exit-code classes, flag vocabulary (after #60).
 - [ ] **#51** Deployment vehicle: container image + compose profile.
