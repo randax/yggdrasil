@@ -51,6 +51,53 @@ services:
       - mc alias set dev http://minio:9000 yggdrasil yggdrasil && mc mb --ignore-existing dev/yggdrasil
     restart: "no"
 
+  # Reference single-node deployment. Profile-gated so the existing backing-
+  # service-only development flow is unchanged.
+  server:
+    profiles: [deployment]
+    image: "${YG_IMAGE:-yggdrasil:local}"
+    build:
+      context: .
+      dockerfile: Dockerfile
+    init: true
+    environment:
+      YG_LISTEN: 0.0.0.0:7311
+      YG_DATABASE_URL: postgres://yggdrasil:yggdrasil@postgres:5432/yggdrasil
+      YG_S3_ENDPOINT: http://minio:9000
+      YG_S3_BUCKET: yggdrasil
+      YG_S3_ACCESS_KEY: yggdrasil
+      YG_S3_SECRET_KEY: yggdrasil
+      YG_S3_REGION: us-east-1
+      YG_BOOTSTRAP_TOKEN: "${YG_BOOTSTRAP_TOKEN:-}"
+      YG_CURSOR_SECRET: "${YG_CURSOR_SECRET:-}"
+      # Forge credential for private clones and org discovery; workers
+      # read it directly, and compose does not forward host env unasked.
+      YG_GITHUB_TOKEN: "${YG_GITHUB_TOKEN:-}"
+    ports:
+      - "127.0.0.1:${YG_SERVER_PORT:-7311}:7311"
+    volumes:
+      - server-git-cache:/var/lib/yggdrasil/git
+      - server-shard-cache:/var/lib/yggdrasil/shard-cache
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - YG_SERVER=http://127.0.0.1:7311 YG_TOKEN="$${YG_BOOTSTRAP_TOKEN}" /usr/local/bin/yg status --json >/dev/null
+      interval: 5s
+      timeout: 3s
+      retries: 24
+      start_period: 5s
+    restart: unless-stopped
+    # Several seconds past the application's 30s drain deadline, so the
+    # final lease-release cleanup is never raced by Docker's SIGKILL.
+    stop_grace_period: 40s
+
 volumes:
   postgres-data:
   minio-data:
+  server-git-cache:
+  server-shard-cache:
