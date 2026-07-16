@@ -74,7 +74,7 @@ async fn fuzzy_symbols_resolve_uniquely_or_return_ranked_candidates() {
         let confidence = candidate["confidence"].as_f64().expect("confidence");
         assert!(
             (confidence - 0.45).abs() < 1e-9,
-            "ADR 0006 spread: {candidate}"
+            "borrowed syntactic-pass spread convention: {candidate}"
         );
     }
 
@@ -96,6 +96,10 @@ async fn fuzzy_symbols_resolve_uniquely_or_return_ranked_candidates() {
     assert_eq!(missing["error"]["kind"], "no_such_symbol");
     assert!(missing["error"].get("candidates").is_none());
 
+    let (status, wrong_case) = h.verb("node", json!({"id": "resolve", "repo": repo})).await;
+    assert_eq!(status, 404);
+    assert_eq!(wrong_case["error"]["kind"], "no_such_symbol");
+
     let human = h.yg_ok(&["node", "Resolve", "--repo", &repo]).await;
     assert!(human.contains("ambiguous symbol"), "{human}");
     assert!(
@@ -105,5 +109,50 @@ async fn fuzzy_symbols_resolve_uniquely_or_return_ranked_candidates() {
     assert!(
         human.contains("0.450000"),
         "confidence is rendered: {human}"
+    );
+}
+
+#[tokio::test]
+async fn fuzzy_ambiguity_caps_rendered_candidates_and_reports_the_exact_count() {
+    let files = (0..=yg_verbs::MAX_ADDRESS_CANDIDATES)
+        .map(|index| {
+            (
+                format!("pkg{index:02}/service.go"),
+                format!("package pkg{index:02}\n\nfunc Resolve() {{}}\n"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let file_refs = files
+        .iter()
+        .map(|(path, contents)| (path.as_str(), contents.as_str()))
+        .collect::<Vec<_>>();
+    let h = Harness::boot_with(&file_refs).await;
+    h.add_repo().await;
+    h.sync_and_index().await;
+    let repo = h.qualifier();
+
+    let ambiguous = h
+        .verb_ok("node", json!({"id": "Resolve", "repo": repo}))
+        .await;
+    let candidates = ambiguous["candidates"].as_array().expect("candidates");
+    let total_matches = yg_verbs::MAX_ADDRESS_CANDIDATES + 1;
+    assert_eq!(ambiguous["total_matches"], total_matches);
+    assert_eq!(candidates.len(), yg_verbs::MAX_ADDRESS_CANDIDATES);
+    let expected_confidence = yg_shard::SYNTACTIC_MATCH / total_matches as f64;
+    for pair in candidates.windows(2) {
+        assert!(pair[0]["id"].as_str() < pair[1]["id"].as_str());
+    }
+    for candidate in candidates {
+        let confidence = candidate["confidence"].as_f64().expect("confidence");
+        assert!((confidence - expected_confidence).abs() < 1e-9);
+    }
+
+    let human = h.yg_ok(&["node", "Resolve", "--repo", &repo]).await;
+    assert!(
+        human.contains(&format!(
+            "showing {} of {total_matches} matches",
+            yg_verbs::MAX_ADDRESS_CANDIDATES
+        )),
+        "{human}"
     );
 }

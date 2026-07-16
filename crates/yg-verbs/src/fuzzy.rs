@@ -1,8 +1,9 @@
 //! Fuzzy node addressing: parse a bare symbol name plus an explicit repo,
 //! resolve it through the indexed FTS segment, and make ambiguity legible
-//! using ADR 0006's spread-confidence convention.
+//! by borrowing the syntactic pass's ADR 0006 spread-confidence convention.
 
 use serde::{Deserialize, Serialize};
+use yg_shard::SYNTACTIC_MATCH;
 
 use crate::{RepoQualifier, ResponseNodeKind, SearchNodeName, SearchPath, VerbId};
 
@@ -10,6 +11,7 @@ use crate::{RepoQualifier, ResponseNodeKind, SearchNodeName, SearchPath, VerbId}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FuzzyNodeAddress {
+    /// Stored symbol name matched byte-for-byte and case-sensitively.
     pub name: SearchNodeName,
     pub repo: RepoQualifier,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -27,12 +29,15 @@ pub struct NodeCandidate {
 }
 
 /// A fuzzy address matched several declarations. Candidates are ordered by
-/// descending confidence and then canonical node id.
+/// descending confidence and then canonical node id, and may be a bounded
+/// prefix of the full match set.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AmbiguousNodeAddress {
     pub resolution: AmbiguousResolution,
     pub address: FuzzyNodeAddress,
+    /// Exact number of declarations matched before rendering was capped.
+    pub total_matches: usize,
     pub candidates: Vec<NodeCandidate>,
 }
 
@@ -54,6 +59,7 @@ pub struct NoSuchSymbol {
 #[serde(rename_all = "snake_case")]
 pub enum NoSuchSymbolKind {
     NoSuchSymbol,
+    UnaddressableSymbol,
 }
 
 /// A node-addressed Verb either resolved normally or returns the ranked set
@@ -71,6 +77,12 @@ pub(crate) enum NodeAddress {
     Fuzzy(FuzzyNodeAddress),
 }
 
+/// Maximum UTF-8 byte length accepted for a fuzzy symbol name.
+///
+/// This mirrors the lexical-search query guard and bounds tokenization work
+/// before a request can cause any Shard to be resolved or opened.
+pub(crate) const MAX_ADDRESS_NAME_BYTES: usize = 1024;
+
 pub(crate) fn parse_address(
     id: &str,
     repo: Option<RepoQualifier>,
@@ -85,6 +97,12 @@ pub(crate) fn parse_address(
     let name = id.trim();
     if name.is_empty() || name != id {
         return Err("a fuzzy node address needs a non-empty bare symbol name".to_string());
+    }
+    if name.len() > MAX_ADDRESS_NAME_BYTES {
+        return Err(format!(
+            "fuzzy symbol name is {} bytes; the limit is {MAX_ADDRESS_NAME_BYTES}",
+            name.len()
+        ));
     }
     let repo = repo
         .filter(|repo| !repo.as_str().is_empty())
@@ -105,7 +123,8 @@ pub(crate) fn parse_address(
     }))
 }
 
-const SYNTACTIC_MATCH: f64 = 0.9;
+/// Maximum number of ambiguous address candidates rendered on the wire.
+pub const MAX_ADDRESS_CANDIDATES: usize = 25;
 
 pub(crate) fn rank_candidates(
     address: &FuzzyNodeAddress,
@@ -125,6 +144,7 @@ pub(crate) fn rank_candidates(
         })
         .collect::<Vec<_>>();
     candidates.sort_unstable_by_key(|candidate| candidate.id.external());
+    candidates.truncate(MAX_ADDRESS_CANDIDATES);
     candidates
 }
 
@@ -163,6 +183,45 @@ mod tests {
     }
 
     #[test]
+    fn rendered_candidates_are_capped_without_changing_confidence() {
+        let address = FuzzyNodeAddress {
+            name: SearchNodeName::new("Resolve".to_string()),
+            repo: RepoQualifier::new("github.com/acme/widgets".to_string()),
+            path: None,
+        };
+        let symbols = (0..=MAX_ADDRESS_CANDIDATES)
+            .rev()
+            .map(|index| yg_shard::LocalSymbol {
+                node_id: yg_shard::LocalSymbolId::new(format!("sym:{index:02}.go#Resolve")),
+                path: yg_shard::LocalSymbolPath::new(format!("{index:02}.go")),
+            })
+            .collect::<Vec<_>>();
+
+        let candidates = rank_candidates(&address, symbols);
+
+        assert_eq!(candidates.len(), MAX_ADDRESS_CANDIDATES);
+        assert_eq!(
+            candidates.first().expect("first candidate").id.external(),
+            "sym:github.com/acme/widgets:00.go#Resolve"
+        );
+        assert_eq!(
+            candidates
+                .last()
+                .expect("last rendered candidate")
+                .id
+                .external(),
+            "sym:github.com/acme/widgets:24.go#Resolve"
+        );
+        let expected = SYNTACTIC_MATCH / (MAX_ADDRESS_CANDIDATES + 1) as f64;
+        assert!(
+            candidates
+                .iter()
+                .all(|candidate| (candidate.confidence - expected).abs() < 1e-9),
+            "confidence uses the exact match count, not the rendered cap"
+        );
+    }
+
+    #[test]
     fn exact_ids_win_before_fuzzy_parsing() {
         let address = parse_address("sym:github.com/acme/widgets:main.go#Hello", None, None)
             .expect("exact id parses");
@@ -198,11 +257,11 @@ mod tests {
         let ambiguous = AmbiguousNodeAddress {
             resolution: AmbiguousResolution::Ambiguous,
             address,
+            total_matches: 2,
             candidates: Vec::new(),
         };
-        assert_eq!(
-            serde_json::to_value(ambiguous).expect("ambiguity serializes")["resolution"],
-            "ambiguous"
-        );
+        let ambiguous = serde_json::to_value(ambiguous).expect("ambiguity serializes");
+        assert_eq!(ambiguous["resolution"], "ambiguous");
+        assert_eq!(ambiguous["total_matches"], 2);
     }
 }

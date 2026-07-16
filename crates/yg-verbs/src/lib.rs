@@ -50,8 +50,8 @@ pub use engine::{
     ResolvedFuzzyShard, ResolvedShard, ShardResolver, VerbError,
 };
 pub use fuzzy::{
-    AddressedResponse, AmbiguousNodeAddress, AmbiguousResolution, FuzzyNodeAddress, NoSuchSymbol,
-    NoSuchSymbolKind, NodeCandidate,
+    AddressedResponse, AmbiguousNodeAddress, AmbiguousResolution, FuzzyNodeAddress,
+    MAX_ADDRESS_CANDIDATES, NoSuchSymbol, NoSuchSymbolKind, NodeCandidate,
 };
 pub use metrics::Metrics;
 pub use search::{
@@ -199,7 +199,8 @@ fn insert_any_of(schema: &mut Value, value: Value) {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct NodeRequest {
-    /// Node id, e.g. sym:github.com/acme/widgets:main.go#Hello.
+    /// Node id, or a bare symbol name matched byte-for-byte and case-sensitively.
+    /// Bare names without a safely searchable term set are un-addressable.
     pub id: String,
     /// Repo qualifier when `id` is a bare symbol name.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -225,7 +226,9 @@ pub struct NeighborsRequest {
 /// filters, exactly as the client spelled them.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct TraversalShape {
-    /// Node id to traverse from.
+    /// Node id to traverse from, or a bare symbol name matched byte-for-byte
+    /// and case-sensitively. Bare names without a safely searchable term set are
+    /// un-addressable.
     pub id: String,
     /// Repo qualifier when `id` is a bare symbol name.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -268,7 +271,9 @@ pub struct SearchRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct HistoryRequest {
-    /// File or Symbol node id.
+    /// File or Symbol node id, or a bare symbol name matched byte-for-byte and
+    /// case-sensitively. Bare names without a safely searchable term set are
+    /// un-addressable.
     pub id: String,
     /// Repo qualifier when `id` is a bare symbol name.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1530,5 +1535,23 @@ mod tests {
             history["properties"]["limit"]["maximum"],
             json!(MAX_HISTORY_LIMIT)
         );
+    }
+
+    #[test]
+    fn node_address_schema_documents_exact_matching_and_zero_term_names() {
+        for verb in [Verb::Node, Verb::Neighbors, Verb::History] {
+            let schema = verb.tool().input_schema();
+            let description = schema["properties"]["id"]["description"]
+                .as_str()
+                .expect("node-address id has a description");
+            assert!(
+                description.contains("byte-for-byte")
+                    && description.contains("case-sensitively")
+                    && description.contains("safely searchable term set")
+                    && description.contains("un-addressable"),
+                "{} id docs are honest: {description}",
+                verb.label()
+            );
+        }
     }
 }

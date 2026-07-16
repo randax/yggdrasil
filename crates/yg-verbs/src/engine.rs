@@ -171,6 +171,14 @@ fn resolve_error(qualifier: &str, from_cursor: bool, e: ResolveError) -> VerbErr
     }
 }
 
+fn parse_node_address(
+    raw_id: &str,
+    repo: Option<RepoQualifier>,
+    path: Option<crate::SearchPath>,
+) -> Result<crate::fuzzy::NodeAddress, VerbError> {
+    crate::fuzzy::parse_address(raw_id, repo, path).map_err(VerbError::BadRequest)
+}
+
 /// The `neighbors` answer as every transport serves it: one page plus
 /// the opaque cursor.
 #[derive(Debug, Serialize, Deserialize)]
@@ -551,8 +559,7 @@ impl<R: ShardResolver + 'static> Engine<R> {
         path: Option<crate::SearchPath>,
         pinned: Option<String>,
     ) -> Result<ResolvedAddress, VerbError> {
-        let address =
-            crate::fuzzy::parse_address(&raw_id, repo, path).map_err(VerbError::BadRequest)?;
+        let address = parse_node_address(&raw_id, repo, path)?;
         let from_cursor = pinned.is_some();
         match address {
             crate::fuzzy::NodeAddress::Exact(id) => {
@@ -582,10 +589,24 @@ impl<R: ShardResolver + 'static> Engine<R> {
                     VerbError::Internal(
                         anyhow::Error::new(error).context("fuzzy resolution task panicked"),
                     )
-                })?
-                .map_err(VerbError::Internal)?;
+                })?;
+                let symbols = match symbols {
+                    Ok(symbols) => symbols,
+                    Err(error)
+                        if error
+                            .downcast_ref::<yg_shard::UnaddressableSymbolName>()
+                            .is_some() =>
+                    {
+                        return Err(VerbError::NoSuchSymbol(NoSuchSymbol {
+                            kind: NoSuchSymbolKind::UnaddressableSymbol,
+                            address,
+                        }));
+                    }
+                    Err(error) => return Err(VerbError::Internal(error)),
+                };
+                let total_matches = symbols.len();
                 let mut candidates = crate::fuzzy::rank_candidates(&address, symbols);
-                match candidates.len() {
+                match total_matches {
                     0 => Err(VerbError::NoSuchSymbol(NoSuchSymbol {
                         kind: NoSuchSymbolKind::NoSuchSymbol,
                         address,
@@ -600,6 +621,7 @@ impl<R: ShardResolver + 'static> Engine<R> {
                     _ => Ok(ResolvedAddress::Ambiguous(AmbiguousNodeAddress {
                         resolution: AmbiguousResolution::Ambiguous,
                         address,
+                        total_matches,
                         candidates,
                     })),
                 }
@@ -713,6 +735,25 @@ mod tests {
         assert!(matches!(
             resolve_error("q", false, ResolveError::NotIndexed),
             VerbError::NotFound(_)
+        ));
+    }
+
+    #[test]
+    fn overlong_fuzzy_names_are_typed_bad_requests() {
+        let outcome = parse_node_address(
+            &"a".repeat(crate::fuzzy::MAX_ADDRESS_NAME_BYTES + 1),
+            Some(RepoQualifier::new("github.com/acme/widgets".to_string())),
+            None,
+        );
+
+        assert!(matches!(
+            outcome,
+            Err(VerbError::BadRequest(message))
+                if message == format!(
+                    "fuzzy symbol name is {} bytes; the limit is {}",
+                    crate::fuzzy::MAX_ADDRESS_NAME_BYTES + 1,
+                    crate::fuzzy::MAX_ADDRESS_NAME_BYTES
+                )
         ));
     }
 }

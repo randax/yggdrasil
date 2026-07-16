@@ -11,6 +11,7 @@
 //! node ids feed straight into `node`/`neighbors`. Writer and reader share
 //! this one schema definition, so they cannot drift.
 
+use std::collections::HashSet;
 use std::io::Read;
 use std::path::Path;
 
@@ -99,6 +100,30 @@ impl LocalSymbolPath {
         &self.0
     }
 }
+
+/// A stored symbol name that cannot be safely addressed through searchable
+/// terms.
+///
+/// The raw display-name field is stored but not indexed, so resolving a name
+/// with no terms or too many distinct terms would require either scanning the
+/// Shard or constructing an excessive Boolean query.
+#[derive(Debug)]
+pub struct UnaddressableSymbolName;
+
+impl std::fmt::Display for UnaddressableSymbolName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the symbol name cannot be safely addressed through searchable terms")
+    }
+}
+
+impl std::error::Error for UnaddressableSymbolName {}
+
+/// Maximum number of distinct analyzed terms in one fuzzy symbol lookup.
+///
+/// Exact-name filtering happens only after Tantivy selects candidates, so
+/// bounding the Boolean query prevents a crafted name from producing an
+/// excessive number of MUST clauses.
+const MAX_SYMBOL_NAME_TERMS: usize = 64;
 
 /// File name of the full-text segment inside a Shard — the packed tantivy
 /// index, recorded under [`crate::Manifest::segments`] like the graph
@@ -578,9 +603,9 @@ pub fn search(index: &FtsIndex, params: &SearchParams) -> anyhow::Result<Vec<Loc
 /// Candidate discovery is index-backed and exhaustive: the terms generated
 /// by the FTS tokenizer select a finite document set, then the stored raw name
 /// is compared exactly so identifier sub-word matches never become fuzzy
-/// addresses. `DocSetCollector` deliberately has no top-N cutoff; truncating
-/// candidates could turn a genuinely ambiguous address into a false unique
-/// match.
+/// addresses. `DocSetCollector` deliberately has no top-N cutoff so callers
+/// retain the exact match count; the address response may cap only its rendered
+/// candidate list after observing that count.
 pub fn symbols_named(
     index: &FtsIndex,
     name: &str,
@@ -592,17 +617,30 @@ pub fn symbols_named(
         .get("default")
         .context("the FTS index has no default tokenizer")?;
     let mut stream = analyzer.token_stream(name);
-    let mut clauses = Vec::new();
+    let mut tokens = Vec::new();
+    let mut seen = HashSet::new();
     while stream.advance() {
-        let term = Term::from_field_text(index.fields.terms, &stream.token().text);
-        clauses.push((
-            Occur::Must,
-            Box::new(TermQuery::new(term, IndexRecordOption::Basic)) as Box<dyn Query>,
-        ));
+        let token = stream.token().text.clone();
+        if seen.insert(token.clone()) {
+            tokens.push(token);
+            if tokens.len() > MAX_SYMBOL_NAME_TERMS {
+                return Err(UnaddressableSymbolName.into());
+            }
+        }
     }
-    if clauses.is_empty() {
-        return Ok(Vec::new());
+    if tokens.is_empty() {
+        return Err(UnaddressableSymbolName.into());
     }
+    let mut clauses = tokens
+        .into_iter()
+        .map(|token| {
+            let term = Term::from_field_text(index.fields.terms, &token);
+            (
+                Occur::Must,
+                Box::new(TermQuery::new(term, IndexRecordOption::Basic)) as Box<dyn Query>,
+            )
+        })
+        .collect::<Vec<_>>();
     let symbol = Term::from_field_text(index.fields.kind, NodeKind::Symbol.as_str());
     clauses.push((
         Occur::Must,
@@ -701,8 +739,9 @@ impl std::error::Error for QueryMalformed {}
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_QUERY_BYTES, MAX_QUERY_DEPTH, SearchDoc, build_fts, guard_query_complexity,
-        identifier_words, open_fts, symbols_named, unpack_fts,
+        MAX_QUERY_BYTES, MAX_QUERY_DEPTH, MAX_SYMBOL_NAME_TERMS, SearchDoc,
+        UnaddressableSymbolName, build_fts, guard_query_complexity, identifier_words, open_fts,
+        symbols_named, unpack_fts,
     };
     use crate::NodeKind;
 
@@ -814,5 +853,63 @@ mod tests {
         assert_eq!(narrowed.len(), 1);
         assert_eq!(narrowed[0].node_id.as_str(), "sym:b/service.go#Resolve");
         assert!(symbols_named(&index, "Missing", None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn zero_term_symbol_names_are_distinct_from_absent_names() {
+        let bytes = build_fts(&[SearchDoc {
+            node_id: "sym:operators.go#::".to_string(),
+            kind: NodeKind::Symbol,
+            name: Some("::".to_string()),
+            path: Some("operators.go".to_string()),
+            content: String::new(),
+        }])
+        .expect("build fixture index");
+        let packed = tempfile::tempdir().expect("packed fixture dir");
+        unpack_fts(&bytes, packed.path()).expect("unpack fixture index");
+        let index = open_fts(packed.path()).expect("open fixture index");
+
+        let error = symbols_named(&index, "::", None)
+            .expect_err("a zero-term name is un-addressable, not absent");
+
+        assert!(error.downcast_ref::<UnaddressableSymbolName>().is_some());
+    }
+
+    #[test]
+    fn duplicate_name_tokens_still_resolve_exactly() {
+        let name = vec!["Resolve"; MAX_SYMBOL_NAME_TERMS + 1].join(" ");
+        let bytes = build_fts(&[SearchDoc {
+            node_id: "sym:service.go#ResolveResolve".to_string(),
+            kind: NodeKind::Symbol,
+            name: Some(name.clone()),
+            path: Some("service.go".to_string()),
+            content: String::new(),
+        }])
+        .expect("build fixture index");
+        let packed = tempfile::tempdir().expect("packed fixture dir");
+        unpack_fts(&bytes, packed.path()).expect("unpack fixture index");
+        let index = open_fts(packed.path()).expect("open fixture index");
+
+        let symbols = symbols_named(&index, &name, None).expect("lookup duplicate-token name");
+
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].node_id.as_str(), "sym:service.go#ResolveResolve");
+    }
+
+    #[test]
+    fn too_many_distinct_name_tokens_are_unaddressable() {
+        let bytes = build_fts(&[]).expect("build empty fixture index");
+        let packed = tempfile::tempdir().expect("packed fixture dir");
+        unpack_fts(&bytes, packed.path()).expect("unpack fixture index");
+        let index = open_fts(packed.path()).expect("open fixture index");
+        let name = (0..=MAX_SYMBOL_NAME_TERMS)
+            .map(|index| format!("token{index}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let error = symbols_named(&index, &name, None)
+            .expect_err("too many distinct tokens must be unaddressable");
+
+        assert!(error.downcast_ref::<UnaddressableSymbolName>().is_some());
     }
 }

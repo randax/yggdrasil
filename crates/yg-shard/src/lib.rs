@@ -22,8 +22,8 @@ mod fts;
 pub mod graph_schema;
 pub use fts::{
     FTS_SEGMENT_FILE, FtsIndex, LocalHit, LocalSymbol, LocalSymbolId, LocalSymbolPath,
-    QueryMalformed, SearchDoc, SearchParams, build_fts, open_fts, search, snippets_for,
-    symbols_named, unpack_fts,
+    QueryMalformed, SearchDoc, SearchParams, UnaddressableSymbolName, build_fts, open_fts, search,
+    snippets_for, symbols_named, unpack_fts,
 };
 
 /// Version of the Shard layout (graph tables + manifest shape). Part of
@@ -59,6 +59,12 @@ pub const SCHEMA_VERSION: u32 = 6;
 /// and the control plane's `provenance_level`. The precise pass (M1)
 /// adds its own.
 pub const SYNTACTIC_PASS: &str = "syntactic";
+
+/// Confidence ceiling for one heuristic syntactic name resolution.
+///
+/// ADR 0006 defines this value and its N-way spread for syntactic-pass
+/// edges. Fuzzy node addressing borrows the same convention.
+pub const SYNTACTIC_MATCH: f64 = 0.9;
 
 /// How a graph edge was derived (ADR 0002, CONTEXT.md). Carried by every
 /// edge from day one, even while only syntactic values exist.

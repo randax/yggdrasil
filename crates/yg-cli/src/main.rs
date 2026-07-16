@@ -6,6 +6,8 @@ mod deploy_config;
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 
+const NODE_ADDRESS_HELP: &str = "Exact node id, or a bare symbol name with --repo. Bare-name matching is byte-exact and case-sensitive; names without a safely searchable term set are un-addressable.";
+
 #[derive(Parser)]
 #[command(
     name = "yg",
@@ -40,7 +42,7 @@ enum Command {
     },
     /// Show one Knowledge Graph node with its edge summary
     Node {
-        #[arg(help = "Exact node id, or a bare symbol name with --repo")]
+        #[arg(help = NODE_ADDRESS_HELP)]
         id: String,
         /// Repo qualifier for a bare symbol name
         #[arg(long)]
@@ -54,7 +56,7 @@ enum Command {
     },
     /// Show a node's neighboring subgraph
     Neighbors {
-        #[arg(help = "Exact node id, or a bare symbol name with --repo")]
+        #[arg(help = NODE_ADDRESS_HELP)]
         id: String,
         /// Repo qualifier for a bare symbol name
         #[arg(long)]
@@ -104,7 +106,7 @@ enum Command {
     },
     /// Show the commits that touched a file (or a symbol's file), newest first
     History {
-        #[arg(help = "Exact node id, or a bare symbol name with --repo")]
+        #[arg(help = NODE_ADDRESS_HELP)]
         id: String,
         /// Repo qualifier for a bare symbol name
         #[arg(long)]
@@ -520,11 +522,18 @@ fn server_error_reason(text: &str) -> Option<String> {
     }
     let payload =
         serde_json::from_value::<yg_verbs::NoSuchSymbol>(body.get("error")?.clone()).ok()?;
-    let mut address = format!(
-        "no such symbol {:?} in {}",
-        payload.address.name.as_str(),
-        payload.address.repo.as_str()
-    );
+    let mut address = match payload.kind {
+        yg_verbs::NoSuchSymbolKind::NoSuchSymbol => format!(
+            "no such symbol {:?} in {}",
+            payload.address.name.as_str(),
+            payload.address.repo.as_str()
+        ),
+        yg_verbs::NoSuchSymbolKind::UnaddressableSymbol => format!(
+            "symbol name {:?} in {} is un-addressable because it has no safely searchable term set",
+            payload.address.name.as_str(),
+            payload.address.repo.as_str()
+        ),
+    };
     if let Some(path) = payload.address.path {
         address.push_str(&format!(" under path {:?}", path.as_str()));
     }
@@ -687,6 +696,13 @@ fn print_candidates(ambiguous: &yg_verbs::AmbiguousNodeAddress) {
         ambiguous.address.name.as_str(),
         ambiguous.address.repo.as_str()
     );
+    if ambiguous.candidates.len() < ambiguous.total_matches {
+        println!(
+            "showing {} of {} matches",
+            ambiguous.candidates.len(),
+            ambiguous.total_matches
+        );
+    }
     for candidate in &ambiguous.candidates {
         println!(
             "{:.6}  {}  {}  ({})",
@@ -1983,5 +1999,43 @@ mod shutdown_tests {
         assert_eq!(request.cause(), yg_sync::ShutdownCause::Failure);
         assert!(request.work_deadline() >= earliest_expected_deadline);
         assert!(request.work_deadline() <= latest_expected_deadline);
+    }
+}
+
+#[cfg(test)]
+mod address_tests {
+    use super::*;
+
+    #[test]
+    fn node_address_help_documents_matching_and_zero_term_names() {
+        for command in ["node", "neighbors", "history"] {
+            let error = match Cli::try_parse_from(["yg", command, "--help"]) {
+                Ok(_) => panic!("--help must exit through clap's display error"),
+                Err(error) => error,
+            };
+            let help = error.to_string();
+            assert!(help.contains("byte-exact"), "{command} help: {help}");
+            assert!(help.contains("case-sensitive"), "{command} help: {help}");
+            assert!(help.contains("un-addressable"), "{command} help: {help}");
+        }
+    }
+
+    #[test]
+    fn zero_term_symbol_404_is_not_reported_as_absent() {
+        let body = serde_json::json!({
+            "error": {
+                "kind": "unaddressable_symbol",
+                "address": {
+                    "name": "::",
+                    "repo": "github.com/acme/widgets"
+                }
+            }
+        });
+
+        let reason = server_error_reason(&body.to_string()).expect("typed error is rendered");
+
+        assert!(reason.contains("un-addressable"), "{reason}");
+        assert!(reason.contains("no safely searchable term set"), "{reason}");
+        assert!(!reason.contains("no such symbol"), "{reason}");
     }
 }
