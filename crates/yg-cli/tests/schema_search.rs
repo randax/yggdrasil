@@ -120,24 +120,39 @@ async fn schema_v7_searches_code_paths_and_normalizes_cross_repo_rank() {
         (scores[2] - scores[3]).abs() <= tier_two_max * 0.05,
         "the second relevance tier is comparable within 5% across corpus sizes: {body}"
     );
-    let mut repo_order = [small.as_str(), large.as_str()];
-    repo_order.sort_unstable();
-    let expected = ["rank/strong.txt", "rank/good.txt"]
-        .into_iter()
-        .flat_map(|path| repo_order.iter().map(move |repo| (*repo, path)))
-        .collect::<Vec<_>>();
-    let actual = ranking_hits
-        .iter()
-        .map(|hit| {
-            (
-                hit["repo"].as_str().expect("hit repo"),
-                hit["path"].as_str().expect("hit path"),
-            )
-        })
-        .collect::<Vec<_>>();
+    // Within a tier, cross-repo order rides on sub-percent score noise
+    // (and the random tmp-path repo keys), so assert tiers as sets: both
+    // strong hits precede both good hits, each tier covering both repos.
+    let tier = |slice: &[serde_json::Value]| {
+        let mut pairs = slice
+            .iter()
+            .map(|hit| {
+                (
+                    hit["repo"].as_str().expect("hit repo").to_string(),
+                    hit["path"].as_str().expect("hit path").to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        pairs.sort_unstable();
+        pairs
+    };
+    let mut expected_tier = |path: &str| {
+        let mut pairs = vec![
+            (small.clone(), path.to_string()),
+            (large.clone(), path.to_string()),
+        ];
+        pairs.sort_unstable();
+        pairs
+    };
     assert_eq!(
-        actual, expected,
-        "relevance tiers interleave repositories before the next tier"
+        tier(&ranking_hits[..2]),
+        expected_tier("rank/strong.txt"),
+        "the strong tier covers both repositories first"
+    );
+    assert_eq!(
+        tier(&ranking_hits[2..4]),
+        expected_tier("rank/good.txt"),
+        "the good tier follows with both repositories"
     );
 
     let body = await_repo_hits(&base, "rate limit", &[&feature]).await;
