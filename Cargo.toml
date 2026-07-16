@@ -12,3 +12,4 @@ rust-version = "1.96"
 
 [workspace.dependencies]
 prometheus-client = "0.23.1"
+url = "2.5.8"

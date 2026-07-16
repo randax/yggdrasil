@@ -57,6 +57,11 @@ impl ForgeBaseUrl {
         Self(value)
     }
 
+    /// Convert the validated control-plane value to its unchanged wire form.
+    pub fn from_domain(value: yg_control::ForgeUrl) -> Self {
+        Self(value.into_string())
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }

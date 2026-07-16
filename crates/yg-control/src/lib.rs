@@ -12,6 +12,182 @@ use sqlx::postgres::PgPoolOptions;
 /// the in-repo dev compose stack.
 pub const DEFAULT_DATABASE_URL: &str = "postgres://yggdrasil:yggdrasil@localhost:5432/yggdrasil";
 
+/// A validated absolute URL identifying a Forge clone root or API root.
+///
+/// Validation uses [`url::Url`], while this value retains the input spelling.
+/// That distinction is intentional: Forge URLs are database keys and appear on
+/// the administrative wire surface, so parsing must not add a trailing slash,
+/// lowercase a host, or otherwise change previously stored bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ForgeUrl(String);
+
+impl ForgeUrl {
+    /// Validate an absolute URL without changing its representation.
+    pub fn parse(value: impl Into<String>) -> Result<Self, ForgeUrlParseError> {
+        let value = value.into();
+        let parsed = url::Url::parse(&value).map_err(|source| ForgeUrlParseError {
+            value: value.clone(),
+            reason: ForgeUrlParseReason::Parser(source),
+        })?;
+        let scheme = value.split_once("://").map(|(scheme, _)| scheme);
+        let hierarchical = scheme.is_some_and(|scheme| {
+            !scheme.is_empty()
+                && scheme.bytes().enumerate().all(|(index, byte)| {
+                    byte.is_ascii_alphabetic()
+                        || (index > 0
+                            && (byte.is_ascii_digit() || matches!(byte, b'+' | b'-' | b'.')))
+                })
+        });
+        if !hierarchical || parsed.cannot_be_a_base() {
+            return Err(ForgeUrlParseError {
+                value,
+                reason: ForgeUrlParseReason::Syntax(
+                    "forge URLs must use an absolute hierarchical scheme such as https:// or file://",
+                ),
+            });
+        }
+        if value
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control())
+            || value.contains('\\')
+        {
+            return Err(ForgeUrlParseError {
+                value,
+                reason: ForgeUrlParseReason::Syntax(
+                    "forge URLs must not contain whitespace or backslashes",
+                ),
+            });
+        }
+        // Workers append repository slugs textually, so a query or
+        // fragment on the root would smuggle itself into every derived
+        // clone and API URL.
+        if parsed.query().is_some() || parsed.fragment().is_some() {
+            return Err(ForgeUrlParseError {
+                value,
+                reason: ForgeUrlParseReason::Syntax(
+                    "forge URLs must not carry a query or fragment",
+                ),
+            });
+        }
+        // Credentials belong in Forge token records, never persisted
+        // inside a stored URL where they would propagate into derived
+        // clone URLs, logs, and metrics labels.
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            return Err(ForgeUrlParseError {
+                value,
+                reason: ForgeUrlParseReason::Syntax("forge URLs must not embed credentials"),
+            });
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl TryFrom<String> for ForgeUrl {
+    type Error = ForgeUrlParseError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::parse(value)
+    }
+}
+
+impl AsRef<str> for ForgeUrl {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl std::ops::Deref for ForgeUrl {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_str()
+    }
+}
+
+impl PartialEq<&str> for ForgeUrl {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
+impl std::fmt::Display for ForgeUrl {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl From<ForgeUrl> for String {
+    fn from(value: ForgeUrl) -> Self {
+        value.into_string()
+    }
+}
+
+/// An untyped URL rejected while entering or leaving the control plane.
+#[derive(Debug)]
+pub struct ForgeUrlParseError {
+    value: String,
+    reason: ForgeUrlParseReason,
+}
+
+#[derive(Debug)]
+enum ForgeUrlParseReason {
+    Parser(url::ParseError),
+    Syntax(&'static str),
+}
+
+impl std::fmt::Display for ForgeUrlParseReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Parser(source) => source.fmt(formatter),
+            Self::Syntax(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::fmt::Display for ForgeUrlParseError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "invalid absolute forge URL {:?}: {}",
+            self.value, self.reason
+        )
+    }
+}
+
+impl std::error::Error for ForgeUrlParseError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match &self.reason {
+            ForgeUrlParseReason::Parser(source) => Some(source),
+            ForgeUrlParseReason::Syntax(_) => None,
+        }
+    }
+}
+
+impl sqlx::Type<sqlx::Postgres> for ForgeUrl {
+    fn type_info() -> sqlx::postgres::PgTypeInfo {
+        <String as sqlx::Type<sqlx::Postgres>>::type_info()
+    }
+
+    fn compatible(ty: &sqlx::postgres::PgTypeInfo) -> bool {
+        <String as sqlx::Type<sqlx::Postgres>>::compatible(ty)
+    }
+}
+
+impl<'row> sqlx::Decode<'row, sqlx::Postgres> for ForgeUrl {
+    fn decode(value: sqlx::postgres::PgValueRef<'row>) -> Result<Self, sqlx::error::BoxDynError> {
+        let value = <String as sqlx::Decode<sqlx::Postgres>>::decode(value)?;
+        Ok(Self::try_from(value)?)
+    }
+}
+
 /// Handle to the control-plane database. The single entry point for
 /// everything the Index Server keeps in Postgres. Clones share one pool.
 #[derive(Clone)]
@@ -103,6 +279,18 @@ pub struct AddRepo<'a> {
     pub poll_interval_seconds: Option<i32>,
 }
 
+/// A repository registration whose URL values were validated by its input
+/// boundary and can flow directly to storage.
+pub struct ValidatedAddRepo<'a> {
+    pub forge_kind: &'a str,
+    pub base_url: &'a ForgeUrl,
+    pub token_env: Option<&'a str>,
+    pub api_root: Option<&'a ForgeUrl>,
+    pub slug: &'a str,
+    pub fetch_depth: Option<i32>,
+    pub poll_interval_seconds: Option<i32>,
+}
+
 pub struct AddRepoOutcome {
     pub repo_id: i64,
     /// False when the repo was already registered (idempotent re-add).
@@ -125,6 +313,15 @@ pub struct ConnectForgeOrg<'a> {
     /// REST API root the forge's discovery listing calls — e.g.
     /// `https://api.github.com`, or a test fixture server.
     pub api_root: Option<&'a str>,
+}
+
+/// A Forge connection whose URL values were validated by its input boundary.
+pub struct ValidatedConnectForgeOrg<'a> {
+    pub forge_kind: &'a str,
+    pub base_url: &'a ForgeUrl,
+    pub org_slug: &'a str,
+    pub token_env: Option<&'a str>,
+    pub api_root: Option<&'a ForgeUrl>,
 }
 
 pub struct ConnectForgeOrgOutcome {
@@ -155,10 +352,10 @@ pub struct DueDiscovery {
     /// Maximum Forge requests per minute for this worker process.
     pub rate_budget: i32,
     pub forge_kind: String,
-    pub base_url: String,
+    pub base_url: ForgeUrl,
     /// REST API root from the Forge record; `None` when the record
     /// predates the field (re-adding the forge backfills it).
-    pub api_root: Option<String>,
+    pub api_root: Option<ForgeUrl>,
     pub org_slug: String,
     pub token_env: Option<String>,
 }
@@ -287,7 +484,7 @@ pub fn member_token_id_is_valid(id: &str) -> bool {
 
 #[derive(Debug, sqlx::FromRow)]
 pub struct DiscoveryRule {
-    pub forge: String,
+    pub forge: ForgeUrl,
     pub pattern: String,
     pub action: String,
     pub applies_to_private: bool,
@@ -307,7 +504,7 @@ pub struct LeasedFetch {
     /// Forge kind, e.g. `github` — selects the worker's forge adapter.
     pub forge_kind: String,
     /// Forge root; the clone URL is `{base_url}/{slug}`.
-    pub base_url: String,
+    pub base_url: ForgeUrl,
     /// Env var holding the Forge token, if the forge has one.
     pub token_env: Option<String>,
     /// Opaque fencing token for this claim. `complete_fetch`/`fail_fetch`
@@ -357,7 +554,7 @@ pub struct LeasedIndex {
     /// Forge kind, e.g. `github` — selects the worker's forge adapter.
     pub forge_kind: String,
     /// Forge root; the clone URL is `{base_url}/{slug}`.
-    pub base_url: String,
+    pub base_url: ForgeUrl,
     /// Env var holding the Forge token, if the forge has one.
     pub token_env: Option<String>,
     /// Shallow-clone override; `None` = full history.
@@ -460,7 +657,7 @@ pub struct DuePoll {
     /// Forge kind, e.g. `github` — selects the worker's forge adapter.
     pub forge_kind: String,
     /// Forge root; the clone URL is `{base_url}/{slug}`.
-    pub base_url: String,
+    pub base_url: ForgeUrl,
     /// Env var holding the Forge token, if the forge has one.
     pub token_env: Option<String>,
     /// Shallow-clone override; `None` = full history.
@@ -493,7 +690,7 @@ pub struct SupersededShard {
 pub struct RepoSyncStatus {
     pub slug: String,
     /// The forge's base URL.
-    pub forge: String,
+    pub forge: ForgeUrl,
     pub visibility: RepoVisibility,
     pub discovery_state: String,
     pub last_synced_commit: Option<String>,
@@ -623,6 +820,28 @@ impl ControlPlane {
     /// changes nothing but its depth override (and re-queues a fetch if
     /// none is pending).
     pub async fn add_repo(&self, repo: AddRepo<'_>) -> anyhow::Result<AddRepoOutcome> {
+        // Direct control-plane callers are also an input boundary. The API
+        // validates earlier so it can return 400; this check prevents another
+        // caller from persisting a value that later claims cannot decode.
+        let base_url = ForgeUrl::parse(repo.base_url)?;
+        let api_root = repo.api_root.map(ForgeUrl::parse).transpose()?;
+        self.add_validated_repo(ValidatedAddRepo {
+            forge_kind: repo.forge_kind,
+            base_url: &base_url,
+            token_env: repo.token_env,
+            api_root: api_root.as_ref(),
+            slug: repo.slug,
+            fetch_depth: repo.fetch_depth,
+            poll_interval_seconds: repo.poll_interval_seconds,
+        })
+        .await
+    }
+
+    /// Register a repository after its input boundary has validated its URLs.
+    pub async fn add_validated_repo(
+        &self,
+        repo: ValidatedAddRepo<'_>,
+    ) -> anyhow::Result<AddRepoOutcome> {
         let mut tx = self.pool.begin().await?;
         // DO UPDATE (rather than DO NOTHING) so RETURNING yields the id
         // on conflict too. The existing kind always wins: the URL
@@ -641,9 +860,9 @@ impl ControlPlane {
              RETURNING id",
         )
         .bind(repo.forge_kind)
-        .bind(repo.base_url)
+        .bind(repo.base_url.as_str())
         .bind(repo.token_env)
-        .bind(repo.api_root)
+        .bind(repo.api_root.map(ForgeUrl::as_str))
         .fetch_one(&mut *tx)
         .await?;
         put_rule_newest(&mut tx, forge_id, repo.slug, RuleAction::Include, true).await?;
@@ -651,7 +870,7 @@ impl ControlPlane {
         // existing row. The qualifier is deterministic from (base_url,
         // slug), so the upsert never changes it; a unique violation on
         // it means the same qualifier arrived via a different forge row.
-        let qualifier = repo_qualifier(repo.base_url, repo.slug);
+        let qualifier = repo_qualifier(repo.base_url.as_str(), repo.slug);
         let inserted: Result<(i64, bool), sqlx::Error> = sqlx::query_as(
             "INSERT INTO repos (forge_id, slug, fetch_depth, qualifier, poll_interval_seconds)
              VALUES ($1, $2, $3, $4, $5)
@@ -706,6 +925,23 @@ impl ControlPlane {
         &self,
         org: ConnectForgeOrg<'_>,
     ) -> anyhow::Result<ConnectForgeOrgOutcome> {
+        let base_url = ForgeUrl::parse(org.base_url)?;
+        let api_root = org.api_root.map(ForgeUrl::parse).transpose()?;
+        self.connect_validated_forge_org(ValidatedConnectForgeOrg {
+            forge_kind: org.forge_kind,
+            base_url: &base_url,
+            org_slug: org.org_slug,
+            token_env: org.token_env,
+            api_root: api_root.as_ref(),
+        })
+        .await
+    }
+
+    /// Connect a Forge org after its input boundary has validated its URLs.
+    pub async fn connect_validated_forge_org(
+        &self,
+        org: ValidatedConnectForgeOrg<'_>,
+    ) -> anyhow::Result<ConnectForgeOrgOutcome> {
         let mut tx = self.pool.begin().await?;
         let (forge_id, forge_kind): (i64, String) = sqlx::query_as(
             "INSERT INTO forges (kind, base_url, token_env, api_root) VALUES ($1, $2, $3, $4)
@@ -716,9 +952,9 @@ impl ControlPlane {
              RETURNING id, kind",
         )
         .bind(org.forge_kind)
-        .bind(org.base_url)
+        .bind(org.base_url.as_str())
         .bind(org.token_env)
-        .bind(org.api_root)
+        .bind(org.api_root.map(ForgeUrl::as_str))
         .fetch_one(&mut *tx)
         .await?;
         let (org_id, created): (i64, bool) = sqlx::query_as(
@@ -749,6 +985,7 @@ impl ControlPlane {
         &self,
         interval: std::time::Duration,
     ) -> anyhow::Result<Option<DueDiscovery>> {
+        let mut tx = self.pool.begin().await?;
         let row = sqlx::query_as(
             "WITH due AS (
                  SELECT id FROM forge_orgs
@@ -767,8 +1004,9 @@ impl ControlPlane {
                        coalesce(o.token_env, f.token_env) AS token_env",
         )
         .bind(interval.as_secs_f64())
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(row)
     }
 
@@ -782,7 +1020,7 @@ impl ControlPlane {
         repos: &[DiscoveredRepo<'_>],
     ) -> anyhow::Result<u64> {
         let mut tx = self.pool.begin().await?;
-        let (forge_id, base_url): (i64, String) = sqlx::query_as(
+        let (forge_id, base_url): (i64, ForgeUrl) = sqlx::query_as(
             "SELECT f.id, f.base_url
              FROM forge_orgs o JOIN forges f ON f.id = o.forge_id
              WHERE o.id = $1
@@ -795,7 +1033,7 @@ impl ControlPlane {
         let mut fetches_queued = 0;
         for repo in repos {
             let state = discovery_state_for(repo.slug, repo.visibility, &rules);
-            let qualifier = repo_qualifier(&base_url, repo.slug);
+            let qualifier = repo_qualifier(base_url.as_str(), repo.slug);
             let existing: Option<(i64, String)> = sqlx::query_as(
                 "SELECT id, discovery_state
                  FROM repos
@@ -1148,10 +1386,12 @@ impl ControlPlane {
             "",
             "r.slug, r.fetch_depth, f.kind AS forge_kind, f.base_url, f.token_env",
         ));
+        let mut tx = self.pool.begin().await?;
         let row: Option<LeasedFetch> = sqlx::query_as(sql)
             .bind(lease.as_secs_f64())
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *tx)
             .await?;
+        tx.commit().await?;
         if let Some(job) = &row {
             self.metrics
                 .observe_claim_latency(JobKind::Fetch, job.claim_latency_seconds);
@@ -1293,6 +1533,7 @@ impl ControlPlane {
         default_interval: std::time::Duration,
         jitter_fraction: f64,
     ) -> anyhow::Result<Option<DuePoll>> {
+        let mut tx = self.pool.begin().await?;
         let row = sqlx::query_as(
             "WITH due AS (
                  SELECT r.id,
@@ -1320,8 +1561,9 @@ impl ControlPlane {
         )
         .bind(default_interval.as_secs_f64())
         .bind(jitter_fraction)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(row)
     }
 
@@ -1378,10 +1620,12 @@ impl ControlPlane {
             "r.slug, r.last_synced_commit AS commit,
              f.kind AS forge_kind, f.base_url, f.token_env, r.fetch_depth",
         ));
+        let mut tx = self.pool.begin().await?;
         let row: Option<LeasedIndex> = sqlx::query_as(sql)
             .bind(lease.as_secs_f64())
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *tx)
             .await?;
+        tx.commit().await?;
         if let Some(job) = &row {
             self.metrics
                 .observe_claim_latency(JobKind::Index, job.claim_latency_seconds);
@@ -2052,13 +2296,60 @@ async fn settle_leased_job(
 #[cfg(test)]
 mod tests {
     use super::{
-        JobKind, REPO_QUALIFIER_SQL, RepoVisibility, RuleRow, SUPERSEDED_SHARDS_PAST_GRACE_QUERY,
-        SUPERSEDED_SHARDS_PAST_GRACE_SQL, ShardState, discovery_state_for, glob_matches,
-        member_token_id_is_valid, repo_qualifier, shard_accepts_publication,
+        ForgeUrl, JobKind, REPO_QUALIFIER_SQL, RepoVisibility, RuleRow,
+        SUPERSEDED_SHARDS_PAST_GRACE_QUERY, SUPERSEDED_SHARDS_PAST_GRACE_SQL, ShardState,
+        discovery_state_for, glob_matches, member_token_id_is_valid, repo_qualifier,
+        shard_accepts_publication,
     };
 
     const HYGIENE_MIGRATION: &str = include_str!("../migrations/0011_job_queue_hygiene.sql");
     const SHARD_STATE_MIGRATION: &str = include_str!("../migrations/0013_shard_reclaiming.sql");
+
+    #[test]
+    fn forge_urls_accept_the_forms_persisted_by_registration_and_fixtures() {
+        for value in [
+            "https://github.com",
+            "HTTPS://Mixed.Case",
+            "http://git.corp.example:8443",
+            "https://github.enterprise.example/api/v3",
+            "file:///tmp/fixtures",
+            "file:///",
+        ] {
+            let parsed = ForgeUrl::parse(value).expect("fixture URL should be valid");
+            assert_eq!(
+                parsed.as_str(),
+                value,
+                "the stored spelling must be retained"
+            );
+            assert_eq!(
+                parsed.to_string(),
+                value,
+                "the wire spelling must be retained"
+            );
+        }
+    }
+
+    #[test]
+    fn forge_urls_reject_untyped_or_malformed_roots() {
+        for value in [
+            "",
+            "git.example.com",
+            "://no-scheme-root",
+            "https://host:bad",
+            "https:example.com",
+            "https:\\example.com",
+            "https://example.com\n",
+            "https://exa\tmple.com",
+            "ssh:git@host/repo",
+            "https://git.example?mirror=1",
+            "https://git.example#frag",
+            "https://token@git.example",
+            "https://user:pass@git.example",
+        ] {
+            let error = ForgeUrl::parse(value).expect_err("malformed URL must be rejected");
+            assert!(error.to_string().contains("invalid absolute forge URL"));
+        }
+    }
 
     /// One direction of the single-sourced qualifier grammar: the SQL
     /// rendering the migration re-derives with is the constant the e2e

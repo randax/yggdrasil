@@ -382,7 +382,7 @@ impl IndexWorker {
         if commit_available(&mirror, commit).await {
             return Ok(mirror);
         }
-        let clone_url = yg_sync::join_clone_url(&job.base_url, &job.slug);
+        let clone_url = yg_sync::join_clone_url(job.base_url.as_str(), &job.slug);
         tracing::info!(slug = %job.slug, "local mirror lacks the commit; fetching");
         let forge = yg_sync::forge::builtin().for_kind(&job.forge_kind);
         let auth = yg_sync::forge_token(job.token_env.as_deref(), &clone_url)
