@@ -50,6 +50,8 @@ pub struct DeployConfig {
     pub discovery_interval: Duration,
     pub gc_grace: Duration,
     pub gc_interval: Duration,
+    /// Cadence for scanning object storage for rowless Shard prefixes.
+    pub orphan_reconcile_interval: Duration,
     /// How long a terminal job row is kept before the GC cadence
     /// removes it — retention only bounds queue-table growth; nothing
     /// reads terminal rows (`yg admin status` already excludes them).
@@ -267,6 +269,11 @@ pub fn resolve(role: Role, lookup: impl Fn(&str) -> Option<String>) -> Resolutio
         discovery_interval: r.worker_duration(worker, "YG_DISCOVERY_INTERVAL", 60 * 60),
         gc_grace: r.worker_duration(worker, "YG_GC_GRACE", 60 * 60),
         gc_interval: r.worker_duration(worker, "YG_GC_INTERVAL", 10 * 60),
+        orphan_reconcile_interval: r.worker_duration(
+            worker,
+            "YG_ORPHAN_RECONCILE_INTERVAL",
+            60 * 60,
+        ),
         job_retention: r.worker_duration(worker, "YG_JOB_RETENTION", 7 * 24 * 3600),
     };
     Resolution {
@@ -618,6 +625,10 @@ mod tests {
         assert_eq!(config.discovery_interval, Duration::from_secs(60 * 60));
         assert_eq!(config.gc_grace, Duration::from_secs(60 * 60));
         assert_eq!(config.gc_interval, Duration::from_secs(10 * 60));
+        assert_eq!(
+            config.orphan_reconcile_interval,
+            Duration::from_secs(60 * 60)
+        );
         assert_eq!(config.job_retention, Duration::from_secs(7 * 24 * 3600));
     }
 
@@ -642,6 +653,7 @@ mod tests {
                 ("YG_DISCOVERY_INTERVAL", "120"),
                 ("YG_GC_GRACE", "10"),
                 ("YG_GC_INTERVAL", "5"),
+                ("YG_ORPHAN_RECONCILE_INTERVAL", "15"),
                 ("YG_JOB_RETENTION", "86400"),
             ]),
         )
@@ -667,6 +679,7 @@ mod tests {
         assert_eq!(config.discovery_interval, Duration::from_secs(120));
         assert_eq!(config.gc_grace, Duration::from_secs(10));
         assert_eq!(config.gc_interval, Duration::from_secs(5));
+        assert_eq!(config.orphan_reconcile_interval, Duration::from_secs(15));
         assert_eq!(config.job_retention, Duration::from_secs(86400));
     }
 
@@ -794,6 +807,7 @@ mod tests {
                 ("YG_POLL_INTERVAL", "soon"),
                 ("YG_GC_GRACE", "0"),
                 ("YG_GC_INTERVAL", "99999999999999999999"),
+                ("YG_ORPHAN_RECONCILE_INTERVAL", "never"),
                 ("YG_SHARD_CACHE_MAX_BYTES", "0"),
             ]),
         );
@@ -816,7 +830,8 @@ mod tests {
                 "YG_SHARD_CACHE_MAX_BYTES",
                 "YG_POLL_INTERVAL",
                 "YG_GC_GRACE",
-                "YG_GC_INTERVAL"
+                "YG_GC_INTERVAL",
+                "YG_ORPHAN_RECONCILE_INTERVAL"
             ]
         );
         let message = format!("{:#}", resolution.into_config().unwrap_err());
@@ -1012,6 +1027,7 @@ mod tests {
                 "YG_DISCOVERY_INTERVAL",
                 "YG_GC_GRACE",
                 "YG_GC_INTERVAL",
+                "YG_ORPHAN_RECONCILE_INTERVAL",
                 "YG_JOB_RETENTION"
             ]
         );

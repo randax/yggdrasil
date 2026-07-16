@@ -968,10 +968,7 @@ impl ControlPlane {
         repo_id: i64,
         revision: &str,
     ) -> anyhow::Result<ShardOperationGuard> {
-        use sha2::Digest;
-
-        let digest = sha2::Sha256::digest(format!("{repo_id}\0{revision}").as_bytes());
-        let key = i64::from_be_bytes(digest[..8].try_into().expect("sha256 has eight bytes"));
+        let key = shard_operation_key(repo_id, revision);
         let connection = self.pool.acquire().await?;
         // A cancelled waiter must close its session: Postgres may grant a
         // blocking advisory-lock request just as the Rust future drops.
@@ -991,6 +988,42 @@ impl ControlPlane {
             )
             .await?;
         Ok(operation)
+    }
+
+    /// Try to own one Shard revision's object/control-plane transition
+    /// without waiting. Reconcilers use this to avoid racing or delaying a
+    /// publisher: a held lock is ordinary concurrent work and is skipped
+    /// until a later sweep.
+    pub async fn try_lock_shard_operation(
+        &self,
+        repo_id: i64,
+        revision: &str,
+    ) -> anyhow::Result<Option<ShardOperationGuard>> {
+        let key = shard_operation_key(repo_id, revision);
+        let connection = self.pool.acquire().await?;
+        // As with the blocking lock, a query error must close this session:
+        // the server may have acquired the advisory lock before the client
+        // observed the failure.
+        let mut operation = ShardOperationGuard {
+            connection: Some(connection),
+            key,
+        };
+        let acquired = sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock($1)")
+            .bind(key)
+            .fetch_one(
+                &mut **operation
+                    .connection
+                    .as_mut()
+                    .expect("Shard operation guard owns its connection"),
+            )
+            .await?;
+        if acquired {
+            Ok(Some(operation))
+        } else {
+            // No lock is held, so return this healthy session to the pool.
+            drop(operation.connection.take());
+            Ok(None)
+        }
     }
 
     /// State of a deterministic Shard revision. Callers coordinating
@@ -1032,13 +1065,14 @@ impl ControlPlane {
     ) -> anyhow::Result<Self> {
         // Sizing invariant: shard-operation guards each pin one dedicated
         // connection while the same task acquires a second, transient one
-        // for coordinated SQL (index publish + GC reclaim: four worst
-        // case), and a discovery sweep holds its coordination transaction
-        // plus one per-repo transaction (two more). Six concurrent holds
-        // worst case, plus headroom for the transient poll/fetch loops.
+        // for coordinated SQL (index publish + superseded GC + orphan
+        // reconciliation: six worst case), and a discovery sweep holds its
+        // coordination transaction plus one per-repo transaction (two more).
+        // Eight concurrent holds worst case, plus one connection each for
+        // the transient poll and fetch loops — the fit is exact, not slack.
         // Raising worker concurrency requires raising this bound with it.
         let pool = PgPoolOptions::new()
-            .max_connections(8)
+            .max_connections(10)
             .connect(database_url)
             .await
             .context("connecting to control-plane Postgres")?;
@@ -2545,6 +2579,13 @@ impl ControlPlane {
         sqlx::query("SELECT 1").execute(&self.pool).await?;
         Ok(())
     }
+}
+
+fn shard_operation_key(repo_id: i64, revision: &str) -> i64 {
+    use sha2::Digest;
+
+    let digest = sha2::Sha256::digest(format!("{repo_id}\0{revision}").as_bytes());
+    i64::from_be_bytes(digest[..8].try_into().expect("sha256 has eight bytes"))
 }
 
 fn random_hex(bytes: usize) -> anyhow::Result<String> {

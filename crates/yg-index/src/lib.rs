@@ -4,6 +4,7 @@ mod commit;
 mod gc;
 mod history;
 mod pass;
+mod reconcile;
 mod resolve;
 mod worker;
 
