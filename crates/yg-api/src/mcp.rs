@@ -187,7 +187,15 @@ fn readable_request_id(id: Option<&serde_json::Value>) -> serde_json::Value {
 }
 
 fn is_valid_request_id(id: &serde_json::Value) -> bool {
-    id.is_string() || id.as_i64().is_some() || id.as_u64().is_some()
+    // JSON-RPC allows string and number ids; a client may serialize an
+    // integral id as `1.0` or `1e3`, so integrality is judged on the
+    // parsed value, not serde_json's internal representation.
+    id.is_string()
+        || id.as_i64().is_some()
+        || id.as_u64().is_some()
+        || id
+            .as_f64()
+            .is_some_and(|id| id.fract() == 0.0 && id.is_finite())
 }
 
 fn protocol_error(id: serde_json::Value, error: McpProtocolError) -> serde_json::Value {
@@ -375,6 +383,16 @@ impl From<yg_verbs::VerbError> for McpVerbError {
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+
+    #[test]
+    fn integral_request_ids_are_valid_regardless_of_number_encoding() {
+        for id in [json!(1), json!(1.0), json!(1e3), json!("abc")] {
+            assert!(super::is_valid_request_id(&id), "{id} is a valid id");
+        }
+        for id in [json!(1.5), json!(true), json!(null), json!([1])] {
+            assert!(!super::is_valid_request_id(&id), "{id} is not a valid id");
+        }
+    }
 
     #[test]
     fn mcp_origin_must_match_host_when_present() {

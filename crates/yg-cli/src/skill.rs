@@ -48,13 +48,21 @@ pub(crate) fn warn_if_contract_mismatches(server: VerbContractVersion) {
             return;
         }
     };
+    // `yg skill install` always stamps this binary's contract version, so
+    // reinstalling only helps when the CLI already agrees with the server;
+    // otherwise the CLI (or server) itself is what needs updating.
+    let remediation = if yg_verbs::status::VERB_CONTRACT_VERSION == server {
+        "run `yg skill install` to update it"
+    } else {
+        "this yg binary speaks a different Verb contract than the server — update the CLI or the server so they match, then run `yg skill install`"
+    };
     match stamped_contract_version(&document) {
         Ok(installed) if installed == server => {}
         Ok(installed) => eprintln!(
-            "warning: installed {SKILL_NAME} Skill uses Verb contract {installed}, but the server uses {server}; run `yg skill install` to update it"
+            "warning: installed {SKILL_NAME} Skill uses Verb contract {installed}, but the server uses {server}; {remediation}"
         ),
         Err(error) => eprintln!(
-            "warning: installed {SKILL_NAME} Skill has no valid Verb contract stamp ({error}); run `yg skill install` to update it"
+            "warning: installed {SKILL_NAME} Skill has no valid Verb contract stamp ({error}); {remediation}"
         ),
     }
 }
