@@ -10,6 +10,7 @@ use prometheus_client::registry::Registry;
 const CACHE_HITS: &str = "yggdrasil_shard_cache_hits";
 const CACHE_MISSES: &str = "yggdrasil_shard_cache_misses";
 const CACHE_EVICTIONS: &str = "yggdrasil_shard_cache_evictions";
+const CACHE_CAPACITY_EVICTIONS: &str = "yggdrasil_shard_cache_capacity_evictions";
 
 /// A typed cache artifact used for metric labels and diagnostics.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -58,6 +59,7 @@ pub struct Metrics {
     hits: ArtifactCounters,
     misses: ArtifactCounters,
     evictions: ArtifactCounters,
+    capacity_evictions: ArtifactCounters,
 }
 
 impl Metrics {
@@ -71,6 +73,11 @@ impl Metrics {
             "Corrupt Shard-cache artifacts rejected.",
             metrics.evictions.clone(),
         );
+        registry.register(
+            CACHE_CAPACITY_EVICTIONS,
+            "Shard-cache artifacts removed to enforce the configured byte capacity.",
+            metrics.capacity_evictions.clone(),
+        );
         metrics
     }
 
@@ -80,12 +87,14 @@ impl Metrics {
             hits: Family::default(),
             misses: Family::default(),
             evictions: Family::default(),
+            capacity_evictions: Family::default(),
         };
         for artifact in Artifact::ALL {
             let labels = ArtifactLabels { artifact };
             let _ = metrics.hits.get_or_create(&labels);
             let _ = metrics.misses.get_or_create(&labels);
             let _ = metrics.evictions.get_or_create(&labels);
+            let _ = metrics.capacity_evictions.get_or_create(&labels);
         }
         metrics
     }
@@ -105,6 +114,12 @@ impl Metrics {
             .get_or_create(&ArtifactLabels { artifact })
             .inc();
     }
+
+    pub(crate) fn capacity_eviction(&self, artifact: Artifact) {
+        self.capacity_evictions
+            .get_or_create(&ArtifactLabels { artifact })
+            .inc();
+    }
 }
 
 #[cfg(test)]
@@ -120,6 +135,7 @@ mod tests {
         metrics.hit(Artifact::Graph);
         metrics.miss(Artifact::Fts);
         metrics.eviction(Artifact::Manifest);
+        metrics.capacity_eviction(Artifact::Graph);
 
         let mut text = String::new();
         encode(&mut text, &registry).unwrap();
@@ -127,6 +143,7 @@ mod tests {
             "yggdrasil_shard_cache_hits_total{artifact=\"graph\"} 1",
             "yggdrasil_shard_cache_misses_total{artifact=\"fts\"} 1",
             "yggdrasil_shard_cache_evictions_total{artifact=\"manifest\"} 1",
+            "yggdrasil_shard_cache_capacity_evictions_total{artifact=\"graph\"} 1",
         ] {
             assert!(text.contains(series), "missing series {series:?}:\n{text}");
         }

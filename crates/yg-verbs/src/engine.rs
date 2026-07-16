@@ -66,6 +66,14 @@ pub struct ResolvedShard {
     /// The immutable Shard revision the path holds — what a pagination
     /// cursor pins.
     pub revision: String,
+    /// Keeps capacity eviction from unlinking the path before it is opened.
+    pub cache_lease: Option<yg_shard::CacheLease>,
+}
+
+/// A locally materialized FTS segment with an optional cache lease.
+pub struct ResolvedFts {
+    pub path: std::path::PathBuf,
+    pub cache_lease: Option<yg_shard::CacheLease>,
 }
 
 /// Matching graph and FTS segments for one immutable Shard revision.
@@ -75,6 +83,8 @@ pub struct ResolvedFuzzyShard {
     pub graph_path: std::path::PathBuf,
     pub fts_path: std::path::PathBuf,
     pub revision: crate::ShardRevision,
+    pub graph_cache_lease: Option<yg_shard::CacheLease>,
+    pub fts_cache_lease: Option<yg_shard::CacheLease>,
 }
 
 /// How the engine reaches Shards: resolve a repo qualifier — via the
@@ -104,7 +114,7 @@ pub trait ShardResolver: Send + Sync {
     fn resolve_fts(
         &self,
         target: &SearchTarget,
-    ) -> impl Future<Output = Result<std::path::PathBuf, ResolveError>> + Send;
+    ) -> impl Future<Output = Result<ResolvedFts, ResolveError>> + Send;
 
     /// Resolve matching graph and FTS segments for a fuzzy address.
     fn resolve_fuzzy(
@@ -362,7 +372,7 @@ impl<R: ShardResolver + 'static> Engine<R> {
         let ResolvedAddress::Exact { shard, id } = resolved else {
             return Ok(resolved.into_ambiguous());
         };
-        run_verb(shard.path, id, crate::node)
+        run_verb(shard.path, shard.cache_lease, id, crate::node)
             .await
             .map(AddressedResponse::Resolved)
     }
@@ -432,7 +442,7 @@ impl<R: ShardResolver + 'static> Engine<R> {
         };
 
         let verb_options = options.clone();
-        let page = run_verb(shard.path, id, move |conn, id| {
+        let page = run_verb(shard.path, shard.cache_lease, id, move |conn, id| {
             crate::neighbors(conn, id, &verb_options)
         })
         .await?;
@@ -516,7 +526,7 @@ impl<R: ShardResolver + 'static> Engine<R> {
                 .as_ref()
                 .map(|c| (c.after_committed_at, c.after_sha.clone())),
         };
-        let page = run_verb(shard.path, id, move |conn, id| {
+        let page = run_verb(shard.path, shard.cache_lease, id, move |conn, id| {
             crate::history(conn, id, &options)
         })
         .await?;
@@ -580,9 +590,12 @@ impl<R: ShardResolver + 'static> Engine<R> {
                 let name = address.name.as_str().to_string();
                 let path = address.path.as_ref().map(|path| path.as_str().to_string());
                 let fts_path = resolved.fts_path;
+                let fts_cache_lease = resolved.fts_cache_lease;
                 let symbols = tokio::task::spawn_blocking(move || {
                     let index = yg_shard::open_fts(&fts_path)?;
-                    yg_shard::symbols_named(&index, &name, path.as_deref())
+                    let symbols = yg_shard::symbols_named(&index, &name, path.as_deref());
+                    drop(fts_cache_lease);
+                    symbols
                 })
                 .await
                 .map_err(|error| {
@@ -615,6 +628,7 @@ impl<R: ShardResolver + 'static> Engine<R> {
                         shard: ResolvedShard {
                             path: resolved.graph_path,
                             revision: resolved.revision.as_str().to_string(),
+                            cache_lease: resolved.graph_cache_lease,
                         },
                         id: candidates.pop().expect("one candidate").id,
                     }),
@@ -648,7 +662,12 @@ impl ResolvedAddress {
 /// graph segment and run the (blocking, SQLite-bound) verb off the
 /// runtime threads — the open does filesystem syscalls, so it belongs
 /// in the closure too. The verb's `None` is the client's 404.
-async fn run_verb<T, F>(path: std::path::PathBuf, id: VerbId, verb: F) -> Result<T, VerbError>
+async fn run_verb<T, F>(
+    path: std::path::PathBuf,
+    cache_lease: Option<yg_shard::CacheLease>,
+    id: VerbId,
+    verb: F,
+) -> Result<T, VerbError>
 where
     T: Send + 'static,
     F: FnOnce(&rusqlite::Connection, &VerbId) -> anyhow::Result<Option<T>> + Send + 'static,
@@ -660,7 +679,9 @@ where
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
         )
         .context("opening the cached graph segment")?;
-        verb(&conn, &id)
+        let result = verb(&conn, &id);
+        drop(cache_lease);
+        result
     })
     .await;
     match outcome {

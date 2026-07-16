@@ -1828,6 +1828,156 @@ async fn yg_serve_role_worker_drains_the_queue_without_serving_http() {
     }
 }
 
+/// A real API process must honor the deploy-configured cache ceiling, not
+/// merely the in-process constructor seam. The fixture derives its cap from
+/// the artifacts it just published, so the test never guesses at SQLite file
+/// sizes: one graph fits, while every pair is known to exceed the cap.
+#[tokio::test(flavor = "multi_thread")]
+async fn spawned_api_evicts_lru_shards_under_the_configured_byte_cap() {
+    use object_store::ObjectStoreExt;
+
+    let (fixture, repo_dir, fixture_url) = go_fixture_repo();
+    let db_name = create_test_db().await;
+    let control = control_plane(&db_name).await;
+    let locator = fixture_url.strip_prefix("file://").unwrap();
+    let (base, slug) = locator.rsplit_once("/acme/").unwrap();
+    let added = control
+        .add_repo(yg_control::AddRepo {
+            forge_kind: "git",
+            base_url: &format!("file://{base}"),
+            token_env: None,
+            api_root: None,
+            slug: &format!("acme/{slug}"),
+            fetch_depth: None,
+            poll_interval_seconds: None,
+        })
+        .await
+        .unwrap();
+
+    let git_cache = fixture.path().join("git-cache");
+    let sync = yg_sync::SyncWorker::new(control_plane(&db_name).await, &git_cache);
+    let store = dev_object_store(&db_name);
+    let indexer =
+        yg_index::IndexWorker::new(control_plane(&db_name).await, store.clone(), &git_cache);
+    let mut artifacts = Vec::new();
+
+    for generation in 1..=3 {
+        if generation > 1 {
+            std::fs::write(
+                repo_dir.join("README.md"),
+                format!("# gadgets\n\nrevision {generation}\n"),
+            )
+            .unwrap();
+            git(&repo_dir, &["add", "."]);
+            git(
+                &repo_dir,
+                &["commit", "-m", &format!("revision {generation}")],
+            );
+            assert!(
+                control.request_fetch(added.repo_id).await.unwrap(),
+                "the next revision must queue a fresh fetch"
+            );
+        }
+
+        assert!(
+            sync.run_once().await.unwrap(),
+            "fetch generation {generation}"
+        );
+        assert!(
+            indexer.run_once().await.unwrap(),
+            "index generation {generation}"
+        );
+        let revision = control.admin_status().await.unwrap()[0]
+            .shard_revision
+            .clone()
+            .expect("indexed repo has a Shard revision");
+        let manifest = store
+            .get(&object_store::path::Path::from(yg_shard::manifest_key(
+                added.repo_id,
+                &revision,
+            )))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let manifest: yg_shard::Manifest = serde_json::from_slice(&manifest).unwrap();
+        let graph = &manifest.segments[yg_shard::GRAPH_SEGMENT_FILE];
+        artifacts.push((revision, graph.sha256.clone(), graph.bytes));
+    }
+
+    let capacity = artifacts.iter().map(|(_, _, bytes)| *bytes).max().unwrap();
+    for left in 0..artifacts.len() {
+        for right in left + 1..artifacts.len() {
+            assert!(
+                artifacts[left].2 + artifacts[right].2 > capacity,
+                "the derived cap must fit one graph but not two: {artifacts:?}"
+            );
+        }
+    }
+    let unique_shas: std::collections::HashSet<&str> =
+        artifacts.iter().map(|(_, sha, _)| sha.as_str()).collect();
+    assert_eq!(
+        unique_shas.len(),
+        artifacts.len(),
+        "each revision must publish distinct graph content"
+    );
+
+    let shard_cache = fixture.path().join("shard-cache");
+    let (_api, url) = spawn_yg_api(&db_name, |cmd| {
+        cmd.env("YG_BOOTSTRAP_TOKEN", TEST_TOKEN)
+            .env("YG_SHARD_CACHE", &shard_cache)
+            .env("YG_SHARD_CACHE_MAX_BYTES", capacity.to_string());
+    });
+    let pool = sqlx::PgPool::connect(&format!("{DEV_POSTGRES}/{db_name}"))
+        .await
+        .unwrap();
+    let node_id = format!("sym:{}:main.go#Hello", repo_dir.display());
+
+    for (revision, _, _) in &artifacts {
+        sqlx::query(
+            "UPDATE repos
+             SET current_shard_id = (
+                 SELECT id FROM shards WHERE repo_id = $1 AND revision = $2
+             )
+             WHERE id = $1",
+        )
+        .bind(added.repo_id)
+        .bind(revision)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let response = reqwest::Client::new()
+            .post(format!("{url}/v1/verbs/node"))
+            .bearer_auth(TEST_TOKEN)
+            .json(&serde_json::json!({"id": node_id}))
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.text().await.unwrap();
+        assert!(
+            status.is_success(),
+            "node at {revision} returned {status}: {body}"
+        );
+
+        let disk_bytes: u64 = std::fs::read_dir(&shard_cache)
+            .unwrap()
+            .map(|entry| entry.unwrap().metadata().unwrap().len())
+            .sum();
+        assert!(
+            disk_bytes <= capacity,
+            "cache uses {disk_bytes} bytes over its {capacity}-byte cap"
+        );
+    }
+
+    let first = shard_cache.join(format!("{}.sqlite", artifacts[0].1));
+    let last = shard_cache.join(format!("{}.sqlite", artifacts[2].1));
+    assert!(!first.exists(), "the least-recent graph must be evicted");
+    assert!(last.is_file(), "the newest graph must remain cached");
+}
+
 /// The documented split topology (docs/DEVELOPMENT.md): one process
 /// serves HTTP, a separate process drains the queues, and they meet
 /// only in Postgres and object storage. The repo-add flows API →

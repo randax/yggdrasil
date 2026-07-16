@@ -12,8 +12,8 @@ use axum::extract::State;
 use axum::response::{IntoResponse, Response};
 use yg_control::ControlPlane;
 use yg_verbs::{
-    RepoQualifier, ResolveError, ResolvedFuzzyShard, ResolvedShard, SearchTarget, ShardResolver,
-    ShardRevision,
+    RepoQualifier, ResolveError, ResolvedFts, ResolvedFuzzyShard, ResolvedShard, SearchTarget,
+    ShardResolver, ShardRevision,
 };
 
 use crate::AppState;
@@ -51,8 +51,16 @@ impl ShardResolver for ShardAccess {
         let Some(revision) = pinned.or(target.revision) else {
             return Err(ResolveError::NotIndexed);
         };
-        match self.shards.graph_path(target.repo_id, &revision).await {
-            Ok(path) => Ok(ResolvedShard { path, revision }),
+        match self
+            .shards
+            .leased_graph_path(target.repo_id, &revision)
+            .await
+        {
+            Ok(leased) => Ok(ResolvedShard {
+                path: leased.path,
+                revision,
+                cache_lease: Some(leased.lease),
+            }),
             Err(error) => Err(map_cache_error(error)),
         }
     }
@@ -94,10 +102,14 @@ impl ShardResolver for ShardAccess {
             })
     }
 
-    async fn resolve_fts(&self, target: &SearchTarget) -> Result<std::path::PathBuf, ResolveError> {
+    async fn resolve_fts(&self, target: &SearchTarget) -> Result<ResolvedFts, ResolveError> {
         self.shards
-            .fts_path(target.repo_id(), target.revision().as_str())
+            .leased_fts_path(target.repo_id(), target.revision().as_str())
             .await
+            .map(|leased| ResolvedFts {
+                path: leased.path,
+                cache_lease: Some(leased.lease),
+            })
             .map_err(map_cache_error)
     }
 
@@ -118,20 +130,22 @@ impl ShardResolver for ShardAccess {
         else {
             return Err(ResolveError::NotIndexed);
         };
-        let graph_path = self
+        let graph = self
             .shards
-            .graph_path(target.repo_id, &revision)
+            .leased_graph_path(target.repo_id, &revision)
             .await
             .map_err(map_cache_error)?;
-        let fts_path = self
+        let fts = self
             .shards
-            .fts_path(target.repo_id, &revision)
+            .leased_fts_path_without_wait(target.repo_id, &revision)
             .await
             .map_err(map_cache_error)?;
         Ok(ResolvedFuzzyShard {
-            graph_path,
-            fts_path,
+            graph_path: graph.path,
+            fts_path: fts.path,
             revision: ShardRevision::new(revision),
+            graph_cache_lease: Some(graph.lease),
+            fts_cache_lease: Some(fts.lease),
         })
     }
 }

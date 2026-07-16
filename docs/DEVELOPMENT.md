@@ -61,6 +61,7 @@ never connects — cannot report it:
 | `YG_S3_REGION` | `us-east-1` | Object storage region |
 | `YG_S3_PREFIX` | *(empty)* | Key prefix all objects land under; empty means the bucket root |
 | `YG_SHARD_CACHE` | `./data/shard-cache` | Server-local tier of Shard segments |
+| `YG_SHARD_CACHE_MAX_BYTES` | `10737418240` (10 GiB) | Maximum disk space retained by the server-local Shard cache; positive bytes |
 | `YG_GIT_CACHE` | `./data/git` | Worker-local cache of bare clones |
 | `YG_GITHUB_TOKEN` | — (optional) | Forge token for `github.com` Sync |
 | `YG_POLL_INTERVAL` | `300` | Seconds between a repo's default-branch head checks (per-repo override: `repo add --poll-interval`) |
@@ -70,8 +71,8 @@ never connects — cannot report it:
 | `YG_JOB_RETENTION` | `604800` | Seconds a terminal job row is kept before the GC cadence removes it (bounds queue-table growth) |
 
 An invalid value (an unparseable listen address, a duration that is not a
-whole number of seconds) refuses to boot with every problem listed, not
-just the first.
+whole number of seconds, or a cache capacity that is not a positive byte
+count) refuses to boot with every problem listed, not just the first.
 
 `yg serve --role=api|worker|all` picks what the process runs: `api` serves
 HTTP only, `worker` drains the Sync and indexing queues (it needs the
@@ -122,6 +123,10 @@ is protected by the deployment network boundary. Metrics are process-local:
 deployment the API endpoint cannot aggregate the separate worker process.
 Configure `YG_WORKER_METRICS_ADDR` on each split worker and scrape that endpoint
 to collect its job and forge observations.
+Shard-cache corruption remains `yggdrasil_shard_cache_evictions_total`; LRU
+capacity removals use the distinct
+`yggdrasil_shard_cache_capacity_evictions_total` counter so dashboards do not
+conflate rejected bytes with normal cache pressure.
 
 ## Checks
 

@@ -28,7 +28,9 @@ use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use yg_control::ControlPlane;
 
-pub use config::{ObjectStoreConfig, RunningServer, ServerConfig, probe_object_store};
+pub use config::{
+    CacheCapacity, ObjectStoreConfig, RunningServer, ServerConfig, probe_object_store,
+};
 pub use health::UPTIME_HEADER;
 pub use metrics::Metrics;
 
@@ -80,10 +82,11 @@ pub async fn serve_with_metrics(
         .await
         .context("object storage unreachable at boot")?;
 
-    let shards = Arc::new(yg_shard::ShardCache::with_metrics(
+    let shards = Arc::new(yg_shard::ShardCache::with_metrics_and_capacity(
         store.clone(),
         config.shard_cache,
         metrics.shard_cache(),
+        config.shard_cache_capacity,
     ));
     let state = Arc::new(AppState {
         engine: yg_verbs::Engine::with_metrics(
