@@ -105,9 +105,19 @@ pub(crate) struct ToolsCapability {}
 
 #[derive(Serialize)]
 pub(crate) struct ServerInfo {
-    name: &'static str,
-    version: &'static str,
+    name: ServerName,
+    version: ServerVersion,
 }
+
+/// The serving implementation's name, mirroring the typed client identity.
+#[derive(Serialize)]
+#[serde(transparent)]
+pub(crate) struct ServerName(&'static str);
+
+/// The serving implementation's version, stamped from the crate manifest.
+#[derive(Serialize)]
+#[serde(transparent)]
+pub(crate) struct ServerVersion(&'static str);
 
 /// MCP requires the requested version to be echoed when supported. For an
 /// unsupported request, the server returns its latest supported version and
@@ -129,8 +139,8 @@ pub(crate) fn initialize(params: InitializeParams) -> InitializeResult {
             tools: ToolsCapability {},
         },
         server_info: ServerInfo {
-            name: "yggdrasil",
-            version: env!("CARGO_PKG_VERSION"),
+            name: ServerName("yggdrasil"),
+            version: ServerVersion(env!("CARGO_PKG_VERSION")),
         },
     }
 }
@@ -141,8 +151,6 @@ pub(crate) enum McpProtocolError {
     NotificationHasId,
     #[error("invalid initialize parameters")]
     InvalidInitializeParams(#[source] serde_json::Error),
-    #[error("serializing the initialize result failed")]
-    SerializeInitializeResult(#[source] serde_json::Error),
 }
 
 #[cfg(test)]

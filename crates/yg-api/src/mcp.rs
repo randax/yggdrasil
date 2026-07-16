@@ -138,12 +138,7 @@ async fn handle_mcp_message(
         .unwrap_or(serde_json::Value::Null);
     let response = match method {
         "initialize" => match serde_json::from_value::<InitializeParams>(params) {
-            Ok(params) => match serde_json::to_value(crate::mcp_protocol::initialize(params)) {
-                Ok(result) => jsonrpc_success(id, result),
-                Err(error) => {
-                    protocol_error(id, McpProtocolError::SerializeInitializeResult(error))
-                }
-            },
+            Ok(params) => jsonrpc_success(id, crate::mcp_protocol::initialize(params)),
             Err(error) => protocol_error(id, McpProtocolError::InvalidInitializeParams(error)),
         },
         "tools/list" => match mcp_tools() {
@@ -207,14 +202,12 @@ fn protocol_error(id: serde_json::Value, error: McpProtocolError) -> serde_json:
             tracing::debug!(error = %source, "invalid MCP initialize parameters");
             jsonrpc_error(id, -32602, "invalid initialize parameters")
         }
-        McpProtocolError::SerializeInitializeResult(source) => {
-            tracing::error!(error = %source, "serializing MCP initialize result failed");
-            jsonrpc_error(id, -32603, "internal server error")
-        }
     }
 }
 
-fn jsonrpc_success(id: serde_json::Value, result: serde_json::Value) -> serde_json::Value {
+/// Assemble the JSON-RPC envelope — the wire boundary where a typed result
+/// becomes its serialized form.
+fn jsonrpc_success(id: serde_json::Value, result: impl Serialize) -> serde_json::Value {
     serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result})
 }
 
