@@ -6,18 +6,7 @@ use crate::engine::{ResolveError, ShardResolver, VerbError};
 
 pub(super) struct RankedRepo {
     pub(super) target: SearchTarget,
-    pub(super) index: Option<yg_shard::FtsIndex>,
     pub(super) hits: Vec<SearchHit>,
-}
-
-/// Retain at most the configured number of completed handles.
-fn retain_completed_handle<I>(retained: &mut usize, index: I) -> Option<I> {
-    if *retained < super::MAX_RETAINED_FTS_HANDLES {
-        *retained += 1;
-        Some(index)
-    } else {
-        None
-    }
 }
 
 /// Resolve, open, and rank repositories with bounded concurrency and handle retention.
@@ -31,8 +20,6 @@ pub(super) async fn rank_targets<R: ShardResolver + 'static>(
     let total = targets.len();
     let mut targets = targets.into_iter().enumerate();
     let mut ranked = Vec::with_capacity(total);
-    let mut retained = 0;
-
     loop {
         let mut tasks = tokio::task::JoinSet::new();
         for _ in 0..super::MAX_CONCURRENT_SEARCH_FANOUT {
@@ -58,14 +45,6 @@ pub(super) async fn rank_targets<R: ShardResolver + 'static>(
             let (position, result) = joined.map_err(|error| {
                 VerbError::Internal(anyhow::Error::new(error).context("search task panicked"))
             })?;
-            let result = result.map(|mut ranked| {
-                let index = ranked
-                    .index
-                    .take()
-                    .expect("ranking always returns an open index");
-                ranked.index = retain_completed_handle(&mut retained, index);
-                ranked
-            });
             batch.push((position, result));
         }
         batch.sort_unstable_by_key(|(position, _)| *position);
@@ -86,10 +65,12 @@ fn spawn_rank_task<R: ShardResolver + 'static>(
     from_cursor: bool,
 ) {
     tasks.spawn(async move {
-        let path = match resolver.resolve_fts(&target).await {
-            Ok(path) => path,
+        let resolved = match resolver.resolve_fts(&target).await {
+            Ok(resolved) => resolved,
             Err(error) => return (position, Err(map_search_shard_error(error, from_cursor))),
         };
+        let path = resolved.path;
+        let cache_lease = resolved.cache_lease;
         let qualifier = target.qualifier.clone();
         let outcome = tokio::task::spawn_blocking(move || -> anyhow::Result<RankedRepo> {
             let index = yg_shard::open_fts(&path)?;
@@ -105,11 +86,11 @@ fn spawn_rank_task<R: ShardResolver + 'static>(
                 .into_iter()
                 .map(|hit| super::types::qualify_hit(qualifier.as_str(), hit))
                 .collect::<anyhow::Result<Vec<_>>>()?;
-            Ok(RankedRepo {
-                target,
-                index: Some(index),
-                hits,
-            })
+            // Handle before lease: eviction is pin-gated, so the index
+            // must close before its artifact becomes evictable.
+            drop(index);
+            drop(cache_lease);
+            Ok(RankedRepo { target, hits })
         })
         .await;
         let result = match outcome {
@@ -203,6 +184,8 @@ fn map_named_target_error(qualifier: &str, error: ResolveError) -> VerbError {
         ResolveError::UnknownRepo => VerbError::NotFound(format!("no indexed repository matches {qualifier:?}")),
         ResolveError::NotIndexed => VerbError::NotFound(format!("{qualifier} is registered but not yet indexed; try again shortly")),
         ResolveError::RevisionMissing(source) | ResolveError::Internal(source) => VerbError::Internal(source),
+        ResolveError::CacheCapacityUnavailable => VerbError::Unavailable(
+            "the Shard cache capacity is too small for the requested artifact; increase the cache capacity and try again".to_string()),
         ResolveError::SchemaOutdated => VerbError::Unavailable(
             "a repo's Shard predates the current index schema and is being re-indexed; try again shortly".to_string()),
     }
@@ -217,6 +200,8 @@ pub(super) fn map_search_shard_error(error: ResolveError, from_cursor: bool) -> 
         ResolveError::SchemaOutdated => VerbError::Unavailable(
             "a repo's Shard predates the current index schema and is being re-indexed; try again shortly".to_string()),
         ResolveError::RevisionMissing(source) | ResolveError::Internal(source) => VerbError::Internal(source),
+        ResolveError::CacheCapacityUnavailable => VerbError::Unavailable(
+            "the Shard cache capacity is too small for the requested artifact; increase the cache capacity and try again".to_string()),
         ResolveError::UnknownRepo => VerbError::NotFound("no indexed repository matches the search target".to_string()),
         ResolveError::NotIndexed => VerbError::NotFound(
             "a search target is registered but not yet indexed; try again shortly".to_string()),
@@ -235,34 +220,6 @@ mod tests {
     use super::*;
     use crate::search::ShardRevision;
     use std::sync::atomic::{AtomicUsize, Ordering};
-
-    struct DropSpy(Arc<AtomicUsize>);
-    impl Drop for DropSpy {
-        fn drop(&mut self) {
-            self.0.fetch_add(1, Ordering::SeqCst);
-        }
-    }
-
-    #[test]
-    fn handles_beyond_retention_bound_drop_at_ranking_completion() {
-        let drops = Arc::new(AtomicUsize::new(0));
-        let mut retained_count = 0;
-        let mut retained = Vec::new();
-        for _ in 0..super::super::MAX_RETAINED_FTS_HANDLES + 3 {
-            if let Some(handle) =
-                retain_completed_handle(&mut retained_count, DropSpy(drops.clone()))
-            {
-                retained.push(handle);
-            }
-        }
-        assert_eq!(retained.len(), super::super::MAX_RETAINED_FTS_HANDLES);
-        assert_eq!(drops.load(Ordering::SeqCst), 3);
-        drop(retained);
-        assert_eq!(
-            drops.load(Ordering::SeqCst),
-            super::super::MAX_RETAINED_FTS_HANDLES + 3
-        );
-    }
 
     #[test]
     fn dedup_targets_collapses_repeated_repos() {
@@ -376,7 +333,7 @@ mod tests {
         async fn resolve_fts(
             &self,
             target: &SearchTarget,
-        ) -> Result<std::path::PathBuf, ResolveError> {
+        ) -> Result<crate::ResolvedFts, ResolveError> {
             self.resolutions.fetch_add(1, Ordering::SeqCst);
             let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
             self.peak.fetch_max(active, Ordering::SeqCst);
@@ -384,10 +341,10 @@ mod tests {
                 tokio::task::yield_now().await;
             }
             self.active.fetch_sub(1, Ordering::SeqCst);
-            Ok(std::path::PathBuf::from(format!(
-                "/definitely-missing/{}",
-                target.repo_id()
-            )))
+            Ok(crate::ResolvedFts {
+                path: std::path::PathBuf::from(format!("/definitely-missing/{}", target.repo_id())),
+                cache_lease: None,
+            })
         }
     }
 
