@@ -29,6 +29,7 @@
 pub mod admin;
 pub mod cursor;
 pub mod engine;
+mod fuzzy;
 pub mod metrics;
 mod search;
 pub mod status;
@@ -45,8 +46,12 @@ use yg_shard::graph_schema::{
 };
 
 pub use engine::{
-    Engine, HistoryCommitView, HistoryResponse, NeighborsResponse, ResolveError, ResolvedShard,
-    ShardResolver, VerbError,
+    Engine, HistoryCommitView, HistoryResponse, NeighborsResponse, ResolveError,
+    ResolvedFuzzyShard, ResolvedShard, ShardResolver, VerbError,
+};
+pub use fuzzy::{
+    AddressedResponse, AmbiguousNodeAddress, AmbiguousResolution, FuzzyNodeAddress,
+    MAX_ADDRESS_CANDIDATES, NoSuchSymbol, NoSuchSymbolKind, NodeCandidate,
 };
 pub use metrics::Metrics;
 pub use search::{
@@ -194,8 +199,15 @@ fn insert_any_of(schema: &mut Value, value: Value) {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct NodeRequest {
-    /// Node id, e.g. sym:github.com/acme/widgets:main.go#Hello.
+    /// Node id, or a bare symbol name matched byte-for-byte and case-sensitively.
+    /// Bare names without a safely searchable term set are un-addressable.
     pub id: String,
+    /// Repo qualifier when `id` is a bare symbol name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo: Option<RepoQualifier>,
+    /// Optional repository-relative path fragment narrowing a bare name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<SearchPath>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -214,8 +226,16 @@ pub struct NeighborsRequest {
 /// filters, exactly as the client spelled them.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct TraversalShape {
-    /// Node id to traverse from.
+    /// Node id to traverse from, or a bare symbol name matched byte-for-byte
+    /// and case-sensitively. Bare names without a safely searchable term set are
+    /// un-addressable.
     pub id: String,
+    /// Repo qualifier when `id` is a bare symbol name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo: Option<RepoQualifier>,
+    /// Optional repository-relative path fragment narrowing a bare name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<SearchPath>,
     /// Which edge direction to follow: in, out, or both.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub direction: Option<String>,
@@ -251,8 +271,16 @@ pub struct SearchRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct HistoryRequest {
-    /// File or Symbol node id.
+    /// File or Symbol node id, or a bare symbol name matched byte-for-byte and
+    /// case-sensitively. Bare names without a safely searchable term set are
+    /// un-addressable.
     pub id: String,
+    /// Repo qualifier when `id` is a bare symbol name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo: Option<RepoQualifier>,
+    /// Optional repository-relative path fragment narrowing a bare name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<SearchPath>,
     /// RFC3339 timestamp or YYYY-MM-DD lower bound.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub since: Option<String>,
@@ -1507,5 +1535,23 @@ mod tests {
             history["properties"]["limit"]["maximum"],
             json!(MAX_HISTORY_LIMIT)
         );
+    }
+
+    #[test]
+    fn node_address_schema_documents_exact_matching_and_zero_term_names() {
+        for verb in [Verb::Node, Verb::Neighbors, Verb::History] {
+            let schema = verb.tool().input_schema();
+            let description = schema["properties"]["id"]["description"]
+                .as_str()
+                .expect("node-address id has a description");
+            assert!(
+                description.contains("byte-for-byte")
+                    && description.contains("case-sensitively")
+                    && description.contains("safely searchable term set")
+                    && description.contains("un-addressable"),
+                "{} id docs are honest: {description}",
+                verb.label()
+            );
+        }
     }
 }

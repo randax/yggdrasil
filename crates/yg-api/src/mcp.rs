@@ -201,7 +201,7 @@ async fn call_verb_tool(
     state: Arc<AppState>,
     name: &str,
     arguments: serde_json::Value,
-) -> Result<Result<serde_json::Value, String>, (i64, String)> {
+) -> Result<Result<serde_json::Value, serde_json::Value>, (i64, String)> {
     let tool =
         yg_verbs::verb_tool(name).ok_or_else(|| (-32602, format!("unknown Verb tool {name:?}")))?;
     let response = match tool.verb {
@@ -248,7 +248,7 @@ fn mcp_internal_error(context: &str, e: &dyn std::fmt::Display) -> (i64, String)
 
 async fn verb_response_value(
     response: Response,
-) -> Result<Result<serde_json::Value, String>, (i64, String)> {
+) -> Result<Result<serde_json::Value, serde_json::Value>, (i64, String)> {
     let status = response.status();
     let bytes = to_bytes(response.into_body(), MCP_VERB_RESPONSE_LIMIT)
         .await
@@ -258,11 +258,7 @@ async fn verb_response_value(
     if status.is_success() {
         Ok(Ok(body))
     } else {
-        let reason = body
-            .get("error")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string)
-            .unwrap_or_else(|| body.to_string());
+        let reason = body.get("error").cloned().unwrap_or(body);
         Ok(Err(reason))
     }
 }

@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 
 use crate::search::SearchTarget;
-use crate::{Direction, SearchRequest, TraversalShape};
+use crate::{Direction, RepoQualifier, SearchPath, SearchRequest, TraversalShape};
 
 /// The longest encoded cursor the codec will decode. The largest
 /// legitimate cursor this server mints is a search cursor pinning
@@ -81,7 +81,17 @@ impl NeighborsCursor {
                 kinds
             })
         }
-        let contradicts = req.id != self.shape.id
+        let address_contradicts = (req.repo.is_some() && req.repo != self.shape.repo)
+            || (req.path.is_some() && req.path != self.shape.path);
+        if address_contradicts {
+            return Err(
+                "this cursor belongs to a different request (id, repo, path, direction, \
+                 edge_kinds, and depth must match the page it came from); start a fresh \
+                 traversal or pass the cursor with the original parameters"
+                    .to_string(),
+            );
+        }
+        let traversal_contradicts = req.id != self.shape.id
             || (req.direction.is_some()
                 && direction(&req.direction)? != direction(&self.shape.direction)?)
             || (req.edge_kinds.is_some()
@@ -89,7 +99,7 @@ impl NeighborsCursor {
             || req
                 .depth
                 .is_some_and(|d| d != self.shape.depth.unwrap_or(1));
-        if contradicts {
+        if traversal_contradicts {
             return Err(
                 "this cursor belongs to a different request (id, direction, edge_kinds, \
                  and depth must match the page it came from); start a fresh traversal \
@@ -113,6 +123,10 @@ impl NeighborsCursor {
 pub(crate) struct HistoryCursor {
     pub rev: String,
     pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo: Option<RepoQualifier>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<SearchPath>,
     /// The normalized `since` floor (unix seconds) the first page used.
     pub since: Option<i64>,
     pub after_committed_at: i64,
@@ -316,10 +330,20 @@ impl HistoryCursor {
     /// A follow-up may repeat the original id and `since` or omit
     /// `since`, nothing else. The `since` is compared already-normalized,
     /// so two spellings of the same instant agree.
-    pub fn agrees_with(&self, req_id: &str, req_since: Option<i64>) -> Result<(), String> {
-        if req_id != self.id || (req_since.is_some() && req_since != self.since) {
+    pub fn agrees_with(
+        &self,
+        req_id: &str,
+        req_repo: Option<&RepoQualifier>,
+        req_path: Option<&SearchPath>,
+        req_since: Option<i64>,
+    ) -> Result<(), String> {
+        if req_id != self.id
+            || req_repo.is_some_and(|repo| Some(repo) != self.repo.as_ref())
+            || req_path.is_some_and(|path| Some(path) != self.path.as_ref())
+            || (req_since.is_some() && req_since != self.since)
+        {
             return Err(
-                "this cursor belongs to a different request (id and since must match the \
+                "this cursor belongs to a different request (id, repo, path, and since must match the \
                  page it came from); start a fresh history or pass the cursor with the \
                  original parameters"
                     .to_string(),
@@ -338,6 +362,8 @@ mod tests {
         let cursor = HistoryCursor {
             rev: "rev-1".to_string(),
             id: "file:github.com/acme/widgets:main.go".to_string(),
+            repo: None,
+            path: None,
             since: Some(1_700_000_000),
             after_committed_at: 1_700_000_100,
             after_sha: "abc123".to_string(),
@@ -371,6 +397,8 @@ mod tests {
         let cursor = HistoryCursor {
             rev: "rev-1".to_string(),
             id: "file:github.com/acme/widgets:main.go".to_string(),
+            repo: None,
+            path: None,
             since: None,
             after_committed_at: 1,
             after_sha: "abc".to_string(),
@@ -384,6 +412,8 @@ mod tests {
             rev: "rev-1".to_string(),
             shape: TraversalShape {
                 id: "sym:github.com/acme/widgets:main.go#Hello".to_string(),
+                repo: None,
+                path: None,
                 direction: None,
                 edge_kinds: Some(vec!["CALLS".to_string(), "DEFINES".to_string()]),
                 depth: None,
@@ -402,6 +432,76 @@ mod tests {
         // A contradicting depth is rejected.
         req.depth = Some(2);
         assert!(cursor.agrees_with(&req).is_err());
+
+        let fuzzy = NeighborsCursor {
+            rev: "rev-1".to_string(),
+            shape: TraversalShape {
+                id: "Hello".to_string(),
+                repo: Some(RepoQualifier::new("github.com/acme/widgets".to_string())),
+                path: Some(SearchPath::new("src/".to_string())),
+                direction: None,
+                edge_kinds: None,
+                depth: None,
+            },
+            after_depth: 1,
+            after: "x".to_string(),
+        };
+        let mut resume = fuzzy.shape.clone();
+        resume.repo = None;
+        resume.path = None;
+        assert!(
+            fuzzy.agrees_with(&resume).is_ok(),
+            "optional address fields may be omitted"
+        );
+        resume.repo = Some(RepoQualifier::new("github.com/other/repo".to_string()));
+        let err = fuzzy
+            .agrees_with(&resume)
+            .expect_err("an explicit repo must agree");
+        assert_eq!(
+            err,
+            "this cursor belongs to a different request (id, repo, path, direction, \
+             edge_kinds, and depth must match the page it came from); start a fresh \
+             traversal or pass the cursor with the original parameters"
+        );
+
+        resume.repo = fuzzy.shape.repo.clone();
+        resume.path = Some(SearchPath::new("tests/".to_string()));
+        resume.direction = Some("sideways".to_string());
+        assert_eq!(
+            fuzzy
+                .agrees_with(&resume)
+                .expect_err("an explicit path must disagree before direction parsing"),
+            err,
+            "repo and path disagreements use the fuzzy-address message even with another invalid field"
+        );
+    }
+
+    #[test]
+    fn exact_neighbors_cursor_disagreement_keeps_legacy_message() {
+        let cursor = NeighborsCursor {
+            rev: "rev-1".to_string(),
+            shape: TraversalShape {
+                id: "sym:github.com/acme/widgets:main.go#Hello".to_string(),
+                repo: None,
+                path: None,
+                direction: None,
+                edge_kinds: None,
+                depth: None,
+            },
+            after_depth: 1,
+            after: "x".to_string(),
+        };
+        let mut request = cursor.shape.clone();
+        request.depth = Some(2);
+
+        assert_eq!(
+            cursor
+                .agrees_with(&request)
+                .expect_err("a different depth must be rejected"),
+            "this cursor belongs to a different request (id, direction, edge_kinds, \
+             and depth must match the page it came from); start a fresh traversal \
+             or pass the cursor with the original parameters"
+        );
     }
 
     #[test]
@@ -409,14 +509,54 @@ mod tests {
         let cursor = HistoryCursor {
             rev: "rev-1".to_string(),
             id: "file:github.com/acme/widgets:main.go".to_string(),
+            repo: None,
+            path: None,
             since: Some(100),
             after_committed_at: 200,
             after_sha: "abc".to_string(),
         };
-        assert!(cursor.agrees_with(&cursor.id, None).is_ok(), "omitted");
-        assert!(cursor.agrees_with(&cursor.id, Some(100)).is_ok(), "same");
-        assert!(cursor.agrees_with(&cursor.id, Some(101)).is_err());
-        assert!(cursor.agrees_with("file:other:x", None).is_err());
+        assert!(
+            cursor.agrees_with(&cursor.id, None, None, None).is_ok(),
+            "omitted"
+        );
+        assert!(
+            cursor
+                .agrees_with(&cursor.id, None, None, Some(100))
+                .is_ok(),
+            "same"
+        );
+        assert!(
+            cursor
+                .agrees_with(&cursor.id, None, None, Some(101))
+                .is_err()
+        );
+        assert!(
+            cursor
+                .agrees_with("file:other:x", None, None, None)
+                .is_err()
+        );
+
+        let fuzzy = HistoryCursor {
+            rev: "rev-1".to_string(),
+            id: "Hello".to_string(),
+            repo: Some(RepoQualifier::new("github.com/acme/widgets".to_string())),
+            path: Some(SearchPath::new("src/".to_string())),
+            since: None,
+            after_committed_at: 200,
+            after_sha: "abc".to_string(),
+        };
+        assert!(fuzzy.agrees_with("Hello", None, None, None).is_ok());
+        assert!(
+            fuzzy
+                .agrees_with("Hello", fuzzy.repo.as_ref(), fuzzy.path.as_ref(), None)
+                .is_ok()
+        );
+        let other = RepoQualifier::new("github.com/other/repo".to_string());
+        assert!(
+            fuzzy
+                .agrees_with("Hello", Some(&other), None, None)
+                .is_err()
+        );
     }
 
     #[test]

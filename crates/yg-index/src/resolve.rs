@@ -2,13 +2,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use yg_shard::{Edge, EdgeKind, Graph, Node, Provenance};
-
-/// Confidence of a syntactic name resolution with a single candidate —
-/// high, but never the 1.0 of a witnessed fact (a DEFINES declaration,
-/// an IMPORTS statement): which symbol a name refers to is still a
-/// guess. N candidates split it N ways (ADR 0006).
-const SYNTACTIC_MATCH: f64 = 0.9;
+use yg_shard::{Edge, EdgeKind, Graph, Node, Provenance, SYNTACTIC_MATCH};
 
 /// Confidence cap for IMPLEMENTS, which matches method *names* only —
 /// signatures are invisible to a reasonable syntactic pass, so even a

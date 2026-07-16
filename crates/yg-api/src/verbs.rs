@@ -12,7 +12,8 @@ use axum::extract::State;
 use axum::response::{IntoResponse, Response};
 use yg_control::ControlPlane;
 use yg_verbs::{
-    RepoQualifier, ResolveError, ResolvedShard, SearchTarget, ShardResolver, ShardRevision,
+    RepoQualifier, ResolveError, ResolvedFuzzyShard, ResolvedShard, SearchTarget, ShardResolver,
+    ShardRevision,
 };
 
 use crate::AppState;
@@ -98,6 +99,40 @@ impl ShardResolver for ShardAccess {
             .fts_path(target.repo_id(), target.revision().as_str())
             .await
             .map_err(map_cache_error)
+    }
+
+    async fn resolve_fuzzy(
+        &self,
+        qualifier: &RepoQualifier,
+        pinned: Option<ShardRevision>,
+    ) -> Result<ResolvedFuzzyShard, ResolveError> {
+        let target = self
+            .control
+            .verb_target(qualifier.as_str())
+            .await
+            .map_err(ResolveError::Internal)?
+            .ok_or(ResolveError::UnknownRepo)?;
+        let Some(revision) = pinned
+            .map(|revision| revision.as_str().to_string())
+            .or(target.revision)
+        else {
+            return Err(ResolveError::NotIndexed);
+        };
+        let graph_path = self
+            .shards
+            .graph_path(target.repo_id, &revision)
+            .await
+            .map_err(map_cache_error)?;
+        let fts_path = self
+            .shards
+            .fts_path(target.repo_id, &revision)
+            .await
+            .map_err(map_cache_error)?;
+        Ok(ResolvedFuzzyShard {
+            graph_path,
+            fts_path,
+            revision: ShardRevision::new(revision),
+        })
     }
 }
 

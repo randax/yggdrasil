@@ -6,6 +6,8 @@ mod deploy_config;
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 
+const NODE_ADDRESS_HELP: &str = "Exact node id, or a bare symbol name with --repo. Bare-name matching is byte-exact and case-sensitive; names without a safely searchable term set are un-addressable.";
+
 #[derive(Parser)]
 #[command(
     name = "yg",
@@ -40,16 +42,28 @@ enum Command {
     },
     /// Show one Knowledge Graph node with its edge summary
     Node {
-        #[arg(help = "Node id, e.g. sym:github.com/acme/widgets:main.go#Hello")]
+        #[arg(help = NODE_ADDRESS_HELP)]
         id: String,
+        /// Repo qualifier for a bare symbol name
+        #[arg(long)]
+        repo: Option<String>,
+        /// Repository-relative path fragment narrowing a bare symbol name
+        #[arg(long)]
+        path: Option<String>,
         /// Emit the raw JSON response instead of the human report
         #[arg(long)]
         json: bool,
     },
     /// Show a node's neighboring subgraph
     Neighbors {
-        #[arg(help = "Node id, e.g. file:github.com/acme/widgets:main.go")]
+        #[arg(help = NODE_ADDRESS_HELP)]
         id: String,
+        /// Repo qualifier for a bare symbol name
+        #[arg(long)]
+        repo: Option<String>,
+        /// Repository-relative path fragment narrowing a bare symbol name
+        #[arg(long)]
+        path: Option<String>,
         /// Follow only edges pointing this way: in, out, or both
         #[arg(long)]
         direction: Option<String>,
@@ -92,8 +106,14 @@ enum Command {
     },
     /// Show the commits that touched a file (or a symbol's file), newest first
     History {
-        #[arg(help = "Node id, e.g. file:github.com/acme/widgets:main.go")]
+        #[arg(help = NODE_ADDRESS_HELP)]
         id: String,
+        /// Repo qualifier for a bare symbol name
+        #[arg(long)]
+        repo: Option<String>,
+        /// Repository-relative path fragment narrowing a bare symbol name
+        #[arg(long)]
+        path: Option<String>,
         /// Only commits at or after this date (RFC3339 or YYYY-MM-DD)
         #[arg(long)]
         since: Option<String>,
@@ -255,16 +275,23 @@ async fn main() -> anyhow::Result<()> {
         Command::Serve { role } => serve(role).await,
         Command::ConfigCheck { role } => config_check(role),
         Command::Status { json } => status(json).await,
-        Command::Node { id, json } => node(id, json).await,
+        Command::Node {
+            id,
+            repo,
+            path,
+            json,
+        } => node(id, repo, path, json).await,
         Command::Neighbors {
             id,
+            repo,
+            path,
             direction,
             kinds,
             depth,
             limit,
             cursor,
             json,
-        } => neighbors(id, direction, kinds, depth, limit, cursor, json).await,
+        } => neighbors(id, repo, path, direction, kinds, depth, limit, cursor, json).await,
         Command::Search {
             query,
             kinds,
@@ -275,11 +302,13 @@ async fn main() -> anyhow::Result<()> {
         } => search(query, kinds, repos, limit, cursor, json).await,
         Command::History {
             id,
+            repo,
+            path,
             since,
             limit,
             cursor,
             json,
-        } => history(id, since, limit, cursor, json).await,
+        } => history(id, repo, path, since, limit, cursor, json).await,
         Command::Mcp => mcp_proxy().await,
         Command::Skill {
             command: SkillCommand::Install,
@@ -478,15 +507,37 @@ where
     if !status.is_success() {
         // Prefer the server's {"error": …} shape, but a proxy or crash
         // can answer with anything — show whatever came back.
-        let reason = serde_json::from_str::<serde_json::Value>(&text)
-            .ok()
-            .and_then(|body| body["error"].as_str().map(str::to_string))
-            .unwrap_or(text);
+        let reason = server_error_reason(&text).unwrap_or(text);
         bail!("the server answered {path} with {status}: {reason}");
     }
     let body = serde_json::from_str(&text)
         .with_context(|| format!("parsing the typed response from {path}"))?;
     Ok(ServerResponse { headers, body })
+}
+
+fn server_error_reason(text: &str) -> Option<String> {
+    let body = serde_json::from_str::<serde_json::Value>(text).ok()?;
+    if let Some(message) = body.get("error").and_then(serde_json::Value::as_str) {
+        return Some(message.to_string());
+    }
+    let payload =
+        serde_json::from_value::<yg_verbs::NoSuchSymbol>(body.get("error")?.clone()).ok()?;
+    let mut address = match payload.kind {
+        yg_verbs::NoSuchSymbolKind::NoSuchSymbol => format!(
+            "no such symbol {:?} in {}",
+            payload.address.name.as_str(),
+            payload.address.repo.as_str()
+        ),
+        yg_verbs::NoSuchSymbolKind::UnaddressableSymbol => format!(
+            "symbol name {:?} in {} is un-addressable because it has no safely searchable term set",
+            payload.address.name.as_str(),
+            payload.address.repo.as_str()
+        ),
+    };
+    if let Some(path) = payload.address.path {
+        address.push_str(&format!(" under path {:?}", path.as_str()));
+    }
+    Some(address)
 }
 
 /// POST one Verb request (RFC 0001 §7).
@@ -583,17 +634,32 @@ where
     Ok(())
 }
 
-async fn node(id: String, json: bool) -> anyhow::Result<()> {
-    let response = post_verb::<yg_verbs::NodeResponse>(
+async fn node(
+    id: String,
+    repo: Option<String>,
+    path: Option<String>,
+    json: bool,
+) -> anyhow::Result<()> {
+    let response = post_verb::<yg_verbs::AddressedResponse<yg_verbs::NodeResponse>>(
         "node",
-        serde_json::to_value(yg_verbs::NodeRequest { id })?,
+        serde_json::to_value(yg_verbs::NodeRequest {
+            id,
+            repo: repo.map(yg_verbs::RepoQualifier::new),
+            path: path.map(yg_verbs::SearchPath::new),
+        })?,
     )
     .await?;
     if json {
         println!("{}", canonical_json(&response.body)?);
         return Ok(());
     }
-    let body = response.body;
+    let body = match response.body {
+        yg_verbs::AddressedResponse::Resolved(body) => body,
+        yg_verbs::AddressedResponse::Ambiguous(ambiguous) => {
+            print_candidates(&ambiguous);
+            return Ok(());
+        }
+    };
     let node = &body.node;
     let kind = &node.kind;
     match node.name.as_deref() {
@@ -622,6 +688,30 @@ async fn node(id: String, json: bool) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+fn print_candidates(ambiguous: &yg_verbs::AmbiguousNodeAddress) {
+    println!(
+        "ambiguous symbol {:?} in {}; choose one:",
+        ambiguous.address.name.as_str(),
+        ambiguous.address.repo.as_str()
+    );
+    if ambiguous.candidates.len() < ambiguous.total_matches {
+        println!(
+            "showing {} of {} matches",
+            ambiguous.candidates.len(),
+            ambiguous.total_matches
+        );
+    }
+    for candidate in &ambiguous.candidates {
+        println!(
+            "{:.6}  {}  {}  ({})",
+            candidate.confidence,
+            candidate.kind,
+            candidate.id,
+            candidate.path.as_str()
+        );
+    }
 }
 
 fn format_provenance(counts: &std::collections::BTreeMap<yg_verbs::Provenance, i64>) -> String {
@@ -658,6 +748,8 @@ mod typed_render_tests {
 #[allow(clippy::too_many_arguments)]
 async fn neighbors(
     id: String,
+    repo: Option<String>,
+    path: Option<String>,
     direction: Option<String>,
     kinds: Vec<String>,
     depth: Option<u32>,
@@ -665,11 +757,13 @@ async fn neighbors(
     cursor: Option<String>,
     json: bool,
 ) -> anyhow::Result<()> {
-    let response = post_verb::<yg_verbs::NeighborsResponse>(
+    let response = post_verb::<yg_verbs::AddressedResponse<yg_verbs::NeighborsResponse>>(
         "neighbors",
         serde_json::to_value(yg_verbs::NeighborsRequest {
             shape: yg_verbs::TraversalShape {
                 id,
+                repo: repo.map(yg_verbs::RepoQualifier::new),
+                path: path.map(yg_verbs::SearchPath::new),
                 direction,
                 edge_kinds: (!kinds.is_empty()).then_some(kinds),
                 depth,
@@ -683,7 +777,13 @@ async fn neighbors(
         println!("{}", canonical_json(&response.body)?);
         return Ok(());
     }
-    let body = response.body;
+    let body = match response.body {
+        yg_verbs::AddressedResponse::Resolved(body) => body,
+        yg_verbs::AddressedResponse::Ambiguous(ambiguous) => {
+            print_candidates(&ambiguous);
+            return Ok(());
+        }
+    };
     if body.nodes.is_empty() {
         println!("no neighbors");
         return Ok(());
@@ -783,15 +883,19 @@ fn plain_snippet(html: &str) -> String {
 
 async fn history(
     id: String,
+    repo: Option<String>,
+    path: Option<String>,
     since: Option<String>,
     limit: Option<u32>,
     cursor: Option<String>,
     json: bool,
 ) -> anyhow::Result<()> {
-    let response = post_verb::<yg_verbs::HistoryResponse>(
+    let response = post_verb::<yg_verbs::AddressedResponse<yg_verbs::HistoryResponse>>(
         "history",
         serde_json::to_value(yg_verbs::HistoryRequest {
             id,
+            repo: repo.map(yg_verbs::RepoQualifier::new),
+            path: path.map(yg_verbs::SearchPath::new),
             since,
             limit,
             cursor,
@@ -802,7 +906,13 @@ async fn history(
         println!("{}", canonical_json(&response.body)?);
         return Ok(());
     }
-    let body = response.body;
+    let body = match response.body {
+        yg_verbs::AddressedResponse::Resolved(body) => body,
+        yg_verbs::AddressedResponse::Ambiguous(ambiguous) => {
+            print_candidates(&ambiguous);
+            return Ok(());
+        }
+    };
     if body.commits.is_empty() {
         println!("no history");
         return Ok(());
@@ -1892,5 +2002,43 @@ mod shutdown_tests {
         assert_eq!(request.cause(), yg_sync::ShutdownCause::Failure);
         assert!(request.work_deadline() >= earliest_expected_deadline);
         assert!(request.work_deadline() <= latest_expected_deadline);
+    }
+}
+
+#[cfg(test)]
+mod address_tests {
+    use super::*;
+
+    #[test]
+    fn node_address_help_documents_matching_and_zero_term_names() {
+        for command in ["node", "neighbors", "history"] {
+            let error = match Cli::try_parse_from(["yg", command, "--help"]) {
+                Ok(_) => panic!("--help must exit through clap's display error"),
+                Err(error) => error,
+            };
+            let help = error.to_string();
+            assert!(help.contains("byte-exact"), "{command} help: {help}");
+            assert!(help.contains("case-sensitive"), "{command} help: {help}");
+            assert!(help.contains("un-addressable"), "{command} help: {help}");
+        }
+    }
+
+    #[test]
+    fn zero_term_symbol_404_is_not_reported_as_absent() {
+        let body = serde_json::json!({
+            "error": {
+                "kind": "unaddressable_symbol",
+                "address": {
+                    "name": "::",
+                    "repo": "github.com/acme/widgets"
+                }
+            }
+        });
+
+        let reason = server_error_reason(&body.to_string()).expect("typed error is rendered");
+
+        assert!(reason.contains("un-addressable"), "{reason}");
+        assert!(reason.contains("no safely searchable term set"), "{reason}");
+        assert!(!reason.contains("no such symbol"), "{reason}");
     }
 }

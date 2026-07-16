@@ -1,10 +1,11 @@
 use anyhow::Context;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::VerbId;
 
 /// A typed repository qualifier on the search resolver seam.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(transparent)]
 pub struct RepoQualifier(String);
 
@@ -72,12 +73,12 @@ impl SearchTarget {
 }
 
 /// A node display name returned by search.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SearchNodeName(String);
 
 impl SearchNodeName {
-    fn new(value: String) -> Self {
+    pub(crate) fn new(value: String) -> Self {
         Self(value)
     }
     /// The node name as indexed.
@@ -87,12 +88,12 @@ impl SearchNodeName {
 }
 
 /// A repository-relative node path returned by search.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(transparent)]
 pub struct SearchPath(String);
 
 impl SearchPath {
-    fn new(value: String) -> Self {
+    pub fn new(value: String) -> Self {
         Self(value)
     }
     /// The repository-relative path spelling.
