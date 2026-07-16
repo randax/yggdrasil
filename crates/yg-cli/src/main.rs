@@ -2305,6 +2305,12 @@ mod cli_ux_tests {
             Err(error) => error,
         };
         assert!(error.use_stderr());
-        assert_eq!(exit_code::ExitClass::Usage.code(), 2);
+        // The clap error itself must carry the documented usage class, not
+        // merely coexist with it.
+        assert_eq!(
+            error.exit_code(),
+            i32::from(exit_code::ExitClass::Usage.code()),
+            "clap rejects a malformed token id with the usage exit class"
+        );
     }
 }
