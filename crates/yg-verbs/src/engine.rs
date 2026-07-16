@@ -187,6 +187,10 @@ pub struct NeighborsResponse {
     pub nodes: Vec<NodeView>,
     pub edges: Vec<GraphEdge>,
     pub next_cursor: Option<String>,
+    /// Whether this page is incomplete because a cap omitted edges or discovery-time nodes;
+    /// callers must OR this flag across pages.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
 }
 
 /// One commit as every transport serves it: the Verb's commit plus a
@@ -449,6 +453,7 @@ impl<R: ShardResolver + 'static> Engine<R> {
             nodes: page.nodes,
             edges: page.edges,
             next_cursor,
+            truncated: page.truncated,
         }))
     }
 

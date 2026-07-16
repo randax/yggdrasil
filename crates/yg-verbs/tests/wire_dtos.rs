@@ -1,6 +1,21 @@
 use serde_json::json;
 
 #[test]
+fn untruncated_neighbors_keep_the_legacy_wire_bytes() {
+    let legacy = r#"{"nodes":[],"edges":[],"next_cursor":null}"#;
+    let mut response: yg_verbs::NeighborsResponse =
+        serde_json::from_str(legacy).expect("the pre-cap response remains accepted");
+    assert!(!response.truncated);
+    assert_eq!(serde_json::to_string(&response).unwrap(), legacy);
+
+    response.truncated = true;
+    assert_eq!(
+        serde_json::to_string(&response).unwrap(),
+        r#"{"nodes":[],"edges":[],"next_cursor":null,"truncated":true}"#
+    );
+}
+
+#[test]
 fn history_commit_view_preserves_the_flat_wire_shape() {
     let response = yg_verbs::HistoryResponse {
         commits: vec![yg_verbs::HistoryCommitView {

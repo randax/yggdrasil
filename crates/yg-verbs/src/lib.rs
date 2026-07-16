@@ -66,6 +66,12 @@ pub const MAX_NEIGHBORS_DEPTH: u32 = 3;
 pub const DEFAULT_NEIGHBORS_LIMIT: usize = 100;
 pub const MIN_PAGE_LIMIT: usize = 1;
 pub const MAX_NEIGHBORS_LIMIT: usize = 1000;
+/// Maximum incident edges loaded for one node during a neighborhood traversal.
+pub const MAX_NEIGHBORS_EDGES_PER_NODE: usize = 1000;
+/// Maximum graph edges returned in one neighborhood page.
+pub const MAX_NEIGHBORS_EDGES_PER_PAGE: usize = 10_000;
+/// Maximum edges examined while discovering nodes for one neighborhood page.
+pub const MAX_TRAVERSAL_EDGES: usize = 10_000;
 pub const DEFAULT_SEARCH_LIMIT: usize = 20;
 pub const MAX_SEARCH_LIMIT: usize = 100;
 pub const DEFAULT_HISTORY_LIMIT: usize = 50;
@@ -619,9 +625,10 @@ pub struct GraphEdge {
 }
 
 /// One page of the `neighbors` Verb's answer: the next slice of the
-/// origin's subgraph (RFC 0001 §7) in traversal order, plus every edge
-/// joining this page to the subgraph already returned. The pages of one
-/// traversal union to the full induced subgraph, each edge exactly once.
+/// origin's subgraph (RFC 0001 §7) in traversal order, plus edges joining
+/// this page to the subgraph already returned. Unless [`Self::truncated`]
+/// is true, the pages of one traversal union to the full induced subgraph,
+/// each edge exactly once.
 ///
 /// `next` is the resume position — `(depth, external id)` of the last
 /// node here — for the caller to wrap into its opaque cursor; `None`
@@ -630,6 +637,9 @@ pub struct GraphEdge {
 pub struct NeighborsPage {
     pub nodes: Vec<NodeView>,
     pub edges: Vec<GraphEdge>,
+    /// Whether this page is incomplete because a cap omitted edges or discovery-time nodes;
+    /// callers must OR this flag across pages.
+    pub truncated: bool,
     #[serde(skip)]
     pub next: Option<(u32, String)>,
 }
@@ -756,7 +766,8 @@ impl NeighborsOptions {
 /// total, Shard-stable order, so a cursor resumed against the same
 /// revision sees exactly the pages a single uninterrupted read would
 /// have. Each edge belongs to the page of its later-ordered endpoint:
-/// every edge of the induced subgraph arrives exactly once.
+/// every edge of the induced subgraph arrives exactly once unless the
+/// returned page carries its truncation marker.
 pub fn neighbors(
     conn: &rusqlite::Connection,
     id: &VerbId,
@@ -765,6 +776,7 @@ pub fn neighbors(
     let empty = NeighborsPage {
         nodes: vec![],
         edges: vec![],
+        truncated: false,
         next: None,
     };
     let Some(local) = &id.local else {
@@ -790,10 +802,13 @@ pub fn neighbors(
     // edge phase below); levels past the page's window are never
     // expanded — deeper nodes can only sort after it.
     let mut memo = EdgeMemo::default();
+    let mut truncated = false;
     let mut order: Vec<(u32, String, String)> = Vec::new(); // (depth, external, local)
     let mut rank: std::collections::HashMap<String, usize> =
         std::collections::HashMap::from([(local.clone(), 0)]);
     let mut frontier: Vec<String> = vec![local.clone()];
+    let mut edges_examined = 0;
+    let mut traversal_budget_exhausted = false;
     // The window starts after the cursor position. A position that
     // isn't in the traversal (a cursor replayed with different filters,
     // say) degrades gracefully: the search's insertion point resumes at
@@ -808,7 +823,15 @@ pub fn neighbors(
     for depth in 1..=options.depth {
         let mut discovered: Vec<(String, String)> = Vec::new(); // (external, local)
         for near in &frontier {
-            for edge in memo.edges_of(conn, near, options.edge_kinds.as_deref())? {
+            let (incident, node_truncated) =
+                memo.edges_of(conn, near, options.edge_kinds.as_deref())?;
+            truncated |= node_truncated;
+            for edge in incident {
+                if edges_examined == MAX_TRAVERSAL_EDGES {
+                    traversal_budget_exhausted = true;
+                    break;
+                }
+                edges_examined += 1;
                 if !follows(edge, near, options.direction) {
                     continue;
                 }
@@ -817,6 +840,9 @@ pub fn neighbors(
                     rank.insert(far.to_string(), usize::MAX); // placed below
                     discovered.push((id.qualify(far), far.to_string()));
                 }
+            }
+            if traversal_budget_exhausted {
+                break;
             }
         }
         // Sorted by *external* id — the order the cursor's binary search
@@ -828,6 +854,10 @@ pub fn neighbors(
             order.push((depth, external.clone(), far.clone()));
         }
         frontier = discovered.into_iter().map(|(_, local)| local).collect();
+        if traversal_budget_exhausted {
+            truncated = true;
+            break;
+        }
         if frontier.is_empty() {
             break;
         }
@@ -858,7 +888,11 @@ pub fn neighbors(
     // nothing: it belongs to its own node's page (the origin's to the
     // first page, below).
     let mut edges = Vec::new();
-    let mut push_edge = |edge: &RawEdge| -> anyhow::Result<()> {
+    let mut page_edges_truncated = false;
+    let mut push_edge = |edge: &RawEdge| -> anyhow::Result<bool> {
+        if edges.len() == MAX_NEIGHBORS_EDGES_PER_PAGE {
+            return Ok(false);
+        }
         let src = VerbId::parse(&id.qualify(&edge.src))
             .map_err(|error| anyhow::anyhow!("invalid stored edge source: {error}"))?;
         let dst = VerbId::parse(&id.qualify(&edge.dst))
@@ -875,30 +909,50 @@ pub fn neighbors(
             confidence: edge.confidence,
             location: edge.location.clone(),
         });
-        Ok(())
+        Ok(true)
     };
-    if start == 0 {
-        for edge in memo.edges_of(conn, local, options.edge_kinds.as_deref())? {
-            if edge.src == edge.dst {
-                push_edge(edge)?;
+    // Once discovery exhausts its aggregate budget, do not let edge assembly
+    // recreate the same unbounded scan through uncached page nodes. The page's
+    // discovered nodes remain deterministic; its truncation marker discloses
+    // that their induced edges were conservatively omitted.
+    if !traversal_budget_exhausted {
+        if start == 0 {
+            let (incident, node_truncated) =
+                memo.edges_of(conn, local, options.edge_kinds.as_deref())?;
+            truncated |= node_truncated;
+            for edge in incident {
+                if edge.src == edge.dst && !push_edge(edge)? {
+                    page_edges_truncated = true;
+                    break;
+                }
+            }
+        }
+        'page_nodes: for (_, _, local) in page {
+            let my_rank = rank[local];
+            let (incident, node_truncated) =
+                memo.edges_of(conn, local, options.edge_kinds.as_deref())?;
+            truncated |= node_truncated;
+            for edge in incident {
+                let qualifies = edge.src == edge.dst
+                    || rank
+                        .get(edge.other_end(local))
+                        .is_some_and(|&far_rank| far_rank < my_rank);
+                if qualifies && !push_edge(edge)? {
+                    page_edges_truncated = true;
+                    break 'page_nodes;
+                }
             }
         }
     }
-    for (_, _, local) in page {
-        let my_rank = rank[local];
-        for edge in memo.edges_of(conn, local, options.edge_kinds.as_deref())? {
-            let qualifies = edge.src == edge.dst
-                || rank
-                    .get(edge.other_end(local))
-                    .is_some_and(|&far_rank| far_rank < my_rank);
-            if qualifies {
-                push_edge(edge)?;
-            }
-        }
-    }
+    truncated |= page_edges_truncated;
 
     let nodes = node_views(conn, page)?;
-    Ok(Some(NeighborsPage { nodes, edges, next }))
+    Ok(Some(NeighborsPage {
+        nodes,
+        edges,
+        truncated,
+        next,
+    }))
 }
 
 /// Whether the traversal may cross `edge` outward from `near`.
@@ -964,7 +1018,12 @@ fn node_views(
 /// page-edge phase ask about overlapping nodes, and the Shard is
 /// immutable for the duration.
 #[derive(Default)]
-struct EdgeMemo(std::collections::HashMap<String, Vec<RawEdge>>);
+struct EdgeMemo(std::collections::HashMap<String, IncidentEdges>);
+
+struct IncidentEdges {
+    edges: Vec<RawEdge>,
+    truncated: bool,
+}
 
 impl EdgeMemo {
     fn edges_of(
@@ -972,12 +1031,13 @@ impl EdgeMemo {
         conn: &rusqlite::Connection,
         local: &str,
         edge_kinds: Option<&[String]>,
-    ) -> anyhow::Result<&[RawEdge]> {
+    ) -> anyhow::Result<(&[RawEdge], bool)> {
         if !self.0.contains_key(local) {
             let edges = incident_edges(conn, local, edge_kinds)?;
             self.0.insert(local.to_string(), edges);
         }
-        Ok(self.0.get(local).expect("just inserted"))
+        let incident = self.0.get(local).expect("just inserted");
+        Ok((&incident.edges, incident.truncated))
     }
 }
 
@@ -989,10 +1049,42 @@ fn incident_edges(
     conn: &rusqlite::Connection,
     local: &str,
     edge_kinds: Option<&[String]>,
+) -> anyhow::Result<IncidentEdges> {
+    // Read each indexed side separately. The previous `(src = ? OR dst = ?)
+    // ORDER BY ... LIMIT` plan built a temporary B-tree from every incident
+    // edge before applying LIMIT, leaving hub latency proportional to degree.
+    // Within a fixed indexed endpoint SQLite stores entries by rowid, so each
+    // side can stop after cap + 1 matching rows. Merge by rowid for deterministic
+    // cap selection, then restore the legacy response ordering for retained edges.
+    let mut edges = incident_edges_at(conn, EDGE_SRC, local, edge_kinds)?;
+    edges.extend(incident_edges_at(conn, EDGE_DST, local, edge_kinds)?);
+    edges.sort_unstable_by_key(|edge| edge.rowid);
+    edges.dedup_by_key(|edge| edge.rowid);
+    let truncated = edges.len() > MAX_NEIGHBORS_EDGES_PER_NODE;
+    edges.truncate(MAX_NEIGHBORS_EDGES_PER_NODE);
+    edges.sort_by(|left, right| {
+        (&left.src, &left.dst, &left.kind, &left.location, left.rowid).cmp(&(
+            &right.src,
+            &right.dst,
+            &right.kind,
+            &right.location,
+            right.rowid,
+        ))
+    });
+    Ok(IncidentEdges { edges, truncated })
+}
+
+/// Load one indexed endpoint of a node's incident edges. `end` is one of
+/// the schema constants selected by [`incident_edges`], never client input.
+fn incident_edges_at(
+    conn: &rusqlite::Connection,
+    end: &str,
+    local: &str,
+    edge_kinds: Option<&[String]>,
 ) -> anyhow::Result<Vec<RawEdge>> {
-    // The kind filter is appended as placeholders, never spliced values.
     let mut params: Vec<&dyn rusqlite::ToSql> = vec![&local as &dyn rusqlite::ToSql];
-    let kinds = match edge_kinds {
+    let kind_filter = match edge_kinds {
+        Some([]) => " AND 0".to_string(),
         Some(kinds) => {
             params.extend(kinds.iter().map(|kind| kind as &dyn rusqlite::ToSql));
             format!(
@@ -1002,30 +1094,33 @@ fn incident_edges(
         }
         None => String::new(),
     };
+    let limit = i64::try_from(MAX_NEIGHBORS_EDGES_PER_NODE + 1)
+        .expect("the per-node edge cap fits SQLite's LIMIT");
+    params.push(&limit);
     let mut stmt = conn.prepare(&format!(
-        "SELECT {EDGE_SRC}, {EDGE_DST}, {EDGE_KIND}, {EDGE_PROVENANCE}, {EDGE_CONFIDENCE}, \
+        "SELECT rowid, {EDGE_SRC}, {EDGE_DST}, {EDGE_KIND}, {EDGE_PROVENANCE}, {EDGE_CONFIDENCE}, \
          {EDGE_LOCATION} FROM {EDGES}
-         WHERE ({EDGE_SRC} = ?1 OR {EDGE_DST} = ?1){kinds}
-         ORDER BY {EDGE_SRC}, {EDGE_DST}, {EDGE_KIND}, {EDGE_LOCATION}"
+         WHERE {end} = ?{kind_filter}
+         ORDER BY rowid LIMIT ?"
     ))?;
-    let edges = stmt
-        .query_map(rusqlite::params_from_iter(params), |row| {
-            Ok(RawEdge {
-                src: row.get(0)?,
-                dst: row.get(1)?,
-                kind: row.get(2)?,
-                provenance: row.get(3)?,
-                confidence: row.get(4)?,
-                location: row.get(5)?,
-            })
-        })?
-        .collect::<Result<Vec<_>, _>>()
-        .context("reading a node's edges")?;
-    Ok(edges)
+    stmt.query_map(rusqlite::params_from_iter(params), |row| {
+        Ok(RawEdge {
+            rowid: row.get(0)?,
+            src: row.get(1)?,
+            dst: row.get(2)?,
+            kind: row.get(3)?,
+            provenance: row.get(4)?,
+            confidence: row.get(5)?,
+            location: row.get(6)?,
+        })
+    })?
+    .collect::<Result<Vec<_>, _>>()
+    .context("reading one indexed side of a node's edges")
 }
 
 /// An edge as the Shard stores it: repo-relative endpoint ids.
 struct RawEdge {
+    rowid: i64,
     src: String,
     dst: String,
     kind: String,
@@ -1328,6 +1423,192 @@ fn history_commit(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn graph_connection(node_count: usize, complete_graph: bool) -> rusqlite::Connection {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TABLE {NODES} (
+                 {NODE_ID} TEXT PRIMARY KEY,
+                 {NODE_KIND} TEXT NOT NULL,
+                 {NODE_NAME} TEXT,
+                 {NODE_PATH} TEXT,
+                 {NODE_COMMITTED_AT} INTEGER
+             );
+             CREATE TABLE {EDGES} (
+                 {EDGE_SRC} TEXT NOT NULL,
+                 {EDGE_DST} TEXT NOT NULL,
+                 {EDGE_KIND} TEXT NOT NULL,
+                 {EDGE_PROVENANCE} TEXT NOT NULL,
+                 {EDGE_CONFIDENCE} REAL NOT NULL,
+                 {EDGE_LOCATION} TEXT
+             );"
+        ))
+        .unwrap();
+        let tx = conn.transaction().unwrap();
+        {
+            let mut insert_node = tx
+                .prepare(&format!(
+                    "INSERT INTO {NODES} ({NODE_ID}, {NODE_KIND}, {NODE_NAME}, {NODE_PATH}, \
+                     {NODE_COMMITTED_AT}) VALUES (?1, ?2, ?3, ?4, NULL)"
+                ))
+                .unwrap();
+            insert_node
+                .execute(rusqlite::params![
+                    "file:hub.rs",
+                    "File",
+                    Option::<String>::None,
+                    "hub.rs"
+                ])
+                .unwrap();
+            for ordinal in 1..node_count {
+                insert_node
+                    .execute(rusqlite::params![
+                        format!("sym:hub.rs#leaf{ordinal:04}"),
+                        "Symbol",
+                        format!("leaf{ordinal:04}"),
+                        "hub.rs"
+                    ])
+                    .unwrap();
+            }
+
+            let mut insert_edge = tx
+                .prepare(&format!(
+                    "INSERT INTO {EDGES} ({EDGE_SRC}, {EDGE_DST}, {EDGE_KIND}, {EDGE_PROVENANCE}, \
+                     {EDGE_CONFIDENCE}, {EDGE_LOCATION}) VALUES (?1, ?2, 'DEFINES', \
+                     'syntactic', 1.0, NULL)"
+                ))
+                .unwrap();
+            if complete_graph {
+                for left in 0..node_count {
+                    let src = if left == 0 {
+                        "file:hub.rs".to_string()
+                    } else {
+                        format!("sym:hub.rs#leaf{left:04}")
+                    };
+                    for right in left + 1..node_count {
+                        let dst = format!("sym:hub.rs#leaf{right:04}");
+                        insert_edge.execute(rusqlite::params![src, dst]).unwrap();
+                    }
+                }
+            } else {
+                for right in 1..node_count {
+                    let dst = format!("sym:hub.rs#leaf{right:04}");
+                    insert_edge
+                        .execute(rusqlite::params!["file:hub.rs", dst])
+                        .unwrap();
+                }
+            }
+        }
+        tx.commit().unwrap();
+        conn
+    }
+
+    fn hub_id() -> VerbId {
+        VerbId::parse("file:github.com/acme/widgets:hub.rs").unwrap()
+    }
+
+    #[test]
+    fn neighbors_caps_each_hub_node_and_marks_the_page_truncated() {
+        let conn = graph_connection(MAX_NEIGHBORS_EDGES_PER_NODE + 2, false);
+        let page = neighbors(
+            &conn,
+            &hub_id(),
+            &NeighborsOptions {
+                limit: MAX_NEIGHBORS_LIMIT,
+                ..NeighborsOptions::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(page.nodes.len(), MAX_NEIGHBORS_EDGES_PER_NODE);
+        assert_eq!(page.edges.len(), MAX_NEIGHBORS_EDGES_PER_NODE);
+        assert!(page.truncated);
+        assert_eq!(page.next, None);
+    }
+
+    #[test]
+    fn neighbors_caps_matching_hub_edges_after_a_selective_kind_filter() {
+        let conn = graph_connection(MAX_NEIGHBORS_EDGES_PER_NODE + 2, false);
+        for ordinal in 1..=5 {
+            conn.execute(
+                &format!(
+                    "INSERT INTO {EDGES} ({EDGE_SRC}, {EDGE_DST}, {EDGE_KIND}, {EDGE_PROVENANCE}, \
+                     {EDGE_CONFIDENCE}, {EDGE_LOCATION}) VALUES (?1, ?2, 'CALLS', \
+                     'syntactic', 1.0, NULL)"
+                ),
+                rusqlite::params!["file:hub.rs", format!("sym:hub.rs#leaf{ordinal:04}")],
+            )
+            .unwrap();
+        }
+        let page = neighbors(
+            &conn,
+            &hub_id(),
+            &NeighborsOptions {
+                edge_kinds: Some(vec!["CALLS".to_string()]),
+                limit: MAX_NEIGHBORS_LIMIT,
+                ..NeighborsOptions::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(page.nodes.len(), 5);
+        assert_eq!(page.edges.len(), 5);
+        assert!(page.edges.iter().all(|edge| edge.kind == EdgeKind::Calls));
+        assert!(!page.truncated);
+    }
+
+    #[test]
+    fn neighbors_caps_aggregate_edges_examined_during_discovery() {
+        let node_count = 102;
+        let degree = node_count - 1;
+        let discovery_examinations = degree + degree * degree;
+        let returned_edges = node_count * (node_count - 1) / 2;
+        assert!(degree < MAX_NEIGHBORS_EDGES_PER_NODE);
+        assert!(discovery_examinations > MAX_TRAVERSAL_EDGES);
+        assert!(returned_edges < MAX_NEIGHBORS_EDGES_PER_PAGE);
+        let conn = graph_connection(node_count, true);
+        let page = neighbors(
+            &conn,
+            &hub_id(),
+            &NeighborsOptions {
+                depth: 2,
+                limit: MAX_NEIGHBORS_LIMIT,
+                ..NeighborsOptions::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(page.nodes.len(), degree);
+        assert!(page.edges.is_empty());
+        assert_eq!(page.next, None);
+        assert!(page.truncated);
+    }
+
+    #[test]
+    fn neighbors_caps_total_page_edges_below_every_node_degree_cap() {
+        let node_count = 143;
+        assert!(node_count - 1 < MAX_NEIGHBORS_EDGES_PER_NODE);
+        assert!(node_count * (node_count - 1) / 2 > MAX_NEIGHBORS_EDGES_PER_PAGE);
+        let conn = graph_connection(node_count, true);
+        let page = neighbors(
+            &conn,
+            &hub_id(),
+            &NeighborsOptions {
+                limit: MAX_NEIGHBORS_LIMIT,
+                ..NeighborsOptions::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(page.nodes.len(), node_count - 1);
+        assert_eq!(page.edges.len(), MAX_NEIGHBORS_EDGES_PER_PAGE);
+        assert!(page.truncated);
+        assert_eq!(page.next, None);
+    }
 
     #[test]
     fn ids_with_port_bearing_qualifiers_round_trip() {

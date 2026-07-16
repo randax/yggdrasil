@@ -105,3 +105,23 @@ pub(crate) fn jsonrpc_parse_error(rejection: &JsonRejection) -> Response {
     )
         .into_response()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn untruncated_neighbors_keep_the_canonical_http_bytes() {
+        let response = yg_verbs::NeighborsResponse {
+            nodes: vec![],
+            edges: vec![],
+            next_cursor: None,
+            truncated: false,
+        };
+
+        assert_eq!(
+            canonical_string(&response).unwrap(),
+            r#"{"edges":[],"next_cursor":null,"nodes":[]}"#
+        );
+    }
+}
