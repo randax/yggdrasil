@@ -211,13 +211,11 @@ async fn call_verb_tool(
         yg_verbs::Verb::Search => {
             let req = decode_tool_args(arguments)?;
             let _timer = state.engine.metrics().timer(yg_verbs::Verb::Search);
-            let response = state.engine.search(req).await.map(|response| {
-                let next_cursor = response.next.as_ref().map(yg_verbs::cursor::encode);
-                yg_verbs::SearchWireResponse {
-                    hits: response.hits,
-                    next_cursor,
-                }
-            });
+            let response = state
+                .engine
+                .search(req)
+                .await
+                .map(yg_verbs::SearchWireResponse::from);
             encode_verb_result(response)
         }
         yg_verbs::Verb::History => {

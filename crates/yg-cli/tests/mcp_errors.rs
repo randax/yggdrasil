@@ -112,9 +112,10 @@ async fn verb_tool_errors_preserve_not_found_gone_and_unavailable() {
         )
         .await
         .unwrap();
-    sqlx::query("UPDATE shards SET revision = $1, manifest_key = $2")
+    sqlx::query("UPDATE shards SET revision = $1, manifest_key = $2 WHERE repo_id = $3")
         .bind(&old_revision)
         .bind(&manifest_key)
+        .bind(repo_id)
         .execute(&pool)
         .await
         .unwrap();
