@@ -1699,6 +1699,10 @@ fn server_config(deploy: &deploy_config::DeployConfig) -> anyhow::Result<yg_api:
             .bootstrap_token
             .clone()
             .context("YG_BOOTSTRAP_TOKEN must be set for API-serving roles")?,
+        cursor_secret: deploy
+            .cursor_secret
+            .clone()
+            .context("YG_CURSOR_SECRET must be set for API-serving roles")?,
         shard_cache: deploy.shard_cache.clone(),
         shard_cache_capacity: deploy.shard_cache_capacity,
     })

@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use super::fanout::RankedRepo;
-use super::{RepoQualifier, SearchHit, SearchSnippet};
+use super::{RepoQualifier, SearchHit, SearchSnippet, SearchTargetProvenance};
 use crate::engine::ShardResolver;
 
 /// Drop retained handles for repositories absent from the selected page.
@@ -19,6 +19,7 @@ pub(super) fn retain_page_repos(
 pub(super) async fn hydrate_snippets<R: ShardResolver + 'static>(
     resolver: Arc<R>,
     ranked: Vec<RankedRepo>,
+    target_provenance: SearchTargetProvenance,
     query: &str,
     page: &mut [SearchHit],
 ) {
@@ -32,7 +33,7 @@ pub(super) async fn hydrate_snippets<R: ShardResolver + 'static>(
         let Some(indices) = by_repo.remove(&qualifier) else {
             continue;
         };
-        let resolved = match resolver.resolve_fts(&repo.target).await {
+        let resolved = match resolver.resolve_fts(&repo.target, target_provenance).await {
             Ok(resolved) => resolved,
             Err(error) => {
                 tracing::warn!(
@@ -127,13 +128,14 @@ mod tests {
         path: std::path::PathBuf,
         target: SearchTarget,
         resolutions: AtomicUsize,
+        control_revalidations: AtomicUsize,
     }
 
     impl ShardResolver for ReopenResolver {
         async fn resolve(
             &self,
             _qualifier: &str,
-            _pinned: Option<String>,
+            _pinned: Option<crate::PinnedShard>,
         ) -> Result<ResolvedShard, ResolveError> {
             Err(ResolveError::UnknownRepo)
         }
@@ -149,8 +151,12 @@ mod tests {
         async fn resolve_fts(
             &self,
             _target: &SearchTarget,
+            provenance: SearchTargetProvenance,
         ) -> Result<crate::ResolvedFts, ResolveError> {
             self.resolutions.fetch_add(1, Ordering::SeqCst);
+            if provenance == SearchTargetProvenance::ResumedFromCursor {
+                self.control_revalidations.fetch_add(1, Ordering::SeqCst);
+            }
             Ok(crate::ResolvedFts {
                 path: self.path.clone(),
                 cache_lease: None,
@@ -199,6 +205,7 @@ mod tests {
             path: path.clone(),
             target: target.clone(),
             resolutions: AtomicUsize::new(0),
+            control_revalidations: AtomicUsize::new(0),
         });
         let ranked = vec![RankedRepo {
             target,
@@ -211,11 +218,13 @@ mod tests {
             .block_on(hydrate_snippets(
                 resolver.clone(),
                 ranked,
+                SearchTargetProvenance::FreshlyEnumerated,
                 "rate limit",
                 &mut page,
             ));
         assert!(page[0].snippet.is_some());
         assert_eq!(resolver.resolutions.load(Ordering::SeqCst), 1);
+        assert_eq!(resolver.control_revalidations.load(Ordering::SeqCst), 0);
         std::fs::remove_dir_all(path).expect("remove fixture");
     }
 
@@ -226,6 +235,7 @@ mod tests {
             path: path.clone(),
             target,
             resolutions: AtomicUsize::new(0),
+            control_revalidations: AtomicUsize::new(0),
         });
 
         let response = tokio::runtime::Builder::new_current_thread()
@@ -233,6 +243,10 @@ mod tests {
             .expect("runtime")
             .block_on(super::super::search(
                 resolver.clone(),
+                &crate::cursor::CursorCodec::new(
+                    crate::CursorSecret::new(b"hydrate-test-secret-at-least-32-bytes".to_vec())
+                        .expect("test secret is non-empty"),
+                ),
                 SearchRequest {
                     query: Some("rate limit".to_string()),
                     kinds: None,
@@ -250,6 +264,11 @@ mod tests {
             resolver.resolutions.load(Ordering::SeqCst),
             2,
             "ranking and hydration each hold a lease for their complete index use"
+        );
+        assert_eq!(
+            resolver.control_revalidations.load(Ordering::SeqCst),
+            0,
+            "a top-level fresh search must not revalidate either FTS resolution"
         );
         std::fs::remove_dir_all(path).expect("remove fixture");
     }

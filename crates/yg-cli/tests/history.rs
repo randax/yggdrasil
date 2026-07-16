@@ -220,10 +220,21 @@ async fn history_paginates_with_a_cursor_without_gaps_or_duplicates() {
 
     // Page size 2: newest two, then the cursor yields the remaining one.
     let p1 = h
-        .verb_ok("history", json!({ "id": file, "limit": 2 }))
+        .verb_ok(
+            "history",
+            json!({ "id": file, "limit": 2, "since": "2000-01-01" }),
+        )
         .await;
     assert_eq!(subjects(&p1), ["c3", "c2"], "newest-first first page");
     let cursor = p1["next_cursor"].as_str().expect("a next cursor");
+
+    let (status, body) = h
+        .verb(
+            "history",
+            json!({ "id": file, "limit": 2, "since": "2000-01-02", "cursor": cursor }),
+        )
+        .await;
+    assert_eq!(status, 400, "a changed since filter is rejected: {body}");
 
     let p2 = h
         .verb_ok(

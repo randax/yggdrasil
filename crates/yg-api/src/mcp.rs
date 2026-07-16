@@ -286,10 +286,7 @@ async fn call_verb_tool(
         }
         yg_verbs::Verb::Search => {
             let req = decode_tool_args(arguments)?;
-            let response = state
-                .search(req)
-                .await
-                .map(yg_verbs::SearchWireResponse::from);
+            let response = state.search(req).await;
             encode_verb_result(response)
         }
         yg_verbs::Verb::History => {
@@ -342,6 +339,9 @@ enum McpVerbErrorKind {
 impl From<yg_verbs::VerbError> for McpVerbError {
     fn from(error: yg_verbs::VerbError) -> Self {
         let (kind, message, detail) = match error {
+            yg_verbs::VerbError::InvalidCursor(error) => {
+                (McpVerbErrorKind::BadRequest, error.to_string(), None)
+            }
             yg_verbs::VerbError::BadRequest(message) => {
                 (McpVerbErrorKind::BadRequest, message, None)
             }

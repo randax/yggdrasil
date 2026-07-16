@@ -13,11 +13,13 @@ base64 = "0.22.1"
 # Parsing the `history` Verb's RFC3339 `since` and rendering commit dates.
 # No clock needed — disable the default `now`/`clock` features.
 chrono = { version = "0.4.45", default-features = false, features = ["std"] }
+hmac.workspace = true
 prometheus-client.workspace = true
 rusqlite = { version = "0.39", features = ["bundled"] }
 schemars = { version = "1.0.4", features = ["derive"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
+sha2.workspace = true
 thiserror = "2.0.17"
 # The engine owns the blocking-execution contract: graph reads run on
 # the blocking pool, never the async runtime's threads.

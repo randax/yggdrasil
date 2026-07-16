@@ -78,6 +78,7 @@ impl From<anyhow::Error> for ApiError {
 impl From<yg_verbs::VerbError> for ApiError {
     fn from(e: yg_verbs::VerbError) -> Self {
         match e {
+            yg_verbs::VerbError::InvalidCursor(error) => Self::bad_request(error.to_string()),
             yg_verbs::VerbError::BadRequest(message) => Self::bad_request(message),
             yg_verbs::VerbError::NotFound(message) => Self::not_found(message),
             yg_verbs::VerbError::NoSuchSymbol(payload) => Self {
