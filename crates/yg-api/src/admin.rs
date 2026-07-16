@@ -41,8 +41,7 @@ pub(crate) async fn admin_forge_add(
     State(state): State<Arc<AppState>>,
     WireJson(req): WireJson<AddForgeRequest>,
 ) -> Result<Response, ApiError> {
-    let forge =
-        discovery_capable_forge(&state.forge_registry, &req.kind).map_err(ApiError::bad_request)?;
+    let forge = discovery_capable_forge(&state.forge_registry, &req.kind)?;
     let org = github_org_slug(&req.org).map_err(ApiError::bad_request)?;
     let base_url = github_base_url(req.base_url.as_deref())
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
@@ -87,11 +86,25 @@ pub(crate) async fn admin_forge_add(
 fn discovery_capable_forge<'a>(
     registry: &'a yg_sync::forge::ForgeRegistry,
     kind: &str,
-) -> Result<&'a dyn Forge, String> {
-    registry
+) -> Result<&'a dyn Forge, ApiError> {
+    let forge = registry
         .by_kind(kind.trim().to_ascii_lowercase().as_str())
         .filter(|forge| forge.discovery().is_some())
-        .ok_or_else(|| format!("forge kind {kind:?} has no discovery adapter in this release"))
+        .ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "forge kind {kind:?} has no discovery adapter in this release"
+            ))
+        })?;
+    endpoint_forge_kind(forge.kind())?;
+    Ok(forge)
+}
+
+fn endpoint_forge_kind(kind: &str) -> Result<ForgeKind, ApiError> {
+    ForgeKind::parse(kind).ok_or_else(|| {
+        ApiError::bad_request(format!(
+            "forge kind {kind} is not supported by this endpoint"
+        ))
+    })
 }
 
 fn github_org_slug(org: &str) -> Result<String, &'static str> {
@@ -154,8 +167,7 @@ pub(crate) async fn admin_forge_discover(
     State(state): State<Arc<AppState>>,
     WireJson(req): WireJson<DiscoverForgeRequest>,
 ) -> Result<Response, ApiError> {
-    let forge =
-        discovery_capable_forge(&state.forge_registry, &req.kind).map_err(ApiError::bad_request)?;
+    let forge = discovery_capable_forge(&state.forge_registry, &req.kind)?;
     let kind = forge.kind();
     let org = github_org_slug(&req.org).map_err(ApiError::bad_request)?;
     let base_url = github_base_url(req.base_url.as_deref())
@@ -290,7 +302,8 @@ pub(crate) async fn admin_repo_add(
     // its adapter before host claims are considered.
     let unclassified = RepoLocator::parse_unclassified(&req.url)
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    let lookup_base = yg_control::ForgeUrl::parse(unclassified.base_url().to_string())
+    let lookup_base = unclassified
+        .configured_lookup_base_url()
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
     let configured_kind = state.control.forge_kind_by_base_url(&lookup_base).await?;
     let locator = if let Some(kind) = configured_kind.as_ref() {
@@ -300,7 +313,7 @@ pub(crate) async fn admin_repo_add(
                 kind.as_str()
             ))
         })?;
-        unclassified.resolve(forge)
+        unclassified.resolve_configured(forge, &lookup_base)
     } else {
         unclassified.resolve_with_registry(&state.forge_registry)
     }
@@ -519,6 +532,23 @@ fn job_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn custom_discovery_kind_has_a_typed_bad_request_response() {
+        let error = endpoint_forge_kind("custom").expect_err("custom must not be representable");
+
+        let response = error.into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("error response body");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).expect("error response JSON"),
+            serde_json::json!({
+                "error": "forge kind custom is not supported by this endpoint"
+            })
+        );
+    }
 
     #[test]
     fn github_admin_urls_report_real_parse_failures() {

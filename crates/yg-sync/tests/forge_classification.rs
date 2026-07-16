@@ -67,3 +67,25 @@ fn registry_classification_preserves_builtin_and_generic_fallbacks() {
         "git"
     );
 }
+
+#[test]
+fn http_spelling_uses_https_only_for_configured_forge_lookup() {
+    let unclassified =
+        RepoLocator::parse_unclassified("http://forge.example/acme/widgets").unwrap();
+    let lookup_base = unclassified.configured_lookup_base_url().unwrap();
+
+    assert_eq!(lookup_base.as_str(), "https://forge.example");
+
+    let configured = unclassified
+        .clone()
+        .resolve_configured(&CustomForge, &lookup_base)
+        .expect("configured adapter should resolve the canonical spelling");
+    assert_eq!(configured.kind, "custom");
+    assert_eq!(configured.base_url, "https://forge.example");
+
+    let locator = unclassified
+        .resolve_with_registry(&ForgeRegistry::builtin())
+        .expect("unknown HTTP Git URL should still resolve");
+    assert_eq!(locator.kind, "git");
+    assert_eq!(locator.base_url, "http://forge.example");
+}

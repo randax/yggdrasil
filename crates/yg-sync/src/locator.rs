@@ -158,9 +158,37 @@ impl RepoLocator {
 }
 
 impl UnclassifiedRepoLocator {
-    /// The normalized root used to look up an already configured Forge.
-    pub fn base_url(&self) -> &str {
-        &self.base_url
+    /// The canonical root spelling used only to query configured Forge records.
+    ///
+    /// Forge administration stores HTTP-capable Forge roots as HTTPS. Preserve
+    /// the typed scheme on this locator so an unknown HTTP Git remote still
+    /// reaches the generic fallback unchanged.
+    pub fn configured_lookup_base_url(
+        &self,
+    ) -> Result<yg_control::ForgeUrl, yg_control::ForgeUrlParseError> {
+        let base_url = match (&self.scheme, &self.host) {
+            (Some(scheme), Some(host)) if scheme == "http" => format!("https://{host}"),
+            _ => self.base_url.clone(),
+        };
+        yg_control::ForgeUrl::parse(base_url)
+    }
+
+    /// Resolve with the adapter selected by a configured Forge record.
+    ///
+    /// The adapter sees the canonical HTTPS spelling used for the lookup, and
+    /// the resulting locator retains the exact configured root. The original
+    /// typed scheme remains untouched on the fallback path.
+    pub fn resolve_configured(
+        mut self,
+        forge: &dyn Forge,
+        configured_base_url: &yg_control::ForgeUrl,
+    ) -> Result<RepoLocator, LocatorError> {
+        if self.scheme.as_deref() == Some("http") {
+            self.scheme = Some("https".into());
+        }
+        let mut locator = self.resolve(forge)?;
+        locator.base_url = configured_base_url.as_str().to_owned();
+        Ok(locator)
     }
 
     /// Resolve through host claims when no configured Forge record matched.
@@ -175,8 +203,8 @@ impl UnclassifiedRepoLocator {
         self.resolve(forge)
     }
 
-    /// Resolve with the adapter selected by a configured Forge record.
-    pub fn resolve(self, forge: &dyn Forge) -> Result<RepoLocator, LocatorError> {
+    /// Resolve with an explicitly selected adapter.
+    fn resolve(self, forge: &dyn Forge) -> Result<RepoLocator, LocatorError> {
         let base_url = match (&self.scheme, &self.host) {
             (Some(scheme), Some(host)) => {
                 let segments: Vec<&str> = self.segments.iter().map(String::as_str).collect();
