@@ -1,6 +1,7 @@
 //! Fuzzy node addressing: parse a bare symbol name plus an explicit repo,
-//! resolve it through the indexed FTS segment, and make ambiguity legible
-//! by borrowing the syntactic pass's ADR 0006 spread-confidence convention.
+//! resolve it byte-exactly through the FTS raw-name index, and make ambiguity
+//! legible by borrowing the syntactic pass's ADR 0006 spread-confidence
+//! convention.
 
 use serde::{Deserialize, Serialize};
 use yg_shard::SYNTACTIC_MATCH;
@@ -59,6 +60,8 @@ pub struct NoSuchSymbol {
 #[serde(rename_all = "snake_case")]
 pub enum NoSuchSymbolKind {
     NoSuchSymbol,
+    /// More declarations share the exact name than the bounded address lookup
+    /// may safely inspect.
     UnaddressableSymbol,
 }
 

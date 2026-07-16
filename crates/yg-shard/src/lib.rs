@@ -52,12 +52,14 @@ pub use fts::{
 /// newest-first ordering and `since` filter).
 /// v6: the syntactic grammar pack adds TypeScript, JavaScript, Python,
 /// Rust, and Java Symbols plus DEFINES/IMPORTS/CALLS facts.
+/// v7: code-aware body and path tokenization, exact raw Symbol names,
+/// per-repo normalized search ranking, and graph edge integrity constraints.
 ///
 /// Bumping this changes every revision id (see
 /// [`syntactic_revision_suffix`]): readers refuse artifacts from other
 /// schema versions ([`SchemaOutdated`]), and worker boot queues a
 /// re-index for every repo still pointing at an outdated revision.
-pub const SCHEMA_VERSION: u32 = 6;
+pub const SCHEMA_VERSION: u32 = 7;
 
 /// Name of the M0 indexing pass, as recorded in revision ids, manifests,
 /// and the control plane's `provenance_level`. The precise pass (M1)
@@ -2010,9 +2012,20 @@ fn build_graph_sqlite(graph: &Graph) -> anyhow::Result<Vec<u8>> {
                  {EDGE_DST}        TEXT NOT NULL,
                  {EDGE_KIND}       TEXT NOT NULL,
                  {EDGE_PROVENANCE} TEXT NOT NULL,
-                 {EDGE_CONFIDENCE} REAL NOT NULL,
+                 {EDGE_CONFIDENCE} REAL NOT NULL
+                     CHECK ({EDGE_CONFIDENCE} >= 0.0 AND {EDGE_CONFIDENCE} <= 1.0),
                  {EDGE_LOCATION}   TEXT
              );
+             -- An edge's derivation and confidence describe it; its
+             -- endpoints, kind, and optional witnessed site identify it.
+             -- Split NULL and non-NULL sites because SQLite treats NULLs
+             -- as distinct in an ordinary UNIQUE constraint.
+             CREATE UNIQUE INDEX edges_unique_without_location
+                 ON {EDGES} ({EDGE_SRC}, {EDGE_DST}, {EDGE_KIND})
+                 WHERE {EDGE_LOCATION} IS NULL;
+             CREATE UNIQUE INDEX edges_unique_with_location
+                 ON {EDGES} ({EDGE_SRC}, {EDGE_DST}, {EDGE_KIND}, {EDGE_LOCATION})
+                 WHERE {EDGE_LOCATION} IS NOT NULL;
              -- Two single-column indexes, not one composite: the read
              -- path's incident-edge lookup is (src = ? OR dst = ?), which
              -- SQLite turns into two index seeks only when each side has
@@ -2066,6 +2079,65 @@ fn build_graph_sqlite(graph: &Graph) -> anyhow::Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_edge(kind: EdgeKind, confidence: f64, location: Option<&str>) -> Edge {
+        Edge {
+            src: "sym:src.rs#source".into(),
+            dst: "sym:dst.rs#target".into(),
+            kind,
+            provenance: Provenance::Syntactic,
+            confidence,
+            location: location.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn graph_build_rejects_duplicate_edges_without_locations() {
+        let edge = test_edge(EdgeKind::Authored, 1.0, None);
+        let graph = Graph {
+            nodes: Vec::new(),
+            edges: vec![edge.clone(), edge],
+        };
+
+        build_graph_sqlite(&graph).expect_err("duplicate AUTHORED edges must fail the build");
+    }
+
+    #[test]
+    fn graph_build_distinguishes_edges_witnessed_at_different_locations() {
+        let graph = Graph {
+            nodes: Vec::new(),
+            edges: vec![
+                test_edge(EdgeKind::Calls, 0.9, Some("src.rs:1:1")),
+                test_edge(EdgeKind::Calls, 0.9, Some("src.rs:2:1")),
+            ],
+        };
+
+        build_graph_sqlite(&graph)
+            .expect("repeated relationships at distinct source sites are unique edges");
+    }
+
+    #[test]
+    fn graph_build_enforces_the_documented_confidence_range() {
+        for confidence in [-f64::EPSILON, 1.0 + f64::EPSILON, f64::NAN] {
+            let graph = Graph {
+                nodes: Vec::new(),
+                edges: vec![test_edge(EdgeKind::Calls, confidence, None)],
+            };
+            assert!(
+                build_graph_sqlite(&graph).is_err(),
+                "confidence {confidence:?} must fail the build"
+            );
+        }
+
+        for confidence in [0.0, 1.0] {
+            let graph = Graph {
+                nodes: Vec::new(),
+                edges: vec![test_edge(EdgeKind::Calls, confidence, None)],
+            };
+            build_graph_sqlite(&graph)
+                .unwrap_or_else(|error| panic!("confidence {confidence} must be valid: {error:#}"));
+        }
+    }
 
     #[test]
     fn contributor_blank_name_is_none_so_the_email_can_stand_in() {

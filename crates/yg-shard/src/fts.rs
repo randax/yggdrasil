@@ -11,7 +11,6 @@
 //! node ids feed straight into `node`/`neighbors`. Writer and reader share
 //! this one schema definition, so they cannot drift.
 
-use std::collections::HashSet;
 use std::path::Path;
 
 use anyhow::Context;
@@ -21,6 +20,9 @@ use tantivy::schema::{
     Field, IndexRecordOption, STORED, STRING, Schema, TextFieldIndexing, TextOptions, Value,
 };
 use tantivy::snippet::SnippetGenerator;
+use tantivy::tokenizer::{
+    LowerCaser, MAX_TOKEN_LEN, SimpleTokenizer, TextAnalyzer, Token, TokenStream, Tokenizer,
+};
 use tantivy::{Index, IndexReader, IndexWriter, TantivyDocument, Term};
 
 use crate::NodeKind;
@@ -100,30 +102,22 @@ impl LocalSymbolPath {
     }
 }
 
-/// A stored symbol name that cannot be safely addressed through searchable
-/// terms.
+/// A stored symbol name that cannot be safely addressed through its exact
+/// index term.
 ///
-/// The raw display-name field is stored but not indexed, so resolving a name
-/// with no terms, too many distinct terms, or too many candidate documents
-/// would require either scanning the Shard or constructing an excessive
-/// Boolean query.
+/// Exact-name lookup is bounded before stored documents are read. A name shared
+/// by more than `MAX_ADDRESS_SCAN_DOCS` declarations is therefore
+/// unaddressable rather than silently truncated into a false unique match.
 #[derive(Debug)]
 pub struct UnaddressableSymbolName;
 
 impl std::fmt::Display for UnaddressableSymbolName {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("the symbol name cannot be safely addressed through searchable terms")
+        f.write_str("too many declarations share the exact symbol name")
     }
 }
 
 impl std::error::Error for UnaddressableSymbolName {}
-
-/// Maximum number of distinct analyzed terms in one fuzzy symbol lookup.
-///
-/// Exact-name filtering happens only after Tantivy selects candidates, so
-/// bounding the Boolean query prevents a crafted name from producing an
-/// excessive number of MUST clauses.
-const MAX_SYMBOL_NAME_TERMS: usize = 64;
 
 /// Maximum candidate documents an exact-name fuzzy address may inspect.
 ///
@@ -138,6 +132,9 @@ const MAX_ADDRESS_SCAN_DOCS: usize = 256;
 /// segment.
 pub const FTS_SEGMENT_FILE: &str = "fts.tar";
 
+const CODE_TOKENIZER: &str = "code";
+const WHOLE_TOKENIZER: &str = "whole";
+
 /// The schema's field handles, resolved once so neither the writer nor the
 /// reader spells a field name twice.
 #[derive(Clone, Copy)]
@@ -148,34 +145,50 @@ struct Fields {
     /// `name`. Kept separate from `terms` so the index-time split words
     /// (`rate limit`) never leak into what the API shows the user.
     name: Field,
-    /// The matchable name text: the raw name plus its split words,
-    /// indexed and boosted but not stored.
+    /// A Symbol's byte-exact, case-sensitive name, indexed with Tantivy's raw
+    /// tokenizer for bounded fuzzy-address lookup. Not stored: `name` is the
+    /// sole display value.
+    raw_name: Field,
+    /// The matchable name text, split by the same code tokenizer as queries
+    /// and boosted but not stored.
     terms: Field,
+    /// Original name text analyzed without camel splitting, preserving whole
+    /// identifier queries while retaining the name-field boost.
+    terms_whole: Field,
+    /// The stored path, also indexed with the code tokenizer so directory and
+    /// filename components are searchable without spelling separators.
     path: Field,
+    /// Path text analyzed without camel splitting.
+    path_whole: Field,
     /// The content, indexed and stored — searched, and the source the
     /// snippet generator reads fragments from. Matched as natural text
-    /// (grep-like): a camelCase identifier inside file content is one
-    /// token, so sub-word matching of code identifiers is the `terms`
-    /// field's job (for Symbols), not the body's.
+    /// with code-aware camel/snake splitting.
     body: Field,
+    /// Body text analyzed without camel splitting. It is not stored; snippet
+    /// fallback reuses the original value stored in `body`.
+    body_whole: Field,
 }
 
 impl Fields {
-    /// Build the schema and its field handles. `terms` and `body` are
-    /// full-text (the default tokenizer: split on punctuation, lowercase);
-    /// `kind` is a raw exact term for filtering; `node_id`/`name`/`path`
-    /// are stored-only for read-back. `body` is stored because the snippet
-    /// generator reads the field value off the matched document; `terms`
-    /// is not — it exists only to be matched.
+    /// Build the schema and its field handles. `terms`, `path`, and `body` use
+    /// the registered code tokenizer; the parallel `*_whole` fields use an
+    /// unfiltered lowercase word tokenizer. `kind`, `node_id`, and `raw_name`
+    /// are raw exact terms. `body` remains stored because snippet generation
+    /// reads the original field value.
     fn schema() -> (Schema, Self) {
         let mut builder = Schema::builder();
-        let indexing = TextFieldIndexing::default()
-            .set_tokenizer("default")
+        let code_indexing = TextFieldIndexing::default()
+            .set_tokenizer(CODE_TOKENIZER)
             .set_index_option(IndexRecordOption::WithFreqsAndPositions);
-        let text_indexed: TextOptions =
-            TextOptions::default().set_indexing_options(indexing.clone());
-        let text_stored: TextOptions = TextOptions::default()
-            .set_indexing_options(indexing)
+        let code_indexed: TextOptions =
+            TextOptions::default().set_indexing_options(code_indexing.clone());
+        let whole_indexed: TextOptions = TextOptions::default().set_indexing_options(
+            TextFieldIndexing::default()
+                .set_tokenizer(WHOLE_TOKENIZER)
+                .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+        );
+        let code_stored: TextOptions = TextOptions::default()
+            .set_indexing_options(code_indexing)
             .set_stored();
         let fields = Self {
             // Indexed (exact) as well as stored: the snippet-hydration
@@ -183,9 +196,13 @@ impl Fields {
             node_id: builder.add_text_field("node_id", STRING | STORED),
             kind: builder.add_text_field("kind", STRING | STORED),
             name: builder.add_text_field("name", STORED),
-            terms: builder.add_text_field("terms", text_indexed),
-            path: builder.add_text_field("path", STORED),
-            body: builder.add_text_field("body", text_stored),
+            raw_name: builder.add_text_field("raw_name", STRING),
+            terms: builder.add_text_field("terms", code_indexed),
+            terms_whole: builder.add_text_field("terms_whole", whole_indexed.clone()),
+            path: builder.add_text_field("path", code_stored.clone()),
+            path_whole: builder.add_text_field("path_whole", whole_indexed.clone()),
+            body: builder.add_text_field("body", code_stored),
+            body_whole: builder.add_text_field("body_whole", whole_indexed),
         };
         (builder.build(), fields)
     }
@@ -202,11 +219,123 @@ impl Fields {
             node_id: field("node_id")?,
             kind: field("kind")?,
             name: field("name")?,
+            raw_name: field("raw_name")?,
             terms: field("terms")?,
+            terms_whole: field("terms_whole")?,
             path: field("path")?,
+            path_whole: field("path_whole")?,
             body: field("body")?,
+            body_whole: field("body_whole")?,
         })
     }
+}
+
+/// Tokenizer for source text and repository-relative paths. It splits on
+/// punctuation/path separators and at camel-case boundaries, lowercases each
+/// word, and chunks pathological words at Tantivy's hard term-size limit.
+/// Unlike Tantivy's default analyzer it has no 40-byte `RemoveLongFilter`, so
+/// long identifiers are indexed instead of silently disappearing.
+#[derive(Clone, Default)]
+struct CodeTokenizer;
+
+struct CodeTokenStream<'a> {
+    text: &'a str,
+    cursor: usize,
+    current: Token,
+}
+
+impl Tokenizer for CodeTokenizer {
+    type TokenStream<'a> = CodeTokenStream<'a>;
+
+    fn token_stream<'a>(&'a mut self, text: &'a str) -> Self::TokenStream<'a> {
+        CodeTokenStream {
+            text,
+            cursor: 0,
+            current: Token::default(),
+        }
+    }
+}
+
+impl TokenStream for CodeTokenStream<'_> {
+    fn advance(&mut self) -> bool {
+        self.current.text.clear();
+        while self.cursor < self.text.len() {
+            let character = self.text[self.cursor..]
+                .chars()
+                .next()
+                .expect("cursor stays on a character boundary");
+            if character.is_alphanumeric() {
+                break;
+            }
+            self.cursor += character.len_utf8();
+        }
+        if self.cursor == self.text.len() {
+            return false;
+        }
+
+        self.current.position = self.current.position.wrapping_add(1);
+        self.current.position_length = 1;
+        self.current.offset_from = self.cursor;
+        let mut previous = None;
+        while self.cursor < self.text.len() {
+            let character = self.text[self.cursor..]
+                .chars()
+                .next()
+                .expect("cursor stays on a character boundary");
+            if !character.is_alphanumeric() {
+                break;
+            }
+            let after = self.cursor + character.len_utf8();
+            let next = self.text[after..].chars().next();
+            let boundary = previous.is_some_and(|previous: char| {
+                (!previous.is_uppercase() && character.is_uppercase())
+                    || (previous.is_uppercase()
+                        && character.is_uppercase()
+                        && next.is_some_and(char::is_lowercase))
+            });
+            let lowercase = character.to_lowercase().collect::<String>();
+            if boundary
+                || (!self.current.text.is_empty()
+                    && self.current.text.len() + lowercase.len() > MAX_TOKEN_LEN)
+            {
+                break;
+            }
+            self.current.text.push_str(&lowercase);
+            self.cursor = after;
+            previous = Some(character);
+        }
+        self.current.offset_to = self.cursor;
+        true
+    }
+
+    fn token(&self) -> &Token {
+        &self.current
+    }
+
+    fn token_mut(&mut self) -> &mut Token {
+        &mut self.current
+    }
+}
+
+#[cfg(test)]
+fn code_tokens(text: &str) -> Vec<Token> {
+    let mut tokenizer = CodeTokenizer;
+    let mut stream = tokenizer.token_stream(text);
+    let mut tokens = Vec::new();
+    while stream.advance() {
+        tokens.push(stream.token().clone());
+    }
+    tokens
+}
+
+fn register_tokenizers(index: &Index) {
+    index.tokenizers().register(CODE_TOKENIZER, CodeTokenizer);
+    index.tokenizers().register(
+        WHOLE_TOKENIZER,
+        TextAnalyzer::builder(SimpleTokenizer::default())
+            .filter(LowerCaser)
+            .build(),
+    );
 }
 
 /// An opened full-text segment, ready to answer [`search`]. Holds the
@@ -217,67 +346,6 @@ pub struct FtsIndex {
     fields: Fields,
 }
 
-/// Split a code identifier into its lowercased words, so a natural query
-/// (`rate limit`) matches a camelCase or snake_case name (`RateLimit`,
-/// `rate_limit`). Splits on non-alphanumeric runs and on camelCase humps,
-/// keeping acronym boundaries (`HTTPServer` → `http`, `server`).
-///
-/// An acronym followed by a short lowercase suffix splits approximately
-/// (`URLs` → `ur`, `ls`) — genuinely ambiguous, and standard splitters
-/// disagree. This costs only sub-word recall on such names: the raw name
-/// is *also* indexed (see [`term_text`]) and tokenized the same way the
-/// query is, so a case-insensitive query for the whole name (`urls`) still
-/// matches, even though a sub-word query (`url`) may not.
-fn identifier_words(name: &str) -> Vec<String> {
-    let mut words = Vec::new();
-    let mut current = String::new();
-    let chars: Vec<char> = name.chars().collect();
-    let flush = |current: &mut String, words: &mut Vec<String>| {
-        if !current.is_empty() {
-            words.push(std::mem::take(current).to_lowercase());
-        }
-    };
-    for (i, &c) in chars.iter().enumerate() {
-        if !c.is_alphanumeric() {
-            flush(&mut current, &mut words);
-            continue;
-        }
-        // A hump starts here when a lowercase/digit gives way to an
-        // uppercase (`rateLimit`), or an acronym gives way to a word
-        // (`HTTPServer`: the S before `erver`).
-        let prev = if i > 0 { Some(chars[i - 1]) } else { None };
-        let next = chars.get(i + 1).copied();
-        let lower_to_upper = prev.is_some_and(|p| !p.is_uppercase()) && c.is_uppercase();
-        let acronym_to_word = prev.is_some_and(|p| p.is_uppercase())
-            && c.is_uppercase()
-            && next.is_some_and(|n| n.is_lowercase());
-        if lower_to_upper || acronym_to_word {
-            flush(&mut current, &mut words);
-        }
-        current.push(c);
-    }
-    flush(&mut current, &mut words);
-    words
-}
-
-/// The text indexed in the `terms` field for matching and boosting: the
-/// name plus its split words, so `RateLimit` matches both `RateLimit` and
-/// `rate limit`. Never stored — the raw name is stored separately for
-/// display.
-fn term_text(doc: &SearchDoc) -> String {
-    match &doc.name {
-        Some(name) => {
-            let mut text = name.clone();
-            for word in identifier_words(name) {
-                text.push(' ');
-                text.push_str(&word);
-            }
-            text
-        }
-        None => String::new(),
-    }
-}
-
 /// Build a full-text segment over `docs` and return the packed bytes —
 /// the tantivy index directory rolled into one tar artifact, ready to put
 /// into object storage beside the graph segment.
@@ -285,6 +353,7 @@ pub fn build_fts(docs: &[SearchDoc]) -> anyhow::Result<Vec<u8>> {
     let dir = tempfile::tempdir().context("creating a scratch dir for the fts segment")?;
     let (schema, fields) = Fields::schema();
     let index = Index::create_in_dir(dir.path(), schema).context("creating the fts index")?;
+    register_tokenizers(&index);
     let mut writer: IndexWriter = index
         .writer(50_000_000)
         .context("opening the fts index writer")?;
@@ -292,19 +361,22 @@ pub fn build_fts(docs: &[SearchDoc]) -> anyhow::Result<Vec<u8>> {
         let mut td = TantivyDocument::default();
         td.add_text(fields.node_id, &doc.node_id);
         td.add_text(fields.kind, doc.kind.as_str());
-        // The raw name is stored for display; its split words go only into
-        // the matchable `terms` field, never into what the API returns.
+        // The raw name is stored for display and analyzed only in the
+        // matchable `terms` field, never in what the API returns.
         if let Some(name) = &doc.name {
             td.add_text(fields.name, name);
-        }
-        let terms = term_text(doc);
-        if !terms.is_empty() {
-            td.add_text(fields.terms, &terms);
+            td.add_text(fields.terms, name);
+            td.add_text(fields.terms_whole, name);
+            if doc.kind == NodeKind::Symbol {
+                td.add_text(fields.raw_name, name);
+            }
         }
         if let Some(path) = &doc.path {
             td.add_text(fields.path, path);
+            td.add_text(fields.path_whole, path);
         }
         td.add_text(fields.body, &doc.content);
+        td.add_text(fields.body_whole, &doc.content);
         writer
             .add_document(td)
             .context("adding a document to the fts index")?;
@@ -389,6 +461,7 @@ fn unpack_fts_reader(reader: impl std::io::Read, dest: &Path) -> anyhow::Result<
 /// Open an unpacked full-text segment directory for reading.
 pub fn open_fts(dir: &Path) -> anyhow::Result<FtsIndex> {
     let index = Index::open_in_dir(dir).context("opening the fts segment")?;
+    register_tokenizers(&index);
     let fields = Fields::of(&index.schema())?;
     // A Shard segment is immutable, so the reader never reloads. Manual
     // avoids the background watch thread the default (`OnCommit`) policy
@@ -532,17 +605,28 @@ fn at_leaf_start(bytes: &[u8], i: usize) -> bool {
     }
 }
 
-/// Parse a user query against the matchable fields (`terms` boosted over
-/// `body`). A query that won't parse is a client error, surfaced as
+/// Parse a user query against the code-aware matchable fields (`terms` boosted
+/// over `path` and `body`) plus a whole-word fallback that preserves collapsed
+/// identifier queries. A query that won't parse is a client error, surfaced as
 /// [`QueryMalformed`]. Shared by ranking and snippet hydration so both
 /// interpret the query identically.
 fn parse_user_query(index: &FtsIndex, query: &str) -> anyhow::Result<Box<dyn Query>> {
     guard_query_complexity(query).map_err(anyhow::Error::new)?;
-    let mut parser =
-        QueryParser::for_index(&index.index, vec![index.fields.terms, index.fields.body]);
+    let mut parser = QueryParser::for_index(
+        &index.index,
+        vec![
+            index.fields.terms,
+            index.fields.terms_whole,
+            index.fields.path,
+            index.fields.path_whole,
+            index.fields.body,
+            index.fields.body_whole,
+        ],
+    );
     // A name hit (a Symbol called RateLimit) should outrank prose that
     // merely mentions the words.
     parser.set_field_boost(index.fields.terms, 3.0);
+    parser.set_field_boost(index.fields.terms_whole, 3.0);
     parser
         .parse_query(query)
         .map_err(|e| anyhow::Error::new(QueryMalformed(e.to_string())))
@@ -613,57 +697,31 @@ pub fn search(index: &FtsIndex, params: &SearchParams) -> anyhow::Result<Vec<Loc
     Ok(hits)
 }
 
-/// Find every Symbol whose stored name exactly equals `name`, optionally
+/// Find every Symbol whose indexed raw name exactly equals `name`, optionally
 /// narrowed to declarations whose repository-relative path contains
 /// `path_fragment`.
 ///
-/// Candidate discovery is index-backed and bounded: the terms generated by the
-/// FTS tokenizer select candidate documents, then the stored raw name is
-/// compared exactly so identifier sub-word matches never become fuzzy
-/// addresses. Candidate sets beyond `MAX_ADDRESS_SCAN_DOCS` are rejected as
-/// unaddressable before stored documents are read, preserving the guarantee
-/// that a truncated scan can never produce a false unique resolution.
+/// Candidate discovery is a case-sensitive raw-term query. Candidate sets
+/// beyond `MAX_ADDRESS_SCAN_DOCS` are rejected as unaddressable before stored
+/// documents are read, preserving the guarantee that a truncated scan can
+/// never produce a false unique resolution.
 pub fn symbols_named(
     index: &FtsIndex,
     name: &str,
     path_fragment: Option<&str>,
 ) -> anyhow::Result<Vec<LocalSymbol>> {
-    let mut analyzer = index
-        .index
-        .tokenizers()
-        .get("default")
-        .context("the FTS index has no default tokenizer")?;
-    let mut stream = analyzer.token_stream(name);
-    let mut tokens = Vec::new();
-    let mut seen = HashSet::new();
-    while stream.advance() {
-        let token = stream.token().text.clone();
-        if seen.insert(token.clone()) {
-            tokens.push(token);
-            if tokens.len() > MAX_SYMBOL_NAME_TERMS {
-                return Err(UnaddressableSymbolName.into());
-            }
-        }
-    }
-    if tokens.is_empty() {
-        return Err(UnaddressableSymbolName.into());
-    }
-    let mut clauses = tokens
-        .into_iter()
-        .map(|token| {
-            let term = Term::from_field_text(index.fields.terms, &token);
-            (
-                Occur::Must,
-                Box::new(TermQuery::new(term, IndexRecordOption::Basic)) as Box<dyn Query>,
-            )
-        })
-        .collect::<Vec<_>>();
+    let raw_name = Term::from_field_text(index.fields.raw_name, name);
     let symbol = Term::from_field_text(index.fields.kind, NodeKind::Symbol.as_str());
-    clauses.push((
-        Occur::Must,
-        Box::new(TermQuery::new(symbol, IndexRecordOption::Basic)),
-    ));
-    let query = BooleanQuery::new(clauses);
+    let query = BooleanQuery::new(vec![
+        (
+            Occur::Must,
+            Box::new(TermQuery::new(raw_name, IndexRecordOption::Basic)) as Box<dyn Query>,
+        ),
+        (
+            Occur::Must,
+            Box::new(TermQuery::new(symbol, IndexRecordOption::Basic)),
+        ),
+    ]);
     let searcher = index.reader.searcher();
     let addresses = searcher
         .search(
@@ -681,12 +739,6 @@ pub fn symbols_named(
             .doc(address)
             .context("reading a symbol lookup document")?;
         let stored = |field| doc.get_first(field).and_then(|value| value.as_str());
-        let Some(stored_name) = stored(index.fields.name) else {
-            continue;
-        };
-        if stored_name != name {
-            continue;
-        }
         let Some(path) = stored(index.fields.path) else {
             continue;
         };
@@ -720,8 +772,11 @@ pub fn snippets_for(
     }
     let searcher = index.reader.searcher();
     let user_query = parse_user_query(index, query)?;
-    let generator = SnippetGenerator::create(&searcher, &*user_query, index.fields.body)
+    let code_generator = SnippetGenerator::create(&searcher, &*user_query, index.fields.body)
         .context("preparing the snippet generator")?;
+    let whole_generator =
+        SnippetGenerator::create(&searcher, &*user_query, index.fields.body_whole)
+            .context("preparing the whole-identifier snippet generator")?;
     for node_id in node_ids {
         let term = Term::from_field_text(index.fields.node_id, node_id);
         let found = searcher
@@ -736,7 +791,20 @@ pub fn snippets_for(
         let doc: TantivyDocument = searcher
             .doc(*address)
             .context("reading a hit's document for snippet hydration")?;
-        let snippet = generator.snippet_from_doc(&doc);
+        let snippet = code_generator.snippet_from_doc(&doc);
+        if !snippet.fragment().is_empty() {
+            out.insert(node_id.clone(), snippet.to_html());
+            continue;
+        }
+        let Some(body) = doc
+            .get_first(index.fields.body)
+            .and_then(|value| value.as_str())
+        else {
+            continue;
+        };
+        let mut whole_doc = TantivyDocument::default();
+        whole_doc.add_text(index.fields.body_whole, body);
+        let snippet = whole_generator.snippet_from_doc(&whole_doc);
         if !snippet.fragment().is_empty() {
             out.insert(node_id.clone(), snippet.to_html());
         }
@@ -762,22 +830,145 @@ impl std::error::Error for QueryMalformed {}
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_ADDRESS_SCAN_DOCS, MAX_QUERY_BYTES, MAX_QUERY_DEPTH, MAX_SYMBOL_NAME_TERMS, SearchDoc,
-        UnaddressableSymbolName, build_fts, guard_query_complexity, identifier_words, open_fts,
-        symbols_named, unpack_fts,
+        MAX_ADDRESS_SCAN_DOCS, MAX_QUERY_BYTES, MAX_QUERY_DEPTH, MAX_TOKEN_LEN, SearchDoc,
+        SearchParams, UnaddressableSymbolName, build_fts, code_tokens, guard_query_complexity,
+        open_fts, search, snippets_for, symbols_named, unpack_fts,
     };
     use crate::NodeKind;
 
     #[test]
-    fn identifier_words_splits_camel_snake_and_acronyms() {
-        assert_eq!(identifier_words("RateLimit"), ["rate", "limit"]);
-        assert_eq!(identifier_words("rate_limit"), ["rate", "limit"]);
-        assert_eq!(identifier_words("HTTPServer"), ["http", "server"]);
-        assert_eq!(identifier_words("parseURL"), ["parse", "url"]);
-        assert_eq!(identifier_words("main.go"), ["main", "go"]);
-        // An acronym trailed by a short lowercase suffix splits at the last
-        // capital before the suffix (the documented approximate behavior).
-        assert_eq!(identifier_words("URLs"), ["ur", "ls"]);
+    fn code_tokenizer_splits_identifiers_and_keeps_long_words() {
+        let long = "identifier".repeat(8);
+        let source = format!("rateLimit HTTPServer snake_case {long}");
+        let tokens = code_tokens(&source)
+            .into_iter()
+            .map(|token| token.text)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            tokens,
+            ["rate", "limit", "http", "server", "snake", "case", &long,]
+        );
+
+        let pathological = "x".repeat(MAX_TOKEN_LEN * 3);
+        let chunks = code_tokens(&pathological);
+        assert_eq!(chunks.len(), 3);
+        assert!(chunks.iter().all(|token| token.text.len() == MAX_TOKEN_LEN));
+    }
+
+    #[test]
+    fn file_bodies_and_paths_use_code_aware_terms() {
+        let bytes = build_fts(&[
+            SearchDoc {
+                node_id: "file:src/http/rate_limiter.rs".to_string(),
+                kind: NodeKind::File,
+                name: Some("opaque".to_string()),
+                path: Some("src/http/rate_limiter.rs".to_string()),
+                content: format!("fn applyRateLimit() {{}} {}", "x".repeat(80)),
+            },
+            SearchDoc {
+                node_id: "file:docs/guide.md".to_string(),
+                kind: NodeKind::File,
+                name: Some("guide.md".to_string()),
+                path: Some("docs/guide.md".to_string()),
+                content: "ordinary prose".to_string(),
+            },
+        ])
+        .expect("build fixture index");
+        let packed = tempfile::tempdir().expect("packed fixture dir");
+        unpack_fts(&bytes, packed.path()).expect("unpack fixture index");
+        let index = open_fts(packed.path()).expect("open fixture index");
+
+        let long_query = "x".repeat(80);
+        for query in [
+            "apply rate limit",
+            "applyratelimit",
+            "http",
+            "limiter",
+            &long_query,
+        ] {
+            let hits = search(
+                &index,
+                &SearchParams {
+                    query,
+                    kinds: Some(&[NodeKind::File]),
+                    limit: 10,
+                },
+            )
+            .expect("search fixture");
+            assert_eq!(
+                hits.first().map(|hit| hit.node_id.as_str()),
+                Some("file:src/http/rate_limiter.rs"),
+                "{query:?} matches code or path components: {hits:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn whole_and_split_identifier_queries_cross_match_without_phrase_gaps() {
+        let bytes = build_fts(&[
+            SearchDoc {
+                node_id: "file:camel.txt".to_string(),
+                kind: NodeKind::File,
+                name: Some("opaque-camel".to_string()),
+                path: Some("camel.txt".to_string()),
+                content: "foo rateLimit".to_string(),
+            },
+            SearchDoc {
+                node_id: "file:snake.txt".to_string(),
+                kind: NodeKind::File,
+                name: Some("opaque-snake".to_string()),
+                path: Some("snake.txt".to_string()),
+                content: "foo rate_limit".to_string(),
+            },
+            SearchDoc {
+                node_id: "file:prose.txt".to_string(),
+                kind: NodeKind::File,
+                name: Some("opaque-prose".to_string()),
+                path: Some("prose.txt".to_string()),
+                content: "foo rate limit".to_string(),
+            },
+        ])
+        .expect("build fixture index");
+        let packed = tempfile::tempdir().expect("packed fixture dir");
+        unpack_fts(&bytes, packed.path()).expect("unpack fixture index");
+        let index = open_fts(packed.path()).expect("open fixture index");
+
+        let ids_for = |query| {
+            search(
+                &index,
+                &SearchParams {
+                    query,
+                    kinds: Some(&[NodeKind::File]),
+                    limit: 10,
+                },
+            )
+            .expect("search fixture")
+            .into_iter()
+            .map(|hit| hit.node_id)
+            .collect::<std::collections::HashSet<_>>()
+        };
+        let camel = ["file:camel.txt".to_string()]
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(ids_for("ratelimit"), camel);
+        let all = [
+            "file:camel.txt".to_string(),
+            "file:snake.txt".to_string(),
+            "file:prose.txt".to_string(),
+        ]
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>();
+        assert_eq!(ids_for("rateLimit"), all);
+        assert_eq!(ids_for("\"foo rate\""), all);
+        let snippets = snippets_for(&index, "ratelimit", &["file:camel.txt".to_string()])
+            .expect("hydrate whole-identifier snippet");
+        assert!(
+            snippets
+                .get("file:camel.txt")
+                .is_some_and(|snippet| snippet.contains("<b>rateLimit</b>")),
+            "whole-identifier fallback still highlights the body: {snippets:?}"
+        );
     }
 
     #[test]
@@ -879,28 +1070,41 @@ mod tests {
     }
 
     #[test]
-    fn zero_term_symbol_names_are_distinct_from_absent_names() {
-        let bytes = build_fts(&[SearchDoc {
-            node_id: "sym:operators.go#::".to_string(),
-            kind: NodeKind::Symbol,
-            name: Some("::".to_string()),
-            path: Some("operators.go".to_string()),
-            content: String::new(),
-        }])
+    fn punctuation_only_and_dollar_symbol_names_are_addressable() {
+        let bytes = build_fts(&[
+            SearchDoc {
+                node_id: "sym:operators.js#::".to_string(),
+                kind: NodeKind::Symbol,
+                name: Some("::".to_string()),
+                path: Some("operators.js".to_string()),
+                content: String::new(),
+            },
+            SearchDoc {
+                node_id: "sym:operators.js#$".to_string(),
+                kind: NodeKind::Symbol,
+                name: Some("$".to_string()),
+                path: Some("operators.js".to_string()),
+                content: String::new(),
+            },
+        ])
         .expect("build fixture index");
         let packed = tempfile::tempdir().expect("packed fixture dir");
         unpack_fts(&bytes, packed.path()).expect("unpack fixture index");
         let index = open_fts(packed.path()).expect("open fixture index");
 
-        let error = symbols_named(&index, "::", None)
-            .expect_err("a zero-term name is un-addressable, not absent");
-
-        assert!(error.downcast_ref::<UnaddressableSymbolName>().is_some());
+        for name in ["::", "$"] {
+            let symbols = symbols_named(&index, name, None).expect("raw name lookup");
+            assert_eq!(symbols.len(), 1);
+            assert_eq!(
+                symbols[0].node_id.as_str(),
+                format!("sym:operators.js#{name}")
+            );
+        }
     }
 
     #[test]
-    fn duplicate_name_tokens_still_resolve_exactly() {
-        let name = vec!["Resolve"; MAX_SYMBOL_NAME_TERMS + 1].join(" ");
+    fn names_longer_than_the_default_token_limit_resolve_exactly() {
+        let name = "LongSymbolName".repeat(4);
         let bytes = build_fts(&[SearchDoc {
             node_id: "sym:service.go#ResolveResolve".to_string(),
             kind: NodeKind::Symbol,
@@ -913,47 +1117,23 @@ mod tests {
         unpack_fts(&bytes, packed.path()).expect("unpack fixture index");
         let index = open_fts(packed.path()).expect("open fixture index");
 
-        let symbols = symbols_named(&index, &name, None).expect("lookup duplicate-token name");
+        let symbols = symbols_named(&index, &name, None).expect("lookup long raw name");
 
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0].node_id.as_str(), "sym:service.go#ResolveResolve");
     }
 
     #[test]
-    fn too_many_distinct_name_tokens_are_unaddressable() {
-        let bytes = build_fts(&[]).expect("build empty fixture index");
-        let packed = tempfile::tempdir().expect("packed fixture dir");
-        unpack_fts(&bytes, packed.path()).expect("unpack fixture index");
-        let index = open_fts(packed.path()).expect("open fixture index");
-        let name = (0..=MAX_SYMBOL_NAME_TERMS)
-            .map(|index| format!("token{index}"))
-            .collect::<Vec<_>>()
-            .join(" ");
-
-        let error = symbols_named(&index, &name, None)
-            .expect_err("too many distinct tokens must be unaddressable");
-
-        assert!(error.downcast_ref::<UnaddressableSymbolName>().is_some());
-    }
-
-    #[test]
     fn candidate_overflow_is_unaddressable_instead_of_false_unique() {
-        let mut documents = (0..MAX_ADDRESS_SCAN_DOCS)
+        let documents = (0..=MAX_ADDRESS_SCAN_DOCS)
             .map(|index| SearchDoc {
-                node_id: format!("sym:service{index}.go#ResolveVariant{index}"),
+                node_id: format!("sym:service{index}.go#Resolve"),
                 kind: NodeKind::Symbol,
-                name: Some(format!("ResolveVariant{index}")),
+                name: Some("Resolve".to_string()),
                 path: Some(format!("service{index}.go")),
                 content: String::new(),
             })
             .collect::<Vec<_>>();
-        documents.push(SearchDoc {
-            node_id: "sym:service.go#Resolve".to_string(),
-            kind: NodeKind::Symbol,
-            name: Some("Resolve".to_string()),
-            path: Some("service.go".to_string()),
-            content: String::new(),
-        });
         let bytes = build_fts(&documents).expect("build overflowing fixture index");
         let packed = tempfile::tempdir().expect("packed fixture dir");
         unpack_fts(&bytes, packed.path()).expect("unpack fixture index");

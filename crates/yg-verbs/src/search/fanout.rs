@@ -9,6 +9,33 @@ pub(super) struct RankedRepo {
     pub(super) hits: Vec<SearchHit>,
 }
 
+/// Put one repository's BM25 scores on a comparable `[0, 1]` scale.
+///
+/// Tantivy ranks each Shard against that repository's own corpus statistics,
+/// so raw scores from differently sized repositories are not directly
+/// comparable. Dividing every score by that repository's maximum preserves
+/// its local ranking and makes its best match `1.0` before cross-repo merge.
+fn normalize_repo_scores(hits: &mut [yg_shard::LocalHit]) {
+    let max_score = hits
+        .iter()
+        .map(|hit| hit.score)
+        .filter(|score| score.is_finite() && *score > 0.0)
+        .max_by(f32::total_cmp);
+    let Some(max_score) = max_score else {
+        for hit in hits {
+            hit.score = 0.0;
+        }
+        return;
+    };
+    for hit in hits {
+        hit.score = if hit.score.is_finite() && hit.score > 0.0 {
+            hit.score / max_score
+        } else {
+            0.0
+        };
+    }
+}
+
 /// Resolve, open, and rank repositories with bounded concurrency and handle retention.
 pub(super) async fn rank_targets<R: ShardResolver + 'static>(
     resolver: Arc<R>,
@@ -74,7 +101,7 @@ fn spawn_rank_task<R: ShardResolver + 'static>(
         let qualifier = target.qualifier.clone();
         let outcome = tokio::task::spawn_blocking(move || -> anyhow::Result<RankedRepo> {
             let index = yg_shard::open_fts(&path)?;
-            let local = yg_shard::search(
+            let mut local = yg_shard::search(
                 &index,
                 &yg_shard::SearchParams {
                     query: &query,
@@ -82,6 +109,7 @@ fn spawn_rank_task<R: ShardResolver + 'static>(
                     limit: super::MAX_SEARCH_WINDOW,
                 },
             )?;
+            normalize_repo_scores(&mut local);
             let hits = local
                 .into_iter()
                 .map(|hit| super::types::qualify_hit(qualifier.as_str(), hit))
@@ -220,6 +248,35 @@ mod tests {
     use super::*;
     use crate::search::ShardRevision;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn local_hit(score: f32) -> yg_shard::LocalHit {
+        yg_shard::LocalHit {
+            node_id: format!("file:{score}"),
+            kind: "File".to_string(),
+            name: None,
+            path: None,
+            score,
+            snippet: None,
+        }
+    }
+
+    #[test]
+    fn repo_scores_normalize_without_changing_local_rank() {
+        let mut small = vec![local_hit(8.0), local_hit(4.0), local_hit(2.0)];
+        let mut large = vec![local_hit(80.0), local_hit(40.0), local_hit(20.0)];
+
+        normalize_repo_scores(&mut small);
+        normalize_repo_scores(&mut large);
+
+        let scores =
+            |hits: &[yg_shard::LocalHit]| hits.iter().map(|hit| hit.score).collect::<Vec<_>>();
+        assert_eq!(scores(&small), [1.0, 0.5, 0.25]);
+        assert_eq!(scores(&large), scores(&small));
+
+        let mut no_hits = Vec::new();
+        normalize_repo_scores(&mut no_hits);
+        assert!(no_hits.is_empty());
+    }
 
     #[test]
     fn dedup_targets_collapses_repeated_repos() {

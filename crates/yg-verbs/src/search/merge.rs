@@ -4,7 +4,8 @@ pub(super) fn clamped_page_limit(offset: usize, limit: usize) -> usize {
     limit.min(super::MAX_SEARCH_WINDOW.saturating_sub(offset))
 }
 
-/// Merge per-repo hits into a deterministic ranking and select one page.
+/// Merge per-repo hits, whose scores are already normalized to each
+/// repository's maximum, into a deterministic ranking and select one page.
 pub(super) fn merge_paginate(
     all: Vec<SearchHit>,
     offset: usize,
