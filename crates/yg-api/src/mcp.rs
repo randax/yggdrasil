@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::AppState;
 use crate::error::error_json;
+use crate::mcp_protocol::{InitializeParams, McpProtocolError};
 use crate::wire::{self, Wire};
 
 pub(crate) async fn mcp(
@@ -103,31 +104,48 @@ async fn handle_mcp_message(
             "JSON-RPC message must be an object",
         ));
     };
+    if object.get("jsonrpc").and_then(serde_json::Value::as_str) != Some("2.0") {
+        return Some(jsonrpc_error(
+            readable_request_id(object.get("id")),
+            -32600,
+            "JSON-RPC request version must be \"2.0\"",
+        ));
+    }
     let Some(method) = object.get("method").and_then(serde_json::Value::as_str) else {
         return Some(jsonrpc_error(
-            object.get("id").cloned().unwrap_or(serde_json::Value::Null),
+            readable_request_id(object.get("id")),
             -32600,
             "JSON-RPC request method must be a string",
         ));
     };
-    let id = object.get("id").cloned()?;
+    if object.get("id").is_some_and(|id| !is_valid_request_id(id)) {
+        return Some(jsonrpc_error(
+            serde_json::Value::Null,
+            -32600,
+            "MCP request id must be a string or integer",
+        ));
+    }
+    let id = match classify_message(object.get("id").cloned(), method) {
+        MessageDisposition::Notification => return None,
+        MessageDisposition::InvalidNotification(id) => {
+            return Some(protocol_error(id, McpProtocolError::NotificationHasId));
+        }
+        MessageDisposition::Request(id) => id,
+    };
     let params = object
         .get("params")
         .cloned()
         .unwrap_or(serde_json::Value::Null);
     let response = match method {
-        "initialize" => jsonrpc_success(
-            id,
-            serde_json::json!({
-                "protocolVersion": "2025-03-26",
-                "capabilities": {"tools": {}},
-                "serverInfo": {
-                    "name": "yggdrasil",
-                    "version": env!("CARGO_PKG_VERSION")
+        "initialize" => match serde_json::from_value::<InitializeParams>(params) {
+            Ok(params) => match serde_json::to_value(crate::mcp_protocol::initialize(params)) {
+                Ok(result) => jsonrpc_success(id, result),
+                Err(error) => {
+                    protocol_error(id, McpProtocolError::SerializeInitializeResult(error))
                 }
-            }),
-        ),
-        "notifications/initialized" => jsonrpc_success(id, serde_json::json!({})),
+            },
+            Err(error) => protocol_error(id, McpProtocolError::InvalidInitializeParams(error)),
+        },
         "tools/list" => match mcp_tools() {
             Ok(tools) => jsonrpc_success(id, serde_json::json!({"tools": tools})),
             Err((code, message)) => jsonrpc_error(id, code, message),
@@ -139,6 +157,53 @@ async fn handle_mcp_message(
         other => jsonrpc_error(id, -32601, format!("unknown MCP method {other:?}")),
     };
     Some(response)
+}
+
+#[derive(Debug, PartialEq)]
+enum MessageDisposition {
+    /// Every valid id-less JSON-RPC request object is one-way, including
+    /// unknown notification methods.
+    Notification,
+    /// MCP notification methods are not requests; attaching an id makes the
+    /// envelope invalid rather than making the method answerable.
+    InvalidNotification(serde_json::Value),
+    Request(serde_json::Value),
+}
+
+fn classify_message(id: Option<serde_json::Value>, method: &str) -> MessageDisposition {
+    match id {
+        None => MessageDisposition::Notification,
+        Some(id) if method.starts_with("notifications/") => {
+            MessageDisposition::InvalidNotification(id)
+        }
+        Some(id) => MessageDisposition::Request(id),
+    }
+}
+
+fn readable_request_id(id: Option<&serde_json::Value>) -> serde_json::Value {
+    id.filter(|id| is_valid_request_id(id))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null)
+}
+
+fn is_valid_request_id(id: &serde_json::Value) -> bool {
+    id.is_string() || id.as_i64().is_some() || id.as_u64().is_some()
+}
+
+fn protocol_error(id: serde_json::Value, error: McpProtocolError) -> serde_json::Value {
+    match error {
+        McpProtocolError::NotificationHasId => {
+            jsonrpc_error(id, -32600, McpProtocolError::NotificationHasId.to_string())
+        }
+        McpProtocolError::InvalidInitializeParams(source) => {
+            tracing::debug!(error = %source, "invalid MCP initialize parameters");
+            jsonrpc_error(id, -32602, "invalid initialize parameters")
+        }
+        McpProtocolError::SerializeInitializeResult(source) => {
+            tracing::error!(error = %source, "serializing MCP initialize result failed");
+            jsonrpc_error(id, -32603, "internal server error")
+        }
+    }
 }
 
 fn jsonrpc_success(id: serde_json::Value, result: serde_json::Value) -> serde_json::Value {
@@ -309,6 +374,8 @@ impl From<yg_verbs::VerbError> for McpVerbError {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     #[test]
     fn mcp_origin_must_match_host_when_present() {
         use axum::http::{HeaderValue, header};
@@ -334,5 +401,29 @@ mod tests {
             !super::mcp_origin_allowed(&headers),
             "cross-origin browser access is rejected"
         );
+    }
+
+    #[test]
+    fn idless_request_objects_are_always_notifications() {
+        for method in ["notifications/initialized", "tools/list", "unknown"] {
+            assert_eq!(
+                super::classify_message(None, method),
+                super::MessageDisposition::Notification
+            );
+        }
+    }
+
+    #[test]
+    fn notification_method_with_id_is_an_invalid_request() {
+        assert_eq!(
+            super::classify_message(Some(json!(7)), "notifications/initialized"),
+            super::MessageDisposition::InvalidNotification(json!(7))
+        );
+        let response = super::protocol_error(
+            json!(7),
+            crate::mcp_protocol::McpProtocolError::NotificationHasId,
+        );
+        assert_eq!(response["error"]["code"], -32600);
+        assert!(response.get("result").is_none(), "{response}");
     }
 }

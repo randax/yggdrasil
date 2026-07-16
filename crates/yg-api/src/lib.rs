@@ -12,6 +12,7 @@ mod config;
 mod error;
 mod health;
 mod mcp;
+mod mcp_protocol;
 mod metrics;
 mod rate_limit;
 mod request_timeout;
