@@ -693,6 +693,10 @@ where
         )
         .context("opening the cached graph segment")?;
         let result = verb(&conn, &id);
+        // The connection must close before the lease releases: eviction
+        // is gated on pin counts, and an open handle past the pin would
+        // let the artifact vanish underneath it.
+        drop(conn);
         drop(cache_lease);
         result
     })

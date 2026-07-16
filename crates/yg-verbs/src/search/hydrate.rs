@@ -85,6 +85,9 @@ async fn hydrate_repo(
     let query = query.to_string();
     let snippets = tokio::task::spawn_blocking(move || {
         let snippets = yg_shard::snippets_for(&index, &query, &local_ids);
+        // Handle before lease: eviction is pin-gated, so the index must
+        // close before its artifact becomes evictable.
+        drop(index);
         drop(cache_lease);
         snippets
     })

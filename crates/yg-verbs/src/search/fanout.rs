@@ -86,8 +86,10 @@ fn spawn_rank_task<R: ShardResolver + 'static>(
                 .into_iter()
                 .map(|hit| super::types::qualify_hit(qualifier.as_str(), hit))
                 .collect::<anyhow::Result<Vec<_>>>()?;
-            drop(cache_lease);
+            // Handle before lease: eviction is pin-gated, so the index
+            // must close before its artifact becomes evictable.
             drop(index);
+            drop(cache_lease);
             Ok(RankedRepo { target, hits })
         })
         .await;
