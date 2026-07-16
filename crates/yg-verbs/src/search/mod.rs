@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use crate::cursor::{self, SearchCursor, SearchKind, SearchMode};
+use crate::cursor::{CursorCodec, SearchCursor, SearchKind, SearchMode};
 use crate::engine::{ShardResolver, VerbError};
 use crate::{DEFAULT_SEARCH_LIMIT, MAX_SEARCH_LIMIT, MIN_PAGE_LIMIT, SearchRequest};
 
@@ -13,7 +13,7 @@ mod types;
 
 pub use types::{
     RepoQualifier, SearchHit, SearchNodeName, SearchPath, SearchResponse, SearchSnippet,
-    SearchTarget, SearchWireResponse, ShardRevision,
+    SearchTarget, SearchTargetProvenance, SearchWireResponse, ShardRevision,
 };
 
 /// The deepest a search cursor may page and each repository may rank.
@@ -28,14 +28,15 @@ const MAX_CONCURRENT_SEARCH_FANOUT: usize = 8;
 /// Run `search` end to end behind the engine seam.
 pub(crate) async fn search<R: ShardResolver + 'static>(
     resolver: Arc<R>,
+    cursors: &CursorCodec,
     req: SearchRequest,
 ) -> Result<SearchResponse, VerbError> {
     let cursor = req
         .cursor
         .as_deref()
-        .map(cursor::decode::<SearchCursor>)
+        .map(|cursor| cursors.decode::<SearchCursor>(cursor))
         .transpose()
-        .map_err(VerbError::BadRequest)?;
+        .map_err(VerbError::InvalidCursor)?;
     let limit = req
         .limit
         .map_or(DEFAULT_SEARCH_LIMIT, |limit| limit as usize);
@@ -45,17 +46,18 @@ pub(crate) async fn search<R: ShardResolver + 'static>(
         )));
     }
 
-    let (query, kind_values, mode, targets, offset) = match cursor {
+    let (query, kind_values, mode, targets, offset, target_provenance) = match cursor {
         Some(cursor) => {
             cursor
                 .agrees_with(&req, MAX_SEARCH_TARGETS)
-                .map_err(|error| VerbError::BadRequest(error.to_string()))?;
+                .map_err(VerbError::InvalidCursor)?;
             (
                 cursor.query,
                 cursor.kinds,
                 cursor.mode,
                 fanout::dedup_targets(cursor.targets),
                 cursor.offset,
+                SearchTargetProvenance::ResumedFromCursor,
             )
         }
         None => {
@@ -73,7 +75,14 @@ pub(crate) async fn search<R: ShardResolver + 'static>(
             let kinds = req
                 .kinds
                 .map(|kinds| kinds.into_iter().map(SearchKind::from).collect());
-            (query, kinds, mode, targets, 0)
+            (
+                query,
+                kinds,
+                mode,
+                targets,
+                0,
+                SearchTargetProvenance::FreshlyEnumerated,
+            )
         }
     };
 
@@ -103,13 +112,12 @@ pub(crate) async fn search<R: ShardResolver + 'static>(
         });
     }
 
-    let from_cursor = req.cursor.is_some();
     let mut ranked = fanout::rank_targets(
         resolver.clone(),
         targets.clone(),
         query.clone(),
         kinds,
-        from_cursor,
+        target_provenance,
     )
     .await?;
     let all = ranked
@@ -118,7 +126,7 @@ pub(crate) async fn search<R: ShardResolver + 'static>(
         .collect();
     let (mut page, has_more) = merge::merge_paginate(all, offset, page_limit);
     let page_repos = hydrate::retain_page_repos(ranked, &page);
-    hydrate::hydrate_snippets(resolver, page_repos, &query, &mut page).await;
+    hydrate::hydrate_snippets(resolver, page_repos, target_provenance, &query, &mut page).await;
 
     let next = (has_more && offset + page_limit < MAX_SEARCH_WINDOW).then(|| SearchCursor {
         query,
@@ -134,13 +142,20 @@ pub(crate) async fn search<R: ShardResolver + 'static>(
 mod tests {
     use super::*;
 
+    fn test_cursors() -> CursorCodec {
+        CursorCodec::new(
+            crate::CursorSecret::new(b"search-module-test-secret-at-least-32-bytes".to_vec())
+                .expect("test secret is non-empty"),
+        )
+    }
+
     struct EmptyResolver;
 
     impl ShardResolver for EmptyResolver {
         async fn resolve(
             &self,
             _: &str,
-            _: Option<String>,
+            _: Option<crate::PinnedShard>,
         ) -> Result<crate::ResolvedShard, crate::ResolveError> {
             Err(crate::ResolveError::UnknownRepo)
         }
@@ -159,17 +174,23 @@ mod tests {
         async fn resolve_fts(
             &self,
             _: &SearchTarget,
+            provenance: SearchTargetProvenance,
         ) -> Result<crate::ResolvedFts, crate::ResolveError> {
-            Err(crate::ResolveError::UnknownRepo)
+            assert_eq!(provenance, SearchTargetProvenance::ResumedFromCursor);
+            Err(crate::ResolveError::RevisionMissing(anyhow::anyhow!(
+                "cursor target vanished"
+            )))
         }
     }
 
     fn resume(cursor: String) -> Result<SearchResponse, VerbError> {
+        let cursors = test_cursors();
         tokio::runtime::Builder::new_current_thread()
             .build()
             .expect("runtime")
             .block_on(search(
                 Arc::new(EmptyResolver),
+                &cursors,
                 SearchRequest {
                     query: None,
                     kinds: None,
@@ -188,7 +209,7 @@ mod tests {
             RepoQualifier::new("repo".to_string()),
             ShardRevision::new("revision".to_string()),
         );
-        let cursor = cursor::encode(&SearchCursor {
+        let cursor = test_cursors().encode(&SearchCursor {
             query: "query".to_string(),
             kinds: None,
             mode: SearchMode::from("lexical".to_string()),
@@ -196,14 +217,17 @@ mod tests {
             offset: 0,
         });
         let outcome = resume(cursor);
-        assert!(
-            matches!(outcome, Err(VerbError::BadRequest(message)) if message == "invalid cursor: it names too many repositories")
-        );
+        assert!(matches!(
+            outcome,
+            Err(VerbError::InvalidCursor(
+                crate::CursorError::SearchTargetCap
+            ))
+        ));
     }
 
     #[test]
     fn unknown_cursor_mode_reaches_the_existing_mode_gate() {
-        let cursor = cursor::encode(&SearchCursor {
+        let cursor = test_cursors().encode(&SearchCursor {
             query: "query".to_string(),
             kinds: None,
             mode: SearchMode::from("future-mode".to_string()),
@@ -219,8 +243,25 @@ mod tests {
     }
 
     #[test]
+    fn vanished_cursor_target_is_gone_not_internal() {
+        let cursor = test_cursors().encode(&SearchCursor {
+            query: "query".to_string(),
+            kinds: None,
+            mode: SearchMode::Lexical,
+            targets: vec![SearchTarget::new(
+                1,
+                RepoQualifier::new("vanished".to_string()),
+                ShardRevision::new("revision".to_string()),
+            )],
+            offset: 0,
+        });
+
+        assert!(matches!(resume(cursor), Err(VerbError::Gone(_))));
+    }
+
+    #[test]
     fn unknown_cursor_kind_reaches_the_existing_vocabulary_gate() {
-        let cursor = cursor::encode(&SearchCursor {
+        let cursor = test_cursors().encode(&SearchCursor {
             query: "query".to_string(),
             kinds: Some(vec![SearchKind::from("FutureKind".to_string())]),
             mode: SearchMode::Lexical,

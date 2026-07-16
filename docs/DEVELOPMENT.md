@@ -35,8 +35,9 @@ volumes (`yggdrasil-dev_postgres-data`, `yggdrasil-dev_minio-data`);
 ## Running the Index Server
 
 The server is configured through `YG_*` environment variables; everything
-defaults to the dev compose stack above except the bootstrap Admin token,
-which is required. All of them resolve through one typed config
+defaults to the dev compose stack above except the bootstrap Admin token and
+cursor-signing secret, which are required for API-serving roles. All of them
+resolve through one typed config
 (`crates/yg-cli/src/deploy_config.rs` — the source of truth this table
 mirrors), and `yg config-check [--role=api|worker|all]` prints the resolved
 configuration (credentials redacted) with every validation error, without
@@ -51,6 +52,7 @@ never connects — cannot report it:
 | Variable | Default | Purpose |
 |---|---|---|
 | `YG_BOOTSTRAP_TOKEN` | — (required for api/all and authenticated worker metrics) | Bootstrap Admin bearer token |
+| `YG_CURSOR_SECRET` | — (required for api/all) | At least 32 bytes of high-entropy secret material for HMAC-signed pagination cursors; keep stable across server restarts |
 | `YG_LISTEN` | `127.0.0.1:7311` | Server bind address |
 | `YG_WORKER_METRICS_ADDR` | — (disabled) | Worker-only `/metrics` bind address (for example `0.0.0.0:9400`); absent means no HTTP listener |
 | `YG_METRICS_UNAUTHENTICATED` | `false` | Expose `GET /metrics` without a bearer token for scraper convenience |
@@ -142,6 +144,7 @@ End to end from a clean checkout:
 ```sh
 docker compose up -d --wait
 export YG_BOOTSTRAP_TOKEN=ygt_dev_$(whoami)
+export YG_CURSOR_SECRET=$(openssl rand -hex 32)
 cargo run -p yg-cli -- serve --role=all &
 export YG_TOKEN=$YG_BOOTSTRAP_TOKEN
 cargo run -p yg-cli -- status

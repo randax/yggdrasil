@@ -11,6 +11,7 @@ use yg_api::{ObjectStoreConfig, RunningServer, ServerConfig, serve};
 /// The bearer token every harness server boots with and every helper
 /// presents.
 pub const TEST_TOKEN: &str = "ygt_test_token";
+pub const TEST_CURSOR_SECRET: &[u8] = b"issue-63-stable-test-cursor-secret";
 
 pub const DEV_POSTGRES: &str = "postgres://yggdrasil:yggdrasil@localhost:5432";
 
@@ -100,6 +101,8 @@ pub fn test_config(db_name: &str) -> ServerConfig {
         // parallel tests can never read each other's Shards.
         object_store: dev_object_store_config(db_name),
         bootstrap_token: TEST_TOKEN.into(),
+        cursor_secret: yg_verbs::CursorSecret::new(TEST_CURSOR_SECRET)
+            .expect("test cursor secret is non-empty"),
         // Per-test (db names are unique) so cache assertions never see
         // another test's segments; content-addressing would make sharing
         // safe, but isolation keeps the tests honest.
@@ -224,7 +227,8 @@ pub fn spawn_yg_role(
     let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin("yg"));
     cmd.env("YG_LISTEN", "127.0.0.1:0")
         .env("YG_DATABASE_URL", format!("{DEV_POSTGRES}/{db_name}"))
-        .env("YG_S3_PREFIX", db_name);
+        .env("YG_S3_PREFIX", db_name)
+        .env("YG_CURSOR_SECRET", "issue-63-stable-test-cursor-secret");
     configure(&mut cmd);
     let child = cmd
         .args(["serve", &format!("--role={role}")])
@@ -460,6 +464,18 @@ impl Harness {
         }
     }
 
+    /// Restart only the API server against the same control plane, object
+    /// prefix, cache, and cursor secret. Continuations minted before the
+    /// restart must remain valid.
+    pub async fn restart_server(&mut self) {
+        self._server.begin_shutdown();
+        self._server.wait().await.expect("server drains cleanly");
+        let mut config = test_config(&self.db_name);
+        config.shard_cache = self._fixture.path().join("shard-cache");
+        self._server = serve(config).await.expect("server restarts");
+        self.base = format!("http://{}", self._server.local_addr());
+    }
+
     pub async fn add_repo(&self) {
         post_repo(&self.base, serde_json::json!({"url": self.fixture_url})).await;
     }
@@ -530,6 +546,16 @@ impl Harness {
         );
         String::from_utf8(out.stdout).expect("yg output is UTF-8")
     }
+}
+
+/// Sign an integration-test cursor payload under the same secret as the
+/// harness server. This is only for tests that need a structurally valid
+/// cursor pointing at deliberately missing state.
+pub fn signed_cursor(payload: &impl serde::Serialize) -> String {
+    yg_verbs::CursorCodec::new(
+        yg_verbs::CursorSecret::new(TEST_CURSOR_SECRET).expect("test cursor secret is non-empty"),
+    )
+    .encode(payload)
 }
 
 /// A local git repository standing in for a Forge-hosted one, addressable

@@ -70,21 +70,6 @@ async fn verb_tool_errors_preserve_not_found_gone_and_unavailable() {
         yg_shard::SYNTACTIC_PASS,
         yg_shard::SCHEMA_VERSION
     );
-    let cursor = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
-        json!({
-            "rev": missing_revision,
-            "id": id,
-            "direction": null,
-            "edge_kinds": null,
-            "depth": 1,
-            "after_depth": 1,
-            "after": id,
-        })
-        .to_string(),
-    );
-    let gone = call_tool(&h, "neighbors", json!({"id": id, "cursor": cursor})).await;
-    assert_tool_error(&gone, "gone", "restart the traversal");
-
     let pool = sqlx::PgPool::connect(&format!("{DEV_POSTGRES}/{}", h.db_name))
         .await
         .unwrap();
@@ -92,6 +77,31 @@ async fn verb_tool_errors_preserve_not_found_gone_and_unavailable() {
         .fetch_one(&pool)
         .await
         .unwrap();
+    let payload = json!({
+        "repo_id": repo_id,
+        "rev": missing_revision,
+        "id": id,
+        "direction": null,
+        "edge_kinds": null,
+        "depth": 1,
+        "after_depth": 1,
+        "after": id,
+    });
+    let cursor = signed_cursor(&payload);
+    let gone = call_tool(&h, "neighbors", json!({"id": id, "cursor": cursor})).await;
+    assert_tool_error(&gone, "gone", "restart the traversal");
+
+    let unsigned = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload.to_string());
+    let invalid = call_tool(&h, "neighbors", json!({"id": id, "cursor": unsigned})).await;
+    assert_tool_error(&invalid, "bad_request", "invalid cursor");
+    let message = invalid["result"]["structuredContent"]["error"]["message"]
+        .as_str()
+        .expect("typed MCP error message");
+    assert!(
+        !message.contains("restart the traversal") && !message.contains(&missing_revision),
+        "an unsigned cursor cannot probe revision existence: {invalid}"
+    );
+
     let old_revision = format!(
         "{commit}-{}-v{}",
         yg_shard::SYNTACTIC_PASS,

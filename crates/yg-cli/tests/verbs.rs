@@ -629,11 +629,12 @@ async fn package_nodes_are_addressable_and_reached_over_imports_edges() {
     assert_eq!(edges[0]["location"], "main.go:3:8");
 }
 
-/// Forge a neighbors cursor the way only a client tampering with (or
-/// outliving) one could: the wire format is opaque base64 JSON.
-fn forged_cursor(fields: serde_json::Value) -> String {
-    use base64::Engine;
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(fields.to_string())
+fn tamper_signature(cursor: &str) -> String {
+    let mut bytes = cursor.as_bytes().to_vec();
+    let signature_start = cursor.rfind('.').expect("signed cursor has a signature") + 1;
+    let first = &mut bytes[signature_start];
+    *first = if *first == b'A' { b'B' } else { b'A' };
+    String::from_utf8(bytes).expect("cursor remains ASCII")
 }
 
 #[tokio::test]
@@ -694,15 +695,29 @@ async fn a_cursor_whose_revision_is_gone_says_expired_not_server_error() {
     h.sync_and_index().await;
 
     let id = format!("file:{}:main.go", h.qualifier());
-    let cursor = forged_cursor(json!({
-        "rev": "0000000000000000000000000000000000000000-syntactic-v2",
+    let missing_revision = format!(
+        "0000000000000000000000000000000000000000-{}-v{}",
+        yg_shard::SYNTACTIC_PASS,
+        yg_shard::SCHEMA_VERSION
+    );
+    let pool = sqlx::PgPool::connect(&format!("{DEV_POSTGRES}/{}", h.db_name))
+        .await
+        .unwrap();
+    let (repo_id,): (i64,) = sqlx::query_as("SELECT repo_id FROM shards")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let payload = json!({
+        "repo_id": repo_id,
+        "rev": missing_revision,
         "id": id,
         "direction": null,
         "edge_kinds": null,
         "depth": 1,
         "after_depth": 1,
         "after": id,
-    }));
+    });
+    let cursor = signed_cursor(&payload);
     let (status, body) = h
         .verb("neighbors", json!({ "id": id, "cursor": cursor }))
         .await;
@@ -714,6 +729,87 @@ async fn a_cursor_whose_revision_is_gone_says_expired_not_server_error() {
             .contains("restart the traversal"),
         "tells the client the way forward: {body}"
     );
+
+    use base64::Engine;
+    let unsigned = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload.to_string());
+    let tampered = tamper_signature(&cursor);
+    for invalid in [unsigned, tampered] {
+        let (status, body) = h
+            .verb("neighbors", json!({ "id": id, "cursor": invalid }))
+            .await;
+        assert_eq!(status, 400, "signature failure is a client error: {body}");
+        let message = body["error"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("invalid cursor"),
+            "clear typed error: {body}"
+        );
+        assert!(
+            !message.contains("restart the traversal") && !message.contains(&missing_revision),
+            "signature failure cannot reveal revision existence: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_cursor_survives_server_restart_with_the_same_secret() {
+    let mut h = five_symbol_harness().await;
+    h.add_repo().await;
+    h.sync_and_index().await;
+
+    let id = format!("file:{}:lib.go", h.qualifier());
+    let node_ids = |page: &serde_json::Value| -> std::collections::HashSet<String> {
+        page["nodes"]
+            .as_array()
+            .expect("nodes")
+            .iter()
+            .map(|node| node["id"].as_str().expect("node id").to_string())
+            .collect()
+    };
+
+    // The unpaginated set is the ground truth: the fixture's neighbor count
+    // shifts with indexing-pass changes, so the walk below is size-agnostic.
+    let full = h
+        .verb_ok("neighbors", json!({"id": id, "limit": 100}))
+        .await;
+    assert!(
+        full["next_cursor"].is_null(),
+        "the fixture fits one oversized page: {full}"
+    );
+    let full_ids = node_ids(&full);
+    assert!(
+        full_ids.len() > 2,
+        "pagination needs multiple pages: {full}"
+    );
+
+    let first = h.verb_ok("neighbors", json!({"id": id, "limit": 2})).await;
+    let mut seen = node_ids(&first);
+    assert_eq!(seen.len(), 2);
+    let mut cursor = first["next_cursor"]
+        .as_str()
+        .expect("first boot mints a continuation")
+        .to_string();
+
+    h.restart_server().await;
+
+    // Every remaining page is served by the restarted process under the
+    // same secret: no duplicates, no losses, clean termination.
+    loop {
+        let page = h
+            .verb_ok("neighbors", json!({"id": id, "limit": 2, "cursor": cursor}))
+            .await;
+        let page_ids = node_ids(&page);
+        assert!(!page_ids.is_empty(), "a continued page has nodes: {page}");
+        assert!(
+            page_ids.is_disjoint(&seen),
+            "restarted pagination repeats nothing: {page}"
+        );
+        seen.extend(page_ids);
+        match page["next_cursor"].as_str() {
+            Some(next) => cursor = next.to_string(),
+            None => break,
+        }
+    }
+    assert_eq!(seen, full_ids, "pagination loses nothing across restarts");
 }
 
 #[tokio::test]

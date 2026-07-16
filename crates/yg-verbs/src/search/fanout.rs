@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use super::{RepoQualifier, SearchHit, SearchTarget};
+use super::{RepoQualifier, SearchHit, SearchTarget, SearchTargetProvenance};
 use crate::engine::{ResolveError, ShardResolver, VerbError};
 
 pub(super) struct RankedRepo {
@@ -45,7 +45,7 @@ pub(super) async fn rank_targets<R: ShardResolver + 'static>(
     targets: Vec<SearchTarget>,
     query: String,
     kinds: Option<Vec<yg_shard::NodeKind>>,
-    from_cursor: bool,
+    target_provenance: SearchTargetProvenance,
 ) -> Result<Vec<RankedRepo>, VerbError> {
     let total = targets.len();
     let mut targets = targets.into_iter().enumerate();
@@ -63,7 +63,7 @@ pub(super) async fn rank_targets<R: ShardResolver + 'static>(
                 target,
                 query.clone(),
                 kinds.clone(),
-                from_cursor,
+                target_provenance,
             );
         }
         if tasks.is_empty() {
@@ -92,12 +92,17 @@ fn spawn_rank_task<R: ShardResolver + 'static>(
     target: SearchTarget,
     query: String,
     kinds: Option<Vec<yg_shard::NodeKind>>,
-    from_cursor: bool,
+    target_provenance: SearchTargetProvenance,
 ) {
     tasks.spawn(async move {
-        let resolved = match resolver.resolve_fts(&target).await {
+        let resolved = match resolver.resolve_fts(&target, target_provenance).await {
             Ok(resolved) => resolved,
-            Err(error) => return (position, Err(map_search_shard_error(error, from_cursor))),
+            Err(error) => {
+                return (
+                    position,
+                    Err(map_search_shard_error(error, target_provenance)),
+                );
+            }
         };
         let path = resolved.path;
         let cache_lease = resolved.cache_lease;
@@ -222,12 +227,23 @@ fn map_named_target_error(qualifier: &str, error: ResolveError) -> VerbError {
     }
 }
 
-pub(super) fn map_search_shard_error(error: ResolveError, from_cursor: bool) -> VerbError {
+pub(super) fn map_search_shard_error(
+    error: ResolveError,
+    target_provenance: SearchTargetProvenance,
+) -> VerbError {
     match error {
-        ResolveError::RevisionMissing(_) if from_cursor => VerbError::Gone(
-            "this cursor's Shard revision is no longer available; restart the search without a cursor".to_string()),
-        ResolveError::SchemaOutdated if from_cursor => VerbError::Gone(
-            "this cursor's Shard revision predates the current index schema; restart the search without a cursor".to_string()),
+        ResolveError::RevisionMissing(_)
+            if target_provenance == SearchTargetProvenance::ResumedFromCursor =>
+        {
+            VerbError::Gone(
+                "this cursor's Shard revision is no longer available; restart the search without a cursor".to_string())
+        }
+        ResolveError::SchemaOutdated
+            if target_provenance == SearchTargetProvenance::ResumedFromCursor =>
+        {
+            VerbError::Gone(
+                "this cursor's Shard revision predates the current index schema; restart the search without a cursor".to_string())
+        }
         ResolveError::SchemaOutdated => VerbError::Unavailable(
             "a repo's Shard predates the current index schema and is being re-indexed; try again shortly".to_string()),
         ResolveError::RevisionMissing(source) | ResolveError::Internal(source) => VerbError::Internal(source),
@@ -323,19 +339,25 @@ mod tests {
     fn search_shard_errors_map_to_client_statuses() {
         let missing = || ResolveError::RevisionMissing(anyhow::anyhow!("gone"));
         assert!(matches!(
-            map_search_shard_error(missing(), true),
+            map_search_shard_error(missing(), SearchTargetProvenance::ResumedFromCursor),
             VerbError::Gone(_)
         ));
         assert!(matches!(
-            map_search_shard_error(ResolveError::SchemaOutdated, true),
+            map_search_shard_error(
+                ResolveError::SchemaOutdated,
+                SearchTargetProvenance::ResumedFromCursor
+            ),
             VerbError::Gone(_)
         ));
         assert!(matches!(
-            map_search_shard_error(ResolveError::SchemaOutdated, false),
+            map_search_shard_error(
+                ResolveError::SchemaOutdated,
+                SearchTargetProvenance::FreshlyEnumerated
+            ),
             VerbError::Unavailable(_)
         ));
         assert!(matches!(
-            map_search_shard_error(missing(), false),
+            map_search_shard_error(missing(), SearchTargetProvenance::FreshlyEnumerated),
             VerbError::Internal(_)
         ));
     }
@@ -345,6 +367,7 @@ mod tests {
         active: AtomicUsize,
         peak: AtomicUsize,
         resolutions: AtomicUsize,
+        control_revalidations: AtomicUsize,
     }
 
     impl CountingResolver {
@@ -354,6 +377,7 @@ mod tests {
                 active: AtomicUsize::new(0),
                 peak: AtomicUsize::new(0),
                 resolutions: AtomicUsize::new(0),
+                control_revalidations: AtomicUsize::new(0),
             }
         }
 
@@ -370,7 +394,7 @@ mod tests {
         async fn resolve(
             &self,
             _: &str,
-            _: Option<String>,
+            _: Option<crate::PinnedShard>,
         ) -> Result<crate::ResolvedShard, ResolveError> {
             Err(ResolveError::UnknownRepo)
         }
@@ -393,8 +417,12 @@ mod tests {
         async fn resolve_fts(
             &self,
             target: &SearchTarget,
+            provenance: SearchTargetProvenance,
         ) -> Result<crate::ResolvedFts, ResolveError> {
             self.resolutions.fetch_add(1, Ordering::SeqCst);
+            if provenance == SearchTargetProvenance::ResumedFromCursor {
+                self.control_revalidations.fetch_add(1, Ordering::SeqCst);
+            }
             let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
             self.peak.fetch_max(active, Ordering::SeqCst);
             for _ in 0..16 {
@@ -422,6 +450,25 @@ mod tests {
     }
 
     #[test]
+    fn fresh_fanout_skips_control_plane_revalidation() {
+        let resolver = Arc::new(CountingResolver::new(1));
+        let result = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime")
+            .block_on(rank_targets(
+                resolver.clone(),
+                vec![CountingResolver::target(0)],
+                "query".to_string(),
+                None,
+                SearchTargetProvenance::FreshlyEnumerated,
+            ));
+
+        assert!(matches!(result, Err(VerbError::Internal(_))));
+        assert_eq!(resolver.resolutions.load(Ordering::SeqCst), 1);
+        assert_eq!(resolver.control_revalidations.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
     fn fanout_never_exceeds_the_named_concurrency_bound() {
         let resolver = Arc::new(CountingResolver::new(
             super::super::MAX_CONCURRENT_SEARCH_FANOUT * 2,
@@ -437,7 +484,7 @@ mod tests {
                 targets,
                 "query".to_string(),
                 None,
-                false,
+                SearchTargetProvenance::FreshlyEnumerated,
             ));
         assert!(matches!(result, Err(VerbError::Internal(_))));
         assert_eq!(
@@ -450,5 +497,10 @@ mod tests {
             "a failing batch must not admit later targets"
         );
         assert_eq!(resolver.active.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            resolver.control_revalidations.load(Ordering::SeqCst),
+            0,
+            "fresh fanout must not enter the cursor-only control-plane revalidation path"
+        );
     }
 }
