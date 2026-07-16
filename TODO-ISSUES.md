@@ -21,7 +21,7 @@ Critical path: **#59 → {#60, #62, #64} → {#63, #65, #66}**.
 - [x] **#79** Typed URL newtypes on control-plane boundary structs (do first — touches structs the rest modify).
 - [x] **#78** Resolve repo-URL forge classification against configured forge records.
 - [x] **#41** Per-repo discovery reconciliation: survive qualifier conflicts, validate discovered slugs, unify lock order.
-- [ ] **#48** Control-plane-shared Forge rate budgeting (absorbs #42's discovery-budget remainder).
+- [x] **#48** Control-plane-shared Forge rate budgeting (absorbs #42's discovery-budget remainder).
 
 ### Verb-engine seam (#59)
 
