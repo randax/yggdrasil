@@ -122,3 +122,54 @@ async fn verb_tool_errors_preserve_not_found_gone_and_unavailable() {
     let unavailable = call_tool(&h, "node", json!({"id": id})).await;
     assert_tool_error(&unavailable, "unavailable", "try again shortly");
 }
+
+#[tokio::test]
+async fn ambiguous_fuzzy_address_is_a_successful_mcp_tool_result() {
+    let h = Harness::boot_with(&[
+        ("alpha/service.go", "package alpha\n\nfunc Resolve() {}\n"),
+        ("beta/service.go", "package beta\n\nfunc Resolve() {}\n"),
+    ])
+    .await;
+    h.add_repo().await;
+    h.sync_and_index().await;
+    let repo = h.qualifier();
+
+    let ambiguous = call_tool(&h, "node", json!({"id": "Resolve", "repo": repo})).await;
+
+    assert!(ambiguous.get("error").is_none(), "{ambiguous}");
+    assert_eq!(ambiguous["result"]["isError"], false, "{ambiguous}");
+    let structured = &ambiguous["result"]["structuredContent"];
+    assert_eq!(structured["resolution"], "ambiguous", "{ambiguous}");
+    assert_eq!(
+        structured["candidates"]
+            .as_array()
+            .expect("ambiguous result has candidates")
+            .len(),
+        2
+    );
+    assert_eq!(structured["total_matches"].as_u64(), Some(2));
+}
+
+#[tokio::test]
+async fn no_such_symbol_mcp_error_preserves_typed_fuzzy_detail() {
+    let h =
+        Harness::boot_with(&[("alpha/service.go", "package alpha\n\nfunc Resolve() {}\n")]).await;
+    h.add_repo().await;
+    h.sync_and_index().await;
+    let repo = h.qualifier();
+
+    let missing = call_tool(&h, "node", json!({"id": "Missing", "repo": repo})).await;
+
+    assert_tool_error(&missing, "not_found", "no such symbol");
+    assert_eq!(
+        missing["result"]["structuredContent"]["error"]["detail"],
+        json!({
+            "kind": "no_such_symbol",
+            "address": {
+                "name": "Missing",
+                "repo": repo,
+            }
+        }),
+        "{missing}"
+    );
+}
