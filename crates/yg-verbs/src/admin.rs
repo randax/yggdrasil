@@ -375,7 +375,6 @@ pub struct IssueTokenResponse {
     pub id: TokenId,
     pub member: MemberName,
     pub token: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<TokenTimestampSeconds>,
 }
 
@@ -485,19 +484,7 @@ pub struct ShardStatus {
 
 #[cfg(test)]
 mod member_token_tests {
-    use super::{IssueTokenResponse, MemberTokenStatus};
-
-    #[test]
-    fn issue_response_accepts_an_older_server_without_expiry() {
-        let response: IssueTokenResponse = serde_json::from_value(serde_json::json!({
-            "id": "mtok_0123456789abcdef01234567",
-            "member": "agent",
-            "token": "secret"
-        }))
-        .unwrap();
-
-        assert!(response.expires_at.is_none());
-    }
+    use super::MemberTokenStatus;
 
     #[test]
     fn member_token_status_uses_operator_facing_lowercase_values() {

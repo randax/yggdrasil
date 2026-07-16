@@ -49,6 +49,7 @@ pub(crate) struct AppState {
     engine: Arc<yg_verbs::Engine<ShardAccess>>,
     metrics: Metrics,
     rate_limiter: rate_limit::TokenRateLimiter,
+    auth_failure_limiter: auth::AuthFailureLimiter,
     search_limiter: search_limit::SearchLimiter,
     mcp_batch_size_limit: usize,
     bootstrap_token: String,
@@ -57,6 +58,9 @@ pub(crate) struct AppState {
 
 impl AppState {
     /// The one transport-independent entry to the server-wide search gate.
+    /// The timer starts before semaphore acquisition, so it includes permit
+    /// wait. The request deadline drops and therefore truncates the timer even
+    /// while detached search execution finishes or reaches its own bound.
     async fn search(
         &self,
         request: yg_verbs::SearchRequest,
@@ -66,6 +70,9 @@ impl AppState {
         self.search_limiter
             .run(move || async move { engine.search(request).await })
             .await
+            .map_err(|_| {
+                yg_verbs::VerbError::Unavailable("search execution timed out".to_owned())
+            })?
     }
 }
 
@@ -180,6 +187,7 @@ async fn serve_with_metrics_registry_and_protection(
         store,
         metrics,
         rate_limiter: rate_limit::TokenRateLimiter::new(protection.token_rate_limit),
+        auth_failure_limiter: auth::AuthFailureLimiter::default(),
         search_limiter: search_limit::SearchLimiter::new(protection.search_concurrency_limit),
         mcp_batch_size_limit: protection.mcp_batch_size_limit.get(),
         bootstrap_token: config.bootstrap_token,

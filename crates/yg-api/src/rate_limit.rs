@@ -57,19 +57,26 @@ impl TokenRateLimiter {
     }
 
     fn check_at(&self, key: TokenRateLimitKey, now: Instant) -> Result<(), Duration> {
-        let cutoff = now.checked_sub(self.window).unwrap_or(now);
+        // An unrepresentable cutoff (window longer than the platform's
+        // Instant history, e.g. shortly after boot) fails CLOSED: no
+        // pruning happens, so every recorded request still counts.
+        let cutoff = now.checked_sub(self.window);
         let mut state = self.inner.lock().expect("rate limiter lock poisoned");
         state.checks_since_prune += 1;
         if state.checks_since_prune >= 1024 {
-            state
-                .requests_by_token
-                .retain(|_, requests| requests.back().is_some_and(|last| *last > cutoff));
+            if let Some(cutoff) = cutoff {
+                state
+                    .requests_by_token
+                    .retain(|_, requests| requests.back().is_some_and(|last| *last > cutoff));
+            }
             state.checks_since_prune = 0;
         }
 
         let requests = state.requests_by_token.entry(key).or_default();
-        while requests.front().is_some_and(|instant| *instant <= cutoff) {
-            requests.pop_front();
+        if let Some(cutoff) = cutoff {
+            while requests.front().is_some_and(|instant| *instant <= cutoff) {
+                requests.pop_front();
+            }
         }
         if requests.len() < self.requests {
             requests.push_back(now);
@@ -87,9 +94,13 @@ impl TokenRateLimiter {
 }
 
 pub(crate) fn rate_limited(retry_after: Duration) -> Response {
+    rate_limited_with_message(retry_after, "token rate limit exceeded")
+}
+
+pub(crate) fn rate_limited_with_message(retry_after: Duration, message: &str) -> Response {
     let retry_after_seconds =
         (retry_after.as_secs() + u64::from(retry_after.subsec_nanos() != 0)).max(1);
-    let mut response = error_json(StatusCode::TOO_MANY_REQUESTS, "token rate limit exceeded");
+    let mut response = error_json(StatusCode::TOO_MANY_REQUESTS, message);
     response.headers_mut().insert(
         header::RETRY_AFTER,
         HeaderValue::from_str(&retry_after_seconds.to_string())

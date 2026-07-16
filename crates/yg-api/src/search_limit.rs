@@ -3,8 +3,14 @@
 use std::future::Future;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::Semaphore;
+
+const SEARCH_EXECUTION_TIMEOUT: Duration = Duration::from_secs(60);
+
+#[derive(Debug)]
+pub(crate) struct SearchExecutionTimeout;
 
 #[derive(Clone)]
 pub(crate) struct SearchLimiter {
@@ -14,11 +20,39 @@ pub(crate) struct SearchLimiter {
 impl SearchLimiter {
     pub(crate) fn new(limit: NonZeroUsize) -> Self {
         Self {
-            permits: Arc::new(Semaphore::new(limit.get())),
+            // Semaphore::new panics above MAX_PERMITS; an accepted config
+            // must not crash the boot, so clamp with a warning instead.
+            permits: Arc::new(Semaphore::new(if limit.get() > Semaphore::MAX_PERMITS {
+                tracing::warn!(
+                    configured = limit.get(),
+                    clamped = Semaphore::MAX_PERMITS,
+                    "search concurrency clamped to the runtime maximum"
+                );
+                Semaphore::MAX_PERMITS
+            } else {
+                limit.get()
+            })),
         }
     }
 
-    pub(crate) async fn run<T, Work, WorkFuture>(&self, work: Work) -> T
+    pub(crate) async fn run<T, Work, WorkFuture>(
+        &self,
+        work: Work,
+    ) -> Result<T, SearchExecutionTimeout>
+    where
+        T: Send + 'static,
+        Work: FnOnce() -> WorkFuture + Send + 'static,
+        WorkFuture: Future<Output = T> + Send + 'static,
+    {
+        self.run_with_execution_timeout(SEARCH_EXECUTION_TIMEOUT, work)
+            .await
+    }
+
+    async fn run_with_execution_timeout<T, Work, WorkFuture>(
+        &self,
+        execution_timeout: Duration,
+        work: Work,
+    ) -> Result<T, SearchExecutionTimeout>
     where
         T: Send + 'static,
         Work: FnOnce() -> WorkFuture + Send + 'static,
@@ -32,7 +66,16 @@ impl SearchLimiter {
             .expect("the search semaphore is never closed");
         tokio::spawn(async move {
             let _permit = permit;
-            work().await
+            match tokio::time::timeout(execution_timeout, work()).await {
+                Ok(result) => Ok(result),
+                Err(_) => {
+                    tracing::warn!(
+                        ?execution_timeout,
+                        "search execution timed out; releasing concurrency permit"
+                    );
+                    Err(SearchExecutionTimeout)
+                }
+            }
         })
         .await
         .expect("limited search task must not panic")
@@ -41,10 +84,8 @@ impl SearchLimiter {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Duration;
-
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[tokio::test]
     async fn concurrent_search_work_never_exceeds_the_named_bound() {
@@ -65,7 +106,8 @@ mod tests {
                         tokio::time::sleep(Duration::from_millis(10)).await;
                         active.fetch_sub(1, Ordering::SeqCst);
                     })
-                    .await;
+                    .await
+                    .expect("search execution stays within timeout");
             }));
         }
         for task in tasks {
@@ -88,7 +130,8 @@ mod tests {
                     let _ = started_tx.send(());
                     let _ = finish_rx.await;
                 })
-                .await;
+                .await
+                .expect("search execution stays within timeout");
         });
         started_rx.await.expect("first work started");
         first.abort();
@@ -100,7 +143,8 @@ mod tests {
                 .run(move || async move {
                     second_counter.fetch_add(1, Ordering::SeqCst);
                 })
-                .await;
+                .await
+                .expect("search execution stays within timeout");
         });
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert_eq!(second_started.load(Ordering::SeqCst), 0);
@@ -108,5 +152,31 @@ mod tests {
         finish_tx.send(()).expect("first work is still running");
         second.await.expect("replacement work completes");
         assert_eq!(second_started.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn timed_out_detached_work_releases_its_permit() {
+        let limiter = SearchLimiter::new(NonZeroUsize::new(1).expect("one is nonzero"));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let first_limiter = limiter.clone();
+        let first = tokio::spawn(async move {
+            first_limiter
+                .run_with_execution_timeout(Duration::from_millis(10), move || async move {
+                    let _ = started_tx.send(());
+                    std::future::pending::<()>().await;
+                })
+                .await
+        });
+        started_rx.await.expect("first work started");
+        first.abort();
+
+        tokio::time::timeout(Duration::from_millis(100), async {
+            limiter
+                .run(|| async {})
+                .await
+                .expect("replacement work completes");
+        })
+        .await
+        .expect("timed-out work releases its permit");
     }
 }

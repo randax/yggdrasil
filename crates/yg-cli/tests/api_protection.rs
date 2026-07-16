@@ -95,7 +95,45 @@ async fn rate_limit_is_per_token_and_returns_retry_after() {
 }
 
 #[tokio::test]
-async fn oversized_mcp_batch_is_rejected_as_one_json_rpc_error() {
+async fn admin_metrics_scrapes_do_not_consume_the_bootstrap_request_budget() {
+    let protection = yg_api::ProtectionConfig {
+        token_rate_limit: yg_api::TokenRateLimitConfig {
+            requests: NonZeroU32::new(1).unwrap(),
+            window: Duration::from_secs(60),
+        },
+        ..yg_api::ProtectionConfig::default()
+    };
+    let (_server, base, _db_name) = boot_with_protection(protection).await;
+    let client = reqwest::Client::new();
+
+    let ordinary = client
+        .get(format!("{base}/v1/status"))
+        .bearer_auth(TEST_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ordinary.status(), 200);
+    let limited = client
+        .get(format!("{base}/v1/status"))
+        .bearer_auth(TEST_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(limited.status(), 429);
+
+    for _ in 0..2 {
+        let scrape = client
+            .get(format!("{base}/metrics"))
+            .bearer_auth(TEST_TOKEN)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(scrape.status(), 200);
+    }
+}
+
+#[tokio::test]
+async fn oversized_mcp_batch_returns_one_json_rpc_error() {
     let protection = yg_api::ProtectionConfig {
         mcp_batch_size_limit: NonZeroUsize::new(2).unwrap(),
         ..yg_api::ProtectionConfig::default()
@@ -114,7 +152,7 @@ async fn oversized_mcp_batch_is_rejected_as_one_json_rpc_error() {
         .send()
         .await
         .unwrap();
-    assert_eq!(response.status(), 400);
+    assert_eq!(response.status(), 200);
     let body: Value = response.json().await.unwrap();
     assert!(
         body.is_object(),
@@ -137,7 +175,7 @@ async fn expired_tokens_are_rejected_and_listed_while_non_expiring_tokens_work()
     let expiring = issue(&base, "short-lived", Some(1)).await;
     let permanent = issue(&base, "no-expiry", None).await;
     assert!(expiring["expires_at"].is_i64());
-    assert!(permanent["expires_at"].is_null());
+    assert_eq!(permanent.get("expires_at"), Some(&Value::Null));
 
     tokio::time::sleep(Duration::from_millis(1_200)).await;
     assert_eq!(
@@ -172,5 +210,5 @@ async fn expired_tokens_are_rejected_and_listed_while_non_expiring_tokens_work()
         .find(|token| token["id"] == permanent["id"])
         .expect("non-expiring token is listed");
     assert_eq!(active["status"], "active");
-    assert!(active["expires_at"].is_null());
+    assert_eq!(active.get("expires_at"), Some(&Value::Null));
 }

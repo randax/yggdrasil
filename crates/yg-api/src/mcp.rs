@@ -40,18 +40,15 @@ pub(crate) async fn mcp(
                 .into_response();
             }
             if messages.len() > state.mcp_batch_size_limit {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Wire(jsonrpc_error(
-                        serde_json::Value::Null,
-                        -32000,
-                        format!(
-                            "JSON-RPC batch exceeds maximum of {} messages",
-                            state.mcp_batch_size_limit
-                        ),
-                    )),
-                )
-                    .into_response();
+                return Wire(jsonrpc_error(
+                    serde_json::Value::Null,
+                    -32000,
+                    format!(
+                        "JSON-RPC batch exceeds maximum of {} messages",
+                        state.mcp_batch_size_limit
+                    ),
+                ))
+                .into_response();
             }
             let mut responses = Vec::new();
             for message in messages {

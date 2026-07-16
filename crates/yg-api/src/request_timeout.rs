@@ -48,6 +48,8 @@ async fn run_with_timeout(
             // body extractor consumes it. Treat it as a transport failure:
             // inventing id:null would be an invalid response to a request
             // with a real id (and notifications must receive no envelope).
+            // MCP currently exposes only read-only Verbs, so this transport
+            // 408 cannot hide a committed side effect.
             TimeoutProtocol::Mcp => StatusCode::REQUEST_TIMEOUT.into_response(),
         },
     }
