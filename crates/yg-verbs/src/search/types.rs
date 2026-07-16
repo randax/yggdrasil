@@ -150,6 +150,18 @@ pub struct SearchWireResponse {
     pub next_cursor: Option<String>,
 }
 
+impl From<super::SearchResponse> for SearchWireResponse {
+    /// The one place the typed continuation becomes its encoded wire
+    /// form, shared by every transport.
+    fn from(response: super::SearchResponse) -> Self {
+        let next_cursor = response.next.as_ref().map(crate::cursor::encode);
+        Self {
+            hits: response.hits,
+            next_cursor,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct SearchResponse {
     /// The requested page in deterministic merged rank order.

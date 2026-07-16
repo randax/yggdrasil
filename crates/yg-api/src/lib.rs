@@ -39,6 +39,7 @@ use verbs::ShardAccess;
 
 pub(crate) struct AppState {
     control: ControlPlane,
+    forge_registry: yg_sync::forge::ForgeRegistry,
     store: Arc<dyn ObjectStore>,
     engine: yg_verbs::Engine<ShardAccess>,
     metrics: Metrics,
@@ -54,7 +55,17 @@ pub(crate) struct MetricsServerState {
 /// Boot the Index Server: connect to the control plane, verify object
 /// storage, and start serving.
 pub async fn serve(config: ServerConfig) -> anyhow::Result<RunningServer> {
-    serve_with_metrics(config, Metrics::new(), MetricsAccess::Admin).await
+    serve_with_registry(config, yg_sync::forge::ForgeRegistry::builtin()).await
+}
+
+/// Boot the Index Server with an injected Forge registry used by repository
+/// registration and Forge administration.
+pub async fn serve_with_registry(
+    config: ServerConfig,
+    forge_registry: yg_sync::forge::ForgeRegistry,
+) -> anyhow::Result<RunningServer> {
+    serve_with_metrics_and_registry(config, Metrics::new(), MetricsAccess::Admin, forge_registry)
+        .await
 }
 
 /// Whether Prometheus exposition participates in the Admin auth policy.
@@ -72,6 +83,22 @@ pub async fn serve_with_metrics(
     config: ServerConfig,
     metrics: Metrics,
     metrics_access: MetricsAccess,
+) -> anyhow::Result<RunningServer> {
+    serve_with_metrics_and_registry(
+        config,
+        metrics,
+        metrics_access,
+        yg_sync::forge::ForgeRegistry::builtin(),
+    )
+    .await
+}
+
+/// Boot the Index Server with supplied metrics and Forge adapters.
+pub async fn serve_with_metrics_and_registry(
+    config: ServerConfig,
+    metrics: Metrics,
+    metrics_access: MetricsAccess,
+    forge_registry: yg_sync::forge::ForgeRegistry,
 ) -> anyhow::Result<RunningServer> {
     let control =
         ControlPlane::connect_and_migrate_with_metrics(&config.database_url, metrics.control())
@@ -94,6 +121,7 @@ pub async fn serve_with_metrics(
             metrics.verbs(),
         ),
         control,
+        forge_registry,
         store,
         metrics,
         bootstrap_token: config.bootstrap_token,

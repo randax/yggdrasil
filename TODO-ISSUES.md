@@ -19,15 +19,15 @@ Critical path: **#59 → {#60, #62, #64} → {#63, #65, #66}**.
 ### Forge/sync seam (#53, merged) — in order
 
 - [x] **#79** Typed URL newtypes on control-plane boundary structs (do first — touches structs the rest modify).
-- [ ] **#78** Resolve repo-URL forge classification against configured forge records.
-- [ ] **#41** Per-repo discovery reconciliation: survive qualifier conflicts, validate discovered slugs, unify lock order.
+- [x] **#78** Resolve repo-URL forge classification against configured forge records.
+- [x] **#41** Per-repo discovery reconciliation: survive qualifier conflicts, validate discovered slugs, unify lock order.
 - [ ] **#48** Control-plane-shared Forge rate budgeting (absorbs #42's discovery-budget remainder).
 
 ### Verb-engine seam (#59)
 
 - [x] **#60** Shared `Serialize + Deserialize` wire DTOs; typed CLI parsing (kill `unwrap_or("?")` fallbacks).
 - [x] **#61** Fuzzy node ids with ranked candidates (no-such-symbol vs ambiguous).
-- [ ] **#62** MCP tools call the Verb engine directly (remove 50MB re-buffer and flattened error strings).
+- [x] **#62** MCP tools call the Verb engine directly (remove 50MB re-buffer and flattened error strings).
 
 ### One shard schema bump (batch: one `SCHEMA_VERSION` bump, one reindex)
 
@@ -38,7 +38,7 @@ Critical path: **#59 → {#60, #62, #64} → {#63, #65, #66}**.
 ### Independents
 
 - [x] **#45** Shard cache: LRU eviction, single-flight cold fetches, streaming verification.
-- [ ] **#44** Cap hub-node fan-out in graph traversals; truncation markers (no schema bump).
+- [x] **#44** Cap hub-node fan-out in graph traversals; truncation markers (no schema bump).
 - [ ] **#58** API protection: per-token rate limits, token expiry, MCP batch caps, server/client timeouts.
 
 ## Wave 3 — dependents

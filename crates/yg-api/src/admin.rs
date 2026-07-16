@@ -11,9 +11,10 @@ use yg_sync::RepoLocator;
 use yg_sync::forge::Forge;
 use yg_verbs::admin::{
     AddForgeResponse, AddRepoResponse, AddRuleResponse, AdminRepoStatus, AdminStatusResponse,
-    DiscoverForgeResponse, DiscoveryState, ForgeBaseUrl, ForgeKind, IssueTokenResponse, JobState,
-    JobStatus, MemberName, OrgName, RepoSlug, RepoVisibility, RevokeTokenResponse, RuleAction,
-    RuleResponse, RulesResponse, ShardStatus, TokenId, VisibilityCounts,
+    DiscoverForgeResponse, DiscoveryQualifierConflictStatus, DiscoveryState, ForgeBaseUrl,
+    ForgeKind, IssueTokenResponse, JobState, JobStatus, MemberName, OrgName, RepoQualifier,
+    RepoSlug, RepoVisibility, RevokeTokenResponse, RuleAction, RuleResponse, RulesResponse,
+    ShardStatus, TokenId, VisibilityCounts,
 };
 
 use crate::AppState;
@@ -41,7 +42,7 @@ pub(crate) async fn admin_forge_add(
     State(state): State<Arc<AppState>>,
     WireJson(req): WireJson<AddForgeRequest>,
 ) -> Result<Response, ApiError> {
-    let forge = discovery_capable_forge(&req.kind).map_err(ApiError::bad_request)?;
+    let forge = discovery_capable_forge(&state.forge_registry, &req.kind)?;
     let org = github_org_slug(&req.org).map_err(ApiError::bad_request)?;
     let base_url = github_base_url(req.base_url.as_deref())
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
@@ -83,11 +84,28 @@ pub(crate) async fn admin_forge_add(
 
 /// Resolve a requested forge kind to a registered adapter that can
 /// discover org repositories.
-fn discovery_capable_forge(kind: &str) -> Result<&'static dyn Forge, String> {
-    yg_sync::forge::builtin()
+fn discovery_capable_forge<'a>(
+    registry: &'a yg_sync::forge::ForgeRegistry,
+    kind: &str,
+) -> Result<&'a dyn Forge, ApiError> {
+    let forge = registry
         .by_kind(kind.trim().to_ascii_lowercase().as_str())
         .filter(|forge| forge.discovery().is_some())
-        .ok_or_else(|| format!("forge kind {kind:?} has no discovery adapter in this release"))
+        .ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "forge kind {kind:?} has no discovery adapter in this release"
+            ))
+        })?;
+    endpoint_forge_kind(forge.kind())?;
+    Ok(forge)
+}
+
+fn endpoint_forge_kind(kind: &str) -> Result<ForgeKind, ApiError> {
+    ForgeKind::parse(kind).ok_or_else(|| {
+        ApiError::bad_request(format!(
+            "forge kind {kind} is not supported by this endpoint"
+        ))
+    })
 }
 
 fn github_org_slug(org: &str) -> Result<String, &'static str> {
@@ -150,7 +168,7 @@ pub(crate) async fn admin_forge_discover(
     State(state): State<Arc<AppState>>,
     WireJson(req): WireJson<DiscoverForgeRequest>,
 ) -> Result<Response, ApiError> {
-    let forge = discovery_capable_forge(&req.kind).map_err(ApiError::bad_request)?;
+    let forge = discovery_capable_forge(&state.forge_registry, &req.kind)?;
     let kind = forge.kind();
     let org = github_org_slug(&req.org).map_err(ApiError::bad_request)?;
     let base_url = github_base_url(req.base_url.as_deref())
@@ -281,12 +299,36 @@ pub(crate) async fn admin_repo_add(
             "poll_interval must be a positive number of seconds (got {interval})"
         )));
     }
-    // The typed parse error renders to its human-facing form here, at
-    // the I/O edge.
-    let locator = RepoLocator::parse(&req.url).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    // Parse URL structure first so an exact configured Forge root can select
+    // its adapter before host claims are considered.
+    let unclassified = RepoLocator::parse_unclassified(&req.url)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let input_base_url = unclassified
+        .input_base_url()
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let lookup_base = unclassified
+        .configured_lookup_base_url()
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let configured_kind = state
+        .control
+        .configured_forge_kind_by_base_url(&lookup_base)
+        .await?;
+    let locator = if let Some(kind) = configured_kind.as_ref() {
+        let forge = state.forge_registry.by_kind(kind.as_str()).ok_or_else(|| {
+            ApiError::internal(anyhow::anyhow!(
+                "configured forge kind {:?} has no registered adapter",
+                kind.as_str()
+            ))
+        })?;
+        unclassified.resolve_configured(forge, &lookup_base)
+    } else {
+        unclassified.resolve_with_registry(&state.forge_registry)
+    }
+    .map_err(|error| ApiError::bad_request(error.to_string()))?;
     let base_url = yg_control::ForgeUrl::parse(locator.base_url)
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    let forge = yg_sync::forge::builtin()
+    let forge = state
+        .forge_registry
         .by_kind(locator.kind)
         .ok_or_else(|| ApiError::internal(anyhow::anyhow!("locator kind without an adapter")))?;
     // Every node id this repo will ever mint embeds its qualifier
@@ -312,6 +354,7 @@ pub(crate) async fn admin_repo_add(
         .add_validated_repo(yg_control::ValidatedAddRepo {
             forge_kind: locator.kind,
             base_url: &base_url,
+            registration_base_url: &input_base_url,
             token_env: forge.default_token_env(),
             api_root: api_root.as_ref(),
             slug: &locator.slug,
@@ -399,6 +442,18 @@ fn record_visibility(counts: &mut VisibilityCounts, visibility: yg_control::Repo
 
 pub(crate) async fn admin_status(State(state): State<Arc<AppState>>) -> Result<Response, ApiError> {
     let repos = state.control.admin_status().await?;
+    let discovery_conflicts = state
+        .control
+        .admin_discovery_conflicts()
+        .await?
+        .into_iter()
+        .map(|conflict| DiscoveryQualifierConflictStatus {
+            forge: ForgeBaseUrl::from_domain(conflict.forge),
+            org: OrgName::new(conflict.org.as_str().to_owned()),
+            slug: RepoSlug::new(conflict.slug.as_str().to_owned()),
+            qualifier: RepoQualifier::new(conflict.qualifier.as_str().to_owned()),
+        })
+        .collect();
     let mut visibility_counts = VisibilityCounts::default();
     for repo in &repos {
         record_visibility(&mut visibility_counts, repo.visibility);
@@ -462,6 +517,7 @@ pub(crate) async fn admin_status(State(state): State<Arc<AppState>>) -> Result<R
     Ok(Wire(AdminStatusResponse {
         repos,
         visibility_counts,
+        discovery_conflicts,
     })
     .into_response())
 }
@@ -497,6 +553,23 @@ fn job_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn custom_discovery_kind_has_a_typed_bad_request_response() {
+        let error = endpoint_forge_kind("custom").expect_err("custom must not be representable");
+
+        let response = error.into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("error response body");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).expect("error response JSON"),
+            serde_json::json!({
+                "error": "forge kind custom is not supported by this endpoint"
+            })
+        );
+    }
 
     #[test]
     fn github_admin_urls_report_real_parse_failures() {

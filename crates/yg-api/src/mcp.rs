@@ -1,23 +1,18 @@
 //! The MCP transport: JSON-RPC over `POST /v1/mcp`, exposing the Verb
-//! catalog as tools. Tool calls route through the same handlers as the
-//! REST endpoints, so the two transports cannot drift.
+//! catalog as tools. Verb tools call the shared engine directly and
+//! encode its typed results and errors into MCP tool-result shapes.
 
 use std::sync::Arc;
 
 use axum::Json;
-use axum::body::to_bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::AppState;
 use crate::error::error_json;
-use crate::search::verb_search;
-use crate::verbs::{verb_history, verb_neighbors, verb_node};
-use crate::wire::{self, Wire, WireJson};
-
-const MCP_VERB_RESPONSE_LIMIT: usize = 50 * 1024 * 1024;
+use crate::wire::{self, Wire};
 
 pub(crate) async fn mcp(
     State(state): State<Arc<AppState>>,
@@ -184,7 +179,7 @@ async fn mcp_call_tool(
     let result = call_verb_tool(state, name, arguments).await?;
     Ok(match result {
         Ok(body) => mcp_tool_result(body, false),
-        Err(reason) => mcp_tool_result(serde_json::json!({"error": reason}), true),
+        Err(error) => mcp_tool_result(serde_json::json!({"error": error}), true),
     })
 }
 
@@ -201,34 +196,33 @@ async fn call_verb_tool(
     state: Arc<AppState>,
     name: &str,
     arguments: serde_json::Value,
-) -> Result<Result<serde_json::Value, serde_json::Value>, (i64, String)> {
+) -> Result<Result<serde_json::Value, McpVerbError>, (i64, String)> {
     let tool =
         yg_verbs::verb_tool(name).ok_or_else(|| (-32602, format!("unknown Verb tool {name:?}")))?;
-    let response = match tool.verb {
+    match tool.verb {
         yg_verbs::Verb::Node => {
             let req = decode_tool_args(arguments)?;
-            verb_node(State(state), WireJson(req)).await.into_response()
+            encode_verb_result(state.engine.node(req).await)
         }
         yg_verbs::Verb::Neighbors => {
             let req = decode_tool_args(arguments)?;
-            verb_neighbors(State(state), WireJson(req))
-                .await
-                .into_response()
+            encode_verb_result(state.engine.neighbors(req).await)
         }
         yg_verbs::Verb::Search => {
             let req = decode_tool_args(arguments)?;
-            verb_search(State(state), WireJson(req))
+            let _timer = state.engine.metrics().timer(yg_verbs::Verb::Search);
+            let response = state
+                .engine
+                .search(req)
                 .await
-                .into_response()
+                .map(yg_verbs::SearchWireResponse::from);
+            encode_verb_result(response)
         }
         yg_verbs::Verb::History => {
             let req = decode_tool_args(arguments)?;
-            verb_history(State(state), WireJson(req))
-                .await
-                .into_response()
+            encode_verb_result(state.engine.history(req).await)
         }
-    };
-    verb_response_value(response).await
+    }
 }
 
 fn decode_tool_args<T>(value: serde_json::Value) -> Result<T, (i64, String)>
@@ -238,28 +232,69 @@ where
     serde_json::from_value(value).map_err(|e| (-32602, format!("invalid tool arguments: {e}")))
 }
 
-/// A server fault inside the MCP tool-call plumbing: like
-/// `ApiError::internal`, the detail goes to the log and the JSON-RPC
-/// client gets a generic message.
-fn mcp_internal_error(context: &str, e: &dyn std::fmt::Display) -> (i64, String) {
-    tracing::error!("{context}: {e}");
-    (-32603, "internal server error".to_string())
+fn encode_verb_result<T>(
+    result: Result<T, yg_verbs::VerbError>,
+) -> Result<Result<serde_json::Value, McpVerbError>, (i64, String)>
+where
+    T: Serialize,
+{
+    match result {
+        Ok(response) => serde_json::to_value(response).map(Ok).map_err(|error| {
+            tracing::error!("serializing MCP Verb result failed: {error}");
+            (-32603, "internal server error".to_string())
+        }),
+        Err(error) => Ok(Err(error.into())),
+    }
 }
 
-async fn verb_response_value(
-    response: Response,
-) -> Result<Result<serde_json::Value, serde_json::Value>, (i64, String)> {
-    let status = response.status();
-    let bytes = to_bytes(response.into_body(), MCP_VERB_RESPONSE_LIMIT)
-        .await
-        .map_err(|e| mcp_internal_error("reading Verb response failed", &e))?;
-    let body: serde_json::Value = serde_json::from_slice(&bytes)
-        .map_err(|e| mcp_internal_error("Verb returned invalid JSON", &e))?;
-    if status.is_success() {
-        Ok(Ok(body))
-    } else {
-        let reason = body.get("error").cloned().unwrap_or(body);
-        Ok(Err(reason))
+#[derive(Serialize)]
+struct McpVerbError {
+    kind: McpVerbErrorKind,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<yg_verbs::NoSuchSymbol>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum McpVerbErrorKind {
+    BadRequest,
+    NotFound,
+    Gone,
+    Unavailable,
+    Internal,
+}
+
+impl From<yg_verbs::VerbError> for McpVerbError {
+    fn from(error: yg_verbs::VerbError) -> Self {
+        let (kind, message, detail) = match error {
+            yg_verbs::VerbError::BadRequest(message) => {
+                (McpVerbErrorKind::BadRequest, message, None)
+            }
+            yg_verbs::VerbError::NotFound(message) => (McpVerbErrorKind::NotFound, message, None),
+            yg_verbs::VerbError::NoSuchSymbol(detail) => (
+                McpVerbErrorKind::NotFound,
+                "no such symbol".to_string(),
+                Some(detail),
+            ),
+            yg_verbs::VerbError::Gone(message) => (McpVerbErrorKind::Gone, message, None),
+            yg_verbs::VerbError::Unavailable(message) => {
+                (McpVerbErrorKind::Unavailable, message, None)
+            }
+            yg_verbs::VerbError::Internal(source) => {
+                tracing::error!("internal error: {source:#}");
+                (
+                    McpVerbErrorKind::Internal,
+                    "internal server error".to_string(),
+                    None,
+                )
+            }
+        };
+        Self {
+            kind,
+            message,
+            detail,
+        }
     }
 }
 

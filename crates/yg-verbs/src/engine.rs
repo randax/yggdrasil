@@ -204,6 +204,10 @@ pub struct NeighborsResponse {
     pub nodes: Vec<NodeView>,
     pub edges: Vec<GraphEdge>,
     pub next_cursor: Option<String>,
+    /// Whether this page is incomplete because a cap omitted edges or discovery-time nodes;
+    /// callers must OR this flag across pages.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
 }
 
 /// One commit as every transport serves it: the Verb's commit plus a
@@ -466,6 +470,7 @@ impl<R: ShardResolver + 'static> Engine<R> {
             nodes: page.nodes,
             edges: page.edges,
             next_cursor,
+            truncated: page.truncated,
         }))
     }
 
@@ -601,6 +606,9 @@ impl<R: ShardResolver + 'static> Engine<R> {
                 let symbols = tokio::task::spawn_blocking(move || {
                     let index = yg_shard::open_fts(&fts_path)?;
                     let symbols = yg_shard::symbols_named(&index, &name, path.as_deref());
+                    // Handle before lease: eviction is pin-gated, so the index
+                    // must close before its artifact becomes evictable.
+                    drop(index);
                     drop(fts_cache_lease);
                     symbols
                 })

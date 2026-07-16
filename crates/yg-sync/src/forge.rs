@@ -171,6 +171,7 @@ pub trait OrgDiscovery: Send + Sync {
 /// (claims carry the forge kind) or by host (URL registration). The
 /// generic git adapter claims every host, so it terminates `for_host`;
 /// custom adapters register ahead of the built-ins.
+#[derive(Clone)]
 pub struct ForgeRegistry {
     forges: Vec<Arc<dyn Forge>>,
 }

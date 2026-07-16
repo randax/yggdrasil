@@ -48,11 +48,13 @@ pub fn decode<T: DeserializeOwned>(cursor: &str) -> Result<T, String> {
 /// it belongs to. Later pages stay on the pinned revision — Shards are
 /// immutable, so a paginated walk sees one consistent graph even across
 /// a pointer swap; only a *fresh* query picks up the new Shard. The
-/// request shape rides along because the page contract ("pages of one
-/// traversal union to the full induced subgraph") only holds when every
-/// page is computed with identical origin and filters: a replay that
-/// contradicts its cursor is rejected, never silently served from a
-/// different traversal.
+/// request shape rides along because the page contract (unless marked
+/// truncated, pages of one traversal union to the full induced subgraph)
+/// only holds when every page is computed with identical origin and
+/// filters: a replay that contradicts its cursor is rejected, never
+/// silently served from a different traversal. The truncation flag is
+/// page-local, so callers must OR it across all pages when deciding
+/// whether that union is complete.
 #[derive(Serialize, Deserialize)]
 pub(crate) struct NeighborsCursor {
     pub rev: String,

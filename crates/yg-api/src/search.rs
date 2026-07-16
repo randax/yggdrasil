@@ -17,10 +17,5 @@ pub(crate) async fn verb_search(
 ) -> Result<Response, ApiError> {
     let _timer = state.engine.metrics().timer(yg_verbs::Verb::Search);
     let response = state.engine.search(req).await?;
-    let next_cursor = response.next.as_ref().map(yg_verbs::cursor::encode);
-    Ok(Wire(SearchWireResponse {
-        hits: response.hits,
-        next_cursor,
-    })
-    .into_response())
+    Ok(Wire(SearchWireResponse::from(response)).into_response())
 }
