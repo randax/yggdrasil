@@ -179,6 +179,110 @@ async fn qualifier_conflict_is_recorded_while_neighboring_repos_reconcile() {
     );
 }
 
+#[tokio::test]
+async fn same_slug_insert_racing_reconciliation_is_upserted_without_a_false_conflict() {
+    let db_name = create_test_db().await;
+    let control = control_plane(&db_name).await;
+    let connected = control
+        .connect_forge_org(yg_control::ConnectForgeOrg {
+            forge_kind: "git",
+            base_url: "https://same-slug-race.example",
+            org_slug: "acme",
+            token_env: None,
+            api_root: Some("https://same-slug-race.example/api"),
+        })
+        .await
+        .unwrap();
+    let stale_owner = control
+        .add_repo(yg_control::AddRepo {
+            forge_kind: "git",
+            base_url: "https://same-slug-race.example",
+            token_env: None,
+            api_root: None,
+            slug: "acme/stale-owner",
+            fetch_depth: None,
+            poll_interval_seconds: None,
+        })
+        .await
+        .unwrap();
+    let pool = sqlx::PgPool::connect(&format!("{DEV_POSTGRES}/{db_name}"))
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO forge_discovery_qualifier_conflicts
+             (forge_org_id, slug, conflicting_repo_id)
+         VALUES ($1, 'acme/raced', $2)",
+    )
+    .bind(connected.org_id)
+    .bind(stale_owner.repo_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE FUNCTION insert_repo_at_reconciliation_seam() RETURNS trigger
+         LANGUAGE plpgsql AS $$
+         BEGIN
+             IF NEW.slug = 'acme/raced' AND NEW.fetch_depth = 7 THEN
+                 INSERT INTO repos
+                     (forge_id, slug, visibility, discovery_state, qualifier,
+                      registration_base_url)
+                 VALUES
+                     (NEW.forge_id, NEW.slug, 'public', 'included', NEW.qualifier,
+                      NEW.registration_base_url);
+             END IF;
+             RETURN NEW;
+         END
+         $$",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER insert_repo_at_reconciliation_seam
+         BEFORE INSERT ON repos
+         FOR EACH ROW EXECUTE FUNCTION insert_repo_at_reconciliation_seam()",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    control
+        .discover_forge_repos(
+            connected.org_id,
+            &[yg_control::DiscoveredRepo {
+                slug: "acme/raced",
+                visibility: yg_control::RepoVisibility::Private,
+                fetch_depth: Some(7),
+            }],
+        )
+        .await
+        .unwrap();
+
+    let statuses = control.admin_status().await.unwrap();
+    let raced = statuses
+        .iter()
+        .find(|status| status.slug == "acme/raced")
+        .expect("the concurrently registered repo must be reconciled");
+    assert_eq!(raced.visibility, yg_control::RepoVisibility::Private);
+    assert_eq!(raced.discovery_state, "discovered");
+    let (fetch_depth,): (Option<i32>,) = sqlx::query_as(
+        "SELECT fetch_depth FROM repos
+         WHERE qualifier = 'same-slug-race.example/acme/raced'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(fetch_depth, Some(7));
+    assert!(
+        control
+            .admin_discovery_conflicts()
+            .await
+            .unwrap()
+            .is_empty(),
+        "successful same-slug reconciliation must clear stale conflict state"
+    );
+}
+
 #[derive(Clone, Default)]
 struct LogSink(Arc<std::sync::Mutex<Vec<u8>>>);
 

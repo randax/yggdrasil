@@ -4,9 +4,9 @@ pub mod metrics;
 pub use metrics::{JobOutcome, JobTimer, Metrics};
 
 use anyhow::Context;
-use sqlx::PgPool;
 use sqlx::pool::PoolConnection;
 use sqlx::postgres::PgPoolOptions;
+use sqlx::{Acquire, PgPool};
 
 /// Where the control plane lives when `YG_DATABASE_URL` says nothing:
 /// the in-repo dev compose stack.
@@ -1108,83 +1108,84 @@ impl ControlPlane {
             let rules = rules_for_forge(&mut tx, forge_id).await?;
             let state = discovery_state_for(repo.slug, repo.visibility, &rules);
             let qualifier = repo_qualifier(base_url.as_str(), repo.slug);
-            let existing: Option<(i64, String)> = sqlx::query_as(
-                "SELECT id, discovery_state
-                 FROM repos
-                 WHERE forge_id = $1 AND slug = $2
-                 FOR UPDATE",
+            // A savepoint keeps a genuine qualifier violation from aborting
+            // the per-repo transaction before its durable conflict can be
+            // recorded. The targeted upsert turns a concurrent registration
+            // of this exact Forge repo into the normal reconciliation path.
+            let mut insert = tx.begin().await?;
+            let upserted: Result<(i64, bool, String), sqlx::Error> = sqlx::query_as(
+                "INSERT INTO repos
+                    (forge_id, slug, visibility, discovery_state, fetch_depth, qualifier,
+                     registration_base_url)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)
+                 ON CONFLICT (forge_id, slug) DO UPDATE
+                 SET slug = repos.slug
+                 RETURNING id, (xmax = 0), discovery_state",
             )
             .bind(forge_id)
             .bind(repo.slug)
-            .fetch_optional(&mut *tx)
-            .await?;
-            let (repo_id, was_included) = match existing {
-                Some((repo_id, previous_state)) => {
+            .bind(repo.visibility.as_str())
+            .bind(state)
+            .bind(repo.fetch_depth)
+            .bind(&qualifier)
+            .bind(base_url.as_str())
+            .fetch_one(&mut *insert)
+            .await;
+            let (repo_id, created, previous_state) = match upserted {
+                Ok(row) => {
+                    insert.commit().await?;
+                    row
+                }
+                Err(sqlx::Error::Database(error))
+                    if error.constraint() == Some("repos_qualifier") =>
+                {
+                    insert.rollback().await?;
+                    let conflicting_repo: Option<(i64, i64, String)> =
+                        sqlx::query_as("SELECT id, forge_id, slug FROM repos WHERE qualifier = $1")
+                            .bind(&qualifier)
+                            .fetch_optional(&mut *tx)
+                            .await?;
+                    let Some((conflicting_repo_id, owner_forge_id, owner_slug)) = conflicting_repo
+                    else {
+                        anyhow::bail!("qualifier violation has no owning repository");
+                    };
+                    if owner_forge_id == forge_id && owner_slug == repo.slug {
+                        anyhow::bail!(
+                            "same repository bypassed the targeted forge-and-slug upsert"
+                        );
+                    }
                     sqlx::query(
-                        "UPDATE repos
-                         SET visibility = $2,
-                             discovery_state = $3,
-                             fetch_depth = coalesce($4, fetch_depth)
-                         WHERE id = $1",
+                        "INSERT INTO forge_discovery_qualifier_conflicts
+                             (forge_org_id, slug, conflicting_repo_id)
+                         VALUES ($1, $2, $3)
+                         ON CONFLICT (forge_org_id, slug) DO UPDATE
+                         SET conflicting_repo_id = excluded.conflicting_repo_id,
+                             last_seen_at = now()",
                     )
-                    .bind(repo_id)
-                    .bind(repo.visibility.as_str())
-                    .bind(state)
-                    .bind(repo.fetch_depth)
+                    .bind(org_id)
+                    .bind(repo.slug)
+                    .bind(conflicting_repo_id)
                     .execute(&mut *tx)
                     .await?;
-                    (repo_id, previous_state == "included")
+                    tx.commit().await?;
+                    continue;
                 }
-                None => {
-                    let inserted: Option<(i64,)> = sqlx::query_as(
-                        "INSERT INTO repos
-                            (forge_id, slug, visibility, discovery_state, fetch_depth, qualifier,
-                             registration_base_url)
-                         VALUES ($1, $2, $3, $4, $5, $6, $7)
-                         ON CONFLICT DO NOTHING
-                         RETURNING id",
-                    )
-                    .bind(forge_id)
-                    .bind(repo.slug)
-                    .bind(repo.visibility.as_str())
-                    .bind(state)
-                    .bind(repo.fetch_depth)
-                    .bind(&qualifier)
-                    .bind(base_url.as_str())
-                    .fetch_optional(&mut *tx)
-                    .await?;
-                    match inserted {
-                        Some((repo_id,)) => (repo_id, false),
-                        None => {
-                            let conflicting_repo: Option<(i64,)> =
-                                sqlx::query_as("SELECT id FROM repos WHERE qualifier = $1")
-                                    .bind(&qualifier)
-                                    .fetch_optional(&mut *tx)
-                                    .await?;
-                            let Some((conflicting_repo_id,)) = conflicting_repo else {
-                                anyhow::bail!(
-                                    "repository insert was skipped without an owning qualifier"
-                                );
-                            };
-                            sqlx::query(
-                                "INSERT INTO forge_discovery_qualifier_conflicts
-                                     (forge_org_id, slug, conflicting_repo_id)
-                                 VALUES ($1, $2, $3)
-                                 ON CONFLICT (forge_org_id, slug) DO UPDATE
-                                 SET conflicting_repo_id = excluded.conflicting_repo_id,
-                                     last_seen_at = now()",
-                            )
-                            .bind(org_id)
-                            .bind(repo.slug)
-                            .bind(conflicting_repo_id)
-                            .execute(&mut *tx)
-                            .await?;
-                            tx.commit().await?;
-                            continue;
-                        }
-                    }
-                }
+                Err(error) => return Err(error.into()),
             };
+            let was_included = !created && previous_state == "included";
+            sqlx::query(
+                "UPDATE repos
+                 SET visibility = $2,
+                     discovery_state = $3,
+                     fetch_depth = coalesce($4, fetch_depth)
+                 WHERE id = $1",
+            )
+            .bind(repo_id)
+            .bind(repo.visibility.as_str())
+            .bind(state)
+            .bind(repo.fetch_depth)
+            .execute(&mut *tx)
+            .await?;
             sqlx::query(
                 "DELETE FROM forge_discovery_qualifier_conflicts
                  WHERE forge_org_id = $1 AND slug = $2",
