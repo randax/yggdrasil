@@ -1,6 +1,29 @@
 use serde_json::json;
 
 #[test]
+fn status_reports_the_typed_verb_contract_and_served_inventory() {
+    let response = yg_verbs::status::StatusResponse {
+        version: "0.1.0".to_owned(),
+        repos_indexed: 2,
+        verb_contract_version: yg_verbs::status::VERB_CONTRACT_VERSION,
+        verbs: yg_verbs::Verb::ALL.to_vec(),
+    };
+    let encoded = serde_json::to_string(&response).expect("status serialization");
+
+    assert_eq!(
+        encoded,
+        r#"{"version":"0.1.0","repos_indexed":2,"verb_contract_version":1,"verbs":["node","neighbors","search","history"]}"#
+    );
+    let decoded = serde_json::from_str::<yg_verbs::status::StatusResponse>(&encoded)
+        .expect("status deserialization");
+    assert_eq!(
+        decoded.verb_contract_version,
+        yg_verbs::status::VERB_CONTRACT_VERSION
+    );
+    assert_eq!(decoded.verbs, yg_verbs::Verb::ALL);
+}
+
+#[test]
 fn untruncated_neighbors_keep_the_legacy_wire_bytes() {
     let legacy = r#"{"nodes":[],"edges":[],"next_cursor":null}"#;
     let mut response: yg_verbs::NeighborsResponse =

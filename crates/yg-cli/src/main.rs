@@ -5,6 +5,7 @@ mod deploy_config;
 mod exit_code;
 mod http_client;
 mod output;
+mod skill;
 
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
@@ -381,7 +382,7 @@ async fn run(command: Command) -> anyhow::Result<()> {
         Command::Mcp => mcp_proxy().await,
         Command::Skill {
             command: SkillCommand::Install,
-        } => skill_install(),
+        } => skill::install().map_err(Into::into),
         Command::Admin { command } => match command {
             AdminCommand::Repo {
                 command:
@@ -433,31 +434,6 @@ async fn run(command: Command) -> anyhow::Result<()> {
             AdminCommand::Status { json } => admin_status(json).await,
         },
     }
-}
-
-fn skill_install() -> anyhow::Result<()> {
-    const SKILL_NAME: &str = "yggdrasil-navigation";
-    const SKILL_DOCUMENT: &str = include_str!("../skills/yggdrasil-navigation/SKILL.md");
-
-    let skill_dir = skill_home_dir()?
-        .join(".claude")
-        .join("skills")
-        .join(SKILL_NAME);
-    std::fs::create_dir_all(&skill_dir)
-        .with_context(|| format!("creating {}", skill_dir.display()))?;
-    let skill_path = skill_dir.join("SKILL.md");
-    std::fs::write(&skill_path, SKILL_DOCUMENT)
-        .with_context(|| format!("writing {}", skill_path.display()))?;
-    println!("installed {SKILL_NAME} Skill at {}", skill_path.display());
-    Ok(())
-}
-
-fn skill_home_dir() -> anyhow::Result<std::path::PathBuf> {
-    std::env::var_os("HOME")
-        .filter(|value| !value.as_os_str().is_empty())
-        .or_else(|| std::env::var_os("USERPROFILE").filter(|value| !value.as_os_str().is_empty()))
-        .map(std::path::PathBuf::from)
-        .context("HOME or USERPROFILE must be set to install Claude Code skills")
 }
 
 /// Where the Index Server lives and how to authenticate, from the same
@@ -2120,6 +2096,7 @@ async fn status(json: bool) -> anyhow::Result<()> {
             yg_api::UPTIME_HEADER
         )
     })?;
+    skill::warn_if_contract_mismatches(response.body.verb_contract_version);
 
     if json {
         // The server keeps volatile uptime out of the (cache-stable)
@@ -2135,6 +2112,15 @@ async fn status(json: bool) -> anyhow::Result<()> {
         let body = response.body;
         println!("yggdrasil Index Server at {server}");
         println!("version:       {}", body.version);
+        println!("Verb contract: {}", body.verb_contract_version);
+        println!(
+            "Verbs:         {}",
+            body.verbs
+                .iter()
+                .map(|verb| verb.label())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
         println!("uptime:        {uptime_seconds}s");
         println!("repos indexed: {}", body.repos_indexed);
     }
