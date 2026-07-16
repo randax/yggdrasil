@@ -877,7 +877,20 @@ impl ControlPlane {
              VALUES ($1, $2, $3, $4, $5, $6)
              ON CONFLICT (forge_id, slug) DO UPDATE
              SET fetch_depth = excluded.fetch_depth,
-                 poll_interval_seconds = excluded.poll_interval_seconds
+                 poll_interval_seconds = excluded.poll_interval_seconds,
+                 -- Backfill NULL provenance only when the re-add's spelling
+                 -- agrees with the row (legacy rows predate the column);
+                 -- a disagreeing spelling leaves the row untouched so the
+                 -- RETURNING comparison below still reports the conflict.
+                 registration_base_url = CASE
+                     WHEN coalesce(repos.registration_base_url, $7)
+                          = excluded.registration_base_url
+                         THEN coalesce(
+                             repos.registration_base_url,
+                             excluded.registration_base_url
+                         )
+                     ELSE repos.registration_base_url
+                 END
              RETURNING id, (xmax = 0),
                        coalesce(registration_base_url, $7) = $6",
         )
