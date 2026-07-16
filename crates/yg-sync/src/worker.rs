@@ -5,11 +5,15 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use yg_control::{ControlPlane, ForgeBudgetTake, JobKind, JobOutcome};
+use yg_control::{
+    ControlPlane, ForgeBudgetTake, ForgeUrl, JobKind, JobOutcome, PollHeadObservation,
+    PollRecordOutcome, PollValidators,
+};
 
 use crate::forge::{
-    Forge, ForgeBudgetExhausted, ForgeRateLimit, ForgeRegistry, ForgeRequestBudget, ListedRepo,
-    OrgDiscovery, github::discovery_client,
+    ConditionalRequestAccounting, Forge, ForgeBudgetExhausted, ForgeRateLimit, ForgeRegistry,
+    ForgeRequestBudget, ListedRepo, OrgDiscovery, RepoPollOutcome, RepoPoller, RepoSlug,
+    github::discovery_client,
 };
 use crate::git::{GitFetcher, forge_token, lock_mirror, remote_head_commit};
 use crate::lease::{LeaseShutdown, with_lease_heartbeat, with_lease_heartbeat_until_shutdown};
@@ -307,11 +311,10 @@ impl SyncWorker {
     }
 
     /// Claim one due repo and compare its default-branch head against the
-    /// synced position with a single cheap conditional request (`git
-    /// ls-remote`). A moved head enqueues a fetch — which re-syncs and
-    /// re-indexes the repo — while an unchanged head costs only that one
-    /// request, transferring no objects (RFC 0001 §3, issue #9). Returns
-    /// whether a repo was due.
+    /// synced position with one conditional request. API-backed adapters can
+    /// use HTTP validators; generic forges retain `git ls-remote`. A moved
+    /// head enqueues a fetch, while an unchanged head transfers no objects
+    /// (RFC 0001 §3, issue #9). Returns whether a repo was due.
     ///
     /// The conditional request is spent only within the forge's rate
     /// budget: a claimed repo that would put the forge over budget (or
@@ -339,6 +342,12 @@ impl SyncWorker {
         };
         self.metrics
             .observe_poll_lag(due.base_url.as_str(), due.poll_lag_seconds);
+        let forge = self.registry.for_kind(&due.forge_kind);
+        if let RepoPollRoute::Http { poller, api_root } =
+            repo_poll_route(forge, due.api_root.as_ref())
+        {
+            return self.poll_repo_api(poller, api_root, &due, cfg).await;
+        }
         // Spend a rate-budget token; over budget, reschedule the repo for
         // when one frees up and back off (no head check this cycle).
         if let Err(retry) = self.take_forge_token(due.forge_id, due.rate_budget).await {
@@ -346,7 +355,6 @@ impl SyncWorker {
             return Ok(false);
         }
         let clone_url = join_clone_url(due.base_url.as_str(), &due.slug);
-        let forge = self.registry.for_kind(&due.forge_kind);
         let auth = forge_token(due.token_env.as_deref(), &clone_url).map(|t| forge.git_auth(t));
         match remote_head_commit(&clone_url, auth.as_ref()).await {
             Ok(Some(head)) if head != due.synced_commit => {
@@ -381,10 +389,156 @@ impl SyncWorker {
         Ok(true)
     }
 
+    async fn poll_repo_api(
+        &self,
+        poller: &dyn RepoPoller,
+        api_root: &ForgeUrl,
+        due: &yg_control::DuePoll,
+        cfg: &PollConfig,
+    ) -> anyhow::Result<bool> {
+        let slug = match RepoSlug::parse(due.slug.clone()) {
+            Ok(slug) => slug,
+            Err(error) => {
+                tracing::warn!(slug = %due.slug, %error, "stored repository slug is invalid");
+                return Ok(true);
+            }
+        };
+        let reservation = match self.take_forge_token(due.forge_id, due.rate_budget).await {
+            Ok(reservation) => reservation,
+            Err(retry) => {
+                self.control.defer_poll(due.repo_id, retry).await?;
+                return Ok(false);
+            }
+        };
+        let token = forge_token(due.token_env.as_deref(), api_root.as_str());
+        let validators = due.validators();
+        match poller
+            .poll_repo(
+                &self.discovery_client,
+                api_root,
+                &slug,
+                token.as_deref(),
+                &validators,
+            )
+            .await
+        {
+            Ok(RepoPollOutcome::NotModified {
+                validators,
+                rate,
+                accounting,
+            }) => {
+                let exhausted_retry = if let Some(cooldown) = rate.exhausted_retry_after() {
+                    // The cooldown drains both budgets. Establish it before
+                    // any fallible persistence, and never briefly expose a
+                    // refund after the Forge reported zero remaining.
+                    Some(
+                        self.cool_forge_down_for(due.forge_id, due.rate_budget, cooldown)
+                            .await,
+                    )
+                } else {
+                    None
+                };
+                self.record_http_poll(due, cfg, validators, PollHeadObservation::NotModified)
+                    .await?;
+                if let Some(retry) = exhausted_retry {
+                    self.control.defer_poll(due.repo_id, retry).await?;
+                    return Ok(false);
+                }
+                if accounting == ConditionalRequestAccounting::AuthenticatedFree {
+                    self.refund_forge_token(due.forge_id, reservation).await?;
+                }
+                Ok(true)
+            }
+            Ok(RepoPollOutcome::Head {
+                head,
+                validators,
+                rate,
+            }) => {
+                let exhausted = if let Some(cooldown) = rate.exhausted_retry_after() {
+                    let _ = self
+                        .cool_forge_down_for(due.forge_id, due.rate_budget, cooldown)
+                        .await;
+                    true
+                } else {
+                    false
+                };
+                self.record_http_poll(due, cfg, validators, PollHeadObservation::Head(head))
+                    .await?;
+                if exhausted {
+                    return Ok(false);
+                }
+                Ok(true)
+            }
+            Err(error) => {
+                if let Some(rate_limit) = error.downcast_ref::<ForgeRateLimit>() {
+                    let retry = self
+                        .cool_forge_down_for(
+                            due.forge_id,
+                            due.rate_budget,
+                            rate_limit.retry_after(),
+                        )
+                        .await;
+                    self.control.defer_poll(due.repo_id, retry).await?;
+                    tracing::warn!(slug = %due.slug, "Forge rate-limited the HTTP poll; backing the Forge off");
+                    return Ok(false);
+                }
+                tracing::warn!(slug = %due.slug, error = format!("{error:#}"), "HTTP poll failed; will retry next interval");
+                Ok(true)
+            }
+        }
+    }
+
+    async fn record_http_poll(
+        &self,
+        due: &yg_control::DuePoll,
+        cfg: &PollConfig,
+        validators: PollValidators,
+        observation: PollHeadObservation,
+    ) -> anyhow::Result<()> {
+        let outcome = self
+            .control
+            .record_poll_observation(due.repo_id, &validators, &observation)
+            .await?;
+        match outcome {
+            PollRecordOutcome::Unchanged => {}
+            PollRecordOutcome::FetchQueued => {
+                tracing::info!(slug = %due.slug, "head moved; fetch queued");
+            }
+            PollRecordOutcome::FetchPending => {
+                self.control
+                    .defer_poll(due.repo_id, in_flight_fetch_repoll(due, cfg))
+                    .await?;
+                tracing::info!(slug = %due.slug, "head moved but fetch is already pending; poll retry scheduled");
+            }
+        }
+        Ok(())
+    }
+
+    async fn refund_forge_token(
+        &self,
+        forge_id: i64,
+        reservation: ForgeTokenReservation,
+    ) -> anyhow::Result<()> {
+        if reservation.fallback_reserved {
+            self.forge_budgets
+                .refund(forge_id, std::num::NonZeroU32::MIN);
+        }
+        if reservation.shared_reserved {
+            self.control
+                .refund_forge_budget(forge_id, std::num::NonZeroU32::MIN)
+                .await?;
+        }
+        Ok(())
+    }
+
     /// Spend one of this forge's rate-budget tokens. `Err(retry_after)`
     /// when none is available — the forge is over budget or cooling down
     /// — so the caller can reschedule the repo for `retry_after` out.
-    async fn take_forge_token(&self, forge_id: i64, rate_budget: i32) -> Result<(), Duration> {
+    async fn take_forge_token(
+        &self,
+        forge_id: i64,
+        rate_budget: i32,
+    ) -> Result<ForgeTokenReservation, Duration> {
         take_shared_or_fallback(&self.control, &self.forge_budgets, forge_id, rate_budget).await
     }
 
@@ -414,14 +568,64 @@ impl SyncWorker {
     }
 }
 
+enum RepoPollRoute<'a> {
+    Http {
+        poller: &'a dyn RepoPoller,
+        api_root: &'a ForgeUrl,
+    },
+    Git,
+}
+
+fn repo_poll_route<'a>(forge: &'a dyn Forge, api_root: Option<&'a ForgeUrl>) -> RepoPollRoute<'a> {
+    match (forge.repo_poller(), api_root) {
+        (Some(poller), Some(api_root)) => RepoPollRoute::Http { poller, api_root },
+        _ => RepoPollRoute::Git,
+    }
+}
+
 #[derive(Default)]
 struct ForgeRequestBudgets {
     buckets: Mutex<HashMap<i64, TokenBucket>>,
     pending_cooldowns: Mutex<HashMap<i64, Instant>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ForgeTokenReservation {
+    shared_reserved: bool,
+    fallback_reserved: bool,
+}
+
 fn fallback_rate(rate_budget: i32) -> i32 {
     rate_budget.min(FALLBACK_REQUESTS_PER_MINUTE)
+}
+
+fn saturating_instant_add(now: Instant, duration: Duration) -> Instant {
+    if let Some(deadline) = now.checked_add(duration) {
+        return deadline;
+    }
+    let mut representable = 0_u128;
+    let mut unrepresentable = duration.as_nanos();
+    while representable + 1 < unrepresentable {
+        let candidate = representable + (unrepresentable - representable) / 2;
+        let seconds = u64::try_from(candidate / 1_000_000_000)
+            .expect("Duration nanoseconds always fit its u64 seconds field");
+        let nanoseconds = u32::try_from(candidate % 1_000_000_000)
+            .expect("subsecond nanoseconds are below one billion");
+        if now
+            .checked_add(Duration::new(seconds, nanoseconds))
+            .is_some()
+        {
+            representable = candidate;
+        } else {
+            unrepresentable = candidate;
+        }
+    }
+    let seconds = u64::try_from(representable / 1_000_000_000)
+        .expect("Duration nanoseconds always fit its u64 seconds field");
+    let nanoseconds = u32::try_from(representable % 1_000_000_000)
+        .expect("subsecond nanoseconds are below one billion");
+    now.checked_add(Duration::new(seconds, nanoseconds))
+        .expect("the binary search retains only representable deadlines")
 }
 
 async fn take_shared_or_fallback(
@@ -429,7 +633,7 @@ async fn take_shared_or_fallback(
     fallback_budgets: &ForgeRequestBudgets,
     forge_id: i64,
     rate_budget: i32,
-) -> Result<(), Duration> {
+) -> Result<ForgeTokenReservation, Duration> {
     if let Some(retry_after) =
         retry_pending_cooldown_with(fallback_budgets, forge_id, |remaining| {
             control.cool_down_forge(forge_id, remaining)
@@ -482,11 +686,16 @@ fn resolve_shared_take(
     forge_id: i64,
     rate_budget: i32,
     shared: anyhow::Result<ForgeBudgetTake>,
-) -> Result<(), Duration> {
+) -> Result<ForgeTokenReservation, Duration> {
     match shared {
         Ok(ForgeBudgetTake::Granted) => {
-            let _ = fallback_budgets.take(forge_id, fallback_rate(rate_budget));
-            Ok(())
+            let fallback_reserved = fallback_budgets
+                .take(forge_id, fallback_rate(rate_budget))
+                .is_ok();
+            Ok(ForgeTokenReservation {
+                shared_reserved: true,
+                fallback_reserved,
+            })
         }
         Ok(ForgeBudgetTake::RetryAfter(retry_after)) => {
             fallback_budgets.cool_down_for(forge_id, fallback_rate(rate_budget), retry_after);
@@ -498,7 +707,12 @@ fn resolve_shared_take(
                 error = format!("{error:#}"),
                 "shared Forge budget unavailable; using stingy fixed-rate local fallback"
             );
-            fallback_budgets.take(forge_id, fallback_rate(rate_budget))
+            fallback_budgets
+                .take(forge_id, fallback_rate(rate_budget))
+                .map(|()| ForgeTokenReservation {
+                    shared_reserved: false,
+                    fallback_reserved: true,
+                })
         }
     }
 }
@@ -537,6 +751,14 @@ async fn report_shared_cooldown(
 }
 
 impl ForgeRequestBudgets {
+    fn refund(&self, forge_id: i64, token_count: std::num::NonZeroU32) {
+        let now = std::time::Instant::now();
+        let mut buckets = self.buckets.lock().unwrap();
+        if let Some(bucket) = buckets.get_mut(&forge_id) {
+            bucket.refund(token_count, now);
+        }
+    }
+
     fn pending_cooldown_retry_after(&self, forge_id: i64) -> Option<(Instant, Duration)> {
         let now = Instant::now();
         let mut pending = self
@@ -552,7 +774,7 @@ impl ForgeRequestBudgets {
     }
 
     fn mark_pending_cooldown(&self, forge_id: i64, cooldown: Duration) {
-        let until = Instant::now() + cooldown;
+        let until = saturating_instant_add(Instant::now(), cooldown);
         let mut pending = self
             .pending_cooldowns
             .lock()
@@ -606,7 +828,7 @@ impl ForgeRequestBudgets {
             .entry(forge_id)
             .or_insert_with(|| TokenBucket::per_minute(rate_budget, now));
         bucket.update_rate(rate_budget, now);
-        bucket.cooldown(now + cooldown);
+        bucket.cooldown(saturating_instant_add(now, cooldown));
         bucket.retry_after(now)
     }
 }
@@ -628,6 +850,7 @@ impl ForgeRequestBudget for DiscoveryBudget<'_> {
                 self.rate_budget,
             )
             .await
+            .map(|_| ())
             .map_err(|retry_after| ForgeBudgetExhausted { retry_after })
         })
     }
@@ -740,6 +963,22 @@ mod tests {
     }
 
     #[test]
+    fn local_cooldown_deadlines_saturate_instead_of_panicking() {
+        let now = std::time::Instant::now();
+        assert_eq!(
+            saturating_instant_add(now, Duration::from_secs(30)),
+            now + Duration::from_secs(30)
+        );
+
+        let saturated = saturating_instant_add(now, Duration::MAX);
+        assert!(saturated > now);
+        assert!(
+            saturated.checked_add(Duration::from_nanos(1)).is_none(),
+            "an oversized delay saturates at the platform's latest monotonic deadline"
+        );
+    }
+
+    #[test]
     fn control_error_uses_only_the_fixed_fallback_burst() {
         let budgets = ForgeRequestBudgets::default();
         for request in 0..2 {
@@ -753,6 +992,22 @@ mod tests {
             resolve_shared_take(&budgets, 7, 8, Err(anyhow::anyhow!("control unavailable")),)
                 .is_err(),
             "the per-worker fallback must expose only a 2-token opening burst"
+        );
+    }
+
+    #[test]
+    fn fallback_grants_never_claim_a_shared_reservation() {
+        let budgets = ForgeRequestBudgets::default();
+        let reservation =
+            resolve_shared_take(&budgets, 7, 8, Err(anyhow::anyhow!("control unavailable")))
+                .expect("the opening local fallback token is available");
+
+        assert_eq!(
+            reservation,
+            ForgeTokenReservation {
+                shared_reserved: false,
+                fallback_reserved: true,
+            }
         );
     }
 
@@ -794,6 +1049,20 @@ mod tests {
             .take(7, 1)
             .expect_err("every fallback consumer must observe the token already spent");
         assert!(exhausted > Duration::ZERO);
+    }
+
+    #[test]
+    fn a_free_poll_refunds_the_local_fallback_reservation() {
+        let budgets = ForgeRequestBudgets::default();
+        assert!(budgets.take(7, 1).is_ok());
+        assert!(budgets.take(7, 1).is_err());
+
+        budgets.refund(7, std::num::NonZeroU32::MIN);
+
+        assert!(
+            budgets.take(7, 1).is_ok(),
+            "a Forge-declared free response restores its provisional token"
+        );
     }
 
     #[test]

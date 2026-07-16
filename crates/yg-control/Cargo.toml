@@ -14,4 +14,5 @@ prometheus-client.workspace = true
 sha2 = "0.11.0"
 sqlx = { version = "0.9.0", default-features = false, features = ["postgres", "runtime-tokio", "migrate", "macros"] }
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "time"] }
+thiserror = "2"
 url.workspace = true

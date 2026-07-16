@@ -835,6 +835,138 @@ pub struct IndexedRepo {
     pub revision: String,
 }
 
+/// An opaque HTTP entity tag, preserved byte-for-byte for `If-None-Match`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PollEtag(Vec<u8>);
+
+impl PollEtag {
+    pub fn new(value: impl Into<Vec<u8>>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl sqlx::Type<sqlx::Postgres> for PollEtag {
+    fn type_info() -> sqlx::postgres::PgTypeInfo {
+        <Vec<u8> as sqlx::Type<sqlx::Postgres>>::type_info()
+    }
+
+    fn compatible(ty: &sqlx::postgres::PgTypeInfo) -> bool {
+        <Vec<u8> as sqlx::Type<sqlx::Postgres>>::compatible(ty)
+    }
+}
+
+impl<'row> sqlx::Decode<'row, sqlx::Postgres> for PollEtag {
+    fn decode(value: sqlx::postgres::PgValueRef<'row>) -> Result<Self, sqlx::error::BoxDynError> {
+        Ok(Self(<Vec<u8> as sqlx::Decode<sqlx::Postgres>>::decode(
+            value,
+        )?))
+    }
+}
+
+/// An opaque HTTP `Last-Modified` value, preserved for `If-Modified-Since`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PollLastModified(Vec<u8>);
+
+impl PollLastModified {
+    pub fn new(value: impl Into<Vec<u8>>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl sqlx::Type<sqlx::Postgres> for PollLastModified {
+    fn type_info() -> sqlx::postgres::PgTypeInfo {
+        <Vec<u8> as sqlx::Type<sqlx::Postgres>>::type_info()
+    }
+
+    fn compatible(ty: &sqlx::postgres::PgTypeInfo) -> bool {
+        <Vec<u8> as sqlx::Type<sqlx::Postgres>>::compatible(ty)
+    }
+}
+
+impl<'row> sqlx::Decode<'row, sqlx::Postgres> for PollLastModified {
+    fn decode(value: sqlx::postgres::PgValueRef<'row>) -> Result<Self, sqlx::error::BoxDynError> {
+        Ok(Self(<Vec<u8> as sqlx::Decode<sqlx::Postgres>>::decode(
+            value,
+        )?))
+    }
+}
+
+/// The conditional-request validators stored for one repository.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PollValidators {
+    pub etag: Option<PollEtag>,
+    pub last_modified: Option<PollLastModified>,
+}
+
+/// A full Git commit object id observed by a repository-head poll.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PollHeadSha(String);
+
+impl PollHeadSha {
+    pub fn parse(value: impl Into<String>) -> Result<Self, InvalidPollHeadSha> {
+        let value = value.into();
+        if value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            Ok(Self(value))
+        } else {
+            Err(InvalidPollHeadSha(value))
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for PollHeadSha {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl sqlx::Type<sqlx::Postgres> for PollHeadSha {
+    fn type_info() -> sqlx::postgres::PgTypeInfo {
+        <String as sqlx::Type<sqlx::Postgres>>::type_info()
+    }
+
+    fn compatible(ty: &sqlx::postgres::PgTypeInfo) -> bool {
+        <String as sqlx::Type<sqlx::Postgres>>::compatible(ty)
+    }
+}
+
+impl<'row> sqlx::Decode<'row, sqlx::Postgres> for PollHeadSha {
+    fn decode(value: sqlx::postgres::PgValueRef<'row>) -> Result<Self, sqlx::error::BoxDynError> {
+        let value = <String as sqlx::Decode<sqlx::Postgres>>::decode(value)?;
+        Self::parse(value).map_err(Into::into)
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("invalid poll head sha {0:?}")]
+pub struct InvalidPollHeadSha(String);
+
+/// What a successful conditional request established about the remote head.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PollHeadObservation {
+    NotModified,
+    Head(PollHeadSha),
+}
+
+/// The atomic result of persisting a poll and reconciling its observed head.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PollRecordOutcome {
+    Unchanged,
+    FetchQueued,
+    FetchPending,
+}
+
 /// A repo the poll loop has claimed for a default-branch head check
 /// (RFC 0001 §3): everything needed to make the cheap conditional request
 /// and, on a moved head, enqueue a fetch. Claiming advances the repo's
@@ -850,6 +982,8 @@ pub struct DuePoll {
     pub forge_kind: String,
     /// Forge root; the clone URL is `{base_url}/{slug}`.
     pub base_url: ForgeUrl,
+    /// REST API root for Forge-specific polling; absent for generic git.
+    pub api_root: Option<ForgeUrl>,
     /// Env var holding the Forge token, if the forge has one.
     pub token_env: Option<String>,
     /// Shallow-clone override; `None` = full history.
@@ -863,6 +997,25 @@ pub struct DuePoll {
     pub rate_budget: i32,
     /// Seconds this repo was overdue when claimed for polling.
     pub poll_lag_seconds: f64,
+    poll_etag: Option<PollEtag>,
+    poll_last_modified: Option<PollLastModified>,
+    poll_observed_head: Option<PollHeadSha>,
+    poll_observed_head_was_invalid: bool,
+}
+
+impl DuePoll {
+    /// The persisted validators to present on this poll.
+    pub fn validators(&self) -> PollValidators {
+        PollValidators {
+            etag: self.poll_etag.clone(),
+            last_modified: self.poll_last_modified.clone(),
+        }
+    }
+
+    /// The last moved head whose fetch has not yet been queued.
+    pub fn observed_head(&self) -> Option<&PollHeadSha> {
+        self.poll_observed_head.as_ref()
+    }
 }
 
 /// Result of atomically charging the fleet-wide request budget for a Forge.
@@ -1985,9 +2138,12 @@ impl ControlPlane {
         jitter_fraction: f64,
     ) -> anyhow::Result<Option<DuePoll>> {
         let mut tx = self.pool.begin().await?;
-        let row = sqlx::query_as(
+        let row: Option<DuePoll> = sqlx::query_as(
             "WITH due AS (
                  SELECT r.id,
+                        r.poll_observed_head IS NOT NULL
+                            AND r.poll_observed_head !~ '^[0-9A-Fa-f]{40}$'
+                            AS poll_observed_head_was_invalid,
                         greatest(extract(epoch FROM now() - r.next_poll_at), 0)::float8
                             AS poll_lag_seconds
                  FROM repos r
@@ -2001,19 +2157,32 @@ impl ControlPlane {
              UPDATE repos r
              SET next_poll_at = now()
                  + make_interval(secs => coalesce(r.poll_interval_seconds, $1)
-                                         * (1 + $2 * random()))
+                                         * (1 + $2 * random())),
+                 poll_observed_head = CASE
+                     WHEN due.poll_observed_head_was_invalid THEN NULL
+                     ELSE r.poll_observed_head
+                 END
              FROM due, forges f
              WHERE r.id = due.id AND f.id = r.forge_id
              RETURNING r.id AS repo_id, r.slug, f.id AS forge_id,
-                       f.kind AS forge_kind, f.base_url, f.token_env, r.fetch_depth,
+                       f.kind AS forge_kind, f.base_url, f.api_root, f.token_env, r.fetch_depth,
                        r.poll_interval_seconds,
                        r.last_synced_commit AS synced_commit, f.rate_budget,
-                       due.poll_lag_seconds",
+                       due.poll_lag_seconds, r.poll_etag, r.poll_last_modified,
+                       r.poll_observed_head, due.poll_observed_head_was_invalid",
         )
         .bind(default_interval.as_secs_f64())
         .bind(jitter_fraction)
         .fetch_optional(&mut *tx)
         .await?;
+        if let Some(due) = row.as_ref()
+            && due.poll_observed_head_was_invalid
+        {
+            eprintln!(
+                "warning: discarded invalid persisted poll head for repository {} ({})",
+                due.repo_id, due.slug
+            );
+        }
         tx.commit().await?;
         Ok(row)
     }
@@ -2120,6 +2289,54 @@ impl ControlPlane {
         }
     }
 
+    /// Return a request reservation after a response the Forge declares free.
+    /// Refilling and capping happen under the same per-Forge row lock as a
+    /// reservation, so concurrent workers cannot inflate the shared bucket.
+    pub async fn refund_forge_budget(
+        &self,
+        forge_id: i64,
+        token_count: std::num::NonZeroU32,
+    ) -> anyhow::Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO forge_rate_budgets
+                 (forge_id, tokens, refill_per_second, updated_at)
+             SELECT id, rate_budget::double precision,
+                    rate_budget::double precision / 60.0, clock_timestamp()
+             FROM forges
+             WHERE id = $1
+             ON CONFLICT (forge_id) DO NOTHING",
+        )
+        .bind(forge_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE forge_rate_budgets b
+             SET tokens = CASE
+                     WHEN b.cooldown_until > clock_timestamp() THEN 0
+                     ELSE least(
+                         f.rate_budget::double precision,
+                         least(
+                             b.tokens + greatest(
+                                 extract(epoch FROM clock_timestamp() - b.updated_at), 0
+                             ) * (f.rate_budget::double precision / 60.0),
+                             f.rate_budget::double precision
+                         ) + $2
+                     )
+                 END,
+                 refill_per_second = f.rate_budget::double precision / 60.0,
+                 updated_at = greatest(b.updated_at, clock_timestamp())
+             FROM forges f
+             WHERE b.forge_id = $1 AND f.id = b.forge_id",
+        )
+        .bind(forge_id)
+        .bind(f64::from(token_count.get()))
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Extend one Forge's fleet-wide cooldown, never shortening a cooldown
     /// another worker already reported. Cooldown drains the bucket and defers
     /// refill until the effective deadline, so expiry resumes empty instead of
@@ -2193,6 +2410,87 @@ impl ControlPlane {
         };
         tx.commit().await?;
         Ok(queued)
+    }
+
+    /// Persist one successful HTTP poll and atomically reconcile its latest
+    /// observed head with the current sync position. A moved head remains
+    /// stored while an older fetch is in flight, so a later 304 can retry the
+    /// enqueue without losing the move behind its validators.
+    pub async fn record_poll_observation(
+        &self,
+        repo_id: i64,
+        validators: &PollValidators,
+        observation: &PollHeadObservation,
+    ) -> anyhow::Result<PollRecordOutcome> {
+        let mut tx = self.pool.begin().await?;
+        let observed_head = match observation {
+            PollHeadObservation::NotModified => None,
+            PollHeadObservation::Head(head) => Some(head.as_str()),
+        };
+        let row: Option<(bool, Option<PollHeadSha>, Option<String>, bool)> = sqlx::query_as(
+            "WITH target AS (
+                 SELECT id,
+                        poll_observed_head IS NOT NULL
+                            AND poll_observed_head !~ '^[0-9A-Fa-f]{40}$'
+                            AS poll_observed_head_was_invalid
+                 FROM repos
+                 WHERE id = $1
+                 FOR UPDATE
+             )
+             UPDATE repos r
+             SET poll_etag = $2,
+                 poll_last_modified = $3,
+                 poll_observed_head = CASE
+                     WHEN $4 IS NOT NULL THEN $4
+                     WHEN target.poll_observed_head_was_invalid THEN NULL
+                     ELSE r.poll_observed_head
+                 END
+             FROM target
+             WHERE r.id = target.id
+             RETURNING r.discovery_state = 'included', r.poll_observed_head,
+                       r.last_synced_commit, target.poll_observed_head_was_invalid",
+        )
+        .bind(repo_id)
+        .bind(validators.etag.as_ref().map(PollEtag::as_bytes))
+        .bind(
+            validators
+                .last_modified
+                .as_ref()
+                .map(PollLastModified::as_bytes),
+        )
+        .bind(observed_head)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((included, observed_head, synced_commit, observed_head_was_invalid)) = row else {
+            tx.commit().await?;
+            return Ok(PollRecordOutcome::Unchanged);
+        };
+        if observed_head_was_invalid {
+            eprintln!("warning: discarded invalid persisted poll head for repository {repo_id}");
+        }
+        let moved = observed_head
+            .as_ref()
+            .zip(synced_commit.as_deref())
+            .is_some_and(|(observed, synced)| observed.as_str() != synced);
+        let queued = if included && moved {
+            enqueue_job_unless_in_flight(&mut tx, JobKind::Fetch, repo_id).await?
+        } else {
+            false
+        };
+        if !moved || queued {
+            sqlx::query("UPDATE repos SET poll_observed_head = NULL WHERE id = $1")
+                .bind(repo_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(if queued {
+            PollRecordOutcome::FetchQueued
+        } else if included && moved {
+            PollRecordOutcome::FetchPending
+        } else {
+            PollRecordOutcome::Unchanged
+        })
     }
 
     /// Claim the next due index job under a lease, same protocol as

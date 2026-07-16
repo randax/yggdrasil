@@ -6,7 +6,7 @@
 pub(crate) mod git_generic;
 pub(crate) mod github;
 
-pub use github::GitHubListingError;
+pub use github::{GitHubListingError, RateLimitRemaining, RateLimitReset, RetryAfter};
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -133,6 +133,95 @@ pub trait Forge: Send + Sync {
     /// Org repository discovery, for forges whose API can list an
     /// org's repositories. `None` for plain git remotes.
     fn discovery(&self) -> Option<&dyn OrgDiscovery>;
+
+    /// Forge-specific conditional repository polling. Plain git remotes keep
+    /// using `git ls-remote`; adapters with a typed HTTP polling protocol
+    /// expose it here.
+    fn repo_poller(&self) -> Option<&dyn RepoPoller> {
+        None
+    }
+}
+
+/// A repository path accepted by a Forge polling API.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoSlug(String);
+
+impl RepoSlug {
+    pub fn parse(value: impl Into<String>) -> Result<Self, InvalidRepoSlug> {
+        let value = value.into();
+        let mut segments = value.split('/');
+        let valid = segments.next().is_some_and(|part| !part.is_empty())
+            && segments.next().is_some_and(|part| !part.is_empty())
+            && segments.next().is_none();
+        if valid {
+            Ok(Self(value))
+        } else {
+            Err(InvalidRepoSlug(value))
+        }
+    }
+
+    pub fn segments(&self) -> (&str, &str) {
+        self.0
+            .split_once('/')
+            .expect("RepoSlug construction requires owner/repo")
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("invalid repository slug {0:?}; expected owner/repo")]
+pub struct InvalidRepoSlug(String);
+
+pub use yg_control::{InvalidPollHeadSha as InvalidCommitSha, PollHeadSha as CommitSha};
+
+/// Parsed primary-rate-limit state accompanying a successful Forge response.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ForgeRateObservation {
+    pub remaining: Option<RateLimitRemaining>,
+    pub reset: Option<RateLimitReset>,
+}
+
+impl ForgeRateObservation {
+    /// A server-directed pause when the primary request allowance is empty.
+    pub fn exhausted_retry_after(self) -> Option<Duration> {
+        self.remaining
+            .is_some_and(RateLimitRemaining::is_exhausted)
+            .then_some(self.reset.map(RateLimitReset::retry_after))
+            .flatten()
+    }
+}
+
+/// A successful conditional repository-head response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepoPollOutcome {
+    NotModified {
+        validators: yg_control::PollValidators,
+        rate: ForgeRateObservation,
+        accounting: ConditionalRequestAccounting,
+    },
+    Head {
+        head: CommitSha,
+        validators: yg_control::PollValidators,
+        rate: ForgeRateObservation,
+    },
+}
+
+/// Whether a conditional response consumed the Forge's primary request budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConditionalRequestAccounting {
+    Charged,
+    AuthenticatedFree,
+}
+
+/// HTTP conditional polling capability implemented by API-backed forges.
+pub trait RepoPoller: Send + Sync {
+    fn poll_repo<'a>(
+        &'a self,
+        client: &'a reqwest::Client,
+        api_root: &'a yg_control::ForgeUrl,
+        slug: &'a RepoSlug,
+        token: Option<&'a str>,
+        validators: &'a yg_control::PollValidators,
+    ) -> BoxFuture<'a, anyhow::Result<RepoPollOutcome>>;
 }
 
 /// Listing an org's repositories through a forge's API.
@@ -258,14 +347,14 @@ mod tests {
 
     #[test]
     fn rate_limit_errors_are_recognized_across_a_forges_phrasings() {
-        let github = github::GitHubForge;
+        let git = git_generic::GitForge;
         for message in [
             "fatal: unable to access: The requested URL returned error: 429",
             "You have exceeded a secondary rate limit",
             "remote: Too Many Requests",
             "error: RPC failed; abuse detection mechanism triggered",
         ] {
-            assert!(github.is_rate_limit(message), "must flag: {message:?}");
+            assert!(git.is_rate_limit(message), "must flag: {message:?}");
         }
         for message in [
             "fatal: repository not found",
@@ -281,7 +370,7 @@ mod tests {
              fatal: repository not found",
         ] {
             assert!(
-                !github.is_rate_limit(message),
+                !git.is_rate_limit(message),
                 "must not flag an ordinary failure: {message:?}"
             );
         }
