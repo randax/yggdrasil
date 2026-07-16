@@ -46,6 +46,15 @@ pub struct SearchTarget {
     pub(super) revision: ShardRevision,
 }
 
+/// How a search target entered the current request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchTargetProvenance {
+    /// The control plane enumerated the target during this request.
+    FreshlyEnumerated,
+    /// A signed cursor restored the target from an earlier request.
+    ResumedFromCursor,
+}
+
 impl SearchTarget {
     /// Build one pinned search target from typed resolver values.
     pub fn new(repo_id: i64, qualifier: RepoQualifier, revision: ShardRevision) -> Self {

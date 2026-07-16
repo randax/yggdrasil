@@ -13,7 +13,7 @@ mod types;
 
 pub use types::{
     RepoQualifier, SearchHit, SearchNodeName, SearchPath, SearchResponse, SearchSnippet,
-    SearchTarget, SearchWireResponse, ShardRevision,
+    SearchTarget, SearchTargetProvenance, SearchWireResponse, ShardRevision,
 };
 
 /// The deepest a search cursor may page and each repository may rank.
@@ -46,7 +46,7 @@ pub(crate) async fn search<R: ShardResolver + 'static>(
         )));
     }
 
-    let (query, kind_values, mode, targets, offset) = match cursor {
+    let (query, kind_values, mode, targets, offset, target_provenance) = match cursor {
         Some(cursor) => {
             cursor
                 .agrees_with(&req, MAX_SEARCH_TARGETS)
@@ -57,6 +57,7 @@ pub(crate) async fn search<R: ShardResolver + 'static>(
                 cursor.mode,
                 fanout::dedup_targets(cursor.targets),
                 cursor.offset,
+                SearchTargetProvenance::ResumedFromCursor,
             )
         }
         None => {
@@ -74,7 +75,14 @@ pub(crate) async fn search<R: ShardResolver + 'static>(
             let kinds = req
                 .kinds
                 .map(|kinds| kinds.into_iter().map(SearchKind::from).collect());
-            (query, kinds, mode, targets, 0)
+            (
+                query,
+                kinds,
+                mode,
+                targets,
+                0,
+                SearchTargetProvenance::FreshlyEnumerated,
+            )
         }
     };
 
@@ -104,13 +112,12 @@ pub(crate) async fn search<R: ShardResolver + 'static>(
         });
     }
 
-    let from_cursor = req.cursor.is_some();
     let mut ranked = fanout::rank_targets(
         resolver.clone(),
         targets.clone(),
         query.clone(),
         kinds,
-        from_cursor,
+        target_provenance,
     )
     .await?;
     let all = ranked
@@ -119,7 +126,7 @@ pub(crate) async fn search<R: ShardResolver + 'static>(
         .collect();
     let (mut page, has_more) = merge::merge_paginate(all, offset, page_limit);
     let page_repos = hydrate::retain_page_repos(ranked, &page);
-    hydrate::hydrate_snippets(resolver, page_repos, &query, &mut page).await;
+    hydrate::hydrate_snippets(resolver, page_repos, target_provenance, &query, &mut page).await;
 
     let next = (has_more && offset + page_limit < MAX_SEARCH_WINDOW).then(|| SearchCursor {
         query,
@@ -167,8 +174,12 @@ mod tests {
         async fn resolve_fts(
             &self,
             _: &SearchTarget,
+            provenance: SearchTargetProvenance,
         ) -> Result<crate::ResolvedFts, crate::ResolveError> {
-            Err(crate::ResolveError::UnknownRepo)
+            assert_eq!(provenance, SearchTargetProvenance::ResumedFromCursor);
+            Err(crate::ResolveError::RevisionMissing(anyhow::anyhow!(
+                "cursor target vanished"
+            )))
         }
     }
 
@@ -229,6 +240,23 @@ mod tests {
             matches!(outcome, Err(VerbError::BadRequest(message)) if message ==
                 "search mode \"future-mode\" is not available; only \"lexical\" is supported (semantic and hybrid arrive with embeddings)")
         );
+    }
+
+    #[test]
+    fn vanished_cursor_target_is_gone_not_internal() {
+        let cursor = test_cursors().encode(&SearchCursor {
+            query: "query".to_string(),
+            kinds: None,
+            mode: SearchMode::Lexical,
+            targets: vec![SearchTarget::new(
+                1,
+                RepoQualifier::new("vanished".to_string()),
+                ShardRevision::new("revision".to_string()),
+            )],
+            offset: 0,
+        });
+
+        assert!(matches!(resume(cursor), Err(VerbError::Gone(_))));
     }
 
     #[test]

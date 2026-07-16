@@ -121,10 +121,13 @@ pub trait ShardResolver: Send + Sync {
         &self,
     ) -> impl Future<Output = Result<Vec<SearchTarget>, ResolveError>> + Send;
 
-    /// Materialize the FTS segment pinned by a search target.
+    /// Materialize the FTS segment pinned by a search target. Provenance lets
+    /// deployments revalidate cursor-restored targets without repeating the
+    /// control-plane lookup that just enumerated fresh targets.
     fn resolve_fts(
         &self,
         target: &SearchTarget,
+        provenance: crate::search::SearchTargetProvenance,
     ) -> impl Future<Output = Result<ResolvedFts, ResolveError>> + Send;
 
     /// Resolve the FTS segment and immutable revision for a fuzzy address.

@@ -13,7 +13,7 @@ use axum::response::{IntoResponse, Response};
 use yg_control::{ControlPlane, ShardState};
 use yg_verbs::{
     PinnedShard, RepoQualifier, ResolveError, ResolvedFts, ResolvedFuzzyShard, ResolvedShard,
-    SearchTarget, ShardResolver, ShardRevision,
+    SearchTarget, SearchTargetProvenance, ShardResolver, ShardRevision,
 };
 
 use crate::AppState;
@@ -24,9 +24,9 @@ use crate::wire::{Wire, WireJson};
 /// the control plane (re-resolved on every call, so a pointer swap is
 /// picked up by the next query without a restart; `pinned` — from a
 /// pagination cursor — bypasses the pointer and reads that exact
-/// immutable revision), and segments come off the local cache. Pinned
-/// revisions are admitted only while their repo remains visible and
-/// their control-plane row remains published.
+/// immutable revision), and segments come off the local cache. Revisions
+/// resurrected from cursors are admitted only while their repo remains
+/// visible and their control-plane row remains published.
 pub(crate) struct ShardAccess {
     control: ControlPlane,
     shards: Arc<yg_shard::ShardCache>,
@@ -134,20 +134,26 @@ impl ShardResolver for ShardAccess {
             })
     }
 
-    async fn resolve_fts(&self, target: &SearchTarget) -> Result<ResolvedFts, ResolveError> {
-        let visible = self
-            .control
-            .verb_target(target.qualifier().as_str())
-            .await
-            .map_err(ResolveError::Internal)?
-            .ok_or_else(|| revision_missing(target.revision().as_str()))?;
-        matching_repo_id(
-            target.repo_id(),
-            visible.repo_id,
-            target.revision().as_str(),
-        )?;
-        self.require_published_revision(target.repo_id(), target.revision().as_str())
-            .await?;
+    async fn resolve_fts(
+        &self,
+        target: &SearchTarget,
+        provenance: SearchTargetProvenance,
+    ) -> Result<ResolvedFts, ResolveError> {
+        if provenance == SearchTargetProvenance::ResumedFromCursor {
+            let visible = self
+                .control
+                .verb_target(target.qualifier().as_str())
+                .await
+                .map_err(ResolveError::Internal)?
+                .ok_or_else(|| revision_missing(target.revision().as_str()))?;
+            matching_repo_id(
+                target.repo_id(),
+                visible.repo_id,
+                target.revision().as_str(),
+            )?;
+            self.require_published_revision(target.repo_id(), target.revision().as_str())
+                .await?;
+        }
         self.shards
             .leased_fts_path(target.repo_id(), target.revision().as_str())
             .await
@@ -333,7 +339,11 @@ mod tests {
             )))
         }
 
-        async fn resolve_fts(&self, _target: &SearchTarget) -> Result<ResolvedFts, ResolveError> {
+        async fn resolve_fts(
+            &self,
+            _target: &SearchTarget,
+            _provenance: SearchTargetProvenance,
+        ) -> Result<ResolvedFts, ResolveError> {
             Err(ResolveError::Internal(anyhow::anyhow!(
                 "unused search FTS resolver"
             )))

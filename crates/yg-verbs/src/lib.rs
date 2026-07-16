@@ -57,7 +57,7 @@ pub use fuzzy::{
 pub use metrics::Metrics;
 pub use search::{
     RepoQualifier, SearchHit, SearchNodeName, SearchPath, SearchResponse, SearchSnippet,
-    SearchTarget, SearchWireResponse, ShardRevision,
+    SearchTarget, SearchTargetProvenance, SearchWireResponse, ShardRevision,
 };
 pub use yg_shard::{EdgeKind, Provenance};
 
