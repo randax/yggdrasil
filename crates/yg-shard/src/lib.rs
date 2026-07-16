@@ -849,12 +849,23 @@ pub struct ShardCache {
     /// Checksums whose on-disk file this process has already verified.
     verified: Arc<std::sync::Mutex<std::collections::HashSet<CacheKey>>>,
     lru: Arc<std::sync::Mutex<DiskLru>>,
-    flights: Flights,
+    flights: Arc<Flights>,
     pins: Arc<Pins>,
     maintenance: Arc<tokio::sync::Mutex<()>>,
     capacity: CacheCapacity,
     metrics: Metrics,
 }
+
+#[cfg(test)]
+struct FtsUnpackTestSeam {
+    repo_id: i64,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+static FTS_UNPACK_TEST_SEAM: std::sync::Mutex<Option<Arc<FtsUnpackTestSeam>>> =
+    std::sync::Mutex::new(None);
 
 /// A single cache artifact cannot fit under the configured byte ceiling.
 #[derive(Debug)]
@@ -988,20 +999,19 @@ impl ShardCache {
         let dir = dir.into();
         let (mut lru, startup_evictions, stale_paths) = DiskLru::scan(&dir, capacity);
         for (path, artifact) in stale_paths {
-            if cache::remove_cached_path(&path).is_err() {
-                let bytes = cache::measure_paths(std::slice::from_ref(&path)).unwrap_or(u64::MAX);
-                lru.track_stale(path, bytes, artifact);
+            if let Err(error) = cache::remove_cached_path(&path) {
+                let remaining = error.remaining_path().to_path_buf();
+                let bytes =
+                    cache::measure_paths(std::slice::from_ref(&remaining)).unwrap_or(u64::MAX);
+                lru.track_stale(remaining, bytes, artifact);
             }
         }
-        for eviction in startup_evictions {
-            let removed = eviction
-                .paths
-                .iter()
-                .all(|path| cache::remove_cached_path(path).is_ok());
+        for mut eviction in startup_evictions {
+            let removed = remove_eviction_paths(&mut eviction).is_ok();
             if removed {
                 metrics.capacity_eviction(eviction.key.artifact);
             } else {
-                lru.restore_existing(eviction);
+                lru.restore_failed_eviction(eviction);
             }
         }
         Self {
@@ -1434,6 +1444,29 @@ impl ShardCache {
             self.metrics.hit(metrics::Artifact::Fts);
             return Ok(unpacked);
         }
+        let task_cache = self.detached_task_handle();
+        let task_revision = revision.to_string();
+        tokio::spawn(async move {
+            task_cache
+                .materialize_fts(repo_id, task_revision, sha, key, archive_path, unpacked)
+                .await
+        })
+        .await
+        .context("FTS materialization task panicked")?
+    }
+
+    /// Own all work after the first possible cache-file commit. The caller
+    /// awaits this detached task, so dropping a cold request cannot strand a
+    /// committed archive or unpacked directory outside LRU accounting.
+    async fn materialize_fts(
+        &self,
+        repo_id: i64,
+        revision: String,
+        sha: String,
+        key: CacheKey,
+        archive_path: std::path::PathBuf,
+        unpacked: std::path::PathBuf,
+    ) -> anyhow::Result<std::path::PathBuf> {
         let gate = self.flights.gate(&sha);
         let _flight = gate.lock().await;
         if self.is_verified(&key, &archive_path).await?
@@ -1452,64 +1485,102 @@ impl ShardCache {
         // correct content — there is nothing to invalidate on a refetch,
         // and deleting it would yank it out from under a concurrent reader.
         self.fetch_verify_into(
-            revision,
+            &revision,
             &sha,
             &archive_path,
-            fts_segment_key(repo_id, revision),
+            fts_segment_key(repo_id, &revision),
             metrics::Artifact::Fts,
         )
         .await?;
 
-        // Unpack the verified archive into its directory if absent.
-        if !tokio::fs::try_exists(&unpacked)
-            .await
-            .context("checking the unpacked fts segment")?
-        {
-            let dir_root = self.dir.clone();
-            let target = unpacked.clone();
-            let sha_for_tmp = sha.clone();
-            let archive = archive_path.clone();
-            // Untarring is blocking fs work; keep it off the runtime threads.
-            tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                static ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                let tmp = dir_root.join(format!(
-                    "{sha_for_tmp}.fts.tmp-{}-{}",
-                    std::process::id(),
-                    ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                ));
-                let mut cleanup = cache::CleanupPath::new(tmp.clone());
-                // A previous crashed unpack may have left this temp dir.
-                let _ = std::fs::remove_dir_all(&tmp);
-                // Clean the temp dir on any failure (a partial unpack, a
-                // rename race) so a failed attempt never leaks it.
-                let unpack_and_commit = || -> anyhow::Result<()> {
-                    fts::unpack_fts_file(&archive, &tmp)?;
-                    match std::fs::rename(&tmp, &target) {
-                        Ok(()) => Ok(()),
-                        // Another task unpacked the same revision first —
-                        // its directory is the complete one; ours is
-                        // redundant.
-                        Err(_) if target.exists() => Ok(()),
-                        Err(e) => {
-                            Err(e).context("committing the unpacked fts segment into the cache")
-                        }
-                    }
-                };
-                let result = unpack_and_commit();
-                if result.is_err() || tmp.exists() {
-                    let _ = std::fs::remove_dir_all(&tmp);
-                } else {
-                    cleanup.disarm();
-                }
-                result
-            })
-            .await
-            .context("fts segment unpack task panicked")??;
+        #[cfg(test)]
+        let unpack_test_seam = {
+            FTS_UNPACK_TEST_SEAM
+                .lock()
+                .expect("FTS unpack test seam lock poisoned")
+                .clone()
+        };
+        #[cfg(test)]
+        if let Some(seam) = unpack_test_seam.filter(|seam| seam.repo_id == repo_id) {
+            seam.entered.notify_one();
+            seam.release.notified().await;
         }
 
-        self.record_verified(key, vec![archive_path, unpacked.clone()])
-            .await?;
+        // Unpack the verified archive into its directory if absent.
+        let unpack_result = match tokio::fs::try_exists(&unpacked)
+            .await
+            .context("checking the unpacked fts segment")
+        {
+            Ok(true) => Ok(()),
+            Ok(false) => {
+                let dir_root = self.dir.clone();
+                let target = unpacked.clone();
+                let sha_for_tmp = sha.clone();
+                let archive = archive_path.clone();
+                // Untarring is blocking fs work; keep it off the runtime threads.
+                tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                    static ATTEMPT: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(0);
+                    let tmp = dir_root.join(format!(
+                        "{sha_for_tmp}.fts.tmp-{}-{}",
+                        std::process::id(),
+                        ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    ));
+                    let mut cleanup = cache::CleanupPath::new(tmp.clone());
+                    // A previous crashed unpack may have left this temp dir.
+                    let _ = std::fs::remove_dir_all(&tmp);
+                    // Clean the temp dir on any failure (a partial unpack, a
+                    // rename race) so a failed attempt never leaks it.
+                    let unpack_and_commit = || -> anyhow::Result<()> {
+                        fts::unpack_fts_file(&archive, &tmp)?;
+                        match std::fs::rename(&tmp, &target) {
+                            Ok(()) => Ok(()),
+                            // Another task unpacked the same revision first —
+                            // its directory is the complete one; ours is
+                            // redundant.
+                            Err(_) if target.exists() => Ok(()),
+                            Err(e) => {
+                                Err(e).context("committing the unpacked fts segment into the cache")
+                            }
+                        }
+                    };
+                    let result = unpack_and_commit();
+                    if result.is_err() || tmp.exists() {
+                        let _ = std::fs::remove_dir_all(&tmp);
+                    } else {
+                        cleanup.disarm();
+                    }
+                    result
+                })
+                .await
+                .context("fts segment unpack task panicked")
+                .and_then(|result| result)
+            }
+            Err(error) => Err(error),
+        };
+
+        let mut committed_paths = vec![archive_path];
+        if unpacked.is_dir() {
+            committed_paths.push(unpacked.clone());
+        }
+        self.record_verified(key, committed_paths).await?;
+        unpack_result?;
         Ok(unpacked)
+    }
+
+    fn detached_task_handle(&self) -> Self {
+        Self {
+            store: self.store.clone(),
+            dir: self.dir.clone(),
+            manifests: self.manifests.clone(),
+            verified: self.verified.clone(),
+            lru: self.lru.clone(),
+            flights: self.flights.clone(),
+            pins: self.pins.clone(),
+            maintenance: self.maintenance.clone(),
+            capacity: self.capacity,
+            metrics: self.metrics.clone(),
+        }
     }
 
     fn forget_manifest(&self, repo_id: i64, revision: &str) {
@@ -1759,14 +1830,9 @@ fn remove_marked_eviction(
     verified: &std::sync::Mutex<std::collections::HashSet<CacheKey>>,
     manifests: &std::sync::Mutex<MemoryLru<String, Arc<Manifest>>>,
     metrics: &Metrics,
-    eviction: cache::Evicted,
+    mut eviction: cache::Evicted,
 ) -> anyhow::Result<()> {
-    let mut first_error = None;
-    for path in &eviction.paths {
-        if let Err(error) = cache::remove_cached_path(path) {
-            first_error.get_or_insert(error);
-        }
-    }
+    let removal = remove_eviction_paths(&mut eviction);
     verified
         .lock()
         .expect("shard cache lock poisoned")
@@ -1780,14 +1846,30 @@ fn remove_marked_eviction(
                 .values()
                 .any(|segment| segment.sha256 == eviction.key.sha)
         });
-    if let Some(error) = first_error {
+    if let Err(error) = removal {
         lru.lock()
             .expect("shard cache lock poisoned")
-            .restore_existing(eviction);
-        return Err(error.into());
+            .restore_failed_eviction(eviction);
+        return Err(error);
     }
-    metrics.capacity_eviction(eviction.key.artifact);
+    if eviction.displaced_cached_entry() {
+        metrics.capacity_eviction(eviction.key.artifact);
+    }
     Ok(())
+}
+
+fn remove_eviction_paths(eviction: &mut cache::Evicted) -> anyhow::Result<()> {
+    let mut first_error = None;
+    for path in &mut eviction.paths {
+        if let Err(error) = cache::remove_cached_path(path) {
+            *path = error.remaining_path().to_path_buf();
+            first_error.get_or_insert(error);
+        }
+    }
+    match first_error {
+        Some(error) => Err(error.into()),
+        None => Ok(()),
+    }
 }
 
 fn public_segment_error(error: anyhow::Error) -> anyhow::Error {
@@ -2005,5 +2087,152 @@ mod tests {
         // rather than printing a blank author.
         assert_eq!(Node::contributor("x@example.com", "").name, None);
         assert_eq!(Node::contributor("y@example.com", "   ").name, None);
+    }
+
+    #[tokio::test]
+    async fn cancelled_fts_unpack_finishes_accounting_committed_paths() {
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let published = write_shard(
+            store.clone().as_ref(),
+            71,
+            "cancelled-unpack",
+            Graph {
+                nodes: vec![Node::file("cancelled.rs")],
+                edges: Vec::new(),
+            },
+            vec![SearchDoc {
+                node_id: "file:cancelled.rs".into(),
+                kind: NodeKind::File,
+                name: Some("cancelled.rs".into()),
+                path: Some("cancelled.rs".into()),
+                content: "fn materialize_even_if_the_request_goes_away() {}".into(),
+            }],
+        )
+        .await
+        .expect("publish cancellation fixture");
+        let directory = tempfile::tempdir().expect("cache directory");
+        let cache = Arc::new(ShardCache::new(store, directory.path()));
+        let seam = Arc::new(FtsUnpackTestSeam {
+            repo_id: 71,
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        *FTS_UNPACK_TEST_SEAM
+            .lock()
+            .expect("FTS unpack test seam lock poisoned") = Some(seam.clone());
+
+        let task_cache = cache.clone();
+        let revision = published.revision;
+        let request = tokio::spawn(async move { task_cache.fts_path(71, &revision).await });
+        seam.entered.notified().await;
+        let archive = std::fs::read_dir(directory.path())
+            .expect("read cache directory")
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| path.extension().is_some_and(|extension| extension == "tar"))
+            .expect("the archive is committed before unpack begins");
+        let sha = checksum_from_cache_path(&archive, ".tar").expect("content-addressed archive");
+
+        request.abort();
+        let _ = request.await;
+        *FTS_UNPACK_TEST_SEAM
+            .lock()
+            .expect("FTS unpack test seam lock poisoned") = None;
+        seam.release.notify_one();
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let accounted = cache
+                    .verified
+                    .lock()
+                    .expect("shard cache lock poisoned")
+                    .contains(&CacheKey {
+                        sha: sha.clone(),
+                        artifact: metrics::Artifact::Fts,
+                    });
+                let removed = !archive.exists();
+                if accounted || removed {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached FTS materialization must finish accounting or cleanup");
+
+        if archive.exists() {
+            assert!(
+                directory.path().join(format!("{sha}.fts")).is_dir(),
+                "an accounted successful materialization includes the unpacked index"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_fts_unpack_accounts_the_committed_archive() {
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let repo_id = 72;
+        let commit = "invalid-tar";
+        let revision = syntactic_revision(commit);
+        let invalid_archive = b"checksum-valid bytes that are not a tar archive".to_vec();
+        let sha = hex::encode(Sha256::digest(&invalid_archive));
+        let manifest = Manifest {
+            schema_version: SCHEMA_VERSION,
+            commit: commit.into(),
+            pass: SYNTACTIC_PASS.into(),
+            counts: Counts { nodes: 0, edges: 0 },
+            segments: BTreeMap::from([(
+                FTS_SEGMENT_FILE.into(),
+                Segment {
+                    sha256: sha.clone(),
+                    bytes: invalid_archive.len() as u64,
+                },
+            )]),
+        };
+        store
+            .put(
+                &fts_segment_key(repo_id, &revision).into(),
+                invalid_archive.into(),
+            )
+            .await
+            .expect("put invalid FTS fixture");
+        store
+            .put(
+                &manifest_key(repo_id, &revision).into(),
+                serde_json::to_vec(&manifest)
+                    .expect("serialize manifest")
+                    .into(),
+            )
+            .await
+            .expect("put manifest fixture");
+
+        let directory = tempfile::tempdir().expect("cache directory");
+        let cache = ShardCache::new(store, directory.path());
+        cache
+            .fts_path(repo_id, &revision)
+            .await
+            .expect_err("an invalid tar cannot materialize an FTS index");
+
+        let archive = directory.path().join(format!("{sha}.tar"));
+        assert!(archive.is_file(), "the committed archive remains on disk");
+        assert!(
+            cache
+                .verified
+                .lock()
+                .expect("shard cache lock poisoned")
+                .contains(&CacheKey {
+                    sha: sha.clone(),
+                    artifact: metrics::Artifact::Fts,
+                }),
+            "the failed materialization's committed archive is LRU-accounted"
+        );
+        assert!(!directory.path().join(format!("{sha}.fts")).exists());
+        assert!(
+            std::fs::read_dir(directory.path())
+                .expect("read cache directory")
+                .flatten()
+                .all(|entry| !entry.file_name().to_string_lossy().contains(".fts.tmp-")),
+            "failed unpack staging is removed"
+        );
     }
 }

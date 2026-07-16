@@ -608,6 +608,42 @@ async fn capacity_eviction_is_exposed_as_its_own_metric() {
 }
 
 #[tokio::test]
+async fn self_eviction_does_not_count_as_displacing_a_cached_artifact() {
+    use prometheus_client::encoding::text::encode;
+    use prometheus_client::registry::Registry;
+
+    let store = Arc::new(ObservedStore::new());
+    let pinned_revision = publish_graph(store.as_ref(), 49, "metric-pinned", 25).await;
+    let rejected_revision = publish_graph(store.as_ref(), 49, "metric-rejected", 25).await;
+    let pinned_size = store
+        .object_size(&graph_segment_key(49, &pinned_revision))
+        .await;
+    let rejected_size = store
+        .object_size(&graph_segment_key(49, &rejected_revision))
+        .await;
+    let capacity = CacheCapacity::new(pinned_size.max(rejected_size)).unwrap();
+    let mut registry = Registry::default();
+    let metrics = Metrics::registered(&mut registry);
+    let directory = tempfile::tempdir().unwrap();
+    let cache = ShardCache::with_metrics_and_capacity(store, directory.path(), metrics, capacity);
+
+    let pinned = cache.leased_graph_path(49, &pinned_revision).await.unwrap();
+    let error = cache
+        .graph_path(49, &rejected_revision)
+        .await
+        .expect_err("the fresh artifact self-evicts while the cache is pinned");
+    assert!(error.downcast_ref::<CacheCapacityUnavailable>().is_some());
+
+    let mut exposition = String::new();
+    encode(&mut exposition, &registry).unwrap();
+    assert!(
+        exposition.contains("yggdrasil_shard_cache_capacity_evictions_total{artifact=\"graph\"} 0"),
+        "rejecting the just-fetched artifact is not a cache displacement:\n{exposition}"
+    );
+    drop(pinned);
+}
+
+#[tokio::test]
 async fn fts_archive_and_unpacked_directory_are_one_bounded_bundle() {
     let store = Arc::new(ObservedStore::new());
     let revision = publish_graph(store.as_ref(), 47, "fts-bundle", 100).await;
@@ -685,6 +721,9 @@ fn constructor_scan_removes_stale_temps_and_enforces_the_existing_disk_cap() {
         .path()
         .join(format!("{second}.sqlite.tmp-123-456"));
     std::fs::write(&stale, vec![0; 32]).unwrap();
+    let stale_fts = directory.path().join(format!("{second}.fts.tmp-123-457"));
+    std::fs::create_dir(&stale_fts).unwrap();
+    std::fs::write(stale_fts.join("partial-index"), vec![0; 32]).unwrap();
 
     let _cache = ShardCache::with_capacity(
         Arc::new(InMemory::new()),
@@ -693,6 +732,10 @@ fn constructor_scan_removes_stale_temps_and_enforces_the_existing_disk_cap() {
     );
 
     assert!(!stale.exists(), "startup removes abandoned staging files");
+    assert!(
+        !stale_fts.exists(),
+        "startup removes partially deleted FTS directories"
+    );
     assert!(regular_file_bytes(directory.path()) <= 8);
     assert!(!directory.path().join(format!("{first}.sqlite")).exists());
     assert!(directory.path().join(format!("{second}.sqlite")).exists());

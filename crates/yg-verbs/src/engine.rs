@@ -55,6 +55,8 @@ pub enum ResolveError {
     RevisionMissing(#[source] anyhow::Error),
     #[error("the Shard predates the current index schema")]
     SchemaOutdated,
+    #[error("the Shard cache capacity is too small for the requested artifact")]
+    CacheCapacityUnavailable,
     #[error(transparent)]
     Internal(anyhow::Error),
 }
@@ -76,14 +78,12 @@ pub struct ResolvedFts {
     pub cache_lease: Option<yg_shard::CacheLease>,
 }
 
-/// Matching graph and FTS segments for one immutable Shard revision.
-/// Only fuzzy addressing materializes both; exact ids retain the graph-only
-/// resolver path and its existing latency and failure behavior.
+/// An FTS segment pinned to one immutable Shard revision for fuzzy addressing.
+/// The graph segment is resolved only after the FTS lookup identifies one id,
+/// so capacity need not accommodate both artifacts at once.
 pub struct ResolvedFuzzyShard {
-    pub graph_path: std::path::PathBuf,
     pub fts_path: std::path::PathBuf,
     pub revision: crate::ShardRevision,
-    pub graph_cache_lease: Option<yg_shard::CacheLease>,
     pub fts_cache_lease: Option<yg_shard::CacheLease>,
 }
 
@@ -116,7 +116,9 @@ pub trait ShardResolver: Send + Sync {
         target: &SearchTarget,
     ) -> impl Future<Output = Result<ResolvedFts, ResolveError>> + Send;
 
-    /// Resolve matching graph and FTS segments for a fuzzy address.
+    /// Resolve the FTS segment and immutable revision for a fuzzy address.
+    /// After the lookup releases this artifact, the engine resolves the graph
+    /// through [`Self::resolve`] at the returned pinned revision.
     fn resolve_fuzzy(
         &self,
         _qualifier: &RepoQualifier,
@@ -177,6 +179,11 @@ fn resolve_error(qualifier: &str, from_cursor: bool, e: ResolveError) -> VerbErr
                 )
             }
         }
+        ResolveError::CacheCapacityUnavailable => VerbError::Unavailable(
+            "the Shard cache capacity is too small for the requested artifact; \
+             increase the cache capacity and try again"
+                .to_string(),
+        ),
         ResolveError::Internal(e) => VerbError::Internal(e),
     }
 }
@@ -624,14 +631,20 @@ impl<R: ShardResolver + 'static> Engine<R> {
                         kind: NoSuchSymbolKind::NoSuchSymbol,
                         address,
                     })),
-                    1 => Ok(ResolvedAddress::Exact {
-                        shard: ResolvedShard {
-                            path: resolved.graph_path,
-                            revision: resolved.revision.as_str().to_string(),
-                            cache_lease: resolved.graph_cache_lease,
-                        },
-                        id: candidates.pop().expect("one candidate").id,
-                    }),
+                    1 => {
+                        let revision = resolved.revision.as_str().to_string();
+                        let shard = self
+                            .resolver
+                            .resolve(qualifier.as_str(), Some(revision))
+                            .await
+                            .map_err(|error| {
+                                resolve_error(qualifier.as_str(), from_cursor, error)
+                            })?;
+                        Ok(ResolvedAddress::Exact {
+                            shard,
+                            id: candidates.pop().expect("one candidate").id,
+                        })
+                    }
                     _ => Ok(ResolvedAddress::Ambiguous(AmbiguousNodeAddress {
                         resolution: AmbiguousResolution::Ambiguous,
                         address,
@@ -756,6 +769,11 @@ mod tests {
         assert!(matches!(
             resolve_error("q", false, ResolveError::NotIndexed),
             VerbError::NotFound(_)
+        ));
+        assert!(matches!(
+            resolve_error("q", false, ResolveError::CacheCapacityUnavailable),
+            VerbError::Unavailable(message)
+                if message.contains("cache capacity is too small")
         ));
     }
 

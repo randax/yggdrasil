@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use crate::metrics::Artifact;
@@ -48,6 +49,7 @@ pub(crate) struct Evicted {
     pub(crate) paths: Vec<PathBuf>,
     bytes: u64,
     used: u64,
+    displaced_cached_entry: bool,
 }
 
 impl Evicted {
@@ -57,7 +59,12 @@ impl Evicted {
             paths,
             bytes,
             used: 0,
+            displaced_cached_entry: false,
         }
+    }
+
+    pub(crate) fn displaced_cached_entry(&self) -> bool {
+        self.displaced_cached_entry
     }
 }
 
@@ -181,6 +188,23 @@ impl DiskLru {
         self.restore(eviction);
     }
 
+    pub(crate) fn restore_failed_eviction(&mut self, mut eviction: Evicted) {
+        let mut stale = Vec::new();
+        eviction.paths.retain(|path| {
+            if let Some(artifact) = stale_artifact(path) {
+                stale.push((path.clone(), artifact));
+                false
+            } else {
+                true
+            }
+        });
+        self.restore_existing(eviction);
+        for (path, artifact) in stale {
+            let bytes = measure_paths(std::slice::from_ref(&path)).unwrap_or(u64::MAX);
+            self.track_stale(path, bytes, artifact);
+        }
+    }
+
     pub(crate) fn take(&mut self, key: &CacheKey) -> Option<Evicted> {
         let entry = self.entries.remove(key)?;
         self.bytes = self.bytes.saturating_sub(u128::from(entry.bytes));
@@ -189,6 +213,7 @@ impl DiskLru {
             paths: entry.paths,
             bytes: entry.bytes,
             used: entry.used,
+            displaced_cached_entry: false,
         })
     }
 
@@ -236,6 +261,7 @@ impl DiskLru {
             };
             self.bytes = self.bytes.saturating_sub(u128::from(entry.bytes));
             evicted.push(Evicted {
+                displaced_cached_entry: protected != Some(&key),
                 key,
                 paths: entry.paths,
                 bytes: entry.bytes,
@@ -290,14 +316,83 @@ fn path_bytes(path: &Path) -> std::io::Result<u64> {
     Ok(bytes)
 }
 
-pub(crate) fn remove_cached_path(path: &Path) -> std::io::Result<()> {
-    if path.is_dir() {
-        std::fs::remove_dir_all(path)
-    } else {
-        match std::fs::remove_file(path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error),
+#[derive(Debug)]
+pub(crate) struct RemoveCachedPathError {
+    source: std::io::Error,
+    remaining_path: PathBuf,
+}
+
+impl RemoveCachedPathError {
+    pub(crate) fn remaining_path(&self) -> &Path {
+        &self.remaining_path
+    }
+}
+
+impl std::fmt::Display for RemoveCachedPathError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.source.fmt(f)
+    }
+}
+
+impl std::error::Error for RemoveCachedPathError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+pub(crate) fn remove_cached_path(path: &Path) -> Result<(), RemoveCachedPathError> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(RemoveCachedPathError {
+                source,
+                remaining_path: path.to_path_buf(),
+            });
+        }
+    };
+    if !metadata.is_dir() {
+        return std::fs::remove_file(path).map_err(|source| RemoveCachedPathError {
+            source,
+            remaining_path: path.to_path_buf(),
+        });
+    }
+    if path.extension().is_some_and(|extension| extension == "fts") {
+        let staged = eviction_staging_path(path);
+        match std::fs::rename(path, &staged) {
+            Ok(()) => {
+                return std::fs::remove_dir_all(&staged).map_err(|source| RemoveCachedPathError {
+                    source,
+                    remaining_path: staged,
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(source) => {
+                return Err(RemoveCachedPathError {
+                    source,
+                    remaining_path: path.to_path_buf(),
+                });
+            }
+        }
+    }
+    std::fs::remove_dir_all(path).map_err(|source| RemoveCachedPathError {
+        source,
+        remaining_path: path.to_path_buf(),
+    })
+}
+
+fn eviction_staging_path(path: &Path) -> PathBuf {
+    static NEXT_STAGING_ID: AtomicU64 = AtomicU64::new(0);
+
+    let file_name = path
+        .file_name()
+        .expect("a cached path has a file name")
+        .to_string_lossy();
+    loop {
+        let id = NEXT_STAGING_ID.fetch_add(1, Ordering::Relaxed);
+        let candidate = path.with_file_name(format!("{file_name}.tmp-{}-{id}", std::process::id()));
+        if !candidate.exists() {
+            return candidate;
         }
     }
 }
@@ -545,13 +640,74 @@ mod tests {
         std::fs::write(dir.path().join(format!("{new_sha}.sqlite")), vec![0; 8]).unwrap();
         let stale_path = dir.path().join(format!("{old_sha}.sqlite.tmp-1-1"));
         std::fs::write(&stale_path, vec![0; 100]).unwrap();
+        let stale_fts_path = dir.path().join(format!("{new_sha}.fts.tmp-1-2"));
+        std::fs::create_dir(&stale_fts_path).unwrap();
+        std::fs::write(stale_fts_path.join("partial-index"), vec![0; 100]).unwrap();
 
         let (lru, evicted, stale) = DiskLru::scan(dir.path(), CacheCapacity::new(8).unwrap());
 
         assert_eq!(lru.bytes, 8);
         assert_eq!(evicted.len(), 1);
-        assert_eq!(stale, [(stale_path, Artifact::Graph)]);
+        assert_eq!(
+            stale,
+            [
+                (stale_path, Artifact::Graph),
+                (stale_fts_path, Artifact::Fts)
+            ]
+        );
         assert_eq!(evicted[0].key.sha, old_sha);
         assert!(evicted[0].paths[0].ends_with(format!("{old_sha}.sqlite")));
+    }
+
+    #[test]
+    fn fts_eviction_renames_before_removing_the_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let sha = "3".repeat(64);
+        let unpacked = dir.path().join(format!("{sha}.fts"));
+        std::fs::create_dir(&unpacked).unwrap();
+        std::fs::write(unpacked.join("index"), b"contents").unwrap();
+
+        remove_cached_path(&unpacked).unwrap();
+
+        assert!(!unpacked.exists());
+        assert!(std::fs::read_dir(dir.path()).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn failed_staged_eviction_stays_accounted_across_same_sha_recording() {
+        let dir = tempfile::tempdir().unwrap();
+        let sha = "4".repeat(64);
+        let staged = dir.path().join(format!("{sha}.fts.tmp-1-1"));
+        std::fs::create_dir(&staged).unwrap();
+        std::fs::write(staged.join("partial-index"), vec![0; 8]).unwrap();
+        let key = CacheKey {
+            sha: sha.clone(),
+            artifact: Artifact::Fts,
+        };
+        let mut lru = DiskLru {
+            capacity: CacheCapacity::new(64).unwrap(),
+            entries: HashMap::new(),
+            bytes: 0,
+            clock: 0,
+        };
+        lru.restore_failed_eviction(Evicted {
+            key: key.clone(),
+            paths: vec![staged.clone()],
+            bytes: 8,
+            used: 1,
+            displaced_cached_entry: true,
+        });
+
+        let replacement = dir.path().join(format!("{sha}.tar"));
+        std::fs::write(&replacement, vec![0; 1]).unwrap();
+        lru.record(key.clone(), vec![replacement], 1, &HashSet::new());
+
+        assert!(lru.entries.contains_key(&key));
+        assert!(
+            lru.entries
+                .values()
+                .any(|entry| entry.paths.iter().any(|path| path == &staged))
+        );
+        assert_eq!(lru.bytes, 9);
     }
 }

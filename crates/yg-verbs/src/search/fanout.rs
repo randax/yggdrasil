@@ -182,6 +182,8 @@ fn map_named_target_error(qualifier: &str, error: ResolveError) -> VerbError {
         ResolveError::UnknownRepo => VerbError::NotFound(format!("no indexed repository matches {qualifier:?}")),
         ResolveError::NotIndexed => VerbError::NotFound(format!("{qualifier} is registered but not yet indexed; try again shortly")),
         ResolveError::RevisionMissing(source) | ResolveError::Internal(source) => VerbError::Internal(source),
+        ResolveError::CacheCapacityUnavailable => VerbError::Unavailable(
+            "the Shard cache capacity is too small for the requested artifact; increase the cache capacity and try again".to_string()),
         ResolveError::SchemaOutdated => VerbError::Unavailable(
             "a repo's Shard predates the current index schema and is being re-indexed; try again shortly".to_string()),
     }
@@ -196,6 +198,8 @@ pub(super) fn map_search_shard_error(error: ResolveError, from_cursor: bool) -> 
         ResolveError::SchemaOutdated => VerbError::Unavailable(
             "a repo's Shard predates the current index schema and is being re-indexed; try again shortly".to_string()),
         ResolveError::RevisionMissing(source) | ResolveError::Internal(source) => VerbError::Internal(source),
+        ResolveError::CacheCapacityUnavailable => VerbError::Unavailable(
+            "the Shard cache capacity is too small for the requested artifact; increase the cache capacity and try again".to_string()),
         ResolveError::UnknownRepo => VerbError::NotFound("no indexed repository matches the search target".to_string()),
         ResolveError::NotIndexed => VerbError::NotFound(
             "a search target is registered but not yet indexed; try again shortly".to_string()),
