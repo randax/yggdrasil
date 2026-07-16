@@ -68,12 +68,14 @@ Yggdrasil is a self-hosted **Index Server** that syncs git repositories from **F
 |---|---|
 | Scale | 5000+ repos, 500+ Members, ~100M LOC org-wide |
 | Verb latency | p95 < 300 ms (warm cache) |
-| Search latency | p95 < 500 ms (warm), cold long-tail documented |
+| Search latency | p95 < 500 ms (warm), cold long-tail characterized below |
 | Freshness (poll path) | change → syntactic layers queryable: p50 ≤ 8 min; precise layer when its build lands |
 | Freshness (webhook path) | p50 ≤ 3 min to syntactic layers |
 | Full-org re-index | overnight with ~40 workers (≈ 5000 repos × ~4 worker-min) |
 | Durability | All Shards rebuildable from git + Forge APIs; Postgres is the only stateful backup target besides object storage |
 | Security | Sandboxed builds (SCIP runs repo-controlled code), bearer tokens, default-deny external providers |
+
+A **cold search** is the first query against a freshly published Shard with an empty local Shard cache. It includes the object-storage round-trip plus FTS segment download and unpack, so its latency scales with Shard size and object-store latency. Observed 2026-07-17 by `cold_search_latency_is_documented` against the dev-compose MinIO with a tiny fixture Shard: cold ≈ 22 ms first search, ≈ 11 ms immediately warm — the cold premium here covers the manifest and FTS-archive fetches from the loopback object store plus a small unpack; production Shards pay the same shape scaled by segment size and store latency. The smoke test emits both figures (visible with --nocapture) and applies only a generous 30 s sanity bound to the cold path; it documents the long tail rather than making it a performance gate.
 
 ## Success metrics
 

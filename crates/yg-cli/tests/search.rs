@@ -256,6 +256,53 @@ async fn an_unsupported_mode_is_rejected() {
     );
 }
 
+/// Documents the cold-cache latency long-tail promised by the PRD. Unlike
+/// the warm target below, this is not a performance gate: object-store
+/// latency and Shard size determine how long fetching and unpacking takes.
+#[tokio::test]
+async fn cold_search_latency_is_documented() {
+    const COLD_LATENCY_SANITY_BOUND: Duration = Duration::from_secs(30);
+
+    let h = Harness::boot_with(RATE_LIMIT_FIXTURE).await;
+    h.add_repo().await;
+    h.sync_and_index().await;
+
+    // The API's Shard cache is isolated under this fixture. Boot, sync, and
+    // indexing must not pre-warm it: the first timed query must pay the
+    // object-storage fetch and FTS segment unpack.
+    let shard_cache = h._fixture.path().join("shard-cache");
+    assert!(
+        !shard_cache.exists()
+            || std::fs::read_dir(&shard_cache)
+                .expect("the Shard cache directory must be readable")
+                .next()
+                .is_none(),
+        "the Shard cache must be empty before the cold search"
+    );
+
+    let cold_start = Instant::now();
+    let cold_body = h.verb_ok("search", json!({"query": "rate limit"})).await;
+    let cold = cold_start.elapsed();
+    assert!(
+        !cold_body["hits"].as_array().unwrap().is_empty(),
+        "the cold query still returns the hit"
+    );
+    assert!(
+        cold < COLD_LATENCY_SANITY_BOUND,
+        "cold search took {cold:?}, over the {COLD_LATENCY_SANITY_BOUND:?} sanity bound"
+    );
+
+    let warm_start = Instant::now();
+    let warm_body = h.verb_ok("search", json!({"query": "rate limit"})).await;
+    let warm = warm_start.elapsed();
+    assert!(
+        !warm_body["hits"].as_array().unwrap().is_empty(),
+        "the subsequent warm query still returns the hit"
+    );
+
+    eprintln!("cold search: {cold:?}; subsequent warm search: {warm:?}");
+}
+
 /// Smoke test for the warm-cache latency target (PRD / ARCHITECTURE §NFR:
 /// `search p95 < 500 ms warm`). It is not a benchmark — it asserts that
 /// once the Shard is materialized, repeated searches clear the documented
