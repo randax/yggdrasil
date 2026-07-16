@@ -106,10 +106,24 @@ pub(crate) struct GoType {
 /// Minimal facts for syntactic language packs whose M0 contract is
 /// Symbols, DEFINES, package IMPORTS, and name-based CALLS.
 pub(crate) struct SimpleFileFacts {
+    pub(crate) language: SimpleLanguageTag,
     pub(crate) file_id: String,
+    pub(crate) dir: String,
     pub(crate) imports: Vec<SimpleImport>,
     pub(crate) calls: Vec<SimpleCall>,
     pub(crate) declarations: Vec<(String, String)>,
+}
+
+/// One of the six non-Go syntactic language packs. Resolution never crosses
+/// these boundaries, even when two languages use the same spelling.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum SimpleLanguageTag {
+    TypeScript,
+    Tsx,
+    JavaScript,
+    Python,
+    Rust,
+    Java,
 }
 
 pub(crate) struct SimpleImport {
@@ -172,9 +186,15 @@ pub(crate) struct SymbolIndex {
     pub(crate) import_dirs: HashMap<String, Vec<String>>,
 }
 
+struct SimpleSymbol {
+    id: String,
+    file_id: String,
+    dir: String,
+}
+
 #[derive(Default)]
 pub(crate) struct SimpleSymbolIndex {
-    pub(crate) symbols: HashMap<String, Vec<String>>,
+    symbols: HashMap<SimpleLanguageTag, HashMap<String, Vec<SimpleSymbol>>>,
 }
 
 impl SimpleSymbolIndex {
@@ -184,21 +204,46 @@ impl SimpleSymbolIndex {
             for (name, id) in &file.declarations {
                 index
                     .symbols
+                    .entry(file.language)
+                    .or_default()
                     .entry(name.clone())
                     .or_default()
-                    .push(id.clone());
+                    .push(SimpleSymbol {
+                        id: id.clone(),
+                        file_id: file.file_id.clone(),
+                        dir: file.dir.clone(),
+                    });
             }
         }
         index
     }
 
-    fn resolve(&self, name: &str) -> Vec<&str> {
-        self.symbols
-            .get(name)
+    fn resolve(&self, file: &SimpleFileFacts, name: &str) -> Vec<&str> {
+        let candidates = self
+            .symbols
+            .get(&file.language)
+            .and_then(|symbols| symbols.get(name))
             .map(Vec::as_slice)
-            .unwrap_or(&[])
+            .unwrap_or(&[]);
+        let same_file = candidates
             .iter()
-            .map(String::as_str)
+            .filter(|candidate| candidate.file_id == file.file_id)
+            .map(|candidate| candidate.id.as_str())
+            .collect::<Vec<_>>();
+        if !same_file.is_empty() {
+            return same_file;
+        }
+        let same_directory = candidates
+            .iter()
+            .filter(|candidate| candidate.dir == file.dir)
+            .map(|candidate| candidate.id.as_str())
+            .collect::<Vec<_>>();
+        if !same_directory.is_empty() {
+            return same_directory;
+        }
+        candidates
+            .iter()
+            .map(|candidate| candidate.id.as_str())
             .collect()
     }
 }
@@ -676,7 +721,7 @@ fn emit_import(
 
 fn emit_simple_call_edges(file: &SimpleFileFacts, index: &SimpleSymbolIndex, graph: &mut Graph) {
     for call in &file.calls {
-        let candidates = index.resolve(&call.callee);
+        let candidates = index.resolve(file, &call.callee);
         push_candidate_edges(
             graph,
             &call.caller_id,

@@ -7,7 +7,7 @@ use crate::resolve::{
 };
 
 use super::{
-    ExtractedFacts, descendants_of_kind, field_text, first_of_kind, mint_symbol, package_dir,
+    ExtractedFacts, descendants_of_kind, field_text, file_dir, first_of_kind, mint_symbol,
 };
 
 /// Phase 1 for one Go file: mint its Symbols and DEFINES edges and distill
@@ -22,7 +22,7 @@ pub(super) fn extract_go(
     let imports = extract_go_imports(root, path, source);
     let mut facts = GoFileFacts {
         file_id: file_id.to_string(),
-        dir: package_dir(path).to_string(),
+        dir: file_dir(path).to_string(),
         has_dot_import: imports.iter().any(|import| import.dot),
         imports,
         calls: Vec::new(),
