@@ -728,12 +728,7 @@ type ReadCloser interface {
 }
 
 #[test]
-fn an_interface_that_embeds_another_does_not_falsely_match_implementers() {
-    // ReadCloser's real method set is {Read, Close}, but Read comes from
-    // the embedded Reader, which a syntactic pass can't fold in. Rather
-    // than match on {Close} alone — which a Close-only type would
-    // satisfy falsely — ReadCloser drives no IMPLEMENTS at all. Plain
-    // Reader (no embeds) still matches.
+fn an_in_repo_interface_embed_chain_matches_its_transitive_method_set() {
     let graph = pass_over(&[(
         "impl.go",
         r#"package gadgets
@@ -742,8 +737,17 @@ type Reader interface {
 	Read()
 }
 
-type ReadCloser interface {
+type ReadAlias interface {
 	Reader
+}
+
+type ReadWriter interface {
+	ReadAlias
+	Write()
+}
+
+type ReadWriteCloser interface {
+	ReadWriter
 	Close()
 }
 
@@ -751,11 +755,19 @@ type CloseOnly struct{}
 
 func (c CloseOnly) Close() {}
 
-type Both struct{}
+type MissingRead struct{}
 
-func (b Both) Read() {}
+func (m MissingRead) Write() {}
 
-func (b Both) Close() {}
+func (m MissingRead) Close() {}
+
+type All struct{}
+
+func (a All) Read() {}
+
+func (a All) Write() {}
+
+func (a All) Close() {}
 "#,
     )]);
 
@@ -763,22 +775,110 @@ func (b Both) Close() {}
         .iter()
         .map(|e| (e.src.as_str(), e.dst.as_str()))
         .collect();
+    assert_eq!(
+        implements,
+        vec![
+            ("sym:impl.go#All", "sym:impl.go#Reader"),
+            ("sym:impl.go#All", "sym:impl.go#ReadAlias"),
+            ("sym:impl.go#All", "sym:impl.go#ReadWriter"),
+            ("sym:impl.go#All", "sym:impl.go#ReadWriteCloser"),
+        ],
+        "All covers every interface in the transitive chain"
+    );
+    for edge in edges_of_kind(&graph, EdgeKind::Implements) {
+        assert_eq!(edge.confidence, 0.5, "name-only confidence stays capped");
+        assert_eq!(edge.location, None);
+    }
+}
+
+#[test]
+fn an_interface_with_an_external_embed_stays_unmatchable() {
+    let graph = pass_over(&[(
+        "external.go",
+        r#"package gadgets
+
+import "io"
+
+type ReadCloser interface {
+	io.Reader
+	Close()
+}
+
+type Candidate struct{}
+
+func (c Candidate) Read(p []byte) (int, error) { return 0, nil }
+
+func (c Candidate) Close() error { return nil }
+"#,
+    )]);
+
+    assert!(
+        edges_of_kind(&graph, EdgeKind::Implements).is_empty(),
+        "an external method set must not be guessed"
+    );
+}
+
+#[test]
+fn mutually_embedding_interfaces_terminate_without_partial_matches() {
+    let graph = pass_over(&[(
+        "cycle.go",
+        r#"package gadgets
+
+type A interface {
+	B
+	F()
+}
+
+type B interface {
+	A
+	G()
+}
+
+type Both struct{}
+
+func (b Both) F() {}
+
+func (b Both) G() {}
+"#,
+    )]);
+
+    assert!(
+        edges_of_kind(&graph, EdgeKind::Implements).is_empty(),
+        "a cyclic closure must be skipped instead of matching a partial set"
+    );
+}
+
+#[test]
+fn an_ambiguous_interface_embed_stays_unmatchable() {
+    let graph = pass_over(&[
+        ("a.go", "package gadgets\n\ntype Base interface { F() }\n"),
+        ("b.go", "package gadgets\n\ntype Base interface { G() }\n"),
+        (
+            "consumer.go",
+            r#"package gadgets
+
+type Consumer interface {
+	Base
+	Close()
+}
+
+type All struct{}
+
+func (a All) F() {}
+
+func (a All) G() {}
+
+func (a All) Close() {}
+"#,
+        ),
+    ]);
+
+    let implements = edges_of_kind(&graph, EdgeKind::Implements);
     assert!(
         !implements
             .iter()
-            .any(|(_, dst)| *dst == "sym:impl.go#ReadCloser"),
-        "no type may falsely IMPLEMENT an interface with unresolved embedded methods: {implements:?}"
-    );
-    // Both covers Reader's {Read}; CloseOnly does not.
-    assert!(
-        implements.contains(&("sym:impl.go#Both", "sym:impl.go#Reader")),
-        "Both implements the fully-known Reader: {implements:?}"
-    );
-    assert!(
-        !implements
-            .iter()
-            .any(|(src, _)| *src == "sym:impl.go#CloseOnly"),
-        "CloseOnly implements nothing it covers: {implements:?}"
+            .any(|edge| edge.dst == "sym:consumer.go#Consumer"),
+        "an ambiguous embedded name must not fold either candidate: {implements:?}"
     );
 }
 
