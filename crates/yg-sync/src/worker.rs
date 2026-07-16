@@ -26,14 +26,14 @@ const FETCH_LEASE: Duration = Duration::from_secs(15 * 60);
 /// head before this poll observed the push. Capped so large default poll
 /// intervals do not hide the detected move for minutes.
 const FETCH_IN_FLIGHT_REPOLL_MAX: Duration = Duration::from_secs(30);
-/// Divides the configured shared Forge rate for the local continuity bucket.
-/// It is used only when the control plane cannot answer a budget operation;
-/// each isolated worker is therefore limited to at most one quarter of the
-/// configured rate (or one request/minute for already-lower budgets).
-/// No local fallback can preserve an exact fleet aggregate during a database
-/// partition; this bound favors brief continuity without matching the healthy
-/// shared rate in every process.
-const LOCAL_FALLBACK_RATE_DIVISOR: i32 = 4;
+/// Maximum requests per minute granted to one isolated worker when the shared
+/// control plane is unavailable. The aggregate fallback rate still grows with
+/// worker count: `N` isolated workers have an opening burst of at most `2 * N`
+/// requests and the same sustained refill rate per minute (both scale with a
+/// lower configured budget). An arbitrary minute starting with full buckets can
+/// therefore approach twice that total. This makes the unavoidable breach
+/// during a database partition explicit and tightly bounded.
+const FALLBACK_REQUESTS_PER_MINUTE: i32 = 2;
 
 /// A Sync worker: drains the fetch queue, mirroring repos into the
 /// worker-local git cache and recording each repo's synced commit.
@@ -44,7 +44,7 @@ pub struct SyncWorker {
     /// by default, injectable so tests register doubles.
     registry: ForgeRegistry,
     discovery_client: reqwest::Client,
-    /// Conservative per-forge continuity budgets, used only while the shared
+    /// Stingy per-forge continuity budgets, used only while the shared
     /// control-plane budget is unreachable. Healthy shared grants shadow-spend
     /// these buckets so a brief outage cannot expose a fresh local burst.
     forge_budgets: ForgeRequestBudgets,
@@ -421,7 +421,7 @@ struct ForgeRequestBudgets {
 }
 
 fn fallback_rate(rate_budget: i32) -> i32 {
-    (rate_budget / LOCAL_FALLBACK_RATE_DIVISOR).max(1)
+    rate_budget.min(FALLBACK_REQUESTS_PER_MINUTE)
 }
 
 async fn take_shared_or_fallback(
@@ -485,9 +485,6 @@ fn resolve_shared_take(
 ) -> Result<(), Duration> {
     match shared {
         Ok(ForgeBudgetTake::Granted) => {
-            if let Some(retry_after) = fallback_budgets.cooldown_retry_after(forge_id) {
-                return Err(retry_after);
-            }
             let _ = fallback_budgets.take(forge_id, fallback_rate(rate_budget));
             Ok(())
         }
@@ -499,7 +496,7 @@ fn resolve_shared_take(
             tracing::warn!(
                 forge_id,
                 error = format!("{error:#}"),
-                "shared Forge budget unavailable; using conservative local fallback"
+                "shared Forge budget unavailable; using stingy fixed-rate local fallback"
             );
             fallback_budgets.take(forge_id, fallback_rate(rate_budget))
         }
@@ -735,27 +732,27 @@ mod tests {
     use crate::{ShutdownCause, shutdown_channel};
 
     #[test]
-    fn fallback_rate_is_a_conservative_share_of_the_fleet_budget() {
-        assert_eq!(fallback_rate(300), 75);
-        assert_eq!(fallback_rate(4), 1);
-        assert_eq!(fallback_rate(3), 1);
+    fn fallback_rate_is_capped_per_worker() {
+        assert_eq!(fallback_rate(300), 2);
+        assert_eq!(fallback_rate(4), 2);
+        assert_eq!(fallback_rate(3), 2);
         assert_eq!(fallback_rate(1), 1);
     }
 
     #[test]
-    fn control_error_uses_only_the_conservative_fallback_burst() {
+    fn control_error_uses_only_the_fixed_fallback_burst() {
         let budgets = ForgeRequestBudgets::default();
         for request in 0..2 {
             assert!(
                 resolve_shared_take(&budgets, 7, 8, Err(anyhow::anyhow!("control unavailable")),)
                     .is_ok(),
-                "quarter-rate fallback should grant request {request} from its opening burst"
+                "fixed fallback should grant request {request} from its opening burst"
             );
         }
         assert!(
             resolve_shared_take(&budgets, 7, 8, Err(anyhow::anyhow!("control unavailable")),)
                 .is_err(),
-            "an 8/min shared budget must expose only a 2-token fallback burst"
+            "the per-worker fallback must expose only a 2-token opening burst"
         );
     }
 
@@ -776,8 +773,12 @@ mod tests {
             "a successful recovery publication clears the pending marker"
         );
         assert!(
-            resolve_shared_take(&budgets, 7, 60, Ok(ForgeBudgetTake::Granted)).is_err(),
-            "the reporting worker also retains its local cooldown"
+            resolve_shared_take(&budgets, 7, 60, Ok(ForgeBudgetTake::Granted)).is_ok(),
+            "a local cooldown interleaving after the pre-take guard must not discard a spent shared token"
+        );
+        assert!(
+            budgets.take(7, fallback_rate(60)).is_err(),
+            "shadow-spending a shared grant must not clear the local cooldown"
         );
     }
 

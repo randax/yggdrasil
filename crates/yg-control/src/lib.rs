@@ -1777,7 +1777,9 @@ impl ControlPlane {
 
     /// Atomically reserve `token_count` requests from one Forge's fleet-wide
     /// token bucket. The database clock drives refill and cooldown timing, and
-    /// the locked row makes concurrent workers observe one shared balance.
+    /// the locked row makes concurrent workers observe one shared balance. The
+    /// per-Forge `FOR UPDATE` row lock is a deliberate fleet-wide serialization
+    /// point; this transaction remains short and performs no network I/O.
     pub async fn take_forge_budget(
         &self,
         forge_id: i64,
@@ -1838,7 +1840,7 @@ impl ControlPlane {
         sqlx::query(
             "UPDATE forge_rate_budgets
              SET tokens = $2, refill_per_second = $3,
-                 updated_at = clock_timestamp()
+                 updated_at = greatest(updated_at, clock_timestamp())
              WHERE forge_id = $1",
         )
         .bind(forge_id)
@@ -1859,7 +1861,11 @@ impl ControlPlane {
     }
 
     /// Extend one Forge's fleet-wide cooldown, never shortening a cooldown
-    /// another worker already reported. Returns the resulting remaining wait.
+    /// another worker already reported. Cooldown drains the bucket and defers
+    /// refill until the effective deadline, so expiry resumes empty instead of
+    /// releasing a burst. Extends-only behavior is deliberate: one anomalous
+    /// `Retry-After` can idle the fleet, accepted in favor of honoring every
+    /// worker's backoff. Returns the resulting remaining wait.
     pub async fn cool_down_forge(
         &self,
         forge_id: i64,
@@ -1880,7 +1886,12 @@ impl ControlPlane {
         .await?;
         let remaining: f64 = sqlx::query_scalar(
             "UPDATE forge_rate_budgets
-             SET cooldown_until = greatest(
+             SET tokens = 0,
+                 cooldown_until = greatest(
+                     coalesce(cooldown_until, clock_timestamp()),
+                     clock_timestamp() + make_interval(secs => $2)
+                 ),
+                 updated_at = greatest(
                      coalesce(cooldown_until, clock_timestamp()),
                      clock_timestamp() + make_interval(secs => $2)
                  )

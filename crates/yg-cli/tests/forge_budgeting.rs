@@ -134,7 +134,7 @@ async fn a_rate_limit_reported_by_one_worker_cools_the_fleet() {
     let db_name = create_test_db().await;
     let first = control_plane(&db_name).await;
     let second = control_plane(&db_name).await;
-    let (_pool, forge_id) = low_budget_forge(&db_name).await;
+    let (pool, forge_id) = low_budget_forge(&db_name).await;
 
     first
         .cool_down_forge(forge_id, Duration::from_secs(30))
@@ -150,6 +150,44 @@ async fn a_rate_limit_reported_by_one_worker_cools_the_fleet() {
     assert!(
         (Duration::from_secs(25)..=Duration::from_secs(30)).contains(&retry_after),
         "the fleet cooldown should have almost its full duration left, got {retry_after:?}"
+    );
+
+    let (tokens, refill_origin_gap): (f64, f64) = sqlx::query_as(
+        "SELECT tokens,
+                abs(extract(epoch FROM updated_at - cooldown_until))::float8
+         FROM forge_rate_budgets
+         WHERE forge_id = $1",
+    )
+    .bind(forge_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(tokens, 0.0, "cooldown must drain the shared bucket");
+    assert!(
+        refill_origin_gap < 0.01,
+        "refill must start at the cooldown deadline, timestamp gap was {refill_origin_gap}s"
+    );
+
+    sqlx::query(
+        "UPDATE forge_rate_budgets
+         SET cooldown_until = clock_timestamp() - interval '10 milliseconds',
+             updated_at = clock_timestamp() - interval '10 milliseconds'
+         WHERE forge_id = $1",
+    )
+    .bind(forge_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let decision = second
+        .take_forge_budget(forge_id, NonZeroU32::MIN)
+        .await
+        .unwrap();
+    let ForgeBudgetTake::RetryAfter(retry_after) = decision else {
+        panic!("cooldown expiry must resume from an empty shared bucket");
+    };
+    assert!(
+        (Duration::from_secs(50)..=Duration::from_secs(60)).contains(&retry_after),
+        "the first post-cooldown token should require a fresh refill, got {retry_after:?}"
     );
 }
 
