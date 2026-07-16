@@ -387,21 +387,29 @@ impl<R: ShardResolver + 'static> Engine<R> {
         &self.metrics
     }
 
+    fn observed<T: Serialize>(&self, verb: crate::Verb, response: T) -> T {
+        self.metrics.observe_response(verb, &response);
+        response
+    }
+
     /// The `node` Verb, end to end: parse, resolve, read.
     pub async fn node(
         &self,
         req: NodeRequest,
     ) -> Result<AddressedResponse<NodeResponse>, VerbError> {
-        let _timer = self.metrics.timer(crate::Verb::Node);
+        let timer = self.metrics.timer(crate::Verb::Node);
         let resolved = self
             .resolve_node_address(req.id, req.repo, req.path, None)
             .await?;
         let ResolvedAddress::Exact { shard, id } = resolved else {
-            return Ok(resolved.into_ambiguous());
+            drop(timer);
+            return Ok(self.observed(crate::Verb::Node, resolved.into_ambiguous()));
         };
-        run_verb(shard.path, shard.cache_lease, id, crate::node)
+        let response = run_verb(shard.path, shard.cache_lease, id, crate::node)
             .await
-            .map(AddressedResponse::Resolved)
+            .map(AddressedResponse::Resolved)?;
+        drop(timer);
+        Ok(self.observed(crate::Verb::Node, response))
     }
 
     /// The `search` Verb, end to end: cursor policy, target resolution,
@@ -410,9 +418,10 @@ impl<R: ShardResolver + 'static> Engine<R> {
         &self,
         req: crate::SearchRequest,
     ) -> Result<crate::SearchWireResponse, VerbError> {
-        crate::search::search(self.resolver.clone(), &self.cursors, req)
+        let response = crate::search::search(self.resolver.clone(), &self.cursors, req)
             .await
-            .map(|response| response.into_wire(&self.cursors))
+            .map(|response| response.into_wire(&self.cursors))?;
+        Ok(response)
     }
 
     /// The `neighbors` Verb, end to end: cursor decode and agreement,
@@ -422,7 +431,7 @@ impl<R: ShardResolver + 'static> Engine<R> {
         &self,
         req: NeighborsRequest,
     ) -> Result<AddressedResponse<NeighborsResponse>, VerbError> {
-        let _timer = self.metrics.timer(crate::Verb::Neighbors);
+        let timer = self.metrics.timer(crate::Verb::Neighbors);
         let cursor = req
             .cursor
             .as_deref()
@@ -473,7 +482,8 @@ impl<R: ShardResolver + 'static> Engine<R> {
             )
             .await?;
         let ResolvedAddress::Exact { shard, id } = resolved else {
-            return Ok(resolved.into_ambiguous());
+            drop(timer);
+            return Ok(self.observed(crate::Verb::Neighbors, resolved.into_ambiguous()));
         };
 
         let verb_options = options.clone();
@@ -491,12 +501,14 @@ impl<R: ShardResolver + 'static> Engine<R> {
                 after: after.clone(),
             })
         });
-        Ok(AddressedResponse::Resolved(NeighborsResponse {
+        let response = AddressedResponse::Resolved(NeighborsResponse {
             nodes: page.nodes,
             edges: page.edges,
             next_cursor,
             truncated: page.truncated,
-        }))
+        });
+        drop(timer);
+        Ok(self.observed(crate::Verb::Neighbors, response))
     }
 
     /// The `history` Verb, end to end: cursor decode and agreement,
@@ -506,7 +518,7 @@ impl<R: ShardResolver + 'static> Engine<R> {
         &self,
         req: HistoryRequest,
     ) -> Result<AddressedResponse<HistoryResponse>, VerbError> {
-        let _timer = self.metrics.timer(crate::Verb::History);
+        let timer = self.metrics.timer(crate::Verb::History);
         let cursor = req
             .cursor
             .as_deref()
@@ -557,7 +569,8 @@ impl<R: ShardResolver + 'static> Engine<R> {
             .resolve_node_address(id_str.clone(), repo.clone(), path.clone(), pinned)
             .await?;
         let ResolvedAddress::Exact { shard, id } = resolved else {
-            return Ok(resolved.into_ambiguous());
+            drop(timer);
+            return Ok(self.observed(crate::Verb::History, resolved.into_ambiguous()));
         };
         let options = HistoryOptions {
             limit,
@@ -597,10 +610,12 @@ impl<R: ShardResolver + 'static> Engine<R> {
                 Ok(HistoryCommitView { date, commit })
             })
             .collect::<Result<Vec<_>, VerbError>>()?;
-        Ok(AddressedResponse::Resolved(HistoryResponse {
+        let response = AddressedResponse::Resolved(HistoryResponse {
             commits,
             next_cursor,
-        }))
+        });
+        drop(timer);
+        Ok(self.observed(crate::Verb::History, response))
     }
 
     async fn resolve_node_address(

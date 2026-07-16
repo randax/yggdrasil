@@ -81,12 +81,18 @@ impl AppState {
         &self,
         request: yg_verbs::SearchRequest,
     ) -> Result<yg_verbs::SearchWireResponse, yg_verbs::VerbError> {
-        let _timer = self.engine.metrics().timer(yg_verbs::Verb::Search);
+        let timer = self.engine.metrics().timer(yg_verbs::Verb::Search);
         let engine = self.engine.clone();
-        self.search_limiter
+        let response = self
+            .search_limiter
             .run(move || async move { engine.search(request).await })
             .await
-            .map_err(search_execution_error)?
+            .map_err(search_execution_error)??;
+        drop(timer);
+        self.engine
+            .metrics()
+            .observe_response(yg_verbs::Verb::Search, &response);
+        Ok(response)
     }
 }
 
