@@ -186,6 +186,17 @@ async fn reconcile_candidate<C: OrphanControl>(
     now: SystemTime,
     grace: Duration,
 ) -> anyhow::Result<bool> {
+    // Unlocked fast path: most examined revisions are healthy, and a
+    // present row means "live, skip" — a decision that needs no lock and
+    // saves the per-revision prefix listing. The authoritative row check
+    // still happens under the lock before any deletion.
+    if control
+        .shard_exists(revision.repo_id, &revision.revision)
+        .await?
+    {
+        return Ok(false);
+    }
+
     let prefix = revision.prefix();
     if !prefix_is_past_grace(store, &prefix, now, grace).await? {
         return Ok(false);
@@ -511,7 +522,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn matching_control_plane_row_skips_old_prefix_under_lock() {
+    async fn matching_control_plane_row_skips_without_listing_or_locking() {
         let store = InMemory::new();
         put_revision(&store, 10, "recorded").await;
         let control = TestControl {
@@ -532,8 +543,57 @@ mod tests {
         .unwrap();
 
         assert_eq!(report.reclaimed, 0);
-        assert!(control.lock_attempts.load(Ordering::Relaxed) > 0);
+        assert_eq!(control.lock_attempts.load(Ordering::Relaxed), 0);
         assert!(revision_exists(&store, 10, "recorded").await);
+    }
+
+    /// A publisher commits its row in the window between the unlocked
+    /// fast-path row check and the sweep's lock acquisition.
+    struct RowAppearsControl {
+        row_checks: AtomicU64,
+        lock_attempts: AtomicU64,
+    }
+
+    impl OrphanControl for RowAppearsControl {
+        type Fence = TestFence;
+
+        async fn try_lock_revision(
+            &self,
+            _repo_id: i64,
+            _revision: &str,
+        ) -> anyhow::Result<Option<Self::Fence>> {
+            self.lock_attempts.fetch_add(1, Ordering::Relaxed);
+            Ok(Some(TestFence))
+        }
+
+        async fn shard_exists(&self, _repo_id: i64, _revision: &str) -> anyhow::Result<bool> {
+            Ok(self.row_checks.fetch_add(1, Ordering::Relaxed) > 0)
+        }
+    }
+
+    #[tokio::test]
+    async fn row_appearing_after_the_fast_path_check_aborts_under_lock() {
+        let store = InMemory::new();
+        put_revision(&store, 15, "landing").await;
+        let control = RowAppearsControl {
+            row_checks: AtomicU64::new(0),
+            lock_attempts: AtomicU64::new(0),
+        };
+
+        let report = reconcile_orphans_at(
+            &control,
+            &store,
+            SystemTime::now(),
+            Duration::ZERO,
+            ORPHAN_RECLAIM_CAP,
+            &TestEvents::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.reclaimed, 0);
+        assert_eq!(control.lock_attempts.load(Ordering::Relaxed), 1);
+        assert!(revision_exists(&store, 15, "landing").await);
     }
 
     #[tokio::test]
