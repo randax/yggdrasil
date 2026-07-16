@@ -1110,17 +1110,18 @@ impl ControlPlane {
             let qualifier = repo_qualifier(base_url.as_str(), repo.slug);
             // A savepoint keeps a genuine qualifier violation from aborting
             // the per-repo transaction before its durable conflict can be
-            // recorded. The targeted upsert turns a concurrent registration
-            // of this exact Forge repo into the normal reconciliation path.
+            // recorded. Ignore a concurrent registration of this exact Forge
+            // repo, then select it for the normal reconciliation path. A
+            // no-op DO UPDATE cannot safely handle a row inserted by a BEFORE
+            // INSERT trigger in the same command.
             let mut insert = tx.begin().await?;
-            let upserted: Result<(i64, bool, String), sqlx::Error> = sqlx::query_as(
+            let inserted: Result<Option<(i64, String)>, sqlx::Error> = sqlx::query_as(
                 "INSERT INTO repos
                     (forge_id, slug, visibility, discovery_state, fetch_depth, qualifier,
                      registration_base_url)
                  VALUES ($1, $2, $3, $4, $5, $6, $7)
-                 ON CONFLICT (forge_id, slug) DO UPDATE
-                 SET slug = repos.slug
-                 RETURNING id, (xmax = 0), discovery_state",
+                 ON CONFLICT (forge_id, slug) DO NOTHING
+                 RETURNING id, discovery_state",
             )
             .bind(forge_id)
             .bind(repo.slug)
@@ -1129,31 +1130,41 @@ impl ControlPlane {
             .bind(repo.fetch_depth)
             .bind(&qualifier)
             .bind(base_url.as_str())
-            .fetch_one(&mut *insert)
+            .fetch_optional(&mut *insert)
             .await;
-            let (repo_id, created, previous_state) = match upserted {
-                Ok(row) => {
+            let (repo_id, created, previous_state) = match inserted {
+                Ok(Some((repo_id, discovery_state))) => {
                     insert.commit().await?;
-                    row
+                    (repo_id, true, discovery_state)
+                }
+                Ok(None) => {
+                    let same_repo: Option<(i64, String)> = sqlx::query_as(
+                        "SELECT id, discovery_state FROM repos
+                         WHERE forge_id = $1 AND slug = $2
+                         FOR UPDATE",
+                    )
+                    .bind(forge_id)
+                    .bind(repo.slug)
+                    .fetch_optional(&mut *insert)
+                    .await?;
+                    let Some((repo_id, discovery_state)) = same_repo else {
+                        anyhow::bail!("same-repository conflict has no owning repository");
+                    };
+                    insert.commit().await?;
+                    (repo_id, false, discovery_state)
                 }
                 Err(sqlx::Error::Database(error))
                     if error.constraint() == Some("repos_qualifier") =>
                 {
                     insert.rollback().await?;
-                    let conflicting_repo: Option<(i64, i64, String)> =
-                        sqlx::query_as("SELECT id, forge_id, slug FROM repos WHERE qualifier = $1")
+                    let conflicting_repo: Option<(i64,)> =
+                        sqlx::query_as("SELECT id FROM repos WHERE qualifier = $1")
                             .bind(&qualifier)
                             .fetch_optional(&mut *tx)
                             .await?;
-                    let Some((conflicting_repo_id, owner_forge_id, owner_slug)) = conflicting_repo
-                    else {
+                    let Some((conflicting_repo_id,)) = conflicting_repo else {
                         anyhow::bail!("qualifier violation has no owning repository");
                     };
-                    if owner_forge_id == forge_id && owner_slug == repo.slug {
-                        anyhow::bail!(
-                            "same repository bypassed the targeted forge-and-slug upsert"
-                        );
-                    }
                     sqlx::query(
                         "INSERT INTO forge_discovery_qualifier_conflicts
                              (forge_org_id, slug, conflicting_repo_id)
