@@ -123,7 +123,7 @@ impl SyncWorker {
                 return Ok(true);
             }
         };
-        let clone_url = join_clone_url(&job.base_url, &job.slug);
+        let clone_url = join_clone_url(job.base_url.as_str(), &job.slug);
         let forge = self.registry.for_kind(&job.forge_kind);
         let auth = forge_token(job.token_env.as_deref(), &clone_url).map(|t| forge.git_auth(t));
         // A lock failure (cache dir on a dead disk) is a failed fetch,
@@ -202,7 +202,7 @@ impl SyncWorker {
             );
             return Ok(true);
         };
-        let Some(api_root) = due.api_root.as_deref() else {
+        let Some(api_root) = due.api_root.as_ref().map(yg_control::ForgeUrl::as_str) else {
             tracing::warn!(
                 forge_kind = %due.forge_kind,
                 org = %due.org_slug,
@@ -323,14 +323,14 @@ impl SyncWorker {
             return Ok(false);
         };
         self.metrics
-            .observe_poll_lag(&due.base_url, due.poll_lag_seconds);
+            .observe_poll_lag(due.base_url.as_str(), due.poll_lag_seconds);
         // Spend a rate-budget token; over budget, reschedule the repo for
         // when one frees up and back off (no head check this cycle).
         if let Err(retry) = self.take_forge_token(due.forge_id, due.rate_budget) {
             self.control.defer_poll(due.repo_id, retry).await?;
             return Ok(false);
         }
-        let clone_url = join_clone_url(&due.base_url, &due.slug);
+        let clone_url = join_clone_url(due.base_url.as_str(), &due.slug);
         let forge = self.registry.for_kind(&due.forge_kind);
         let auth = forge_token(due.token_env.as_deref(), &clone_url).map(|t| forge.git_auth(t));
         match remote_head_commit(&clone_url, auth.as_ref()).await {

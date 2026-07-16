@@ -48,14 +48,19 @@ pub(crate) async fn admin_forge_add(
         .token_env
         .as_deref()
         .or_else(|| forge.default_token_env());
+    let api_root = forge
+        .default_api_root(base_url.as_str())
+        .map(yg_control::ForgeUrl::parse)
+        .transpose()
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
     let outcome = state
         .control
-        .connect_forge_org(yg_control::ConnectForgeOrg {
+        .connect_validated_forge_org(yg_control::ValidatedConnectForgeOrg {
             forge_kind: forge.kind(),
             base_url: &base_url,
             org_slug: &org,
             token_env,
-            api_root: forge.default_api_root(&base_url).as_deref(),
+            api_root: api_root.as_ref(),
         })
         .await?;
     let kind = stored_forge_kind(outcome.forge_kind.as_str())?;
@@ -68,7 +73,7 @@ pub(crate) async fn admin_forge_add(
         Wire(AddForgeResponse {
             kind,
             org: OrgName::new(org),
-            base_url: ForgeBaseUrl::new(base_url),
+            base_url: ForgeBaseUrl::from_domain(base_url),
             created: outcome.created,
         }),
     )
@@ -99,14 +104,14 @@ fn github_org_slug(org: &str) -> Result<String, &'static str> {
     }
 }
 
-fn github_base_url(base_url: Option<&str>) -> Result<String, &'static str> {
+fn github_base_url(base_url: Option<&str>) -> Result<yg_control::ForgeUrl, String> {
     let base_url = base_url
         .unwrap_or("https://github.com")
         .trim()
         .trim_end_matches('/');
     let base_url = base_url.to_ascii_lowercase();
     let Some(rest) = base_url.strip_prefix("https://") else {
-        return Err("github forge base_url must start with https://");
+        return Err("github forge base_url must start with https://".to_string());
     };
     if rest.is_empty()
         || rest.contains('/')
@@ -115,9 +120,11 @@ fn github_base_url(base_url: Option<&str>) -> Result<String, &'static str> {
         || rest.contains('#')
         || rest.bytes().any(|b| b.is_ascii_whitespace())
     {
-        return Err("github forge base_url must be a clone root like https://github.com");
+        return Err(
+            "github forge base_url must be a clone root like https://github.com".to_string(),
+        );
     }
-    Ok(base_url)
+    yg_control::ForgeUrl::parse(base_url).map_err(|error| error.to_string())
 }
 
 #[derive(Deserialize)]
@@ -143,7 +150,7 @@ pub(crate) async fn admin_forge_discover(
     Ok(Wire(DiscoverForgeResponse {
         kind: stored_forge_kind(stored_kind.as_str())?,
         org: OrgName::new(org),
-        base_url: ForgeBaseUrl::new(base_url),
+        base_url: ForgeBaseUrl::from_domain(base_url),
         queued: true,
     })
     .into_response())
@@ -206,7 +213,7 @@ pub(crate) async fn admin_rules_add(
             StatusCode::OK
         },
         Wire(AddRuleResponse {
-            forge: ForgeBaseUrl::new(forge),
+            forge: ForgeBaseUrl::from_domain(forge),
             pattern: pattern.to_string(),
             action: wire_action,
             applies_to_private: req.private.unwrap_or(false),
@@ -232,7 +239,7 @@ pub(crate) async fn admin_rules_list(
                 ))
             })?;
             Ok(RuleResponse {
-                forge: ForgeBaseUrl::new(rule.forge),
+                forge: ForgeBaseUrl::from_domain(rule.forge),
                 pattern: rule.pattern,
                 action,
                 applies_to_private: rule.applies_to_private,
@@ -263,6 +270,8 @@ pub(crate) async fn admin_repo_add(
     // The typed parse error renders to its human-facing form here, at
     // the I/O edge.
     let locator = RepoLocator::parse(&req.url).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let base_url = yg_control::ForgeUrl::parse(locator.base_url)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
     let forge = yg_sync::forge::builtin()
         .by_kind(locator.kind)
         .ok_or_else(|| ApiError::internal(anyhow::anyhow!("locator kind without an adapter")))?;
@@ -270,7 +279,7 @@ pub(crate) async fn admin_repo_add(
     // (RFC 0001 §5); a qualifier the id grammar can't address — an
     // IPv6 host, a path with a stray colon — would index a repo no
     // query could reach. Refused here, with the reason, instead.
-    let qualifier = yg_control::repo_qualifier(&locator.base_url, &locator.slug);
+    let qualifier = yg_control::repo_qualifier(base_url.as_str(), &locator.slug);
     if !yg_verbs::addressable_qualifier(&qualifier) {
         return Err(ApiError::bad_request(format!(
             "{} maps to repo qualifier {qualifier:?}, which node ids cannot address \
@@ -279,13 +288,18 @@ pub(crate) async fn admin_repo_add(
             req.url
         )));
     }
+    let api_root = forge
+        .default_api_root(base_url.as_str())
+        .map(yg_control::ForgeUrl::parse)
+        .transpose()
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
     let outcome = state
         .control
-        .add_repo(yg_control::AddRepo {
+        .add_validated_repo(yg_control::ValidatedAddRepo {
             forge_kind: locator.kind,
-            base_url: &locator.base_url,
+            base_url: &base_url,
             token_env: forge.default_token_env(),
-            api_root: forge.default_api_root(&locator.base_url).as_deref(),
+            api_root: api_root.as_ref(),
             slug: &locator.slug,
             fetch_depth: req.depth,
             poll_interval_seconds: req.poll_interval,
@@ -420,7 +434,7 @@ pub(crate) async fn admin_status(State(state): State<Arc<AppState>>) -> Result<R
                     edges: r.shard_edge_count.unwrap_or(0),
                 }),
                 slug: RepoSlug::new(r.slug),
-                forge: ForgeBaseUrl::new(r.forge),
+                forge: ForgeBaseUrl::from_domain(r.forge),
                 visibility: match r.visibility {
                     yg_control::RepoVisibility::Public => RepoVisibility::Public,
                     yg_control::RepoVisibility::Internal => RepoVisibility::Internal,
@@ -469,6 +483,13 @@ fn job_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn github_admin_urls_report_real_parse_failures() {
+        let error = github_base_url(Some("https://github.com:bad"))
+            .expect_err("an invalid port must not pass URL validation");
+        assert!(error.contains("invalid absolute forge URL"));
+    }
 
     #[test]
     fn stored_non_github_forge_kind_remains_typed_in_the_response_path() {

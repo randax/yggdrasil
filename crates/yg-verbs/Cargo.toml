@@ -23,4 +23,5 @@ thiserror = "2.0.17"
 # the blocking pool, never the async runtime's threads.
 tokio = { version = "1.52.3", features = ["rt"] }
 tracing = "0.1.44"
+yg-control = { version = "0.1.0", path = "../yg-control" }
 yg-shard = { version = "0.1.0", path = "../yg-shard" }

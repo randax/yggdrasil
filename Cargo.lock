@@ -4202,6 +4202,7 @@ dependencies = [
  "sha2 0.11.0",
  "sqlx",
  "tokio",
+ "url",
 ]
 
 [[package]]
@@ -4280,6 +4281,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "yg-control",
  "yg-shard",
 ]
 
