@@ -18,6 +18,17 @@ use yg_shard::{
 
 const STREAM_CHUNK_BYTES: usize = 4 * 1024;
 
+/// Bound every test-side store rendezvous: if the cache short-circuits and
+/// never issues the awaited object-store get, the test must fail fast with a
+/// clear message instead of hanging CI on an unfulfilled Notify.
+const RENDEZVOUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+async fn await_rendezvous(notify: &Notify, what: &str) {
+    tokio::time::timeout(RENDEZVOUS_TIMEOUT, notify.notified())
+        .await
+        .unwrap_or_else(|_| panic!("{what}: the observed store get never started"));
+}
+
 #[derive(Debug)]
 struct ObservedStore {
     inner: InMemory,
@@ -269,7 +280,7 @@ async fn concurrent_cold_reads_fetch_one_content_hash_once() {
     let first_cache = cache.clone();
     let first_revision = revision.clone();
     let first = tokio::spawn(async move { first_cache.graph_path(42, &first_revision).await });
-    store.first_target_get_started.notified().await;
+    await_rendezvous(&store.first_target_get_started, "held first fetch").await;
     let second_cache = cache.clone();
     let second_revision = revision.clone();
     let second_started = Arc::new(tokio::sync::Barrier::new(2));
@@ -414,7 +425,7 @@ async fn leased_graph_artifact_blocks_eviction_until_the_lease_drops() {
     let waiting_revision = second_revision.clone();
     let waiting =
         tokio::spawn(async move { task_cache.leased_graph_path(45, &waiting_revision).await });
-    store.first_target_get_started.notified().await;
+    await_rendezvous(&store.first_target_get_started, "held first fetch").await;
     assert!(
         !waiting.is_finished(),
         "leased resolution remains pending while its fetch is held"
@@ -503,7 +514,7 @@ async fn concurrent_distinct_cold_fetches_never_return_an_evicted_leased_path() 
             .leased_graph_path(48, &first_task_revision)
             .await
     });
-    store.first_target_get_started.notified().await;
+    await_rendezvous(&store.first_target_get_started, "held first fetch").await;
     let second_cache = cache.clone();
     let second_task_revision = second_revision.clone();
     let second_task = tokio::spawn(async move {
