@@ -54,6 +54,6 @@ Critical path: **#59 → {#60, #62, #64} → {#63, #65, #66}**.
 ## Wave 4 — closers
 
 - [x] **#24** Document cold-cache search latency long-tail (after #45/#64 change the numbers).
-- [ ] **#56** Docs truth restoration — deliberately last, so docs describe the final state.
+- [x] **#56** Docs truth restoration — deliberately last, so docs describe the final state.
 - [ ] **#28** ETag conditional requests + rate-limit headers for GitHub polling (unblocked by #53, kept M1+).
 - [ ] **#37** Close umbrella PRD when children are done.
