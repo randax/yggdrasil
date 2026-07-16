@@ -54,6 +54,11 @@ never connects — cannot report it:
 | `YG_LISTEN` | `127.0.0.1:7311` | Server bind address |
 | `YG_WORKER_METRICS_ADDR` | — (disabled) | Worker-only `/metrics` bind address (for example `0.0.0.0:9400`); absent means no HTTP listener |
 | `YG_METRICS_UNAUTHENTICATED` | `false` | Expose `GET /metrics` without a bearer token for scraper convenience |
+| `YG_TOKEN_RATE_LIMIT_REQUESTS` | `120` | Requests allowed per bearer token in each rate-limit window |
+| `YG_TOKEN_RATE_LIMIT_WINDOW` | `60` | Per-token rate-limit window in seconds |
+| `YG_SEARCH_CONCURRENCY` | `8` | Server-wide concurrent `search` execution cap across REST and MCP |
+| `YG_MCP_BATCH_SIZE` | `32` | Maximum JSON-RPC messages accepted in one MCP batch |
+| `YG_REQUEST_TIMEOUT` | `30` | Whole-request server deadline in seconds |
 | `YG_DATABASE_URL` | dev compose Postgres | Control-plane database |
 | `YG_S3_ENDPOINT` | `http://localhost:9000` | Object storage endpoint |
 | `YG_S3_BUCKET` | `yggdrasil` | Shard bucket |
@@ -70,8 +75,8 @@ never connects — cannot report it:
 | `YG_JOB_RETENTION` | `604800` | Seconds a terminal job row is kept before the GC cadence removes it (bounds queue-table growth) |
 
 An invalid value (an unparseable listen address, a duration that is not a
-whole number of seconds) refuses to boot with every problem listed, not
-just the first.
+whole number of seconds, or a non-positive count) refuses to boot with every
+problem listed, not just the first.
 
 `yg serve --role=api|worker|all` picks what the process runs: `api` serves
 HTTP only, `worker` drains the Sync and indexing queues (it needs the

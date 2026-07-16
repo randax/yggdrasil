@@ -128,6 +128,25 @@ impl MemberName {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+/// Positive token lifetime requested on the administrative wire surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TokenLifetimeSeconds(u64);
+
+impl TokenLifetimeSeconds {
+    pub fn new(seconds: u64) -> Self {
+        Self(seconds)
+    }
+
+    pub fn get(self) -> u64 {
+        self.0
+    }
 }
 
 impl std::fmt::Display for MemberName {
@@ -344,10 +363,61 @@ pub struct RuleResponse {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct IssueTokenRequest {
+    pub member: MemberName,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_in_seconds: Option<TokenLifetimeSeconds>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IssueTokenResponse {
     pub id: TokenId,
     pub member: MemberName,
     pub token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<TokenTimestampSeconds>,
+}
+
+/// Whole Unix seconds on the member-token administrative wire surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TokenTimestampSeconds(i64);
+
+impl TokenTimestampSeconds {
+    pub fn new(seconds: i64) -> Self {
+        Self(seconds)
+    }
+
+    pub fn get(self) -> i64 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MemberTokenStatus {
+    Active,
+    Expired,
+    Revoked,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemberTokenResponse {
+    pub id: TokenId,
+    pub member: MemberName,
+    pub created_at: TokenTimestampSeconds,
+    pub last_used_at: Option<TokenTimestampSeconds>,
+    pub expires_at: Option<TokenTimestampSeconds>,
+    pub revoked_at: Option<TokenTimestampSeconds>,
+    pub status: MemberTokenStatus,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemberTokensResponse {
+    pub tokens: Vec<MemberTokenResponse>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -411,4 +481,29 @@ pub struct ShardStatus {
     pub revision: String,
     pub nodes: i64,
     pub edges: i64,
+}
+
+#[cfg(test)]
+mod member_token_tests {
+    use super::{IssueTokenResponse, MemberTokenStatus};
+
+    #[test]
+    fn issue_response_accepts_an_older_server_without_expiry() {
+        let response: IssueTokenResponse = serde_json::from_value(serde_json::json!({
+            "id": "mtok_0123456789abcdef01234567",
+            "member": "agent",
+            "token": "secret"
+        }))
+        .unwrap();
+
+        assert!(response.expires_at.is_none());
+    }
+
+    #[test]
+    fn member_token_status_uses_operator_facing_lowercase_values() {
+        assert_eq!(
+            serde_json::to_string(&MemberTokenStatus::Expired).unwrap(),
+            "\"expired\""
+        );
+    }
 }

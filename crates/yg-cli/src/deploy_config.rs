@@ -42,6 +42,8 @@ pub struct DeployConfig {
     pub shard_cache: std::path::PathBuf,
     pub git_cache: std::path::PathBuf,
     pub object_store: ObjectStoreConfig,
+    /// Resource bounds applied by API-serving roles.
+    pub protection: yg_api::ProtectionConfig,
     pub poll_interval: Duration,
     pub discovery_interval: Duration,
     pub gc_grace: Duration,
@@ -86,6 +88,10 @@ pub enum ConfigError {
         var: &'static str,
         value: String,
     },
+    InvalidPositiveInteger {
+        var: &'static str,
+        value: String,
+    },
     MissingBootstrapToken {
         var: &'static str,
     },
@@ -106,6 +112,9 @@ impl std::fmt::Display for ConfigError {
                 f,
                 "{var}: {value:?} must be a whole number of seconds, 1..={MAX_DURATION_SECS}"
             ),
+            Self::InvalidPositiveInteger { var, value } => {
+                write!(f, "{var}: {value:?} must be a positive whole number")
+            }
             Self::MissingBootstrapToken { var } => write!(
                 f,
                 "{var} must be set to a non-empty token; an API or authenticated metrics \
@@ -185,6 +194,31 @@ pub fn resolve(role: Role, lookup: impl Fn(&str) -> Option<String>) -> Resolutio
     } else {
         None
     };
+    let protection = if api {
+        let defaults = yg_api::ProtectionConfig::default();
+        yg_api::ProtectionConfig {
+            token_rate_limit: yg_api::TokenRateLimitConfig {
+                requests: r.positive_u32(
+                    "YG_TOKEN_RATE_LIMIT_REQUESTS",
+                    defaults.token_rate_limit.requests.get(),
+                ),
+                window: r.duration_secs(
+                    "YG_TOKEN_RATE_LIMIT_WINDOW",
+                    defaults.token_rate_limit.window.as_secs(),
+                ),
+            },
+            search_concurrency_limit: r.positive_usize(
+                "YG_SEARCH_CONCURRENCY",
+                defaults.search_concurrency_limit.get(),
+            ),
+            mcp_batch_size_limit: r
+                .positive_usize("YG_MCP_BATCH_SIZE", defaults.mcp_batch_size_limit.get()),
+            request_timeout: r
+                .duration_secs("YG_REQUEST_TIMEOUT", defaults.request_timeout.as_secs()),
+        }
+    } else {
+        yg_api::ProtectionConfig::default()
+    };
     let config = DeployConfig {
         listen,
         worker_metrics_addr,
@@ -211,6 +245,7 @@ pub fn resolve(role: Role, lookup: impl Fn(&str) -> Option<String>) -> Resolutio
             region: r.string("YG_S3_REGION", "us-east-1"),
             key_prefix: r.string("YG_S3_PREFIX", ""),
         },
+        protection,
         poll_interval: r.worker_duration(worker, "YG_POLL_INTERVAL", 5 * 60),
         discovery_interval: r.worker_duration(worker, "YG_DISCOVERY_INTERVAL", 60 * 60),
         gc_grace: r.worker_duration(worker, "YG_GC_GRACE", 60 * 60),
@@ -413,6 +448,46 @@ impl Resolver<'_> {
             }
         }
     }
+
+    fn positive_u32(&mut self, var: &'static str, default: u32) -> std::num::NonZeroU32 {
+        let fallback = std::num::NonZeroU32::new(default).expect("default must be positive");
+        let Some(value) = self.raw(var) else {
+            self.record(var, default.to_string(), Source::Default);
+            return fallback;
+        };
+        match value.trim().parse::<std::num::NonZeroU32>() {
+            Ok(parsed) => {
+                self.record(var, parsed.to_string(), Source::Env);
+                parsed
+            }
+            Err(_) => {
+                self.record(var, value.clone(), Source::Env);
+                self.errors
+                    .push(ConfigError::InvalidPositiveInteger { var, value });
+                fallback
+            }
+        }
+    }
+
+    fn positive_usize(&mut self, var: &'static str, default: usize) -> std::num::NonZeroUsize {
+        let fallback = std::num::NonZeroUsize::new(default).expect("default must be positive");
+        let Some(value) = self.raw(var) else {
+            self.record(var, default.to_string(), Source::Default);
+            return fallback;
+        };
+        match value.trim().parse::<std::num::NonZeroUsize>() {
+            Ok(parsed) => {
+                self.record(var, parsed.to_string(), Source::Env);
+                parsed
+            }
+            Err(_) => {
+                self.record(var, value.clone(), Source::Env);
+                self.errors
+                    .push(ConfigError::InvalidPositiveInteger { var, value });
+                fallback
+            }
+        }
+    }
 }
 
 /// What the settings report shows in place of any credential.
@@ -548,6 +623,58 @@ mod tests {
     }
 
     #[test]
+    fn api_protection_settings_resolve_to_typed_positive_values() {
+        let config = resolve(
+            Role::Api,
+            env(&[
+                ("YG_BOOTSTRAP_TOKEN", "ygt_admin"),
+                ("YG_TOKEN_RATE_LIMIT_REQUESTS", "7"),
+                ("YG_TOKEN_RATE_LIMIT_WINDOW", "11"),
+                ("YG_SEARCH_CONCURRENCY", "3"),
+                ("YG_MCP_BATCH_SIZE", "5"),
+                ("YG_REQUEST_TIMEOUT", "13"),
+            ]),
+        )
+        .into_config()
+        .unwrap();
+
+        assert_eq!(config.protection.token_rate_limit.requests.get(), 7);
+        assert_eq!(
+            config.protection.token_rate_limit.window,
+            Duration::from_secs(11)
+        );
+        assert_eq!(config.protection.search_concurrency_limit.get(), 3);
+        assert_eq!(config.protection.mcp_batch_size_limit.get(), 5);
+        assert_eq!(config.protection.request_timeout, Duration::from_secs(13));
+    }
+
+    #[test]
+    fn zero_api_protection_counts_are_rejected_together() {
+        let resolution = resolve(
+            Role::Api,
+            env(&[
+                ("YG_BOOTSTRAP_TOKEN", "ygt_admin"),
+                ("YG_TOKEN_RATE_LIMIT_REQUESTS", "0"),
+                ("YG_SEARCH_CONCURRENCY", "0"),
+                ("YG_MCP_BATCH_SIZE", "0"),
+            ]),
+        );
+        for var in [
+            "YG_TOKEN_RATE_LIMIT_REQUESTS",
+            "YG_SEARCH_CONCURRENCY",
+            "YG_MCP_BATCH_SIZE",
+        ] {
+            assert!(
+                resolution.errors.iter().any(|error| matches!(
+                    error,
+                    ConfigError::InvalidPositiveInteger { var: found, .. } if *found == var
+                )),
+                "missing validation error for {var}"
+            );
+        }
+    }
+
+    #[test]
     fn bootstrap_token_is_required_for_api_and_authenticated_metrics() {
         for role in [Role::Api, Role::All] {
             let resolution = resolve(role, env(&[]));
@@ -627,6 +754,7 @@ mod tests {
             .map(|e| match e {
                 ConfigError::InvalidListenAddr { var, .. }
                 | ConfigError::InvalidDurationSecs { var, .. }
+                | ConfigError::InvalidPositiveInteger { var, .. }
                 | ConfigError::MissingBootstrapToken { var } => *var,
             })
             .collect();
@@ -807,6 +935,11 @@ mod tests {
                 "YG_LISTEN",
                 "YG_METRICS_UNAUTHENTICATED",
                 "YG_BOOTSTRAP_TOKEN",
+                "YG_TOKEN_RATE_LIMIT_REQUESTS",
+                "YG_TOKEN_RATE_LIMIT_WINDOW",
+                "YG_SEARCH_CONCURRENCY",
+                "YG_MCP_BATCH_SIZE",
+                "YG_REQUEST_TIMEOUT",
                 "YG_DATABASE_URL",
                 "YG_SHARD_CACHE",
                 "YG_GIT_CACHE",

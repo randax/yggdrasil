@@ -13,7 +13,10 @@ mod error;
 mod health;
 mod mcp;
 mod metrics;
+mod rate_limit;
+mod request_timeout;
 mod search;
+mod search_limit;
 mod verbs;
 mod wire;
 
@@ -28,7 +31,11 @@ use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use yg_control::ControlPlane;
 
-pub use config::{ObjectStoreConfig, RunningServer, ServerConfig, probe_object_store};
+pub use config::{
+    DEFAULT_MCP_BATCH_SIZE_LIMIT, DEFAULT_REQUEST_TIMEOUT, DEFAULT_SEARCH_CONCURRENCY_LIMIT,
+    DEFAULT_TOKEN_RATE_LIMIT_REQUESTS, DEFAULT_TOKEN_RATE_LIMIT_WINDOW, ObjectStoreConfig,
+    ProtectionConfig, RunningServer, ServerConfig, TokenRateLimitConfig, probe_object_store,
+};
 pub use health::UPTIME_HEADER;
 pub use metrics::Metrics;
 
@@ -39,10 +46,27 @@ pub(crate) struct AppState {
     control: ControlPlane,
     forge_registry: yg_sync::forge::ForgeRegistry,
     store: Arc<dyn ObjectStore>,
-    engine: yg_verbs::Engine<ShardAccess>,
+    engine: Arc<yg_verbs::Engine<ShardAccess>>,
     metrics: Metrics,
+    rate_limiter: rate_limit::TokenRateLimiter,
+    search_limiter: search_limit::SearchLimiter,
+    mcp_batch_size_limit: usize,
     bootstrap_token: String,
     started: std::time::Instant,
+}
+
+impl AppState {
+    /// The one transport-independent entry to the server-wide search gate.
+    async fn search(
+        &self,
+        request: yg_verbs::SearchRequest,
+    ) -> Result<yg_verbs::SearchResponse, yg_verbs::VerbError> {
+        let _timer = self.engine.metrics().timer(yg_verbs::Verb::Search);
+        let engine = self.engine.clone();
+        self.search_limiter
+            .run(move || async move { engine.search(request).await })
+            .await
+    }
 }
 
 pub(crate) struct MetricsServerState {
@@ -91,12 +115,46 @@ pub async fn serve_with_metrics(
     .await
 }
 
+/// Boot the Index Server with explicit request-protection bounds.
+pub async fn serve_with_metrics_and_protection(
+    config: ServerConfig,
+    metrics: Metrics,
+    metrics_access: MetricsAccess,
+    protection: ProtectionConfig,
+) -> anyhow::Result<RunningServer> {
+    serve_with_metrics_registry_and_protection(
+        config,
+        metrics,
+        metrics_access,
+        yg_sync::forge::ForgeRegistry::builtin(),
+        protection,
+    )
+    .await
+}
+
 /// Boot the Index Server with supplied metrics and Forge adapters.
 pub async fn serve_with_metrics_and_registry(
     config: ServerConfig,
     metrics: Metrics,
     metrics_access: MetricsAccess,
     forge_registry: yg_sync::forge::ForgeRegistry,
+) -> anyhow::Result<RunningServer> {
+    serve_with_metrics_registry_and_protection(
+        config,
+        metrics,
+        metrics_access,
+        forge_registry,
+        ProtectionConfig::default(),
+    )
+    .await
+}
+
+async fn serve_with_metrics_registry_and_protection(
+    config: ServerConfig,
+    metrics: Metrics,
+    metrics_access: MetricsAccess,
+    forge_registry: yg_sync::forge::ForgeRegistry,
+    protection: ProtectionConfig,
 ) -> anyhow::Result<RunningServer> {
     let control =
         ControlPlane::connect_and_migrate_with_metrics(&config.database_url, metrics.control())
@@ -113,14 +171,17 @@ pub async fn serve_with_metrics_and_registry(
         metrics.shard_cache(),
     ));
     let state = Arc::new(AppState {
-        engine: yg_verbs::Engine::with_metrics(
+        engine: Arc::new(yg_verbs::Engine::with_metrics(
             ShardAccess::new(control.clone(), shards.clone()),
             metrics.verbs(),
-        ),
+        )),
         control,
         forge_registry,
         store,
         metrics,
+        rate_limiter: rate_limit::TokenRateLimiter::new(protection.token_rate_limit),
+        search_limiter: search_limit::SearchLimiter::new(protection.search_concurrency_limit),
+        mcp_batch_size_limit: protection.mcp_batch_size_limit.get(),
         bootstrap_token: config.bootstrap_token,
         started: std::time::Instant::now(),
     });
@@ -136,7 +197,10 @@ pub async fn serve_with_metrics_and_registry(
             "/rules",
             get(admin::admin_rules_list).post(admin::admin_rules_add),
         )
-        .route("/tokens", post(admin::admin_token_issue))
+        .route(
+            "/tokens",
+            get(admin::admin_tokens_list).post(admin::admin_token_issue),
+        )
         .route("/tokens/{id}/revoke", post(admin::admin_token_revoke))
         .route("/status", get(admin::admin_status))
         // Catch-alls so the scope gate covers the whole /admin subtree,
@@ -208,7 +272,11 @@ pub async fn serve_with_metrics_and_registry(
                 .method_not_allowed_fallback(wire::method_not_allowed),
         ),
     }
-    .with_state(state);
+    .with_state(state)
+    .layer(middleware::from_fn_with_state(
+        request_timeout::RequestTimeout::new(protection.request_timeout),
+        request_timeout::enforce,
+    ));
 
     let listener = TcpListener::bind(config.listen)
         .await

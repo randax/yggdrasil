@@ -470,12 +470,159 @@ pub struct AddRuleOutcome {
     pub fetches_queued: u64,
 }
 
+/// Longest lifetime accepted for a member token. This keeps the value safely
+/// inside PostgreSQL's interval range while still allowing long-lived agent
+/// credentials.
+pub const MAX_MEMBER_TOKEN_LIFETIME_SECONDS: u64 = 10 * 365 * 24 * 60 * 60;
+
+/// Non-empty administrator-supplied identity attached to a member token.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MemberName(String);
+
+impl MemberName {
+    pub fn new(value: impl Into<String>) -> Result<Self, MemberNameError> {
+        let value = value.into();
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return Err(MemberNameError);
+        }
+        Ok(Self(trimmed.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemberNameError;
+
+impl std::fmt::Display for MemberNameError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("member must not be empty")
+    }
+}
+
+impl std::error::Error for MemberNameError {}
+
+/// A positive, bounded lifetime supplied when a member token is issued.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemberTokenLifetimeSeconds(u64);
+
+impl MemberTokenLifetimeSeconds {
+    pub fn new(seconds: u64) -> Result<Self, MemberTokenLifetimeError> {
+        if !(1..=MAX_MEMBER_TOKEN_LIFETIME_SECONDS).contains(&seconds) {
+            return Err(MemberTokenLifetimeError { seconds });
+        }
+        Ok(Self(seconds))
+    }
+
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemberTokenLifetimeError {
+    seconds: u64,
+}
+
+impl std::fmt::Display for MemberTokenLifetimeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "member token lifetime must be 1..={MAX_MEMBER_TOKEN_LIFETIME_SECONDS} seconds (got {})",
+            self.seconds
+        )
+    }
+}
+
+impl std::error::Error for MemberTokenLifetimeError {}
+
+/// Stable identifier for one persisted member token.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MemberTokenId(String);
+
+impl MemberTokenId {
+    pub fn new(value: String) -> Result<Self, MemberTokenIdError> {
+        if !member_token_id_is_valid(&value) {
+            return Err(MemberTokenIdError { value });
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberTokenIdError {
+    value: String,
+}
+
+impl std::fmt::Display for MemberTokenIdError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "member token id {:?} must look like mtok_<24 hex characters>",
+            self.value
+        )
+    }
+}
+
+impl std::error::Error for MemberTokenIdError {}
+
+/// Whole Unix seconds used for member-token lifecycle timestamps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct MemberTokenTimestampSeconds(i64);
+
+impl MemberTokenTimestampSeconds {
+    fn from_database(seconds: i64) -> Self {
+        Self(seconds)
+    }
+
+    pub fn get(self) -> i64 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemberTokenStatus {
+    Active,
+    Expired,
+    Revoked,
+}
+
+pub struct MemberTokenSummary {
+    pub id: MemberTokenId,
+    pub member: MemberName,
+    pub created_at: MemberTokenTimestampSeconds,
+    pub last_used_at: Option<MemberTokenTimestampSeconds>,
+    pub expires_at: Option<MemberTokenTimestampSeconds>,
+    pub revoked_at: Option<MemberTokenTimestampSeconds>,
+    pub status: MemberTokenStatus,
+}
+
+pub struct AuthenticatedMemberToken {
+    pub id: MemberTokenId,
+}
+
 pub struct IssuedMemberToken {
-    pub id: String,
-    pub member: String,
+    pub id: MemberTokenId,
+    pub member: MemberName,
     /// The bearer token material. Returned only from issue time; only its
     /// hash is persisted.
     pub token: String,
+    pub expires_at: Option<MemberTokenTimestampSeconds>,
 }
 
 /// Member token ids are URL path components and operator-facing handles,
@@ -1350,32 +1497,43 @@ impl ControlPlane {
     /// Issue a bearer token for a human or agent Member. The plaintext
     /// token is returned to the caller once; only its SHA-256 hash is
     /// recorded.
-    pub async fn issue_member_token(&self, member: &str) -> anyhow::Result<IssuedMemberToken> {
-        let member = member.trim();
-        anyhow::ensure!(!member.is_empty(), "member must not be empty");
+    pub async fn issue_member_token(
+        &self,
+        member: MemberName,
+        lifetime: Option<MemberTokenLifetimeSeconds>,
+    ) -> anyhow::Result<IssuedMemberToken> {
+        let lifetime_seconds = lifetime
+            .map(MemberTokenLifetimeSeconds::get)
+            .map(|seconds| {
+                i64::try_from(seconds).expect("validated member-token lifetime fits in i64")
+            });
 
         for _ in 0..3 {
             let id = format!("mtok_{}", random_hex(12)?);
             let token = format!("ygm_{}", random_hex(32)?);
             debug_assert!(member_token_id_is_valid(&id));
             let token_hash = hash_member_token(&token);
-            let inserted = sqlx::query(
-                "INSERT INTO member_tokens (id, member, token_hash)
-                 VALUES ($1, $2, $3)
-                 ON CONFLICT DO NOTHING",
+            let inserted: Option<(Option<i64>,)> = sqlx::query_as(
+                "INSERT INTO member_tokens (id, member, token_hash, expires_at)
+                 VALUES ($1, $2, $3,
+                         CASE WHEN $4::bigint IS NULL THEN NULL
+                              ELSE now() + make_interval(secs => $4::double precision)
+                         END)
+                 ON CONFLICT DO NOTHING
+                 RETURNING floor(extract(epoch FROM expires_at))::bigint",
             )
             .bind(&id)
-            .bind(member)
+            .bind(member.as_str())
             .bind(&token_hash)
-            .execute(&self.pool)
-            .await?
-            .rows_affected()
-                == 1;
-            if inserted {
+            .bind(lifetime_seconds)
+            .fetch_optional(&self.pool)
+            .await?;
+            if let Some((expires_at,)) = inserted {
                 return Ok(IssuedMemberToken {
-                    id,
-                    member: member.to_string(),
+                    id: MemberTokenId::new(id).expect("freshly generated member-token id is valid"),
+                    member,
                     token,
+                    expires_at: expires_at.map(MemberTokenTimestampSeconds::from_database),
                 });
             }
         }
@@ -1402,36 +1560,99 @@ impl ControlPlane {
     /// Validate a presented member bearer token. `last_used_at` is
     /// stamped on first use and then at most once a minute, so hot Verb
     /// traffic does not turn every read request into a write.
-    pub async fn authenticate_member_token(&self, token: &str) -> anyhow::Result<bool> {
+    pub async fn authenticate_member_token(
+        &self,
+        token: &str,
+    ) -> anyhow::Result<Option<AuthenticatedMemberToken>> {
         let token_hash = hash_member_token(token);
-        let touched = sqlx::query(
+        let touched: Option<(String,)> = sqlx::query_as(
             "UPDATE member_tokens
              SET last_used_at = now()
              WHERE token_hash = $1
                AND revoked_at IS NULL
-               AND (last_used_at IS NULL OR last_used_at < now() - make_interval(secs => 60))",
+               AND (expires_at IS NULL OR expires_at > now())
+               AND (last_used_at IS NULL OR last_used_at < now() - make_interval(secs => 60))
+             RETURNING id",
         )
         .bind(&token_hash)
-        .execute(&self.pool)
-        .await?
-        .rows_affected()
-            == 1;
+        .fetch_optional(&self.pool)
+        .await?;
 
-        let authenticated = if touched {
-            true
+        let id = if let Some((id,)) = touched {
+            Some(id)
         } else {
-            let (active,): (bool,) = sqlx::query_as(
-                "SELECT EXISTS (
-                     SELECT 1 FROM member_tokens
-                     WHERE token_hash = $1 AND revoked_at IS NULL
-                 )",
+            sqlx::query_as(
+                "SELECT id FROM member_tokens
+                 WHERE token_hash = $1
+                   AND revoked_at IS NULL
+                   AND (expires_at IS NULL OR expires_at > now())",
             )
             .bind(token_hash)
-            .fetch_one(&self.pool)
-            .await?;
-            active
+            .fetch_optional(&self.pool)
+            .await?
+            .map(|(id,)| id)
         };
-        Ok(authenticated)
+        id.map(MemberTokenId::new)
+            .transpose()
+            .map(|token| token.map(|id| AuthenticatedMemberToken { id }))
+            .map_err(Into::into)
+    }
+
+    /// List every member token without exposing its bearer material. Revoked
+    /// and expired rows remain visible so administrators can distinguish their
+    /// lifecycle state from an unknown token id.
+    pub async fn member_tokens(&self) -> anyhow::Result<Vec<MemberTokenSummary>> {
+        #[derive(sqlx::FromRow)]
+        struct MemberTokenRow {
+            id: String,
+            member: String,
+            created_at_seconds: i64,
+            last_used_at_seconds: Option<i64>,
+            expires_at_seconds: Option<i64>,
+            revoked_at_seconds: Option<i64>,
+            expired: bool,
+            revoked: bool,
+        }
+
+        let rows: Vec<MemberTokenRow> = sqlx::query_as(
+            "SELECT id, member,
+                    floor(extract(epoch FROM created_at))::bigint AS created_at_seconds,
+                    floor(extract(epoch FROM last_used_at))::bigint AS last_used_at_seconds,
+                    floor(extract(epoch FROM expires_at))::bigint AS expires_at_seconds,
+                    floor(extract(epoch FROM revoked_at))::bigint AS revoked_at_seconds,
+                    expires_at IS NOT NULL AND expires_at <= now() AS expired,
+                    revoked_at IS NOT NULL AS revoked
+             FROM member_tokens
+             ORDER BY created_at DESC, id DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                Ok(MemberTokenSummary {
+                    id: MemberTokenId::new(row.id)?,
+                    member: MemberName::new(row.member)?,
+                    created_at: MemberTokenTimestampSeconds::from_database(row.created_at_seconds),
+                    last_used_at: row
+                        .last_used_at_seconds
+                        .map(MemberTokenTimestampSeconds::from_database),
+                    expires_at: row
+                        .expires_at_seconds
+                        .map(MemberTokenTimestampSeconds::from_database),
+                    revoked_at: row
+                        .revoked_at_seconds
+                        .map(MemberTokenTimestampSeconds::from_database),
+                    status: if row.revoked {
+                        MemberTokenStatus::Revoked
+                    } else if row.expired {
+                        MemberTokenStatus::Expired
+                    } else {
+                        MemberTokenStatus::Active
+                    },
+                })
+            })
+            .collect()
     }
 
     /// Every registered repo with its sync position: last synced commit,
@@ -2472,7 +2693,8 @@ async fn settle_leased_job(
 #[cfg(test)]
 mod tests {
     use super::{
-        ForgeUrl, JobKind, REPO_QUALIFIER_SQL, RepoVisibility, RuleRow,
+        ForgeUrl, JobKind, MAX_MEMBER_TOKEN_LIFETIME_SECONDS, MemberName,
+        MemberTokenLifetimeSeconds, REPO_QUALIFIER_SQL, RepoVisibility, RuleRow,
         SUPERSEDED_SHARDS_PAST_GRACE_QUERY, SUPERSEDED_SHARDS_PAST_GRACE_SQL, ShardState,
         discovery_state_for, glob_matches, member_token_id_is_valid, repo_qualifier,
         shard_accepts_publication,
@@ -2480,6 +2702,25 @@ mod tests {
 
     const HYGIENE_MIGRATION: &str = include_str!("../migrations/0011_job_queue_hygiene.sql");
     const SHARD_STATE_MIGRATION: &str = include_str!("../migrations/0013_shard_reclaiming.sql");
+    const MEMBER_TOKEN_EXPIRY_MIGRATION: &str =
+        include_str!("../migrations/0016_member_token_expiry.sql");
+
+    #[test]
+    fn member_token_expiry_domain_rejects_empty_names_and_invalid_lifetimes() {
+        assert!(MemberName::new("   ").is_err());
+        assert_eq!(MemberName::new("  agent  ").unwrap().as_str(), "agent");
+        assert!(MemberTokenLifetimeSeconds::new(0).is_err());
+        assert!(MemberTokenLifetimeSeconds::new(MAX_MEMBER_TOKEN_LIFETIME_SECONDS + 1).is_err());
+        assert_eq!(MemberTokenLifetimeSeconds::new(60).unwrap().get(), 60);
+    }
+
+    #[test]
+    fn member_token_expiry_migration_is_nullable_and_non_destructive() {
+        let normalized = MEMBER_TOKEN_EXPIRY_MIGRATION.to_ascii_lowercase();
+        assert!(normalized.contains("add column expires_at timestamptz"));
+        assert!(!normalized.contains("not null"));
+        assert!(!normalized.contains("drop "));
+    }
 
     #[test]
     fn forge_urls_accept_the_forms_persisted_by_registration_and_fixtures() {

@@ -12,6 +12,7 @@ use axum::response::{IntoResponse, Response};
 use crate::AppState;
 use crate::MetricsServerState;
 use crate::error::{ApiError, error_json};
+use crate::rate_limit::{MemberRateLimitKey, TokenRateLimitKey, rate_limited};
 
 fn presented_bearer(req: &Request) -> Option<&str> {
     req.headers()
@@ -52,17 +53,23 @@ pub(crate) async fn authenticate(
         return error_json(StatusCode::UNAUTHORIZED, "missing or invalid bearer token");
     };
 
-    let scope = if is_bootstrap_token(presented, &state.bootstrap_token) {
-        TokenScope::Admin
+    let (scope, rate_limit_key) = if is_bootstrap_token(presented, &state.bootstrap_token) {
+        (TokenScope::Admin, TokenRateLimitKey::Bootstrap)
     } else {
         match state.control.authenticate_member_token(presented).await {
-            Ok(true) => TokenScope::Member,
-            Ok(false) => {
+            Ok(Some(authenticated)) => (
+                TokenScope::Member,
+                TokenRateLimitKey::Member(MemberRateLimitKey::new(&authenticated.id)),
+            ),
+            Ok(None) => {
                 return error_json(StatusCode::UNAUTHORIZED, "missing or invalid bearer token");
             }
             Err(e) => return ApiError::internal(e.context("auth lookup failed")).into_response(),
         }
     };
+    if let Err(retry_after) = state.rate_limiter.check(rate_limit_key) {
+        return rate_limited(retry_after);
+    }
     req.extensions_mut().insert(scope);
     next.run(req).await
 }

@@ -15,7 +15,6 @@ pub(crate) async fn verb_search(
     State(state): State<Arc<AppState>>,
     WireJson(req): WireJson<yg_verbs::SearchRequest>,
 ) -> Result<Response, ApiError> {
-    let _timer = state.engine.metrics().timer(yg_verbs::Verb::Search);
-    let response = state.engine.search(req).await?;
+    let response = state.search(req).await?;
     Ok(Wire(SearchWireResponse::from(response)).into_response())
 }
