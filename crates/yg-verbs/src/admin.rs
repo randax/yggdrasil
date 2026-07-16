@@ -23,6 +23,27 @@ impl std::fmt::Display for RepoSlug {
     }
 }
 
+/// A repository qualifier that is already owned by another registration.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RepoQualifier(String);
+
+impl RepoQualifier {
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for RepoQualifier {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 /// A forge organization name validated by the control-plane boundary.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -341,6 +362,8 @@ pub struct RevokeTokenResponse {
 pub struct AdminStatusResponse {
     pub repos: Vec<AdminRepoStatus>,
     pub visibility_counts: VisibilityCounts,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub discovery_conflicts: Vec<DiscoveryQualifierConflictStatus>,
 }
 
 #[derive(Clone, Copy, Default, Serialize, Deserialize)]
@@ -362,6 +385,16 @@ pub struct AdminRepoStatus {
     pub sync: JobStatus,
     pub index: JobStatus,
     pub shard: Option<ShardStatus>,
+}
+
+/// A Forge-listed repository rejected because its qualifier is already owned.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiscoveryQualifierConflictStatus {
+    pub forge: ForgeBaseUrl,
+    pub org: OrgName,
+    pub slug: RepoSlug,
+    pub qualifier: RepoQualifier,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

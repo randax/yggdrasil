@@ -12,6 +12,10 @@ use sqlx::postgres::PgPoolOptions;
 /// the in-repo dev compose stack.
 pub const DEFAULT_DATABASE_URL: &str = "postgres://yggdrasil:yggdrasil@localhost:5432/yggdrasil";
 
+/// Two-key advisory-lock namespace for one complete Forge-org discovery
+/// sweep. The second key is PostgreSQL's stable hash of the bigint org id.
+const DISCOVERY_SWEEP_LOCK_NAMESPACE: i32 = 0x5947_4453;
+
 /// A validated absolute URL identifying a Forge clone root or API root.
 ///
 /// Validation uses [`url::Url`], while this value retains the input spelling.
@@ -625,6 +629,46 @@ impl std::fmt::Display for QualifierConflict {
 
 impl std::error::Error for QualifierConflict {}
 
+/// A repository slug returned by Forge discovery and rejected because its
+/// qualifier is already owned by another registered repository.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConflictingDiscoverySlug(String);
+
+impl ConflictingDiscoverySlug {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// An external-id qualifier that caused a Forge discovery collision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConflictingRepoQualifier(String);
+
+impl ConflictingRepoQualifier {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// The connected Forge organization whose listing produced a conflict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConflictingDiscoveryOrg(String);
+
+impl ConflictingDiscoveryOrg {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// One durable qualifier collision surfaced by the Admin status endpoint.
+#[derive(Debug)]
+pub struct DiscoveryQualifierConflict {
+    pub forge: ForgeUrl,
+    pub org: ConflictingDiscoveryOrg,
+    pub slug: ConflictingDiscoverySlug,
+    pub qualifier: ConflictingRepoQualifier,
+}
+
 /// What a Verb request resolves its repo qualifier to: the repo plus its
 /// current Shard pointer.
 #[derive(sqlx::FromRow)]
@@ -1039,19 +1083,28 @@ impl ControlPlane {
         org_id: i64,
         repos: &[DiscoveredRepo<'_>],
     ) -> anyhow::Result<u64> {
-        let mut tx = self.pool.begin().await?;
+        // Scheduled and on-demand discovery can overlap. Serialize complete
+        // listings for one org so an older sweep cannot prune a conflict a
+        // newer sweep just observed. This coordination transaction touches no
+        // repo or rule rows; every repository still commits independently.
+        let mut sweep = begin_discovery_sweep(&self.pool, org_id).await?;
         let (forge_id, base_url): (i64, ForgeUrl) = sqlx::query_as(
             "SELECT f.id, f.base_url
              FROM forge_orgs o JOIN forges f ON f.id = o.forge_id
-             WHERE o.id = $1
-             FOR UPDATE",
+             WHERE o.id = $1",
         )
         .bind(org_id)
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut *sweep)
         .await?;
-        let rules = rules_for_forge(&mut tx, forge_id).await?;
         let mut fetches_queued = 0;
         for repo in repos {
+            // One repository is one reconciliation transaction. A durable
+            // collision therefore cannot roll back valid neighbors in the
+            // same Forge listing. Locking the Forge first also serializes the
+            // rule snapshot with add_rule's forge -> repos lock order.
+            let mut tx = self.pool.begin().await?;
+            lock_forge_for_update(&mut tx, forge_id).await?;
+            let rules = rules_for_forge(&mut tx, forge_id).await?;
             let state = discovery_state_for(repo.slug, repo.visibility, &rules);
             let qualifier = repo_qualifier(base_url.as_str(), repo.slug);
             let existing: Option<(i64, String)> = sqlx::query_as(
@@ -1087,7 +1140,7 @@ impl ControlPlane {
                             (forge_id, slug, visibility, discovery_state, fetch_depth, qualifier,
                              registration_base_url)
                          VALUES ($1, $2, $3, $4, $5, $6, $7)
-                         ON CONFLICT (forge_id, slug) DO NOTHING
+                         ON CONFLICT DO NOTHING
                          RETURNING id",
                     )
                     .bind(forge_id)
@@ -1098,44 +1151,47 @@ impl ControlPlane {
                     .bind(&qualifier)
                     .bind(base_url.as_str())
                     .fetch_optional(&mut *tx)
-                    .await
-                    .map_err(|e| match e {
-                        sqlx::Error::Database(db) if db.constraint() == Some("repos_qualifier") => {
-                            anyhow::Error::new(QualifierConflict { qualifier })
-                        }
-                        other => other.into(),
-                    })?;
+                    .await?;
                     match inserted {
                         Some((repo_id,)) => (repo_id, false),
                         None => {
-                            let (repo_id, previous_state): (i64, String) = sqlx::query_as(
-                                "SELECT id, discovery_state
-                                 FROM repos
-                                 WHERE forge_id = $1 AND slug = $2
-                                 FOR UPDATE",
-                            )
-                            .bind(forge_id)
-                            .bind(repo.slug)
-                            .fetch_one(&mut *tx)
-                            .await?;
+                            let conflicting_repo: Option<(i64,)> =
+                                sqlx::query_as("SELECT id FROM repos WHERE qualifier = $1")
+                                    .bind(&qualifier)
+                                    .fetch_optional(&mut *tx)
+                                    .await?;
+                            let Some((conflicting_repo_id,)) = conflicting_repo else {
+                                anyhow::bail!(
+                                    "repository insert was skipped without an owning qualifier"
+                                );
+                            };
                             sqlx::query(
-                                "UPDATE repos
-                                 SET visibility = $2,
-                                     discovery_state = $3,
-                                     fetch_depth = coalesce($4, fetch_depth)
-                                 WHERE id = $1",
+                                "INSERT INTO forge_discovery_qualifier_conflicts
+                                     (forge_org_id, slug, conflicting_repo_id)
+                                 VALUES ($1, $2, $3)
+                                 ON CONFLICT (forge_org_id, slug) DO UPDATE
+                                 SET conflicting_repo_id = excluded.conflicting_repo_id,
+                                     last_seen_at = now()",
                             )
-                            .bind(repo_id)
-                            .bind(repo.visibility.as_str())
-                            .bind(state)
-                            .bind(repo.fetch_depth)
+                            .bind(org_id)
+                            .bind(repo.slug)
+                            .bind(conflicting_repo_id)
                             .execute(&mut *tx)
                             .await?;
-                            (repo_id, previous_state == "included")
+                            tx.commit().await?;
+                            continue;
                         }
                     }
                 }
             };
+            sqlx::query(
+                "DELETE FROM forge_discovery_qualifier_conflicts
+                 WHERE forge_org_id = $1 AND slug = $2",
+            )
+            .bind(org_id)
+            .bind(repo.slug)
+            .execute(&mut *tx)
+            .await?;
             if state == "included"
                 && !was_included
                 && enqueue_job_unless_in_flight(&mut tx, JobKind::Fetch, repo_id).await?
@@ -1144,12 +1200,25 @@ impl ControlPlane {
             } else if state != "included" && was_included {
                 remove_repo_from_indexing(&mut tx, repo_id).await?;
             }
+            tx.commit().await?;
         }
+        // The listing is complete, so conflicts absent from it are resolved.
+        // Keep this cleanup outside every repo transaction so handled
+        // qualifier collisions cannot prune one another mid-sweep.
+        let listed_slugs: Vec<String> = repos.iter().map(|repo| repo.slug.to_owned()).collect();
+        sqlx::query(
+            "DELETE FROM forge_discovery_qualifier_conflicts
+             WHERE forge_org_id = $1 AND NOT (slug = ANY($2))",
+        )
+        .bind(org_id)
+        .bind(listed_slugs)
+        .execute(&mut *sweep)
+        .await?;
         sqlx::query("UPDATE forge_orgs SET last_discovered_at = now() WHERE id = $1")
             .bind(org_id)
-            .execute(&mut *tx)
+            .execute(&mut *sweep)
             .await?;
-        tx.commit().await?;
+        sweep.commit().await?;
         Ok(fetches_queued)
     }
 
@@ -1173,7 +1242,8 @@ impl ControlPlane {
             "SELECT id, slug, visibility, discovery_state
              FROM repos
              WHERE forge_id = $1
-             ORDER BY id",
+             ORDER BY id
+             FOR UPDATE",
         )
         .bind(rule.forge_id)
         .fetch_all(&mut *tx)
@@ -1379,6 +1449,34 @@ impl ControlPlane {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)
+    }
+
+    /// Qualifier collisions recorded while reconciling Forge listings.
+    /// These are separate from repo status because the unique qualifier
+    /// constraint deliberately prevents the discovered repository from
+    /// acquiring a `repos` row.
+    pub async fn admin_discovery_conflicts(
+        &self,
+    ) -> anyhow::Result<Vec<DiscoveryQualifierConflict>> {
+        let rows: Vec<(ForgeUrl, String, String, String)> = sqlx::query_as(
+            "SELECT f.base_url, o.org_slug, c.slug, r.qualifier
+             FROM forge_discovery_qualifier_conflicts c
+             JOIN forge_orgs o ON o.id = c.forge_org_id
+             JOIN forges f ON f.id = o.forge_id
+             JOIN repos r ON r.id = c.conflicting_repo_id
+             ORDER BY f.base_url, o.org_slug, c.slug",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(forge, org, slug, qualifier)| DiscoveryQualifierConflict {
+                forge,
+                org: ConflictingDiscoveryOrg(org),
+                slug: ConflictingDiscoverySlug(slug),
+                qualifier: ConflictingRepoQualifier(qualifier),
+            })
+            .collect())
     }
 
     /// Refresh queue-depth gauges from Postgres, the source of truth
@@ -2136,6 +2234,28 @@ async fn rules_for_forge(
     .fetch_all(&mut **tx)
     .await?;
     Ok(rules)
+}
+
+async fn begin_discovery_sweep(
+    pool: &PgPool,
+    org_id: i64,
+) -> anyhow::Result<sqlx::Transaction<'_, sqlx::Postgres>> {
+    loop {
+        let mut tx = pool.begin().await?;
+        let (locked,): (bool,) =
+            sqlx::query_as("SELECT pg_try_advisory_xact_lock($1, hashint8($2))")
+                .bind(DISCOVERY_SWEEP_LOCK_NAMESPACE)
+                .bind(org_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        if locked {
+            return Ok(tx);
+        }
+        // Never pin a pool connection while another sweep owns the lock: the
+        // owner needs a second connection for its independent per-repo tx.
+        tx.rollback().await?;
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
 }
 
 async fn lock_forge_for_update(

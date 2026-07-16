@@ -13,7 +13,7 @@ use crate::forge::{
 };
 use crate::git::{GitFetcher, forge_token, lock_mirror, remote_head_commit};
 use crate::lease::{LeaseShutdown, with_lease_heartbeat, with_lease_heartbeat_until_shutdown};
-use crate::locator::join_clone_url;
+use crate::locator::{join_clone_url, normalize_repo_slug};
 use crate::metrics::Metrics;
 use crate::rate::{RATE_LIMIT_COOLDOWN, TokenBucket};
 use crate::shutdown::Shutdown;
@@ -241,6 +241,24 @@ impl SyncWorker {
                 return Ok(true);
             }
         };
+        let repos: Vec<ListedRepo> = repos
+            .into_iter()
+            .filter_map(|repo| match normalize_repo_slug(&repo.slug) {
+                Ok(slug) => Some(ListedRepo {
+                    slug,
+                    visibility: repo.visibility,
+                }),
+                Err(error) => {
+                    tracing::warn!(
+                        org = %due.org_slug,
+                        slug = ?repo.slug,
+                        error = ?error,
+                        "forge discovery rejected an invalid repository slug"
+                    );
+                    None
+                }
+            })
+            .collect();
         let discovered: Vec<_> = repos
             .iter()
             .map(|repo| yg_control::DiscoveredRepo {
@@ -249,22 +267,10 @@ impl SyncWorker {
                 fetch_depth: None,
             })
             .collect();
-        let queued = match self
+        let queued = self
             .control
             .discover_forge_repos(due.org_id, &discovered)
-            .await
-        {
-            Ok(queued) => queued,
-            Err(e) if e.downcast_ref::<yg_control::QualifierConflict>().is_some() => {
-                tracing::warn!(
-                    org = %due.org_slug,
-                    error = format!("{e:#}"),
-                    "forge discovery found a repo qualifier conflict; skipping this discovery pass"
-                );
-                return Ok(true);
-            }
-            Err(e) => return Err(e),
-        };
+            .await?;
         tracing::info!(
             org = %due.org_slug,
             repos = discovered.len(),
