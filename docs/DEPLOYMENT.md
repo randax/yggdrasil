@@ -39,6 +39,14 @@ server deliberately refuses to start when either variable is empty or invalid.
 To index private repositories or run org discovery, also export
 `YG_GITHUB_TOKEN` before starting the profile — the service forwards it to
 the workers; without it only public repositories clone.
+
+> **Secret handling:** the profile passes these secrets as container
+> environment variables, so anyone who can run `docker inspect` or render
+> the compose config on the host can read them — never paste rendered
+> configs into logs or issues. For a production deployment, prefer a
+> secret store (Docker/Compose `secrets:`, or your orchestrator's
+> equivalent) over host environment variables; this reference profile
+> favors first-boot simplicity.
 The complete configuration table, including object-store, cache, protection,
 polling, and GC settings, is in [Development](DEVELOPMENT.md#running-the-index-server).
 
