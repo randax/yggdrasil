@@ -756,6 +756,10 @@ struct ForgeBudgetState {
     rate_budget: i32,
 }
 
+fn forge_budget_retry_after(cooldown_wait: f64, refill_wait: f64) -> std::time::Duration {
+    std::time::Duration::from_secs_f64(cooldown_wait + refill_wait)
+}
+
 /// A superseded Shard the GC sweep may reclaim: no repo points at it and
 /// its grace window has elapsed. Carries what object storage needs to
 /// delete the Shard's segments — its repo and revision name the
@@ -1854,9 +1858,10 @@ impl ControlPlane {
             Ok(ForgeBudgetTake::Granted)
         } else {
             let refill_wait = ((requested - available).max(0.0) * 60.0) / capacity;
-            Ok(ForgeBudgetTake::RetryAfter(
-                std::time::Duration::from_secs_f64(cooldown_wait.max(refill_wait)),
-            ))
+            Ok(ForgeBudgetTake::RetryAfter(forge_budget_retry_after(
+                cooldown_wait,
+                refill_wait,
+            )))
         }
     }
 
@@ -1865,7 +1870,8 @@ impl ControlPlane {
     /// refill until the effective deadline, so expiry resumes empty instead of
     /// releasing a burst. Extends-only behavior is deliberate: one anomalous
     /// `Retry-After` can idle the fleet, accepted in favor of honoring every
-    /// worker's backoff. Returns the resulting remaining wait.
+    /// worker's backoff. Returns when the drained bucket can next grant one
+    /// request: the remaining cooldown plus a fresh token's refill time.
     pub async fn cool_down_forge(
         &self,
         forge_id: i64,
@@ -1884,26 +1890,32 @@ impl ControlPlane {
         .bind(forge_id)
         .execute(&mut *tx)
         .await?;
-        let remaining: f64 = sqlx::query_scalar(
-            "UPDATE forge_rate_budgets
+        let (cooldown_wait, refill_wait): (f64, f64) = sqlx::query_as(
+            "UPDATE forge_rate_budgets b
              SET tokens = 0,
+                 refill_per_second = f.rate_budget::double precision / 60.0,
                  cooldown_until = greatest(
-                     coalesce(cooldown_until, clock_timestamp()),
+                     coalesce(b.cooldown_until, clock_timestamp()),
                      clock_timestamp() + make_interval(secs => $2)
                  ),
                  updated_at = greatest(
-                     coalesce(cooldown_until, clock_timestamp()),
+                     coalesce(b.cooldown_until, clock_timestamp()),
                      clock_timestamp() + make_interval(secs => $2)
                  )
-             WHERE forge_id = $1
-             RETURNING extract(epoch FROM cooldown_until - clock_timestamp())::float8",
+             FROM forges f
+             WHERE b.forge_id = $1 AND f.id = b.forge_id
+             RETURNING extract(epoch FROM b.cooldown_until - clock_timestamp())::float8,
+                       60.0 / f.rate_budget::double precision",
         )
         .bind(forge_id)
         .bind(cooldown.as_secs_f64())
         .fetch_one(&mut *tx)
         .await?;
         tx.commit().await?;
-        Ok(std::time::Duration::from_secs_f64(remaining.max(0.0)))
+        Ok(forge_budget_retry_after(
+            cooldown_wait.max(0.0),
+            refill_wait,
+        ))
     }
 
     /// Enqueue a fetch for a repo whose default branch the poll loop saw
@@ -2643,12 +2655,24 @@ mod tests {
     use super::{
         ForgeUrl, JobKind, REPO_QUALIFIER_SQL, RepoVisibility, RuleRow,
         SUPERSEDED_SHARDS_PAST_GRACE_QUERY, SUPERSEDED_SHARDS_PAST_GRACE_SQL, ShardState,
-        discovery_state_for, glob_matches, member_token_id_is_valid, repo_qualifier,
-        shard_accepts_publication,
+        discovery_state_for, forge_budget_retry_after, glob_matches, member_token_id_is_valid,
+        repo_qualifier, shard_accepts_publication,
     };
 
     const HYGIENE_MIGRATION: &str = include_str!("../migrations/0011_job_queue_hygiene.sql");
     const SHARD_STATE_MIGRATION: &str = include_str!("../migrations/0013_shard_reclaiming.sql");
+
+    #[test]
+    fn drained_forge_cooldown_includes_post_cooldown_refill() {
+        assert_eq!(
+            forge_budget_retry_after(30.0, 60.0),
+            std::time::Duration::from_secs(90)
+        );
+        assert_eq!(
+            forge_budget_retry_after(0.0, 60.0),
+            std::time::Duration::from_secs(60)
+        );
+    }
 
     #[test]
     fn forge_urls_accept_the_forms_persisted_by_registration_and_fixtures() {

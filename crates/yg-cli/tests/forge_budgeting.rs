@@ -136,10 +136,14 @@ async fn a_rate_limit_reported_by_one_worker_cools_the_fleet() {
     let second = control_plane(&db_name).await;
     let (pool, forge_id) = low_budget_forge(&db_name).await;
 
-    first
+    let cooldown_retry = first
         .cool_down_forge(forge_id, Duration::from_secs(30))
         .await
         .unwrap();
+    assert!(
+        (Duration::from_secs(85)..=Duration::from_secs(90)).contains(&cooldown_retry),
+        "a drained fleet bucket should include cooldown plus fresh refill, got {cooldown_retry:?}"
+    );
     let decision = second
         .take_forge_budget(forge_id, NonZeroU32::MIN)
         .await
@@ -148,8 +152,8 @@ async fn a_rate_limit_reported_by_one_worker_cools_the_fleet() {
         panic!("a second worker must observe the fleet-wide cooldown");
     };
     assert!(
-        (Duration::from_secs(25)..=Duration::from_secs(30)).contains(&retry_after),
-        "the fleet cooldown should have almost its full duration left, got {retry_after:?}"
+        (Duration::from_secs(85)..=Duration::from_secs(90)).contains(&retry_after),
+        "a drained fleet bucket should include cooldown plus fresh refill, got {retry_after:?}"
     );
 
     let (tokens, refill_origin_gap): (f64, f64) = sqlx::query_as(
@@ -230,8 +234,8 @@ async fn a_typed_discovery_rate_limit_is_published_to_other_workers() {
         panic!("another worker must observe the typed adapter cooldown");
     };
     assert!(
-        (Duration::from_secs(25)..=Duration::from_secs(30)).contains(&retry_after),
-        "the typed discovery cooldown should have almost 30s left, got {retry_after:?}"
+        (Duration::from_secs(25)..=Duration::from_secs(31)).contains(&retry_after),
+        "the typed discovery cooldown should include its 300/min fresh refill, got {retry_after:?}"
     );
 }
 
@@ -406,7 +410,19 @@ async fn two_worker_processes_share_the_forge_request_budget() {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        if budget_exists && due == 0 {
+        let refill_deferred: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM repos
+             WHERE next_poll_at BETWEEN now() + interval '35 seconds'
+                                    AND now() + interval '65 seconds'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        if budget_exists
+            && due == 0
+            && refill_deferred == 1
+            && requests.load(Ordering::Relaxed) == 1
+        {
             break;
         }
         assert!(
