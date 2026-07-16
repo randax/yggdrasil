@@ -58,6 +58,17 @@ impl ForgeUrl {
                 ),
             });
         }
+        // Workers append repository slugs textually, so a query or
+        // fragment on the root would smuggle itself into every derived
+        // clone and API URL.
+        if parsed.query().is_some() || parsed.fragment().is_some() {
+            return Err(ForgeUrlParseError {
+                value,
+                reason: ForgeUrlParseReason::Syntax(
+                    "forge URLs must not carry a query or fragment",
+                ),
+            });
+        }
         Ok(Self(value))
     }
 
@@ -2321,6 +2332,8 @@ mod tests {
             "https://example.com\n",
             "https://exa\tmple.com",
             "ssh:git@host/repo",
+            "https://git.example?mirror=1",
+            "https://git.example#frag",
         ] {
             let error = ForgeUrl::parse(value).expect_err("malformed URL must be rejected");
             assert!(error.to_string().contains("invalid absolute forge URL"));
