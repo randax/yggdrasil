@@ -11,7 +11,7 @@ pub mod metrics;
 pub use cache::{CacheCapacity, CacheLease, LeasedPath};
 pub use metrics::Metrics;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -52,12 +52,14 @@ pub use fts::{
 /// newest-first ordering and `since` filter).
 /// v6: the syntactic grammar pack adds TypeScript, JavaScript, Python,
 /// Rust, and Java Symbols plus DEFINES/IMPORTS/CALLS facts.
+/// v7: code-aware body and path tokenization, exact raw Symbol names,
+/// per-repo normalized search ranking, and graph edge integrity constraints.
 ///
 /// Bumping this changes every revision id (see
 /// [`syntactic_revision_suffix`]): readers refuse artifacts from other
 /// schema versions ([`SchemaOutdated`]), and worker boot queues a
 /// re-index for every repo still pointing at an outdated revision.
-pub const SCHEMA_VERSION: u32 = 6;
+pub const SCHEMA_VERSION: u32 = 7;
 
 /// Name of the M0 indexing pass, as recorded in revision ids, manifests,
 /// and the control plane's `provenance_level`. The precise pass (M1)
@@ -644,41 +646,58 @@ pub struct PreparedShard {
 /// touching object storage. Publishers can do this expensive CPU work before
 /// entering their short publication critical section.
 pub async fn prepare_shard(
-    graph: Graph,
+    mut graph: Graph,
     search_docs: Vec<SearchDoc>,
 ) -> anyhow::Result<PreparedShard> {
-    let counts = Counts {
-        nodes: graph.nodes.len() as i64,
-        edges: graph.edges.len() as i64,
-    };
-
     // Build and digest both segments off the runtime threads: building a
     // tantivy index and hashing a large artifact are as blocking as the
     // graph build.
-    let (graph_bytes, graph_segment, fts_bytes, fts_segment) = tokio::task::spawn_blocking(
-        move || -> anyhow::Result<(Vec<u8>, Segment, Vec<u8>, Segment)> {
-            let graph_bytes = build_graph_sqlite(&graph)?;
-            let graph_segment = Segment {
-                sha256: sha256_hex(&graph_bytes),
-                bytes: graph_bytes.len() as u64,
-            };
-            let fts_bytes = build_fts(&search_docs)?;
-            let fts_segment = Segment {
-                sha256: sha256_hex(&fts_bytes),
-                bytes: fts_bytes.len() as u64,
-            };
-            Ok((graph_bytes, graph_segment, fts_bytes, fts_segment))
-        },
-    )
-    .await
-    .context("shard segment build task panicked")??;
-    Ok(PreparedShard {
-        graph_bytes,
-        graph_segment,
-        fts_bytes,
-        fts_segment,
-        counts,
+    tokio::task::spawn_blocking(move || -> anyhow::Result<PreparedShard> {
+        deduplicate_identical_edges(&mut graph);
+        let counts = Counts {
+            nodes: graph.nodes.len() as i64,
+            edges: graph.edges.len() as i64,
+        };
+        let graph_bytes = build_graph_sqlite(&graph)?;
+        let graph_segment = Segment {
+            sha256: sha256_hex(&graph_bytes),
+            bytes: graph_bytes.len() as u64,
+        };
+        let fts_bytes = build_fts(&search_docs)?;
+        let fts_segment = Segment {
+            sha256: sha256_hex(&fts_bytes),
+            bytes: fts_bytes.len() as u64,
+        };
+        Ok(PreparedShard {
+            graph_bytes,
+            graph_segment,
+            fts_bytes,
+            fts_segment,
+            counts,
+        })
     })
+    .await
+    .context("shard segment build task panicked")?
+}
+
+/// Drop facts repeated byte-for-byte by an extractor before SQLite insertion.
+///
+/// The artifact's unique indexes intentionally identify an edge without its
+/// provenance or confidence. Keeping those fields in this deduplication key
+/// means conflicting derivations still reach SQLite and fail loudly instead of
+/// being mistaken for harmless extractor repetition.
+fn deduplicate_identical_edges(graph: &mut Graph) {
+    let mut seen = BTreeSet::new();
+    graph.edges.retain(|edge| {
+        seen.insert((
+            edge.src.clone(),
+            edge.dst.clone(),
+            edge.kind.as_str(),
+            edge.provenance.as_str(),
+            edge.confidence.to_bits(),
+            edge.location.clone(),
+        ))
+    });
 }
 
 /// Publish prepared segments for `commit` of repo `repo_id`: the graph
@@ -2010,9 +2029,20 @@ fn build_graph_sqlite(graph: &Graph) -> anyhow::Result<Vec<u8>> {
                  {EDGE_DST}        TEXT NOT NULL,
                  {EDGE_KIND}       TEXT NOT NULL,
                  {EDGE_PROVENANCE} TEXT NOT NULL,
-                 {EDGE_CONFIDENCE} REAL NOT NULL,
+                 {EDGE_CONFIDENCE} REAL NOT NULL
+                     CHECK ({EDGE_CONFIDENCE} >= 0.0 AND {EDGE_CONFIDENCE} <= 1.0),
                  {EDGE_LOCATION}   TEXT
              );
+             -- An edge's derivation and confidence describe it; its
+             -- endpoints, kind, and optional witnessed site identify it.
+             -- Split NULL and non-NULL sites because SQLite treats NULLs
+             -- as distinct in an ordinary UNIQUE constraint.
+             CREATE UNIQUE INDEX edges_unique_without_location
+                 ON {EDGES} ({EDGE_SRC}, {EDGE_DST}, {EDGE_KIND})
+                 WHERE {EDGE_LOCATION} IS NULL;
+             CREATE UNIQUE INDEX edges_unique_with_location
+                 ON {EDGES} ({EDGE_SRC}, {EDGE_DST}, {EDGE_KIND}, {EDGE_LOCATION})
+                 WHERE {EDGE_LOCATION} IS NOT NULL;
              -- Two single-column indexes, not one composite: the read
              -- path's incident-edge lookup is (src = ? OR dst = ?), which
              -- SQLite turns into two index seeks only when each side has
@@ -2066,6 +2096,87 @@ fn build_graph_sqlite(graph: &Graph) -> anyhow::Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_edge(kind: EdgeKind, confidence: f64, location: Option<&str>) -> Edge {
+        Edge {
+            src: "sym:src.rs#source".into(),
+            dst: "sym:dst.rs#target".into(),
+            kind,
+            provenance: Provenance::Syntactic,
+            confidence,
+            location: location.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn graph_build_rejects_conflicting_duplicate_edges_without_locations() {
+        let mut graph = Graph {
+            nodes: Vec::new(),
+            edges: vec![
+                test_edge(EdgeKind::Authored, 1.0, None),
+                test_edge(EdgeKind::Authored, 0.9, None),
+            ],
+        };
+        deduplicate_identical_edges(&mut graph);
+
+        assert_eq!(
+            graph.edges.len(),
+            2,
+            "conflicting facts are not deduplicated"
+        );
+        build_graph_sqlite(&graph)
+            .expect_err("conflicting duplicate AUTHORED edges must fail the build");
+    }
+
+    #[test]
+    fn writer_deduplicates_only_identical_edges() {
+        let edge = test_edge(EdgeKind::Imports, 0.9, Some("app.py:1:1"));
+        let mut graph = Graph {
+            nodes: Vec::new(),
+            edges: vec![edge.clone(), edge],
+        };
+
+        deduplicate_identical_edges(&mut graph);
+
+        assert_eq!(graph.edges.len(), 1);
+    }
+
+    #[test]
+    fn graph_build_distinguishes_edges_witnessed_at_different_locations() {
+        let graph = Graph {
+            nodes: Vec::new(),
+            edges: vec![
+                test_edge(EdgeKind::Calls, 0.9, Some("src.rs:1:1")),
+                test_edge(EdgeKind::Calls, 0.9, Some("src.rs:2:1")),
+            ],
+        };
+
+        build_graph_sqlite(&graph)
+            .expect("repeated relationships at distinct source sites are unique edges");
+    }
+
+    #[test]
+    fn graph_build_enforces_the_documented_confidence_range() {
+        for confidence in [-f64::EPSILON, 1.0 + f64::EPSILON, f64::NAN] {
+            let graph = Graph {
+                nodes: Vec::new(),
+                edges: vec![test_edge(EdgeKind::Calls, confidence, None)],
+            };
+            assert!(
+                build_graph_sqlite(&graph).is_err(),
+                "confidence {confidence:?} must fail the build"
+            );
+        }
+
+        for confidence in [0.0, 1.0] {
+            let graph = Graph {
+                nodes: Vec::new(),
+                edges: vec![test_edge(EdgeKind::Calls, confidence, None)],
+            };
+            build_graph_sqlite(&graph)
+                .unwrap_or_else(|error| panic!("confidence {confidence} must be valid: {error:#}"));
+        }
+    }
 
     #[test]
     fn contributor_blank_name_is_none_so_the_email_can_stand_in() {

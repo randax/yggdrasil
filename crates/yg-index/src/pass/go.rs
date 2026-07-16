@@ -7,7 +7,7 @@ use crate::resolve::{
 };
 
 use super::{
-    ExtractedFacts, descendants_of_kind, field_text, first_of_kind, mint_symbol, package_dir,
+    ExtractedFacts, descendants_of_kind, field_text, file_dir, first_of_kind, mint_symbol,
 };
 
 /// Phase 1 for one Go file: mint its Symbols and DEFINES edges and distill
@@ -22,7 +22,7 @@ pub(super) fn extract_go(
     let imports = extract_go_imports(root, path, source);
     let mut facts = GoFileFacts {
         file_id: file_id.to_string(),
-        dir: package_dir(path).to_string(),
+        dir: file_dir(path).to_string(),
         has_dot_import: imports.iter().any(|import| import.dot),
         imports,
         calls: Vec::new(),
@@ -251,13 +251,14 @@ fn collect_type_facts(
     }
 }
 
-/// An interface declaration's method set and whether it is complete.
-/// Any `type_elem` (an embedded interface, or a `A | B` / `~int`
-/// constraint) makes the set incomplete: the embedded methods aren't
-/// resolved here, and a constraint isn't a regular interface at all.
+/// An interface declaration's direct method set and type-element shape.
+/// Lone named type elements are counted for phase-2 embed resolution;
+/// unions, approximations, and other constraints make the interface
+/// ineligible for IMPLEMENTS matching.
 fn interface_shape(interface: tree_sitter::Node<'_>, source: &[u8]) -> InterfaceShape {
     let mut direct_methods = BTreeSet::new();
-    let mut complete = true;
+    let mut embedded_count = 0;
+    let mut has_type_constraints = false;
     let mut cursor = interface.walk();
     for elem in interface.children(&mut cursor) {
         match elem.kind() {
@@ -266,13 +267,20 @@ fn interface_shape(interface: tree_sitter::Node<'_>, source: &[u8]) -> Interface
                     direct_methods.insert(name.to_string());
                 }
             }
-            "type_elem" => complete = false,
+            "type_elem" => {
+                if embedded_interface_type(elem).is_some() {
+                    embedded_count += 1;
+                } else {
+                    has_type_constraints = true;
+                }
+            }
             _ => {}
         }
     }
     InterfaceShape {
         direct_methods,
-        complete,
+        embedded_count,
+        has_type_constraints,
     }
 }
 

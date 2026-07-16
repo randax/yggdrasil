@@ -7,7 +7,7 @@ mod http_client;
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 
-const NODE_ADDRESS_HELP: &str = "Exact node id, or a bare symbol name with --repo. Bare-name matching is byte-exact and case-sensitive; names without a safely searchable term set are un-addressable.";
+const NODE_ADDRESS_HELP: &str = "Exact node id, or a bare symbol name with --repo. Bare-name matching is byte-exact and case-sensitive; names shared by too many declarations are un-addressable.";
 
 #[derive(Parser)]
 #[command(
@@ -537,7 +537,7 @@ fn server_error_reason(text: &str) -> Option<String> {
             payload.address.repo.as_str()
         ),
         yg_verbs::NoSuchSymbolKind::UnaddressableSymbol => format!(
-            "symbol name {:?} in {} is un-addressable because it has no safely searchable term set",
+            "symbol name {:?} in {} is un-addressable because too many declarations share that exact name",
             payload.address.name.as_str(),
             payload.address.repo.as_str()
         ),
@@ -2061,7 +2061,7 @@ mod address_tests {
     use super::*;
 
     #[test]
-    fn node_address_help_documents_matching_and_zero_term_names() {
+    fn node_address_help_documents_matching_and_bounded_ambiguity() {
         for command in ["node", "neighbors", "history"] {
             let error = match Cli::try_parse_from(["yg", command, "--help"]) {
                 Ok(_) => panic!("--help must exit through clap's display error"),
@@ -2075,12 +2075,12 @@ mod address_tests {
     }
 
     #[test]
-    fn zero_term_symbol_404_is_not_reported_as_absent() {
+    fn overloaded_symbol_404_is_not_reported_as_absent() {
         let body = serde_json::json!({
             "error": {
                 "kind": "unaddressable_symbol",
                 "address": {
-                    "name": "::",
+                    "name": "Resolve",
                     "repo": "github.com/acme/widgets"
                 }
             }
@@ -2089,7 +2089,7 @@ mod address_tests {
         let reason = server_error_reason(&body.to_string()).expect("typed error is rendered");
 
         assert!(reason.contains("un-addressable"), "{reason}");
-        assert!(reason.contains("no safely searchable term set"), "{reason}");
+        assert!(reason.contains("too many declarations"), "{reason}");
         assert!(!reason.contains("no such symbol"), "{reason}");
     }
 }
