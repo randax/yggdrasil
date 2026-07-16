@@ -7,8 +7,9 @@ use anyhow::Context;
 use serde::Deserialize;
 
 use super::{
-    BoxFuture, Forge, ForgeRateLimit, ForgeRequestBudget, ListedRepo, OrgDiscovery,
-    acquire_forge_request, common_rate_limit_phrasing,
+    BoxFuture, CommitSha, ConditionalRequestAccounting, Forge, ForgeRateLimit,
+    ForgeRateObservation, ForgeRequestBudget, ListedRepo, OrgDiscovery, RepoPollOutcome,
+    RepoPoller, RepoSlug, acquire_forge_request,
 };
 use crate::rate::RATE_LIMIT_COOLDOWN;
 
@@ -17,10 +18,50 @@ const GITHUB_PAGE_SIZE: usize = 100;
 /// size this permits 100,000 repositories while bounding malformed pagination.
 const GITHUB_ORG_PAGE_LIMIT: usize = 1_000;
 /// Smallest server-requested cooldown honored for a GitHub API rate limit.
-const MIN_RETRY_AFTER: Duration = Duration::from_secs(1);
-/// Largest server-requested cooldown honored for a GitHub API rate limit.
-const MAX_RETRY_AFTER: Duration = Duration::from_secs(60 * 60);
+const MIN_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(5);
 const SECONDARY_RATE_LIMIT_MESSAGE: &str = "you have exceeded a secondary rate limit";
+
+/// Parsed `X-RateLimit-Remaining` request count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RateLimitRemaining(u32);
+
+impl RateLimitRemaining {
+    pub fn new(value: u32) -> Self {
+        Self(value)
+    }
+
+    pub fn get(self) -> u32 {
+        self.0
+    }
+
+    pub fn is_exhausted(self) -> bool {
+        self.0 == 0
+    }
+}
+
+/// Parsed `X-RateLimit-Reset` deadline, represented relative to receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RateLimitReset(Duration);
+
+impl RateLimitReset {
+    pub fn after(delay: Duration) -> Self {
+        Self(delay)
+    }
+
+    pub fn retry_after(self) -> Duration {
+        self.0
+    }
+}
+
+/// Parsed `Retry-After` delay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetryAfter(Duration);
+
+impl RetryAfter {
+    pub fn duration(self) -> Duration {
+        self.0
+    }
+}
 
 pub(crate) struct GitHubForge;
 
@@ -69,12 +110,302 @@ impl Forge for GitHubForge {
     }
 
     fn is_rate_limit(&self, message: &str) -> bool {
-        common_rate_limit_phrasing(message)
+        let _ = message;
+        false
     }
 
     fn discovery(&self) -> Option<&dyn OrgDiscovery> {
         Some(self)
     }
+
+    fn repo_poller(&self) -> Option<&dyn RepoPoller> {
+        Some(self)
+    }
+}
+
+#[derive(Deserialize)]
+struct GitHubCommit {
+    sha: String,
+}
+
+#[derive(Deserialize)]
+struct GitHubErrorResponse {
+    message: String,
+    documentation_url: Option<String>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum GitHubPollError {
+    #[error("building GitHub commit API URL from {0}")]
+    ApiUrl(yg_control::ForgeUrl),
+    #[error("GitHub poll request failed")]
+    Request(#[source] reqwest::Error),
+    #[error("GitHub poll returned unexpected status {0}")]
+    HttpStatus(reqwest::StatusCode),
+    #[error("GitHub poll returned invalid {name} header")]
+    InvalidHeader { name: &'static str },
+    #[error(transparent)]
+    InvalidCommit(#[from] super::InvalidCommitSha),
+}
+
+impl RepoPoller for GitHubForge {
+    fn poll_repo<'a>(
+        &'a self,
+        client: &'a reqwest::Client,
+        api_root: &'a yg_control::ForgeUrl,
+        slug: &'a RepoSlug,
+        token: Option<&'a str>,
+        validators: &'a yg_control::PollValidators,
+    ) -> BoxFuture<'a, anyhow::Result<RepoPollOutcome>> {
+        Box::pin(async move { poll_repo(client, api_root, slug, token, validators).await })
+    }
+}
+
+async fn poll_repo(
+    client: &reqwest::Client,
+    api_root: &yg_control::ForgeUrl,
+    slug: &RepoSlug,
+    token: Option<&str>,
+    validators: &yg_control::PollValidators,
+) -> anyhow::Result<RepoPollOutcome> {
+    let request = build_poll_request(client, api_root, slug, token, validators)?;
+    let response = client
+        .execute(request)
+        .await
+        .map_err(GitHubPollError::Request)?;
+    parse_poll_response(response, validators, token.is_some()).await
+}
+
+fn build_poll_request(
+    client: &reqwest::Client,
+    api_root: &yg_control::ForgeUrl,
+    slug: &RepoSlug,
+    token: Option<&str>,
+    validators: &yg_control::PollValidators,
+) -> Result<reqwest::Request, GitHubPollError> {
+    let mut url = reqwest::Url::parse(api_root.as_str())
+        .map_err(|_| GitHubPollError::ApiUrl(api_root.clone()))?;
+    let (owner, repo) = slug.segments();
+    {
+        let mut path = url
+            .path_segments_mut()
+            .map_err(|()| GitHubPollError::ApiUrl(api_root.clone()))?;
+        path.pop_if_empty()
+            .push("repos")
+            .push(owner)
+            .push(repo)
+            .push("commits")
+            .push("HEAD");
+    }
+    let mut request = client
+        .get(url)
+        .header(reqwest::header::USER_AGENT, "yggdrasil-sync")
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json");
+    if let Some(token) = token {
+        request = request.bearer_auth(token);
+    }
+    if let Some(etag) = &validators.etag {
+        let value = reqwest::header::HeaderValue::from_bytes(etag.as_bytes())
+            .map_err(|_| GitHubPollError::InvalidHeader { name: "ETag" })?;
+        request = request.header(reqwest::header::IF_NONE_MATCH, value);
+    }
+    if let Some(last_modified) = &validators.last_modified {
+        let value =
+            reqwest::header::HeaderValue::from_bytes(last_modified.as_bytes()).map_err(|_| {
+                GitHubPollError::InvalidHeader {
+                    name: "Last-Modified",
+                }
+            })?;
+        request = request.header(reqwest::header::IF_MODIFIED_SINCE, value);
+    }
+
+    request.build().map_err(GitHubPollError::Request)
+}
+
+async fn parse_poll_response(
+    response: reqwest::Response,
+    validators: &yg_control::PollValidators,
+    authenticated: bool,
+) -> anyhow::Result<RepoPollOutcome> {
+    let status = response.status();
+    let now = SystemTime::now();
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status == reqwest::StatusCode::FORBIDDEN
+    {
+        let has_retry_after = response
+            .headers()
+            .contains_key(reqwest::header::RETRY_AFTER);
+        let retry_after = parse_retry_after_header(response.headers(), now).unwrap_or(None);
+        let rate = ForgeRateObservation {
+            remaining: parse_u32_header(response.headers(), "x-ratelimit-remaining")
+                .unwrap_or(None)
+                .map(RateLimitRemaining),
+            reset: parse_rate_limit_reset_header(response.headers(), now).unwrap_or(None),
+        };
+        let remaining_exhausted = rate.remaining.is_some_and(RateLimitRemaining::is_exhausted);
+        let body = response
+            .json::<GitHubErrorResponse>()
+            .await
+            .unwrap_or(GitHubErrorResponse {
+                message: String::new(),
+                documentation_url: None,
+            });
+        let secondary = is_secondary_rate_limit_response(&body);
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS
+            || (status == reqwest::StatusCode::FORBIDDEN
+                && (has_retry_after || remaining_exhausted || secondary))
+        {
+            return Err(
+                ForgeRateLimit::new(status, rate_limit_retry_after(retry_after, rate)).into(),
+            );
+        }
+        return Err(GitHubPollError::HttpStatus(status).into());
+    }
+    let rate = parse_rate_observation(response.headers(), now)?;
+    let response_validators = response_validators(
+        response.headers(),
+        validators,
+        status == reqwest::StatusCode::NOT_MODIFIED,
+    );
+    if status == reqwest::StatusCode::NOT_MODIFIED {
+        return Ok(RepoPollOutcome::NotModified {
+            validators: response_validators,
+            rate,
+            accounting: if authenticated {
+                ConditionalRequestAccounting::AuthenticatedFree
+            } else {
+                ConditionalRequestAccounting::Charged
+            },
+        });
+    }
+    if status.is_success() {
+        let commit: GitHubCommit = response.json().await.map_err(GitHubPollError::Request)?;
+        return Ok(RepoPollOutcome::Head {
+            head: CommitSha::parse(commit.sha)?,
+            validators: response_validators,
+            rate,
+        });
+    }
+
+    Err(GitHubPollError::HttpStatus(status).into())
+}
+
+fn rate_limit_retry_after(retry_after: Option<RetryAfter>, rate: ForgeRateObservation) -> Duration {
+    retry_after
+        .map(RetryAfter::duration)
+        .into_iter()
+        .chain(rate.exhausted_retry_after())
+        .max()
+        .unwrap_or(RATE_LIMIT_COOLDOWN)
+}
+
+fn response_validators(
+    headers: &reqwest::header::HeaderMap,
+    previous: &yg_control::PollValidators,
+    retain_missing: bool,
+) -> yg_control::PollValidators {
+    let previous_etag = retain_missing.then(|| previous.etag.clone()).flatten();
+    let previous_last_modified = retain_missing
+        .then(|| previous.last_modified.clone())
+        .flatten();
+    yg_control::PollValidators {
+        etag: headers
+            .get(reqwest::header::ETAG)
+            .map(|value| yg_control::PollEtag::new(value.as_bytes()))
+            .or(previous_etag),
+        last_modified: headers
+            .get(reqwest::header::LAST_MODIFIED)
+            .map(|value| yg_control::PollLastModified::new(value.as_bytes()))
+            .or(previous_last_modified),
+    }
+}
+
+fn parse_rate_observation(
+    headers: &reqwest::header::HeaderMap,
+    now: SystemTime,
+) -> Result<ForgeRateObservation, GitHubPollError> {
+    let remaining = parse_u32_header(headers, "x-ratelimit-remaining")?.map(RateLimitRemaining);
+    let reset = parse_rate_limit_reset_header(headers, now)?;
+    Ok(ForgeRateObservation { remaining, reset })
+}
+
+fn parse_rate_limit_reset_header(
+    headers: &reqwest::header::HeaderMap,
+    now: SystemTime,
+) -> Result<Option<RateLimitReset>, GitHubPollError> {
+    Ok(parse_u64_header(headers, "x-ratelimit-reset")?
+        .map(|seconds| {
+            SystemTime::UNIX_EPOCH
+                .checked_add(Duration::from_secs(seconds))
+                .ok_or(GitHubPollError::InvalidHeader {
+                    name: "X-RateLimit-Reset",
+                })
+        })
+        .transpose()?
+        .map(|reset| {
+            reset
+                .duration_since(now)
+                .unwrap_or(Duration::ZERO)
+                .max(MIN_RATE_LIMIT_COOLDOWN)
+        })
+        .map(RateLimitReset))
+}
+
+fn parse_u32_header(
+    headers: &reqwest::header::HeaderMap,
+    name: &'static str,
+) -> Result<Option<u32>, GitHubPollError> {
+    headers
+        .get(name)
+        .map(|value| {
+            value
+                .to_str()
+                .ok()
+                .and_then(|value| value.trim().parse().ok())
+                .ok_or(GitHubPollError::InvalidHeader { name })
+        })
+        .transpose()
+}
+
+fn parse_u64_header(
+    headers: &reqwest::header::HeaderMap,
+    name: &'static str,
+) -> Result<Option<u64>, GitHubPollError> {
+    headers
+        .get(name)
+        .map(|value| {
+            value
+                .to_str()
+                .ok()
+                .and_then(|value| value.trim().parse().ok())
+                .ok_or(GitHubPollError::InvalidHeader { name })
+        })
+        .transpose()
+}
+
+fn parse_retry_after_header(
+    headers: &reqwest::header::HeaderMap,
+    now: SystemTime,
+) -> Result<Option<RetryAfter>, GitHubPollError> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .map(|value| {
+            value
+                .to_str()
+                .ok()
+                .and_then(|value| parse_retry_after(value, now))
+                .map(RetryAfter)
+                .ok_or(GitHubPollError::InvalidHeader {
+                    name: "Retry-After",
+                })
+        })
+        .transpose()
+}
+
+fn is_secondary_rate_limit_response(body: &GitHubErrorResponse) -> bool {
+    is_secondary_rate_limit_message(&body.message)
+        || body.documentation_url.as_deref().is_some_and(|url| {
+            url.contains("secondary-rate-limits") || url.contains("abuse-rate-limits")
+        })
 }
 
 #[derive(Deserialize)]
@@ -289,7 +620,10 @@ fn parse_retry_after(value: &str, now: SystemTime) -> Option<Duration> {
             let deadline = parse_imf_fixdate(value.trim())?;
             Some(deadline.duration_since(now).unwrap_or(Duration::ZERO))
         })?;
-    Some(duration.clamp(MIN_RETRY_AFTER, MAX_RETRY_AFTER))
+    let duration = duration.max(MIN_RATE_LIMIT_COOLDOWN);
+    std::time::Instant::now()
+        .checked_add(duration)
+        .map(|_| duration)
 }
 
 fn retry_after_or_default(value: Option<&str>, now: SystemTime) -> Duration {
@@ -375,6 +709,245 @@ mod tests {
 
     use super::*;
 
+    async fn poll_fixture(
+        response: String,
+        validators: yg_control::PollValidators,
+    ) -> Option<(anyhow::Result<RepoPollOutcome>, String)> {
+        poll_fixture_with_token(response, validators, None).await
+    }
+
+    async fn poll_fixture_with_token(
+        response: String,
+        validators: yg_control::PollValidators,
+        token: Option<&str>,
+    ) -> Option<(anyhow::Result<RepoPollOutcome>, String)> {
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return None,
+            Err(error) => panic!("binding GitHub poll fixture: {error}"),
+        };
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0; 4096];
+            socket.readable().await.unwrap();
+            let read = socket.try_read(&mut buf).unwrap();
+            socket.writable().await.unwrap();
+            socket.try_write(response.as_bytes()).unwrap();
+            String::from_utf8(buf[..read].to_vec()).unwrap()
+        });
+        let api_root = yg_control::ForgeUrl::parse(format!("http://{addr}")).unwrap();
+        let slug = RepoSlug::parse("acme/widgets").unwrap();
+        let result = GitHubForge
+            .poll_repo(&discovery_client(), &api_root, &slug, token, &validators)
+            .await;
+        Some((result, server.await.unwrap()))
+    }
+
+    #[test]
+    fn conditional_poll_request_contains_the_stored_validators() {
+        let validators = yg_control::PollValidators {
+            etag: Some(yg_control::PollEtag::new(b"\"revision-one\"")),
+            last_modified: Some(yg_control::PollLastModified::new(
+                b"Wed, 21 Oct 2015 07:28:00 GMT",
+            )),
+        };
+        let request = build_poll_request(
+            &discovery_client(),
+            &yg_control::ForgeUrl::parse("https://api.github.test").unwrap(),
+            &RepoSlug::parse("acme/widgets").unwrap(),
+            None,
+            &validators,
+        )
+        .unwrap();
+
+        assert_eq!(request.url().path(), "/repos/acme/widgets/commits/HEAD");
+        assert_eq!(
+            request.headers()[reqwest::header::IF_NONE_MATCH].as_bytes(),
+            b"\"revision-one\""
+        );
+        assert_eq!(
+            request.headers()[reqwest::header::IF_MODIFIED_SINCE].as_bytes(),
+            b"Wed, 21 Oct 2015 07:28:00 GMT"
+        );
+    }
+
+    #[tokio::test]
+    async fn conditional_poll_sends_stored_validators_and_maps_304() {
+        let validators = yg_control::PollValidators {
+            etag: Some(yg_control::PollEtag::new(b"\"revision-one\"")),
+            last_modified: Some(yg_control::PollLastModified::new(
+                b"Wed, 21 Oct 2015 07:28:00 GMT",
+            )),
+        };
+        let Some((result, request)) = poll_fixture(
+            "HTTP/1.1 304 Not Modified\r\ncontent-length: 0\r\n\r\n".to_string(),
+            validators.clone(),
+        )
+        .await
+        else {
+            return;
+        };
+
+        assert!(matches!(
+            result.unwrap(),
+            RepoPollOutcome::NotModified {
+                validators: returned,
+                accounting: ConditionalRequestAccounting::Charged,
+                ..
+            } if returned == validators
+        ));
+        let request = request.to_ascii_lowercase();
+        assert!(request.starts_with("get /repos/acme/widgets/commits/head "));
+        assert!(request.contains("if-none-match: \"revision-one\""));
+        assert!(request.contains("if-modified-since: wed, 21 oct 2015 07:28:00 gmt"));
+    }
+
+    #[tokio::test]
+    async fn authenticated_304_is_marked_free() {
+        let Some((result, request)) = poll_fixture_with_token(
+            "HTTP/1.1 304 Not Modified\r\ncontent-length: 0\r\n\r\n".to_string(),
+            yg_control::PollValidators::default(),
+            Some("secret"),
+        )
+        .await
+        else {
+            return;
+        };
+
+        assert!(matches!(
+            result.unwrap(),
+            RepoPollOutcome::NotModified {
+                accounting: ConditionalRequestAccounting::AuthenticatedFree,
+                ..
+            }
+        ));
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer secret")
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_poll_returns_a_typed_head_and_new_validators() {
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let body = format!(r#"{{"sha":"{sha}"}}"#);
+        let response = format!(
+            "HTTP/1.1 200 OK\r\netag: \"revision-two\"\r\nlast-modified: Thu, 22 Oct 2015 07:28:00 GMT\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let Some((result, _)) = poll_fixture(response, yg_control::PollValidators::default()).await
+        else {
+            return;
+        };
+
+        match result.unwrap() {
+            RepoPollOutcome::Head {
+                head, validators, ..
+            } => {
+                assert_eq!(head.as_str(), sha);
+                assert_eq!(validators.etag.unwrap().as_bytes(), b"\"revision-two\"");
+                assert_eq!(
+                    validators.last_modified.unwrap().as_bytes(),
+                    b"Thu, 22 Oct 2015 07:28:00 GMT"
+                );
+            }
+            RepoPollOutcome::NotModified { .. } => panic!("fixture returned a commit"),
+        }
+    }
+
+    #[test]
+    fn exhausted_primary_limit_uses_the_typed_reset_epoch() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-ratelimit-remaining", "0".parse().unwrap());
+        headers.insert("x-ratelimit-reset", "160".parse().unwrap());
+        let observation =
+            parse_rate_observation(&headers, SystemTime::UNIX_EPOCH + Duration::from_secs(100))
+                .unwrap();
+
+        assert_eq!(observation.remaining.map(RateLimitRemaining::get), Some(0));
+        assert_eq!(
+            observation.exhausted_retry_after(),
+            Some(Duration::from_secs(60))
+        );
+    }
+
+    #[test]
+    fn exhausted_primary_limit_with_past_reset_uses_minimum_cooldown() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-ratelimit-remaining", "0".parse().unwrap());
+        headers.insert("x-ratelimit-reset", "99".parse().unwrap());
+        let observation =
+            parse_rate_observation(&headers, SystemTime::UNIX_EPOCH + Duration::from_secs(100))
+                .unwrap();
+
+        assert_eq!(
+            observation.exhausted_retry_after(),
+            Some(MIN_RATE_LIMIT_COOLDOWN)
+        );
+    }
+
+    #[test]
+    fn a_later_primary_reset_wins_over_retry_after() {
+        let retry = rate_limit_retry_after(
+            Some(RetryAfter(Duration::from_secs(17))),
+            ForgeRateObservation {
+                remaining: Some(RateLimitRemaining(0)),
+                reset: Some(RateLimitReset(Duration::from_secs(60))),
+            },
+        );
+        assert_eq!(retry, Duration::from_secs(60));
+    }
+
+    #[tokio::test]
+    async fn retry_after_on_429_surfaces_a_typed_forge_cooldown() {
+        let body = r#"{"message":"slow down"}"#;
+        let response = format!(
+            "HTTP/1.1 429 Too Many Requests\r\nretry-after: 17\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let Some((result, _)) = poll_fixture(response, yg_control::PollValidators::default()).await
+        else {
+            return;
+        };
+        let error = result.expect_err("429 must request a Forge cooldown");
+        let signal = error
+            .downcast_ref::<ForgeRateLimit>()
+            .expect("rate limit stays typed across the adapter seam");
+        assert_eq!(signal.retry_after(), Duration::from_secs(17));
+    }
+
+    #[tokio::test]
+    async fn malformed_429_metadata_uses_the_default_forge_cooldown() {
+        let response = "HTTP/1.1 429 Too Many Requests\r\nretry-after: garbage\r\nx-ratelimit-remaining: garbage\r\nx-ratelimit-reset: garbage\r\ncontent-length: 0\r\n\r\n".to_string();
+        let Some((result, _)) = poll_fixture(response, yg_control::PollValidators::default()).await
+        else {
+            return;
+        };
+
+        let error = result.expect_err("429 must remain an authoritative rate-limit response");
+        let signal = error
+            .downcast_ref::<ForgeRateLimit>()
+            .expect("malformed optional metadata must not mask the typed cooldown");
+        assert_eq!(signal.retry_after(), RATE_LIMIT_COOLDOWN);
+    }
+
+    #[tokio::test]
+    async fn malformed_403_reset_preserves_an_exhausted_primary_limit() {
+        let response = "HTTP/1.1 403 Forbidden\r\nx-ratelimit-remaining: 0\r\nx-ratelimit-reset: garbage\r\ncontent-length: 0\r\n\r\n".to_string();
+        let Some((result, _)) = poll_fixture(response, yg_control::PollValidators::default()).await
+        else {
+            return;
+        };
+
+        let error = result.expect_err("an exhausted 403 must request a Forge cooldown");
+        let signal = error
+            .downcast_ref::<ForgeRateLimit>()
+            .expect("malformed reset metadata must not erase the exhausted-limit signal");
+        assert_eq!(signal.retry_after(), RATE_LIMIT_COOLDOWN);
+    }
+
     struct CountingBudget(AtomicUsize);
 
     impl ForgeRequestBudget for CountingBudget {
@@ -450,7 +1023,7 @@ mod tests {
             Some("Wed, 21 Oct 2015 07:28:00 GMT"),
             deadline + Duration::from_secs(1),
         );
-        assert_eq!(expired, MIN_RETRY_AFTER);
+        assert_eq!(expired, MIN_RATE_LIMIT_COOLDOWN);
     }
 
     #[tokio::test]
@@ -463,22 +1036,30 @@ mod tests {
         let date = retry_after_from_429_fixture("Wed, 21 Oct 2099 07:28:00 GMT")
             .await
             .expect("the second fixture binds when the first one did");
-        assert_eq!(date, MAX_RETRY_AFTER);
+        assert!(
+            date > Duration::from_secs(60 * 60),
+            "a future server deadline must not be shortened to one hour"
+        );
     }
 
     #[test]
-    fn unusable_retry_after_falls_back_and_server_values_are_clamped() {
+    fn unusable_retry_after_falls_back_and_zero_uses_minimum_cooldown() {
         assert_eq!(
             retry_after_or_default(Some("not-a-date"), SystemTime::UNIX_EPOCH),
             RATE_LIMIT_COOLDOWN
         );
         assert_eq!(
             retry_after_or_default(Some("0"), SystemTime::UNIX_EPOCH),
-            MIN_RETRY_AFTER
+            MIN_RATE_LIMIT_COOLDOWN
         );
         assert_eq!(
             retry_after_or_default(Some("86400"), SystemTime::UNIX_EPOCH),
-            MAX_RETRY_AFTER
+            Duration::from_secs(86_400)
+        );
+        assert_eq!(
+            retry_after_or_default(Some(&u64::MAX.to_string()), SystemTime::UNIX_EPOCH),
+            RATE_LIMIT_COOLDOWN,
+            "an unrepresentable monotonic deadline must not panic the worker"
         );
     }
 
@@ -672,7 +1253,11 @@ mod tests {
 
     #[tokio::test]
     async fn github_org_listing_maps_public_internal_and_private_visibility() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("binding repository-list fixture server: {error}"),
+        };
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (socket, _) = listener.accept().await.unwrap();

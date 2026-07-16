@@ -587,7 +587,7 @@ mod tests {
         assert!(stderr.contains("The requested URL returned error: 429"));
         assert!(
             crate::forge::builtin()
-                .for_kind("github")
+                .for_kind("git")
                 .is_rate_limit(&stderr),
             "C-locale git stderr must remain recognizable as a rate limit: {stderr:?}"
         );
