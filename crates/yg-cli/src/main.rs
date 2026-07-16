@@ -2,6 +2,7 @@
 
 mod client_config;
 mod deploy_config;
+mod http_client;
 
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
@@ -229,12 +230,17 @@ enum TokenCommand {
     Issue {
         #[arg(help = "Member name for a human or agent")]
         member: String,
+        /// Expire the token after this many seconds; omitted means no expiry
+        #[arg(long)]
+        expires_in_seconds: Option<u64>,
     },
     /// Revoke an active Member bearer token by id
     Revoke {
         #[arg(help = "Token id shown by `yg admin token issue`")]
         id: String,
     },
+    /// List Member tokens and their expiry/revocation status
+    List,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -349,8 +355,12 @@ async fn main() -> anyhow::Result<()> {
                 RulesCommand::List => admin_rules_list().await,
             },
             AdminCommand::Token { command } => match command {
-                TokenCommand::Issue { member } => admin_token_issue(member).await,
+                TokenCommand::Issue {
+                    member,
+                    expires_in_seconds,
+                } => admin_token_issue(member, expires_in_seconds).await,
                 TokenCommand::Revoke { id } => admin_token_revoke(id).await,
+                TokenCommand::List => admin_tokens_list().await,
             },
             AdminCommand::Status { json } => admin_status(json).await,
         },
@@ -488,10 +498,8 @@ async fn server_request<T>(
 where
     T: serde::de::DeserializeOwned + serde::Serialize,
 {
-    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     let (server, token) = client_env()?;
-    let mut request = CLIENT
-        .get_or_init(reqwest::Client::new)
+    let mut request = http_client::shared()
         .request(method, format!("{server}{path}"))
         .bearer_auth(&token);
     if let Some(body) = body {
@@ -556,16 +564,12 @@ where
 async fn mcp_proxy() -> anyhow::Result<()> {
     let (server, token) = client_env()?;
     let endpoint = format!("{server}/v1/mcp");
-    let client = reqwest::Client::new();
+    let client = http_client::shared();
     let stdin = std::io::stdin();
     let mut input = std::io::BufReader::new(stdin.lock());
     let stdout = std::io::stdout();
     let mut output = stdout.lock();
     while let Some(body) = read_mcp_message(&mut input)? {
-        let id = serde_json::from_slice::<serde_json::Value>(&body)
-            .ok()
-            .and_then(|body| body.get("id").cloned())
-            .unwrap_or(serde_json::Value::Null);
         let resp = client
             .post(&endpoint)
             .bearer_auth(&token)
@@ -592,17 +596,11 @@ async fn mcp_proxy() -> anyhow::Result<()> {
             let reason = parsed
                 .and_then(|body| body["error"].as_str().map(str::to_string))
                 .unwrap_or(text);
-            Some(
-                serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "error": {
-                        "code": -32000,
-                        "message": format!("MCP HTTP endpoint answered {status}: {reason}")
-                    }
-                })
-                .to_string(),
-            )
+            // A transport failure has no protocol-safe synthetic response:
+            // a batch has multiple ids and a notification must receive none.
+            // Terminate the stdio session so the MCP client observes the
+            // failed transport without an invented JSON-RPC correlation.
+            anyhow::bail!("MCP HTTP endpoint answered {status}: {reason}")
         }) else {
             continue;
         };
@@ -1078,18 +1076,57 @@ async fn admin_rules_list() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn admin_token_issue(member: String) -> anyhow::Result<()> {
+async fn admin_token_issue(member: String, expires_in_seconds: Option<u64>) -> anyhow::Result<()> {
+    let request = yg_verbs::admin::IssueTokenRequest {
+        member: yg_verbs::admin::MemberName::new(member),
+        expires_in_seconds: expires_in_seconds.map(yg_verbs::admin::TokenLifetimeSeconds::new),
+    };
     let response = server_json::<yg_verbs::admin::IssueTokenResponse>(
         reqwest::Method::POST,
         "/v1/admin/tokens",
-        Some(serde_json::json!({ "member": member })),
+        Some(serde_json::to_value(request)?),
     )
     .await?;
     let body = response.body;
     println!("id: {}", body.id);
     println!("member: {}", body.member);
+    match body.expires_at {
+        Some(expires_at) => println!("expires at: {}", expires_at.get()),
+        None => println!("expires: never"),
+    }
     println!("token: {}", body.token);
     println!("save this token now; it will not be shown again");
+    Ok(())
+}
+
+async fn admin_tokens_list() -> anyhow::Result<()> {
+    let response = server_json::<yg_verbs::admin::MemberTokensResponse>(
+        reqwest::Method::GET,
+        "/v1/admin/tokens",
+        None,
+    )
+    .await?;
+    if response.body.tokens.is_empty() {
+        println!("no member tokens");
+        return Ok(());
+    }
+    for token in response.body.tokens {
+        let status = match token.status {
+            yg_verbs::admin::MemberTokenStatus::Active => "active",
+            yg_verbs::admin::MemberTokenStatus::Expired => "expired",
+            yg_verbs::admin::MemberTokenStatus::Revoked => "revoked",
+        };
+        let expiry = token
+            .expires_at
+            .map(|timestamp| timestamp.get().to_string())
+            .unwrap_or_else(|| "never".to_string());
+        println!(
+            "{}  {}  {status}  created={}  expires={expiry}",
+            token.id,
+            token.member,
+            token.created_at.get(),
+        );
+    }
     Ok(())
 }
 
@@ -1266,10 +1303,11 @@ async fn serve(role: Role) -> anyhow::Result<()> {
 
     match role {
         Role::Api => {
-            let mut server = yg_api::serve_with_metrics(
+            let mut server = yg_api::serve_with_metrics_and_protection(
                 server_config(&deploy)?,
                 metrics,
                 metrics_access(&deploy),
+                deploy.protection,
             )
             .await?;
             println!("listening on http://{}", server.local_addr());
@@ -1370,10 +1408,11 @@ async fn serve(role: Role) -> anyhow::Result<()> {
             }
         }
         Role::All => {
-            let mut server = yg_api::serve_with_metrics(
+            let mut server = yg_api::serve_with_metrics_and_protection(
                 server_config(&deploy)?,
                 metrics.clone(),
                 metrics_access(&deploy),
+                deploy.protection,
             )
             .await?;
             let workers = workers(&deploy, &metrics).await?;

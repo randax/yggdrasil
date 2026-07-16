@@ -12,9 +12,10 @@ use yg_sync::forge::Forge;
 use yg_verbs::admin::{
     AddForgeResponse, AddRepoResponse, AddRuleResponse, AdminRepoStatus, AdminStatusResponse,
     DiscoverForgeResponse, DiscoveryQualifierConflictStatus, DiscoveryState, ForgeBaseUrl,
-    ForgeKind, IssueTokenResponse, JobState, JobStatus, MemberName, OrgName, RepoQualifier,
-    RepoSlug, RepoVisibility, RevokeTokenResponse, RuleAction, RuleResponse, RulesResponse,
-    ShardStatus, TokenId, VisibilityCounts,
+    ForgeKind, IssueTokenRequest, IssueTokenResponse, JobState, JobStatus, MemberName,
+    MemberTokenResponse, MemberTokenStatus, MemberTokensResponse, OrgName, RepoQualifier, RepoSlug,
+    RepoVisibility, RevokeTokenResponse, RuleAction, RuleResponse, RulesResponse, ShardStatus,
+    TokenId, TokenTimestampSeconds, VisibilityCounts,
 };
 
 use crate::AppState;
@@ -386,29 +387,61 @@ pub(crate) async fn admin_repo_add(
         .into_response())
 }
 
-#[derive(Deserialize)]
-pub(crate) struct IssueTokenRequest {
-    member: String,
-}
-
 pub(crate) async fn admin_token_issue(
     State(state): State<Arc<AppState>>,
     WireJson(req): WireJson<IssueTokenRequest>,
 ) -> Result<Response, ApiError> {
-    let member = req.member.trim();
-    if member.is_empty() {
-        return Err(ApiError::bad_request("member must not be empty"));
-    }
-    let issued = state.control.issue_member_token(member).await?;
+    let member = yg_control::MemberName::new(req.member.into_string())
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let lifetime = req
+        .expires_in_seconds
+        .map(|seconds| yg_control::MemberTokenLifetimeSeconds::new(seconds.get()))
+        .transpose()
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let issued = state.control.issue_member_token(member, lifetime).await?;
     Ok((
         StatusCode::CREATED,
         Wire(IssueTokenResponse {
-            id: TokenId::new(issued.id),
-            member: MemberName::new(issued.member),
+            id: TokenId::new(issued.id.into_string()),
+            member: MemberName::new(issued.member.into_string()),
             token: issued.token,
+            expires_at: issued
+                .expires_at
+                .map(|timestamp| TokenTimestampSeconds::new(timestamp.get())),
         }),
     )
         .into_response())
+}
+
+pub(crate) async fn admin_tokens_list(
+    State(state): State<Arc<AppState>>,
+) -> Result<Response, ApiError> {
+    let tokens = state
+        .control
+        .member_tokens()
+        .await?
+        .into_iter()
+        .map(|token| MemberTokenResponse {
+            id: TokenId::new(token.id.into_string()),
+            member: MemberName::new(token.member.into_string()),
+            created_at: TokenTimestampSeconds::new(token.created_at.get()),
+            last_used_at: token
+                .last_used_at
+                .map(|timestamp| TokenTimestampSeconds::new(timestamp.get())),
+            expires_at: token
+                .expires_at
+                .map(|timestamp| TokenTimestampSeconds::new(timestamp.get())),
+            revoked_at: token
+                .revoked_at
+                .map(|timestamp| TokenTimestampSeconds::new(timestamp.get())),
+            status: match token.status {
+                yg_control::MemberTokenStatus::Active => MemberTokenStatus::Active,
+                yg_control::MemberTokenStatus::Expired => MemberTokenStatus::Expired,
+                yg_control::MemberTokenStatus::Revoked => MemberTokenStatus::Revoked,
+            },
+        })
+        .collect();
+    Ok(Wire(MemberTokensResponse { tokens }).into_response())
 }
 
 pub(crate) async fn admin_token_revoke(

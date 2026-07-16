@@ -39,6 +39,17 @@ pub(crate) async fn mcp(
                 ))
                 .into_response();
             }
+            if messages.len() > state.mcp_batch_size_limit {
+                return Wire(jsonrpc_error(
+                    serde_json::Value::Null,
+                    -32000,
+                    format!(
+                        "JSON-RPC batch exceeds maximum of {} messages",
+                        state.mcp_batch_size_limit
+                    ),
+                ))
+                .into_response();
+            }
             let mut responses = Vec::new();
             for message in messages {
                 if let Some(response) = handle_mcp_message(state.clone(), message).await {
@@ -210,9 +221,7 @@ async fn call_verb_tool(
         }
         yg_verbs::Verb::Search => {
             let req = decode_tool_args(arguments)?;
-            let _timer = state.engine.metrics().timer(yg_verbs::Verb::Search);
             let response = state
-                .engine
                 .search(req)
                 .await
                 .map(yg_verbs::SearchWireResponse::from);
