@@ -13,9 +13,10 @@ use serde::{Deserialize, Serialize};
 use crate::cursor::{self, HistoryCursor, NeighborsCursor};
 use crate::search::{RepoQualifier, SearchResponse, SearchTarget};
 use crate::{
-    DEFAULT_HISTORY_LIMIT, DEFAULT_NEIGHBORS_DEPTH, DEFAULT_NEIGHBORS_LIMIT, Direction, GraphEdge,
-    HistoryCommit, HistoryOptions, HistoryRequest, MAX_HISTORY_LIMIT, MIN_PAGE_LIMIT,
-    NeighborsOptions, NeighborsRequest, NodeRequest, NodeResponse, NodeView, VerbId,
+    AddressedResponse, AmbiguousNodeAddress, AmbiguousResolution, DEFAULT_HISTORY_LIMIT,
+    DEFAULT_NEIGHBORS_DEPTH, DEFAULT_NEIGHBORS_LIMIT, Direction, GraphEdge, HistoryCommit,
+    HistoryOptions, HistoryRequest, MAX_HISTORY_LIMIT, MIN_PAGE_LIMIT, NeighborsOptions,
+    NeighborsRequest, NoSuchSymbol, NoSuchSymbolKind, NodeRequest, NodeResponse, NodeView, VerbId,
 };
 
 /// The sanitized error every Verb leaves the engine through: a client
@@ -29,6 +30,8 @@ pub enum VerbError {
     BadRequest(String),
     #[error("{0}")]
     NotFound(String),
+    #[error("no such symbol")]
+    NoSuchSymbol(NoSuchSymbol),
     #[error("{0}")]
     Gone(String),
     #[error("{0}")]
@@ -65,6 +68,15 @@ pub struct ResolvedShard {
     pub revision: String,
 }
 
+/// Matching graph and FTS segments for one immutable Shard revision.
+/// Only fuzzy addressing materializes both; exact ids retain the graph-only
+/// resolver path and its existing latency and failure behavior.
+pub struct ResolvedFuzzyShard {
+    pub graph_path: std::path::PathBuf,
+    pub fts_path: std::path::PathBuf,
+    pub revision: crate::ShardRevision,
+}
+
 /// How the engine reaches Shards: resolve a repo qualifier — via the
 /// pointer, or `pinned` (from a pagination cursor) bypassing it to read
 /// that exact immutable revision — to a verified local graph segment.
@@ -93,6 +105,19 @@ pub trait ShardResolver: Send + Sync {
         &self,
         target: &SearchTarget,
     ) -> impl Future<Output = Result<std::path::PathBuf, ResolveError>> + Send;
+
+    /// Resolve matching graph and FTS segments for a fuzzy address.
+    fn resolve_fuzzy(
+        &self,
+        _qualifier: &RepoQualifier,
+        _pinned: Option<crate::ShardRevision>,
+    ) -> impl Future<Output = Result<ResolvedFuzzyShard, ResolveError>> + Send {
+        async {
+            Err(ResolveError::Internal(anyhow::anyhow!(
+                "fuzzy resolution is not implemented by this Shard resolver"
+            )))
+        }
+    }
 }
 
 /// Map a resolution failure to the client's error. The words are the
@@ -318,15 +343,20 @@ impl<R: ShardResolver + 'static> Engine<R> {
     }
 
     /// The `node` Verb, end to end: parse, resolve, read.
-    pub async fn node(&self, req: NodeRequest) -> Result<NodeResponse, VerbError> {
+    pub async fn node(
+        &self,
+        req: NodeRequest,
+    ) -> Result<AddressedResponse<NodeResponse>, VerbError> {
         let _timer = self.metrics.timer(crate::Verb::Node);
-        let id = VerbId::parse(&req.id).map_err(VerbError::BadRequest)?;
-        let shard = self
-            .resolver
-            .resolve(&id.repo, None)
+        let resolved = self
+            .resolve_node_address(req.id, req.repo, req.path, None)
+            .await?;
+        let ResolvedAddress::Exact { shard, id } = resolved else {
+            return Ok(resolved.into_ambiguous());
+        };
+        run_verb(shard.path, id, crate::node)
             .await
-            .map_err(|e| resolve_error(&id.repo, false, e))?;
-        run_verb(shard.path, id, crate::node).await
+            .map(AddressedResponse::Resolved)
     }
 
     /// The `search` Verb, end to end: cursor policy, target resolution,
@@ -338,7 +368,10 @@ impl<R: ShardResolver + 'static> Engine<R> {
     /// The `neighbors` Verb, end to end: cursor decode and agreement,
     /// validation, resolve (pinned by the cursor where present), read,
     /// cursor encode.
-    pub async fn neighbors(&self, req: NeighborsRequest) -> Result<NeighborsResponse, VerbError> {
+    pub async fn neighbors(
+        &self,
+        req: NeighborsRequest,
+    ) -> Result<AddressedResponse<NeighborsResponse>, VerbError> {
         let _timer = self.metrics.timer(crate::Verb::Neighbors);
         let cursor = req
             .cursor
@@ -375,16 +408,20 @@ impl<R: ShardResolver + 'static> Engine<R> {
         };
         options.validate().map_err(VerbError::BadRequest)?;
 
-        let id = VerbId::parse(&shape.id).map_err(VerbError::BadRequest)?;
         // A cursor pins the revision its traversal started on; fresh
         // queries resolve the current pointer.
         let pinned = cursor.as_ref().map(|c| c.rev.clone());
-        let from_cursor = pinned.is_some();
-        let shard = self
-            .resolver
-            .resolve(&id.repo, pinned)
-            .await
-            .map_err(|e| resolve_error(&id.repo, from_cursor, e))?;
+        let resolved = self
+            .resolve_node_address(
+                shape.id.clone(),
+                shape.repo.clone(),
+                shape.path.clone(),
+                pinned,
+            )
+            .await?;
+        let ResolvedAddress::Exact { shard, id } = resolved else {
+            return Ok(resolved.into_ambiguous());
+        };
 
         let verb_options = options.clone();
         let page = run_verb(shard.path, id, move |conn, id| {
@@ -400,17 +437,20 @@ impl<R: ShardResolver + 'static> Engine<R> {
                 after: after.clone(),
             })
         });
-        Ok(NeighborsResponse {
+        Ok(AddressedResponse::Resolved(NeighborsResponse {
             nodes: page.nodes,
             edges: page.edges,
             next_cursor,
-        })
+        }))
     }
 
     /// The `history` Verb, end to end: cursor decode and agreement,
     /// `since` normalization, validation, resolve (pinned by the cursor
     /// where present), read, cursor encode, date rendering.
-    pub async fn history(&self, req: HistoryRequest) -> Result<HistoryResponse, VerbError> {
+    pub async fn history(
+        &self,
+        req: HistoryRequest,
+    ) -> Result<AddressedResponse<HistoryResponse>, VerbError> {
         let _timer = self.metrics.timer(crate::Verb::History);
         let cursor = req
             .cursor
@@ -426,17 +466,26 @@ impl<R: ShardResolver + 'static> Engine<R> {
             .map_err(VerbError::BadRequest)?;
         if let Some(cursor) = &cursor {
             cursor
-                .agrees_with(&req.id, req_since)
+                .agrees_with(&req.id, req.repo.as_ref(), req.path.as_ref(), req_since)
                 .map_err(VerbError::BadRequest)?;
         }
         // The id + since in force: the cursor's where resuming (it
         // remembers the original, and agrees_with ruled out
         // contradiction), the request's on a fresh history.
-        let (id_str, since) = match &cursor {
-            Some(cursor) => (cursor.id.clone(), cursor.since),
-            None => (req.id.clone(), req_since),
+        let (id_str, repo, path, since) = match &cursor {
+            Some(cursor) => (
+                cursor.id.clone(),
+                cursor.repo.clone(),
+                cursor.path.clone(),
+                cursor.since,
+            ),
+            None => (
+                req.id.clone(),
+                req.repo.clone(),
+                req.path.clone(),
+                req_since,
+            ),
         };
-        let id = VerbId::parse(&id_str).map_err(VerbError::BadRequest)?;
         let limit = req.limit.map_or(DEFAULT_HISTORY_LIMIT, |l| l as usize);
         if !(MIN_PAGE_LIMIT..=MAX_HISTORY_LIMIT).contains(&limit) {
             return Err(VerbError::BadRequest(format!(
@@ -446,12 +495,12 @@ impl<R: ShardResolver + 'static> Engine<R> {
         // A cursor pins the revision its history started on; fresh
         // queries resolve the current pointer.
         let pinned = cursor.as_ref().map(|c| c.rev.clone());
-        let from_cursor = pinned.is_some();
-        let shard = self
-            .resolver
-            .resolve(&id.repo, pinned)
-            .await
-            .map_err(|e| resolve_error(&id.repo, from_cursor, e))?;
+        let resolved = self
+            .resolve_node_address(id_str.clone(), repo.clone(), path.clone(), pinned)
+            .await?;
+        let ResolvedAddress::Exact { shard, id } = resolved else {
+            return Ok(resolved.into_ambiguous());
+        };
         let options = HistoryOptions {
             limit,
             since,
@@ -467,6 +516,8 @@ impl<R: ShardResolver + 'static> Engine<R> {
             cursor::encode(&HistoryCursor {
                 rev: shard.revision.clone(),
                 id: id_str.clone(),
+                repo: repo.clone(),
+                path: path.clone(),
                 since,
                 after_committed_at: *at,
                 after_sha: sha.clone(),
@@ -487,10 +538,87 @@ impl<R: ShardResolver + 'static> Engine<R> {
                 Ok(HistoryCommitView { date, commit })
             })
             .collect::<Result<Vec<_>, VerbError>>()?;
-        Ok(HistoryResponse {
+        Ok(AddressedResponse::Resolved(HistoryResponse {
             commits,
             next_cursor,
-        })
+        }))
+    }
+
+    async fn resolve_node_address(
+        &self,
+        raw_id: String,
+        repo: Option<RepoQualifier>,
+        path: Option<crate::SearchPath>,
+        pinned: Option<String>,
+    ) -> Result<ResolvedAddress, VerbError> {
+        let address =
+            crate::fuzzy::parse_address(&raw_id, repo, path).map_err(VerbError::BadRequest)?;
+        let from_cursor = pinned.is_some();
+        match address {
+            crate::fuzzy::NodeAddress::Exact(id) => {
+                let shard = self
+                    .resolver
+                    .resolve(&id.repo, pinned)
+                    .await
+                    .map_err(|error| resolve_error(&id.repo, from_cursor, error))?;
+                Ok(ResolvedAddress::Exact { shard, id })
+            }
+            crate::fuzzy::NodeAddress::Fuzzy(address) => {
+                let qualifier = address.repo.clone();
+                let resolved = self
+                    .resolver
+                    .resolve_fuzzy(&qualifier, pinned.map(crate::ShardRevision::new))
+                    .await
+                    .map_err(|error| resolve_error(qualifier.as_str(), from_cursor, error))?;
+                let name = address.name.as_str().to_string();
+                let path = address.path.as_ref().map(|path| path.as_str().to_string());
+                let fts_path = resolved.fts_path;
+                let symbols = tokio::task::spawn_blocking(move || {
+                    let index = yg_shard::open_fts(&fts_path)?;
+                    yg_shard::symbols_named(&index, &name, path.as_deref())
+                })
+                .await
+                .map_err(|error| {
+                    VerbError::Internal(
+                        anyhow::Error::new(error).context("fuzzy resolution task panicked"),
+                    )
+                })?
+                .map_err(VerbError::Internal)?;
+                let mut candidates = crate::fuzzy::rank_candidates(&address, symbols);
+                match candidates.len() {
+                    0 => Err(VerbError::NoSuchSymbol(NoSuchSymbol {
+                        kind: NoSuchSymbolKind::NoSuchSymbol,
+                        address,
+                    })),
+                    1 => Ok(ResolvedAddress::Exact {
+                        shard: ResolvedShard {
+                            path: resolved.graph_path,
+                            revision: resolved.revision.as_str().to_string(),
+                        },
+                        id: candidates.pop().expect("one candidate").id,
+                    }),
+                    _ => Ok(ResolvedAddress::Ambiguous(AmbiguousNodeAddress {
+                        resolution: AmbiguousResolution::Ambiguous,
+                        address,
+                        candidates,
+                    })),
+                }
+            }
+        }
+    }
+}
+
+enum ResolvedAddress {
+    Exact { shard: ResolvedShard, id: VerbId },
+    Ambiguous(AmbiguousNodeAddress),
+}
+
+impl ResolvedAddress {
+    fn into_ambiguous<T>(self) -> AddressedResponse<T> {
+        match self {
+            Self::Ambiguous(ambiguous) => AddressedResponse::Ambiguous(ambiguous),
+            Self::Exact { .. } => unreachable!("the caller matched the exact variant"),
+        }
     }
 }
 

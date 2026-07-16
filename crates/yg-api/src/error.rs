@@ -19,14 +19,20 @@ pub(crate) fn error_json(status: StatusCode, message: impl Into<String>) -> Resp
 #[derive(Debug)]
 pub(crate) struct ApiError {
     pub(crate) status: StatusCode,
-    pub(crate) message: String,
+    body: ErrorBody,
+}
+
+#[derive(Debug)]
+enum ErrorBody {
+    Message(String),
+    NoSuchSymbol(yg_verbs::NoSuchSymbol),
 }
 
 impl ApiError {
     fn new(status: StatusCode, message: impl Into<String>) -> Self {
         Self {
             status,
-            message: message.into(),
+            body: ErrorBody::Message(message.into()),
         }
     }
 
@@ -74,6 +80,10 @@ impl From<yg_verbs::VerbError> for ApiError {
         match e {
             yg_verbs::VerbError::BadRequest(message) => Self::bad_request(message),
             yg_verbs::VerbError::NotFound(message) => Self::not_found(message),
+            yg_verbs::VerbError::NoSuchSymbol(payload) => Self {
+                status: StatusCode::NOT_FOUND,
+                body: ErrorBody::NoSuchSymbol(payload),
+            },
             yg_verbs::VerbError::Gone(message) => Self::gone(message),
             yg_verbs::VerbError::Unavailable(message) => Self::unavailable(message),
             yg_verbs::VerbError::Internal(source) => Self::internal(source),
@@ -83,6 +93,11 @@ impl From<yg_verbs::VerbError> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        error_json(self.status, self.message)
+        match self.body {
+            ErrorBody::Message(message) => error_json(self.status, message),
+            ErrorBody::NoSuchSymbol(payload) => {
+                (self.status, Wire(serde_json::json!({"error": payload}))).into_response()
+            }
+        }
     }
 }

@@ -15,7 +15,7 @@ use std::io::Read;
 use std::path::Path;
 
 use anyhow::Context;
-use tantivy::collector::TopDocs;
+use tantivy::collector::{DocSetCollector, TopDocs};
 use tantivy::query::{BooleanQuery, Occur, Query, QueryParser, TermQuery};
 use tantivy::schema::{
     Field, IndexRecordOption, STORED, STRING, Schema, TextFieldIndexing, TextOptions, Value,
@@ -62,6 +62,42 @@ pub struct LocalHit {
     pub path: Option<String>,
     pub score: f32,
     pub snippet: Option<String>,
+}
+
+/// One symbol declaration found by an exact-name lookup in the FTS
+/// segment. The graph reader uses the node id; the remaining fields are
+/// enough to present an ambiguous address without opening or scanning the
+/// graph segment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalSymbol {
+    pub node_id: LocalSymbolId,
+    pub path: LocalSymbolPath,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalSymbolId(String);
+
+impl LocalSymbolId {
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalSymbolPath(String);
+
+impl LocalSymbolPath {
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 /// File name of the full-text segment inside a Shard — the packed tantivy
@@ -535,6 +571,78 @@ pub fn search(index: &FtsIndex, params: &SearchParams) -> anyhow::Result<Vec<Loc
     Ok(hits)
 }
 
+/// Find every Symbol whose stored name exactly equals `name`, optionally
+/// narrowed to declarations whose repository-relative path contains
+/// `path_fragment`.
+///
+/// Candidate discovery is index-backed and exhaustive: the terms generated
+/// by the FTS tokenizer select a finite document set, then the stored raw name
+/// is compared exactly so identifier sub-word matches never become fuzzy
+/// addresses. `DocSetCollector` deliberately has no top-N cutoff; truncating
+/// candidates could turn a genuinely ambiguous address into a false unique
+/// match.
+pub fn symbols_named(
+    index: &FtsIndex,
+    name: &str,
+    path_fragment: Option<&str>,
+) -> anyhow::Result<Vec<LocalSymbol>> {
+    let mut analyzer = index
+        .index
+        .tokenizers()
+        .get("default")
+        .context("the FTS index has no default tokenizer")?;
+    let mut stream = analyzer.token_stream(name);
+    let mut clauses = Vec::new();
+    while stream.advance() {
+        let term = Term::from_field_text(index.fields.terms, &stream.token().text);
+        clauses.push((
+            Occur::Must,
+            Box::new(TermQuery::new(term, IndexRecordOption::Basic)) as Box<dyn Query>,
+        ));
+    }
+    if clauses.is_empty() {
+        return Ok(Vec::new());
+    }
+    let symbol = Term::from_field_text(index.fields.kind, NodeKind::Symbol.as_str());
+    clauses.push((
+        Occur::Must,
+        Box::new(TermQuery::new(symbol, IndexRecordOption::Basic)),
+    ));
+    let query = BooleanQuery::new(clauses);
+    let searcher = index.reader.searcher();
+    let addresses = searcher
+        .search(&query, &DocSetCollector)
+        .context("looking up symbol declarations by name")?;
+
+    let mut symbols = Vec::new();
+    for address in addresses {
+        let doc: TantivyDocument = searcher
+            .doc(address)
+            .context("reading a symbol lookup document")?;
+        let stored = |field| doc.get_first(field).and_then(|value| value.as_str());
+        let Some(stored_name) = stored(index.fields.name) else {
+            continue;
+        };
+        if stored_name != name {
+            continue;
+        }
+        let Some(path) = stored(index.fields.path) else {
+            continue;
+        };
+        if path_fragment.is_some_and(|fragment| !path.contains(fragment)) {
+            continue;
+        }
+        let node_id =
+            stored(index.fields.node_id).context("a symbol lookup document has no node_id")?;
+        symbols.push(LocalSymbol {
+            node_id: LocalSymbolId::new(node_id.to_string()),
+            path: LocalSymbolPath::new(path.to_string()),
+        });
+    }
+    symbols.sort_unstable_by(|left, right| left.node_id.0.cmp(&right.node_id.0));
+    Ok(symbols)
+}
+
 /// Highlighted snippets for specific hits, keyed by node id — the
 /// hydration pass run over the final page after the cross-repo merge.
 /// `query` is the same user query the ranking used, so the highlight
@@ -593,8 +701,10 @@ impl std::error::Error for QueryMalformed {}
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_QUERY_BYTES, MAX_QUERY_DEPTH, guard_query_complexity, identifier_words, unpack_fts,
+        MAX_QUERY_BYTES, MAX_QUERY_DEPTH, SearchDoc, build_fts, guard_query_complexity,
+        identifier_words, open_fts, symbols_named, unpack_fts,
     };
+    use crate::NodeKind;
 
     #[test]
     fn identifier_words_splits_camel_snake_and_acronyms() {
@@ -662,5 +772,47 @@ mod tests {
             !dir.path().join("sub").exists() && !dir.path().join("escape").exists(),
             "nothing was written outside a bare file name"
         );
+    }
+
+    #[test]
+    fn exact_symbol_lookup_is_exhaustive_and_path_narrowable() {
+        let bytes = build_fts(&[
+            SearchDoc {
+                node_id: "sym:a/service.go#Resolve".to_string(),
+                kind: NodeKind::Symbol,
+                name: Some("Resolve".to_string()),
+                path: Some("a/service.go".to_string()),
+                content: String::new(),
+            },
+            SearchDoc {
+                node_id: "sym:b/service.go#Resolve".to_string(),
+                kind: NodeKind::Symbol,
+                name: Some("Resolve".to_string()),
+                path: Some("b/service.go".to_string()),
+                content: String::new(),
+            },
+            SearchDoc {
+                node_id: "sym:a/service.go#Resolver".to_string(),
+                kind: NodeKind::Symbol,
+                name: Some("Resolver".to_string()),
+                path: Some("a/service.go".to_string()),
+                content: String::new(),
+            },
+        ])
+        .expect("build fixture index");
+        let packed = tempfile::tempdir().expect("packed fixture dir");
+        unpack_fts(&bytes, packed.path()).expect("unpack fixture index");
+        let index = open_fts(packed.path()).expect("open fixture index");
+
+        let all = symbols_named(&index, "Resolve", None).expect("lookup all declarations");
+        assert_eq!(all.len(), 2, "the prefix-like Resolver is exact-filtered");
+        assert_eq!(all[0].path.as_str(), "a/service.go");
+        assert_eq!(all[1].path.as_str(), "b/service.go");
+
+        let narrowed =
+            symbols_named(&index, "Resolve", Some("b/")).expect("lookup under path fragment");
+        assert_eq!(narrowed.len(), 1);
+        assert_eq!(narrowed[0].node_id.as_str(), "sym:b/service.go#Resolve");
+        assert!(symbols_named(&index, "Missing", None).unwrap().is_empty());
     }
 }

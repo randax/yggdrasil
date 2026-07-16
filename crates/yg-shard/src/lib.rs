@@ -21,8 +21,9 @@ use sha2::{Digest, Sha256};
 mod fts;
 pub mod graph_schema;
 pub use fts::{
-    FTS_SEGMENT_FILE, FtsIndex, LocalHit, QueryMalformed, SearchDoc, SearchParams, build_fts,
-    open_fts, search, snippets_for, unpack_fts,
+    FTS_SEGMENT_FILE, FtsIndex, LocalHit, LocalSymbol, LocalSymbolId, LocalSymbolPath,
+    QueryMalformed, SearchDoc, SearchParams, build_fts, open_fts, search, snippets_for,
+    symbols_named, unpack_fts,
 };
 
 /// Version of the Shard layout (graph tables + manifest shape). Part of
