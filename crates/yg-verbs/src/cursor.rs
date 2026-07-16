@@ -81,9 +81,17 @@ impl NeighborsCursor {
                 kinds
             })
         }
-        let contradicts = req.id != self.shape.id
-            || (req.repo.is_some() && req.repo != self.shape.repo)
-            || (req.path.is_some() && req.path != self.shape.path)
+        let address_contradicts = (req.repo.is_some() && req.repo != self.shape.repo)
+            || (req.path.is_some() && req.path != self.shape.path);
+        if address_contradicts {
+            return Err(
+                "this cursor belongs to a different request (id, repo, path, direction, \
+                 edge_kinds, and depth must match the page it came from); start a fresh \
+                 traversal or pass the cursor with the original parameters"
+                    .to_string(),
+            );
+        }
+        let traversal_contradicts = req.id != self.shape.id
             || (req.direction.is_some()
                 && direction(&req.direction)? != direction(&self.shape.direction)?)
             || (req.edge_kinds.is_some()
@@ -91,7 +99,7 @@ impl NeighborsCursor {
             || req
                 .depth
                 .is_some_and(|d| d != self.shape.depth.unwrap_or(1));
-        if contradicts {
+        if traversal_contradicts {
             return Err(
                 "this cursor belongs to a different request (id, direction, edge_kinds, \
                  and depth must match the page it came from); start a fresh traversal \
@@ -446,9 +454,53 @@ mod tests {
             "optional address fields may be omitted"
         );
         resume.repo = Some(RepoQualifier::new("github.com/other/repo".to_string()));
-        assert!(
-            fuzzy.agrees_with(&resume).is_err(),
-            "an explicit repo must agree"
+        let err = fuzzy
+            .agrees_with(&resume)
+            .expect_err("an explicit repo must agree");
+        assert_eq!(
+            err,
+            "this cursor belongs to a different request (id, repo, path, direction, \
+             edge_kinds, and depth must match the page it came from); start a fresh \
+             traversal or pass the cursor with the original parameters"
+        );
+
+        resume.repo = fuzzy.shape.repo.clone();
+        resume.path = Some(SearchPath::new("tests/".to_string()));
+        resume.direction = Some("sideways".to_string());
+        assert_eq!(
+            fuzzy
+                .agrees_with(&resume)
+                .expect_err("an explicit path must disagree before direction parsing"),
+            err,
+            "repo and path disagreements use the fuzzy-address message even with another invalid field"
+        );
+    }
+
+    #[test]
+    fn exact_neighbors_cursor_disagreement_keeps_legacy_message() {
+        let cursor = NeighborsCursor {
+            rev: "rev-1".to_string(),
+            shape: TraversalShape {
+                id: "sym:github.com/acme/widgets:main.go#Hello".to_string(),
+                repo: None,
+                path: None,
+                direction: None,
+                edge_kinds: None,
+                depth: None,
+            },
+            after_depth: 1,
+            after: "x".to_string(),
+        };
+        let mut request = cursor.shape.clone();
+        request.depth = Some(2);
+
+        assert_eq!(
+            cursor
+                .agrees_with(&request)
+                .expect_err("a different depth must be rejected"),
+            "this cursor belongs to a different request (id, direction, edge_kinds, \
+             and depth must match the page it came from); start a fresh traversal \
+             or pass the cursor with the original parameters"
         );
     }
 
