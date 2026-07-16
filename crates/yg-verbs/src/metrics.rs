@@ -91,6 +91,13 @@ impl Metrics {
     /// The engine calls this after its final response DTO is formed, which
     /// gives REST and MCP one shared payload measurement. Transport envelopes,
     /// headers, and error bodies are deliberately outside this observation.
+    ///
+    /// Deliberate costs, weighed against splitting the measurement into each
+    /// transport: this is one extra compact serialization pass, bounded by
+    /// the response caps, on top of the wire layer's own canonicalization;
+    /// and it runs after the latency timer drops, so the duration histogram
+    /// keeps meaning "verb execution" rather than absorbing observability
+    /// overhead.
     pub fn observe_response<T: serde::Serialize + ?Sized>(&self, verb: Verb, response: &T) {
         let mut counter = ByteCounter::default();
         match serde_json::to_writer(&mut counter, response) {
