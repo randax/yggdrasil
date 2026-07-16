@@ -12,7 +12,10 @@ use tokio::task::JoinHandle;
 // of this crate keep addressing it as `yg_api::ObjectStoreConfig`.
 pub use yg_shard::{CacheCapacity, ObjectStoreConfig, probe_object_store};
 
-pub const DEFAULT_TOKEN_RATE_LIMIT_REQUESTS: u32 = 120;
+// Generous enough that legitimate concurrent agent bursts (and the
+// query-storm e2e suites) never trip it, while still bounding a
+// runaway retry loop to ~16 sustained requests per second per token.
+pub const DEFAULT_TOKEN_RATE_LIMIT_REQUESTS: u32 = 1000;
 pub const DEFAULT_TOKEN_RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
 pub const DEFAULT_SEARCH_CONCURRENCY_LIMIT: usize = 8;
 pub const DEFAULT_MCP_BATCH_SIZE_LIMIT: usize = 32;

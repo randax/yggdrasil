@@ -54,7 +54,7 @@ never connects — cannot report it:
 | `YG_LISTEN` | `127.0.0.1:7311` | Server bind address |
 | `YG_WORKER_METRICS_ADDR` | — (disabled) | Worker-only `/metrics` bind address (for example `0.0.0.0:9400`); absent means no HTTP listener |
 | `YG_METRICS_UNAUTHENTICATED` | `false` | Expose `GET /metrics` without a bearer token for scraper convenience |
-| `YG_TOKEN_RATE_LIMIT_REQUESTS` | `120` | Requests allowed per bearer token in each rate-limit window |
+| `YG_TOKEN_RATE_LIMIT_REQUESTS` | `1000` | Requests allowed per bearer token in each rate-limit window |
 | `YG_TOKEN_RATE_LIMIT_WINDOW` | `60` | Per-token rate-limit window in seconds |
 | `YG_SEARCH_CONCURRENCY` | `8` | Server-wide concurrent `search` execution cap across REST and MCP |
 | `YG_MCP_BATCH_SIZE` | `32` | Maximum JSON-RPC messages accepted in one MCP batch |
