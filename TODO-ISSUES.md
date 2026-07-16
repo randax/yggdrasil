@@ -46,7 +46,7 @@ Critical path: **#59 → {#60, #62, #64} → {#63, #65, #66}**.
 - [x] **#63** Signed, re-validated cursors (after #59/#60 consolidate cursor infra).
 - [x] **#65** MCP conformance + Skill contract-version handshake (after #62).
 - [x] **#66** CLI UX: machine-readable writes, exit-code classes, flag vocabulary (after #60).
-- [ ] **#51** Deployment vehicle: container image + compose profile.
+- [x] **#51** Deployment vehicle: container image + compose profile.
 - [ ] ~~**#15** Release packaging (atop #51).~~ *Skipped per owner instruction (2026-07-16).*
 - [x] **#68** Tokens-per-task metrics + orientation-efficiency eval (after #47; baseline after #64/#44).
 - [x] **#29** Orphaned object-storage segment reconciler (after #40).

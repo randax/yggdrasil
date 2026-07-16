@@ -1,5 +1,8 @@
 # Developing yggdrasil
 
+For the container image, reference Compose deployment, first boot, and
+upgrades, see [Deployment](DEPLOYMENT.md).
+
 ## Prerequisites
 
 - Rust (stable — `rust-toolchain.toml` pins the channel and pulls in rustfmt + clippy)
