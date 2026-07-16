@@ -45,9 +45,10 @@ use yg_shard::graph_schema::{
     NODE_COMMITTED_AT, NODE_ID, NODE_KIND, NODE_NAME, NODE_PATH, NODES,
 };
 
+pub use cursor::{CursorCodec, CursorError, CursorSecret, CursorSecretError};
 pub use engine::{
-    Engine, HistoryCommitView, HistoryResponse, NeighborsResponse, ResolveError, ResolvedFts,
-    ResolvedFuzzyShard, ResolvedShard, ShardResolver, VerbError,
+    Engine, HistoryCommitView, HistoryResponse, NeighborsResponse, PinnedShard, ResolveError,
+    ResolvedFts, ResolvedFuzzyShard, ResolvedShard, ShardResolver, VerbError,
 };
 pub use fuzzy::{
     AddressedResponse, AmbiguousNodeAddress, AmbiguousResolution, FuzzyNodeAddress,
@@ -56,7 +57,7 @@ pub use fuzzy::{
 pub use metrics::Metrics;
 pub use search::{
     RepoQualifier, SearchHit, SearchNodeName, SearchPath, SearchResponse, SearchSnippet,
-    SearchTarget, SearchWireResponse, ShardRevision,
+    SearchTarget, SearchTargetProvenance, SearchWireResponse, ShardRevision,
 };
 pub use yg_shard::{EdgeKind, Provenance};
 

@@ -22,6 +22,10 @@ fn config_check_reports_resolved_config_without_starting_the_server() {
         // Unreachable database and object store: config-check succeeding
         // anyway is what proves it never connects.
         .env("YG_BOOTSTRAP_TOKEN", "ygt_admin_credential")
+        .env(
+            "YG_CURSOR_SECRET",
+            "issue-63-config-check-secret-at-least-32-bytes",
+        )
         .env("YG_DATABASE_URL", "postgres://db.invalid:5432/yg")
         .env("YG_S3_ENDPOINT", "http://s3.invalid:9000")
         .env("YG_SHARD_CACHE_MAX_BYTES", "1048576")
@@ -48,6 +52,10 @@ fn config_check_reports_resolved_config_without_starting_the_server() {
 #[test]
 fn config_check_never_prints_credentials() {
     yg().env("YG_BOOTSTRAP_TOKEN", "ygt_admin_credential")
+        .env(
+            "YG_CURSOR_SECRET",
+            "issue-63-config-check-secret-at-least-32-bytes",
+        )
         .env("YG_S3_ACCESS_KEY", "s3_access_credential")
         .env("YG_S3_SECRET_KEY", "s3_secret_credential")
         // Assembled at runtime so no source line carries something a
@@ -77,8 +85,8 @@ fn config_check_never_prints_credentials() {
 #[test]
 fn config_check_reports_every_validation_error_and_exits_nonzero() {
     yg()
-        // No bootstrap token, a bad listen address, and a bad duration:
-        // all three must be reported in one run.
+        // Both API secrets are absent alongside independent scalar errors;
+        // all of them must be reported in one run.
         .env("YG_LISTEN", "not-an-address")
         .env("YG_GC_GRACE", "soon")
         .env("YG_SHARD_CACHE_MAX_BYTES", "0")
@@ -87,6 +95,7 @@ fn config_check_reports_every_validation_error_and_exits_nonzero() {
         .failure()
         .stderr(
             contains("YG_BOOTSTRAP_TOKEN")
+                .and(contains("YG_CURSOR_SECRET"))
                 .and(contains("YG_LISTEN"))
                 .and(contains("not-an-address"))
                 .and(contains("YG_GC_GRACE"))
