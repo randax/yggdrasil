@@ -136,7 +136,7 @@ async fn schema_v7_searches_code_paths_and_normalizes_cross_repo_rank() {
         pairs.sort_unstable();
         pairs
     };
-    let mut expected_tier = |path: &str| {
+    let expected_tier = |path: &str| {
         let mut pairs = vec![
             (small.clone(), path.to_string()),
             (large.clone(), path.to_string()),
