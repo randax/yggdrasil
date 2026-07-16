@@ -4231,10 +4231,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "yg-providers"
-version = "0.1.0"
-
-[[package]]
 name = "yg-shard"
 version = "0.1.0"
 dependencies = [
