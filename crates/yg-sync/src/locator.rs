@@ -1,6 +1,7 @@
 //! Parsing repository URLs into a Forge root plus repo slug.
 
 use crate::forge::Forge;
+use crate::forge::ForgeRegistry;
 use crate::forge::git_generic::GitForge;
 
 /// Why a repository URL failed to parse. Typed per the repo's
@@ -54,6 +55,18 @@ pub struct RepoLocator {
     pub slug: String,
 }
 
+/// A syntactically parsed repository URL whose Forge adapter has not yet been
+/// selected. Keeping this phase separate lets callers consult configured
+/// Forge records before falling back to host claims.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnclassifiedRepoLocator {
+    url: String,
+    scheme: Option<String>,
+    host: Option<String>,
+    base_url: String,
+    segments: Vec<String>,
+}
+
 impl RepoLocator {
     /// Parse a repository URL as given to `yg admin repo add`.
     ///
@@ -68,6 +81,16 @@ impl RepoLocator {
     /// path — credentials, query strings, fragments, `.`/`..` segments —
     /// is rejected rather than guessed at.
     pub fn parse(url: &str) -> Result<Self, LocatorError> {
+        Self::parse_with_registry(url, crate::forge::builtin())
+    }
+
+    /// Parse using an injected Forge registry for host classification.
+    pub fn parse_with_registry(url: &str, registry: &ForgeRegistry) -> Result<Self, LocatorError> {
+        Self::parse_unclassified(url)?.resolve_with_registry(registry)
+    }
+
+    /// Parse URL structure without selecting a Forge adapter.
+    pub fn parse_unclassified(url: &str) -> Result<UnclassifiedRepoLocator, LocatorError> {
         let url = url.trim().trim_end_matches('/');
         if url.contains('?') || url.contains('#') {
             return Err(LocatorError::QueryOrFragment { url: url.into() });
@@ -84,10 +107,12 @@ impl RepoLocator {
             let Some((base_parts, slug_parts)) = segments.split_last_chunk::<2>() else {
                 return Err(LocatorError::TooFewFileSegments { url: url.into() });
             };
-            return Ok(Self {
-                kind: GitForge.kind(),
+            return Ok(UnclassifiedRepoLocator {
+                url: url.into(),
+                scheme: None,
+                host: None,
                 base_url: format!("file:///{}", base_parts.join("/")),
-                slug: slug_parts.join("/"),
+                segments: slug_parts.iter().map(|segment| (*segment).into()).collect(),
             });
         }
 
@@ -117,23 +142,89 @@ impl RepoLocator {
         if segments.len() < 2 {
             return Err(LocatorError::TooFewSegments { url: url.into() });
         }
-        // The forge claiming this host owns the rest of the rules: path
-        // shape (GitHub is exactly owner/repo) and canonical scheme
-        // (GitHub only speaks https, so a token never travels plaintext
-        // because of a URL spelling and http/https variants land on one
-        // forge row).
-        let forge = crate::forge::builtin().for_host(&host);
-        let scheme = forge.canonical_scheme(&scheme, &segments, url)?;
-        Ok(Self {
-            kind: forge.kind(),
+        Ok(UnclassifiedRepoLocator {
+            url: url.into(),
             base_url: format!("{scheme}://{host}"),
-            slug: segments.join("/"),
+            scheme: Some(scheme),
+            host: Some(host),
+            segments: segments.into_iter().map(Into::into).collect(),
         })
     }
 
     /// The URL workers clone/fetch from.
     pub fn clone_url(&self) -> String {
         join_clone_url(&self.base_url, &self.slug)
+    }
+}
+
+impl UnclassifiedRepoLocator {
+    /// The normalized Forge root as the caller spelled it, before adapter
+    /// classification changes its scheme.
+    pub fn input_base_url(&self) -> Result<yg_control::ForgeUrl, yg_control::ForgeUrlParseError> {
+        yg_control::ForgeUrl::parse(self.base_url.clone())
+    }
+
+    /// The canonical root spelling used only to query configured Forge records.
+    ///
+    /// Forge administration stores HTTP-capable Forge roots as HTTPS. Preserve
+    /// the typed scheme on this locator so an unknown HTTP Git remote still
+    /// reaches the generic fallback unchanged.
+    pub fn configured_lookup_base_url(
+        &self,
+    ) -> Result<yg_control::ForgeUrl, yg_control::ForgeUrlParseError> {
+        let base_url = match (&self.scheme, &self.host) {
+            (Some(scheme), Some(host)) if scheme == "http" => format!("https://{host}"),
+            _ => self.base_url.clone(),
+        };
+        yg_control::ForgeUrl::parse(base_url)
+    }
+
+    /// Resolve with the adapter selected by a configured Forge record.
+    ///
+    /// The adapter sees the canonical HTTPS spelling used for the lookup, and
+    /// the resulting locator retains the exact configured root. The original
+    /// typed scheme remains untouched on the fallback path.
+    pub fn resolve_configured(
+        mut self,
+        forge: &dyn Forge,
+        configured_base_url: &yg_control::ForgeUrl,
+    ) -> Result<RepoLocator, LocatorError> {
+        if self.scheme.as_deref() == Some("http") {
+            self.scheme = Some("https".into());
+        }
+        let mut locator = self.resolve(forge)?;
+        locator.base_url = configured_base_url.as_str().to_owned();
+        Ok(locator)
+    }
+
+    /// Resolve through host claims when no configured Forge record matched.
+    pub fn resolve_with_registry(
+        self,
+        registry: &ForgeRegistry,
+    ) -> Result<RepoLocator, LocatorError> {
+        let forge = self
+            .host
+            .as_deref()
+            .map_or(&GitForge as &dyn Forge, |host| registry.for_host(host));
+        self.resolve(forge)
+    }
+
+    /// Resolve with an explicitly selected adapter.
+    fn resolve(self, forge: &dyn Forge) -> Result<RepoLocator, LocatorError> {
+        let base_url = match (&self.scheme, &self.host) {
+            (Some(scheme), Some(host)) => {
+                let segments: Vec<&str> = self.segments.iter().map(String::as_str).collect();
+                let scheme = forge.canonical_scheme(scheme, &segments, &self.url)?;
+                format!("{scheme}://{host}")
+            }
+            (None, None) => self.base_url,
+            _ => unreachable!("parsed locators have both a scheme and host, or neither"),
+        };
+        Ok(RepoLocator {
+            kind: forge.kind(),
+            base_url,
+            slug: self.segments.join("/"),
+        })
     }
 }
 

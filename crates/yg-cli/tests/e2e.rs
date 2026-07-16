@@ -4,8 +4,58 @@
 
 mod common;
 
+use std::sync::Arc;
+
 use common::*;
-use yg_api::serve;
+use yg_api::{serve, serve_with_registry};
+use yg_sync::forge::{BoxFuture, Forge, ForgeRegistry, GitAuth, ListedRepo, OrgDiscovery};
+
+struct UnsupportedDiscoveryForge;
+
+impl Forge for UnsupportedDiscoveryForge {
+    fn kind(&self) -> &'static str {
+        "custom"
+    }
+
+    fn claims_host(&self, host: &str) -> bool {
+        host == "custom.example"
+    }
+
+    fn default_token_env(&self) -> Option<&'static str> {
+        None
+    }
+
+    fn default_api_root(&self, base_url: &str) -> Option<String> {
+        Some(format!("{base_url}/api"))
+    }
+
+    fn git_auth(&self, token: String) -> GitAuth {
+        GitAuth {
+            username: "custom",
+            token,
+        }
+    }
+
+    fn is_rate_limit(&self, _message: &str) -> bool {
+        false
+    }
+
+    fn discovery(&self) -> Option<&dyn OrgDiscovery> {
+        Some(self)
+    }
+}
+
+impl OrgDiscovery for UnsupportedDiscoveryForge {
+    fn list_org_repos<'a>(
+        &'a self,
+        _client: &'a reqwest::Client,
+        _api_root: &'a str,
+        _org: &'a str,
+        _token: Option<&'a str>,
+    ) -> BoxFuture<'a, anyhow::Result<Vec<ListedRepo>>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+}
 
 #[tokio::test]
 async fn admin_repo_add_registers_repo_and_admin_status_lists_it_queued() {
@@ -431,6 +481,93 @@ async fn admin_forge_add_normalizes_base_url_and_defaults_the_github_token_env()
         due.api_root.as_deref(),
         Some("https://api.github.com"),
         "registration must record the forge's API root on the record"
+    );
+}
+
+#[tokio::test]
+async fn custom_forge_add_is_rejected_before_mutating_the_default_row() {
+    let db_name = create_test_db().await;
+    let control = control_plane(&db_name).await;
+    let registry = ForgeRegistry::builtin().register(Arc::new(UnsupportedDiscoveryForge));
+    let server = serve_with_registry(test_config(&db_name), registry)
+        .await
+        .unwrap();
+    let base = format!("http://{}", server.local_addr());
+    let client = reqwest::Client::new();
+    let request = serde_json::json!({"kind": "custom", "org": "acme"});
+
+    let add = client
+        .post(format!("{base}/v1/admin/forges"))
+        .bearer_auth(TEST_TOKEN)
+        .json(&request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(add.status(), 400);
+    assert_eq!(
+        add.json::<serde_json::Value>().await.unwrap(),
+        serde_json::json!({
+            "error": "forge kind custom is not supported by this endpoint"
+        })
+    );
+    assert_eq!(
+        control
+            .forge_id_by_base_url("https://github.com")
+            .await
+            .unwrap(),
+        None,
+        "rejected forge add must not create the default GitHub forge row"
+    );
+}
+
+#[tokio::test]
+async fn custom_forge_discover_is_rejected_before_resetting_the_schedule() {
+    let db_name = create_test_db().await;
+    let control = control_plane(&db_name).await;
+    control
+        .connect_forge_org(yg_control::ConnectForgeOrg {
+            forge_kind: "github",
+            base_url: "https://github.com",
+            org_slug: "acme",
+            token_env: None,
+            api_root: None,
+        })
+        .await
+        .unwrap();
+    control
+        .claim_due_discovery(std::time::Duration::from_secs(3600))
+        .await
+        .unwrap()
+        .expect("the setup org must initially be due");
+
+    let registry = ForgeRegistry::builtin().register(Arc::new(UnsupportedDiscoveryForge));
+    let server = serve_with_registry(test_config(&db_name), registry)
+        .await
+        .unwrap();
+    let base = format!("http://{}", server.local_addr());
+    let client = reqwest::Client::new();
+    let request = serde_json::json!({"kind": "custom", "org": "acme"});
+    let discover = client
+        .post(format!("{base}/v1/admin/forges/discover"))
+        .bearer_auth(TEST_TOKEN)
+        .json(&request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(discover.status(), 400);
+    assert_eq!(
+        discover.json::<serde_json::Value>().await.unwrap(),
+        serde_json::json!({
+            "error": "forge kind custom is not supported by this endpoint"
+        })
+    );
+    assert!(
+        control
+            .claim_due_discovery(std::time::Duration::from_secs(3600))
+            .await
+            .unwrap()
+            .is_none(),
+        "rejected discovery must not make the org due again"
     );
 }
 
