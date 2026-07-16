@@ -34,6 +34,8 @@ pub enum LocatorError {
     DotSegments { path: String },
     #[error("repository paths must not contain whitespace or control characters: {path}")]
     ForbiddenPathCharacters { path: String },
+    #[error("repository paths must not contain URL credential delimiters ':' or '@': {path}")]
+    CredentialPathCharacters { path: String },
     #[error(
         "GitHub repositories are owner/repo — drop the trailing path \
          (got {extra} extra segment(s)): {url}"
@@ -237,6 +239,19 @@ pub fn join_clone_url(base_url: &str, slug: &str) -> String {
     format!("{base}/{slug}")
 }
 
+/// Validate and normalize a Forge API repository slug with the same generic
+/// path rules used by manual repository URL registration.
+pub(crate) fn normalize_repo_slug(slug: &str) -> Result<String, LocatorError> {
+    if slug.contains('?') || slug.contains('#') {
+        return Err(LocatorError::QueryOrFragment { url: slug.into() });
+    }
+    let segments = path_segments(slug)?;
+    if segments.len() < 2 {
+        return Err(LocatorError::TooFewSegments { url: slug.into() });
+    }
+    Ok(segments.join("/"))
+}
+
 /// A repository path split into its meaningful segments: empty segments
 /// (doubled slashes) collapse; `.`/`..` segments are rejected — they
 /// never name a repository, only an escape attempt or a typo.
@@ -245,10 +260,13 @@ fn path_segments(path: &str) -> Result<Vec<&str>, LocatorError> {
     // repository path; stored in the slug they would be rejoined
     // verbatim into a clone URL that fails every fetch forever.
     if path
-        .bytes()
-        .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+        .chars()
+        .any(|character| character.is_whitespace() || character.is_control())
     {
         return Err(LocatorError::ForbiddenPathCharacters { path: path.into() });
+    }
+    if path.contains([':', '@']) {
+        return Err(LocatorError::CredentialPathCharacters { path: path.into() });
     }
     let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     if segments.iter().any(|s| *s == "." || *s == "..") {

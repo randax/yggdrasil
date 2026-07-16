@@ -1117,11 +1117,13 @@ async fn admin_status(json: bool) -> anyhow::Result<()> {
         return Ok(());
     }
     let body = response.body;
-    if body.repos.is_empty() {
+    if body.repos.is_empty() && body.discovery_conflicts.is_empty() {
         println!("no repositories registered — add one with: yg admin repo add <url>");
         return Ok(());
     }
-    print_visibility_counts(body.visibility_counts);
+    if !body.repos.is_empty() {
+        print_visibility_counts(body.visibility_counts);
+    }
     for repo in body.repos {
         let commit = repo
             .last_synced_commit
@@ -1149,6 +1151,12 @@ async fn admin_status(json: bool) -> anyhow::Result<()> {
             print!("  [index attempt {}: {error}]", repo.index.attempts);
         }
         println!();
+    }
+    for conflict in body.discovery_conflicts {
+        println!(
+            "{}  discovery conflict ({}/{}, qualifier {} is already registered)",
+            conflict.slug, conflict.forge, conflict.org, conflict.qualifier
+        );
     }
     Ok(())
 }

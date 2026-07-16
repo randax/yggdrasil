@@ -11,9 +11,10 @@ use yg_sync::RepoLocator;
 use yg_sync::forge::Forge;
 use yg_verbs::admin::{
     AddForgeResponse, AddRepoResponse, AddRuleResponse, AdminRepoStatus, AdminStatusResponse,
-    DiscoverForgeResponse, DiscoveryState, ForgeBaseUrl, ForgeKind, IssueTokenResponse, JobState,
-    JobStatus, MemberName, OrgName, RepoSlug, RepoVisibility, RevokeTokenResponse, RuleAction,
-    RuleResponse, RulesResponse, ShardStatus, TokenId, VisibilityCounts,
+    DiscoverForgeResponse, DiscoveryQualifierConflictStatus, DiscoveryState, ForgeBaseUrl,
+    ForgeKind, IssueTokenResponse, JobState, JobStatus, MemberName, OrgName, RepoQualifier,
+    RepoSlug, RepoVisibility, RevokeTokenResponse, RuleAction, RuleResponse, RulesResponse,
+    ShardStatus, TokenId, VisibilityCounts,
 };
 
 use crate::AppState;
@@ -441,6 +442,18 @@ fn record_visibility(counts: &mut VisibilityCounts, visibility: yg_control::Repo
 
 pub(crate) async fn admin_status(State(state): State<Arc<AppState>>) -> Result<Response, ApiError> {
     let repos = state.control.admin_status().await?;
+    let discovery_conflicts = state
+        .control
+        .admin_discovery_conflicts()
+        .await?
+        .into_iter()
+        .map(|conflict| DiscoveryQualifierConflictStatus {
+            forge: ForgeBaseUrl::from_domain(conflict.forge),
+            org: OrgName::new(conflict.org.as_str().to_owned()),
+            slug: RepoSlug::new(conflict.slug.as_str().to_owned()),
+            qualifier: RepoQualifier::new(conflict.qualifier.as_str().to_owned()),
+        })
+        .collect();
     let mut visibility_counts = VisibilityCounts::default();
     for repo in &repos {
         record_visibility(&mut visibility_counts, repo.visibility);
@@ -504,6 +517,7 @@ pub(crate) async fn admin_status(State(state): State<Arc<AppState>>) -> Result<R
     Ok(Wire(AdminStatusResponse {
         repos,
         visibility_counts,
+        discovery_conflicts,
     })
     .into_response())
 }
