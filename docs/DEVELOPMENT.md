@@ -106,6 +106,37 @@ and `YG_TOKEN`; both can instead be set as top-level `server` and `token`
 keys in `~/.config/yg/config.toml` (standard TOML; the environment wins
 over the file).
 
+### CLI automation
+
+Every administrative write command supports `--json`, matching the existing
+machine-readable convention on read commands. JSON is written as one typed
+response document to stdout; diagnostics remain on stderr. Without `--json`,
+the existing human-readable output is unchanged. The write commands are
+`admin repo add`, `admin forge add`, `admin forge discover`, `admin rules add`,
+`admin token issue`, and `admin token revoke`. Token issuance includes its
+one-time secret in the JSON response, so callers must protect stdout as
+credential material.
+
+Scripts can branch on this stable exit-code vocabulary:
+
+| Code | Meaning |
+|---:|---|
+| 0 | Success |
+| 1 | Other failure, including rejected non-authentication 4xx requests |
+| 2 | Command-line usage error |
+| 3 | Authentication or authorization failure (HTTP 401 or 403) |
+| 4 | Resource not found (HTTP 404) |
+| 5 | Server or transport failure (HTTP 5xx, connection, timeout, or invalid server response) |
+
+Code 2 preserves clap's command-line convention. Codes 3 through 5 form a
+small contiguous set for the failure classes where automation normally takes a
+different action: replace credentials, stop looking for a resource, or retry the
+server request.
+
+Node and edge filters use distinct vocabulary: `search --node-kinds` filters
+result node kinds, while `neighbors --edge-kinds` filters traversed edge kinds.
+The previously ambiguous `--kind` spelling is intentionally not retained.
+
 End to end from a clean checkout:
 
 ```sh

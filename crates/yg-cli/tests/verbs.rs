@@ -68,7 +68,7 @@ async fn yg_neighbors_lists_the_subgraph_humanly_and_as_raw_json() {
             &id,
             "--direction",
             "out",
-            "--kind",
+            "--edge-kinds",
             "CALLS",
             "--json",
         ])
