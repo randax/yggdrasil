@@ -206,6 +206,7 @@ async fn git_log_history(git_dir: &Path, commit: &CommitSha) -> anyhow::Result<S
         .args(["log", commit.as_str(), "--no-renames", "--name-only", "-z"])
         .arg("--pretty=format:%H%x00%ct%x00%an%x00%ae%x00%s%x00")
         .env("GIT_TERMINAL_PROMPT", "0")
+        .env("LC_ALL", "C")
         .kill_on_drop(true);
     let out = tokio::time::timeout(HISTORY_LOG_TIMEOUT, cmd.output())
         .await

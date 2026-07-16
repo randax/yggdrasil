@@ -6,8 +6,36 @@
 pub(crate) mod git_generic;
 pub(crate) mod github;
 
+pub use github::GitHubListingError;
+
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
+
+/// A Forge API response asking this process to stop making requests for a
+/// bounded period. Adapters surface this typed signal so the worker can apply
+/// it to the same per-Forge cooldown used by polling.
+#[derive(Debug, thiserror::Error)]
+#[error("forge returned {status} and requested a {retry_after:?} cooldown")]
+pub struct ForgeRateLimit {
+    status: reqwest::StatusCode,
+    retry_after: Duration,
+}
+
+impl ForgeRateLimit {
+    /// Create a Forge-wide cooldown signal for an API response.
+    pub fn new(status: reqwest::StatusCode, retry_after: Duration) -> Self {
+        Self {
+            status,
+            retry_after,
+        }
+    }
+
+    /// The duration the Forge-wide request bucket must remain paused.
+    pub fn retry_after(&self) -> Duration {
+        self.retry_after
+    }
+}
 
 /// Boxed future for dyn-compatible async trait methods.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -17,6 +45,31 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub struct ListedRepo {
     pub slug: String,
     pub visibility: yg_control::RepoVisibility,
+}
+
+/// A Forge request could not be spent from the worker's per-process
+/// budget. The duration says when the budget can next grant a request.
+#[derive(Debug, thiserror::Error)]
+#[error("Forge request budget exhausted; retry after {retry_after:?}")]
+pub struct ForgeBudgetExhausted {
+    pub retry_after: Duration,
+}
+
+/// The per-process request budget presented to a Forge discovery
+/// adapter. Adapters take one token immediately before each API call.
+pub trait ForgeRequestBudget: Send + Sync {
+    fn take(&self) -> Result<(), ForgeBudgetExhausted>;
+}
+
+/// Wait until one Forge request can be charged. Sleeping is cancellable with
+/// the surrounding discovery future, so shutdown never leaves detached work.
+pub(crate) async fn acquire_forge_request(budget: &dyn ForgeRequestBudget) {
+    loop {
+        match budget.take() {
+            Ok(()) => return,
+            Err(exhausted) => tokio::time::sleep(exhausted.retry_after).await,
+        }
+    }
 }
 
 /// Basic-auth credentials for git-over-HTTP: each forge dictates the
@@ -84,7 +137,8 @@ pub trait Forge: Send + Sync {
 
 /// Listing an org's repositories through a forge's API.
 pub trait OrgDiscovery: Send + Sync {
-    /// List every repository of `org`, following pagination.
+    /// List every repository of `org`, following pagination. Return
+    /// [`ForgeRateLimit`] to request a Forge-wide cooldown.
     fn list_org_repos<'a>(
         &'a self,
         client: &'a reqwest::Client,
@@ -92,6 +146,25 @@ pub trait OrgDiscovery: Send + Sync {
         org: &'a str,
         token: Option<&'a str>,
     ) -> BoxFuture<'a, anyhow::Result<Vec<ListedRepo>>>;
+
+    /// List every repository while charging each discovery operation to
+    /// the worker's Forge request budget. The default covers adapters
+    /// whose listing is one request; paginated adapters override this
+    /// and take a token before every page. Return [`ForgeRateLimit`] to
+    /// request a Forge-wide cooldown.
+    fn list_org_repos_budgeted<'a>(
+        &'a self,
+        client: &'a reqwest::Client,
+        api_root: &'a str,
+        org: &'a str,
+        token: Option<&'a str>,
+        budget: &'a dyn ForgeRequestBudget,
+    ) -> BoxFuture<'a, anyhow::Result<Vec<ListedRepo>>> {
+        Box::pin(async move {
+            acquire_forge_request(budget).await;
+            self.list_org_repos(client, api_root, org, token).await
+        })
+    }
 }
 
 /// The forge adapters a worker dispatches through, looked up by kind

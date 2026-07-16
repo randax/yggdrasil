@@ -349,16 +349,9 @@ impl IndexWorker {
             let _serialize_same_mirror =
                 yg_sync::lock_mirror(&self.git_cache, job.repo_id, INDEX_LEASE).await?;
             let mirror = self.ensure_mirror_has(job, commit).await?;
-            // The checkout extraction is blocking (archive | tar); run it
-            // off the runtime threads, under the lock.
-            {
-                let mirror = mirror.clone();
-                let commit = commit.clone();
-                let dest = checkout.path().to_path_buf();
-                tokio::task::spawn_blocking(move || extract_tree(&mirror, &commit, &dest))
-                    .await
-                    .context("checkout extraction task panicked")??;
-            }
+            // The async archive pipeline is timeout- and kill-guarded, and
+            // remains under the mirror lock until both children settle.
+            extract_tree(&mirror, commit, checkout.path()).await?;
             // The history walk runs its own (timeout- and kill-guarded) git
             // log, still under the mirror lock so a concurrent prune can't
             // GC objects mid-walk.
@@ -454,17 +447,64 @@ async fn commit_available(mirror: &Path, commit: &CommitSha) -> bool {
     let mut cmd = tokio::process::Command::new("git");
     cmd.arg("--git-dir")
         .arg(mirror)
-        .args(["cat-file", "-e", &format!("{commit}^{{commit}}")]);
+        .args(["cat-file", "-e", &format!("{commit}^{{commit}}")])
+        .env("LC_ALL", "C");
     cmd.kill_on_drop(true);
-    matches!(cmd.status().await, Ok(status) if status.success())
+    commit_probe_succeeds_before(mirror, COMMIT_PROBE_TIMEOUT, cmd.status()).await
 }
+
+/// Maximum time for the cheap local commit-presence probe. A slow probe is a
+/// sick mirror or filesystem, not evidence that the commit is available.
+const COMMIT_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+
+async fn commit_probe_succeeds_before(
+    mirror: &Path,
+    timeout: Duration,
+    status: impl Future<Output = std::io::Result<std::process::ExitStatus>>,
+) -> bool {
+    match tokio::time::timeout(timeout, status).await {
+        Ok(Ok(status)) => status.success(),
+        Ok(Err(_)) => false,
+        Err(_) => {
+            tracing::warn!(
+                mirror = %mirror.display(),
+                timeout_seconds = timeout.as_secs(),
+                "git commit availability probe timed out; treating commit as unavailable"
+            );
+            false
+        }
+    }
+}
+
+/// Maximum time for materializing a checkout. Both `git archive` and `tar`
+/// run under this one deadline so neither can retain the mirror lock forever.
+const TREE_EXTRACTION_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 /// Materialize `commit`'s tree from a bare mirror into `dest`, without
 /// touching the mirror: `git archive` piped through `tar`.
-fn extract_tree(mirror: &Path, commit: &CommitSha, dest: &Path) -> anyhow::Result<()> {
-    use std::io::Read;
-    use std::process::{Command, Stdio};
-    let mut archive = Command::new("git")
+async fn extract_tree(mirror: &Path, commit: &CommitSha, dest: &Path) -> anyhow::Result<()> {
+    tokio::time::timeout(
+        TREE_EXTRACTION_TIMEOUT,
+        extract_tree_pipeline(mirror, commit, dest),
+    )
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "checkout extraction for {commit} still running after {} minutes; \
+             git archive and tar killed (hung mirror filesystem?)",
+            TREE_EXTRACTION_TIMEOUT.as_secs() / 60
+        )
+    })?
+}
+
+async fn extract_tree_pipeline(
+    mirror: &Path,
+    commit: &CommitSha,
+    dest: &Path,
+) -> anyhow::Result<()> {
+    use std::process::Stdio;
+    let mut archive_cmd = tokio::process::Command::new("git");
+    archive_cmd
         // --git-dir, not -C: never let repo discovery climb out of the
         // mirror path into an enclosing repository.
         .arg("--git-dir")
@@ -477,52 +517,55 @@ fn extract_tree(mirror: &Path, commit: &CommitSha, dest: &Path) -> anyhow::Resul
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env("GIT_TERMINAL_PROMPT", "0")
+        .env("LC_ALL", "C")
+        .kill_on_drop(true);
+    let mut archive = archive_cmd
         .spawn()
         .context("running git archive (is git installed on this worker?)")?;
-    // Drain stderr concurrently: left unread, a chatty git (GIT_TRACE,
-    // attribute warnings) fills the pipe buffer and deadlocks the
-    // archive | tar pipeline.
-    let mut archive_stderr = archive.stderr.take().expect("stderr was piped above");
-    let stderr_reader = std::thread::spawn(move || {
-        let mut buf = String::new();
-        let _ = archive_stderr.read_to_string(&mut buf);
-        buf
-    });
-    let unpack = Command::new("tar")
+    let mut archive_stdout = archive.stdout.take().expect("stdout was piped above");
+    let mut unpack_cmd = tokio::process::Command::new("tar");
+    unpack_cmd
         // -f - pins the archive to stdin: without it, an inherited TAPE
         // env var (or an odd compiled-in default) makes tar ignore the
         // pipe entirely.
         .args(["-x", "-f", "-"])
         .arg("-C")
         .arg(dest)
-        .stdin(Stdio::from(
-            archive.stdout.take().expect("stdout was piped above"),
-        ))
+        .stdin(Stdio::piped())
         .stderr(Stdio::piped())
-        .output();
-    let unpack = match unpack {
-        Ok(output) => output,
-        // tar never spawned (missing binary, fork pressure): reap git
-        // before bailing — a std Child is neither killed nor reaped on
-        // drop, and this path repeats every retry, accruing one zombie
-        // per attempt for the worker's lifetime.
-        Err(e) => {
-            let _ = archive.kill();
-            let _ = archive.wait();
-            let _ = stderr_reader.join();
-            return Err(e).context("running tar (is tar installed on this worker?)");
+        .kill_on_drop(true);
+    let mut unpack = match unpack_cmd.spawn() {
+        Ok(unpack) => unpack,
+        Err(error) => {
+            let _ = archive.kill().await;
+            let _ = archive.wait().await;
+            return Err(error).context("running tar (is tar installed on this worker?)");
         }
     };
-    let archive_status = archive.wait().context("waiting for git archive")?;
-    let archive_stderr = stderr_reader
-        .join()
-        .unwrap_or_else(|_| "stderr reader panicked".to_string());
+    let mut unpack_stdin = unpack.stdin.take().expect("stdin was piped above");
+    // Drain both stderr pipes and copy the archive concurrently. The outer
+    // timeout owns this whole future, including both launches; cancellation
+    // drops the kill-on-drop children.
+    let (archive, unpack, _) = tokio::try_join!(
+        archive.wait_with_output(),
+        unpack.wait_with_output(),
+        async move {
+            // A tar failure closes the pipe and surfaces through tar's
+            // status/stderr below; do not replace that useful error with
+            // the copy's generic broken-pipe error.
+            let _ = tokio::io::copy(&mut archive_stdout, &mut unpack_stdin).await;
+            drop(unpack_stdin);
+            Ok::<(), std::io::Error>(())
+        }
+    )
+    .context("waiting for git archive and tar")?;
+    let archive_stderr = String::from_utf8_lossy(&archive.stderr);
     // tar's verdict first: when tar dies (disk full, unwritable dest),
     // git takes an EPIPE and "fails" with nothing on stderr — blaming
     // git would hide the actual cause.
     if !unpack.status.success() {
         let tar_stderr = String::from_utf8_lossy(&unpack.stderr);
-        let git_said = if archive_status.success() || archive_stderr.trim().is_empty() {
+        let git_said = if archive.status.success() || archive_stderr.trim().is_empty() {
             String::new()
         } else {
             format!(" (git archive: {})", archive_stderr.trim())
@@ -532,7 +575,7 @@ fn extract_tree(mirror: &Path, commit: &CommitSha, dest: &Path) -> anyhow::Resul
             tar_stderr.trim()
         );
     }
-    if !archive_status.success() {
+    if !archive.status.success() {
         anyhow::bail!("git archive {commit} failed: {}", archive_stderr.trim());
     }
     Ok(())
@@ -555,6 +598,18 @@ mod tests {
         async fn release(self) {
             self.releases.fetch_add(1, Ordering::SeqCst);
         }
+    }
+
+    #[tokio::test]
+    async fn commit_probe_timeout_is_not_available() {
+        let available = commit_probe_succeeds_before(
+            Path::new("/stalled-mirror"),
+            Duration::ZERO,
+            std::future::pending::<std::io::Result<std::process::ExitStatus>>(),
+        )
+        .await;
+
+        assert!(!available);
     }
 
     #[tokio::test]

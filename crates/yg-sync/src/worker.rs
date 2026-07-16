@@ -7,7 +7,10 @@ use std::time::{Duration, Instant};
 
 use yg_control::{ControlPlane, JobKind, JobOutcome};
 
-use crate::forge::{Forge, ForgeRegistry, github::discovery_client};
+use crate::forge::{
+    Forge, ForgeBudgetExhausted, ForgeRateLimit, ForgeRegistry, ForgeRequestBudget, ListedRepo,
+    OrgDiscovery, github::discovery_client,
+};
 use crate::git::{GitFetcher, forge_token, lock_mirror, remote_head_commit};
 use crate::lease::{LeaseShutdown, with_lease_heartbeat, with_lease_heartbeat_until_shutdown};
 use crate::locator::join_clone_url;
@@ -33,12 +36,10 @@ pub struct SyncWorker {
     /// by default, injectable so tests register doubles.
     registry: ForgeRegistry,
     discovery_client: reqwest::Client,
-    /// Per-forge rate budgets, keyed by forge id. Created on first poll
-    /// of a forge and kept for the worker's life; the poll loop spends a
-    /// token per conditional request and backs the forge off on a
-    /// rate-limit signal. In-process: one worker's view of its own
-    /// request rate (the per-repo interval smooths the fleet's).
-    poll_buckets: Mutex<HashMap<i64, TokenBucket>>,
+    /// Per-forge rate budgets, keyed by forge id. Polling and discovery
+    /// share the same in-process budget and spend one token per Forge
+    /// request. A rate-limit signal backs the whole Forge off.
+    forge_budgets: ForgeRequestBudgets,
     metrics: Metrics,
 }
 
@@ -78,7 +79,7 @@ impl SyncWorker {
             fetcher: GitFetcher::new(git_cache),
             registry,
             discovery_client: discovery_client(),
-            poll_buckets: Mutex::new(HashMap::new()),
+            forge_budgets: ForgeRequestBudgets::default(),
             metrics,
         }
     }
@@ -215,14 +216,20 @@ impl SyncWorker {
                 .map(|token| token.trim().to_string())
                 .filter(|token| !token.is_empty())
         });
-        let repos = match discovery
-            .list_org_repos(
-                &self.discovery_client,
-                api_root,
-                &due.org_slug,
-                token.as_deref(),
-            )
-            .await
+        let budget = DiscoveryBudget {
+            budgets: &self.forge_budgets,
+            forge_id: due.forge_id,
+            rate_budget: due.rate_budget,
+        };
+        let repos = match list_org_repos_with_budget(
+            discovery,
+            &self.discovery_client,
+            api_root,
+            &due.org_slug,
+            token.as_deref(),
+            &budget,
+        )
+        .await
         {
             Ok(repos) => repos,
             Err(e) => {
@@ -267,6 +274,23 @@ impl SyncWorker {
         Ok(true)
     }
 
+    /// Run one discovery pass, cancelling any in-progress Forge budget wait
+    /// or API request as soon as process shutdown begins.
+    pub async fn discover_once_with_shutdown(
+        &self,
+        cfg: &DiscoveryConfig,
+        shutdown: Shutdown,
+    ) -> anyhow::Result<bool> {
+        if shutdown.deadline().is_some() {
+            return Ok(false);
+        }
+        Ok(
+            cancel_discovery_on_shutdown(shutdown, self.discover_once(cfg))
+                .await?
+                .unwrap_or(false),
+        )
+    }
+
     /// Claim one due repo and compare its default-branch head against the
     /// synced position with a single cheap conditional request (`git
     /// ls-remote`). A moved head enqueues a fetch — which re-syncs and
@@ -302,7 +326,7 @@ impl SyncWorker {
             .observe_poll_lag(&due.base_url, due.poll_lag_seconds);
         // Spend a rate-budget token; over budget, reschedule the repo for
         // when one frees up and back off (no head check this cycle).
-        if let Err(retry) = self.take_poll_token(due.forge_id, due.rate_budget) {
+        if let Err(retry) = self.take_forge_token(due.forge_id, due.rate_budget) {
             self.control.defer_poll(due.repo_id, retry).await?;
             return Ok(false);
         }
@@ -345,9 +369,33 @@ impl SyncWorker {
     /// Spend one of this forge's rate-budget tokens. `Err(retry_after)`
     /// when none is available — the forge is over budget or cooling down
     /// — so the caller can reschedule the repo for `retry_after` out.
-    fn take_poll_token(&self, forge_id: i64, rate_budget: i32) -> Result<(), Duration> {
+    fn take_forge_token(&self, forge_id: i64, rate_budget: i32) -> Result<(), Duration> {
+        self.forge_budgets.take(forge_id, rate_budget)
+    }
+
+    /// Cool a forge down after it signalled a rate limit, returning when
+    /// its next poll should be attempted (past the cooldown).
+    fn cool_forge_down(&self, forge_id: i64, rate_budget: i32) -> Duration {
+        self.cool_forge_down_for(forge_id, rate_budget, RATE_LIMIT_COOLDOWN)
+    }
+
+    /// Apply an adapter-provided cooldown duration to the Forge's request
+    /// bucket, returning when that bucket may next grant a request.
+    fn cool_forge_down_for(&self, forge_id: i64, rate_budget: i32, cooldown: Duration) -> Duration {
+        self.forge_budgets
+            .cool_down_for(forge_id, rate_budget, cooldown)
+    }
+}
+
+#[derive(Default)]
+struct ForgeRequestBudgets {
+    buckets: Mutex<HashMap<i64, TokenBucket>>,
+}
+
+impl ForgeRequestBudgets {
+    fn take(&self, forge_id: i64, rate_budget: i32) -> Result<(), Duration> {
         let now = Instant::now();
-        let mut buckets = self.poll_buckets.lock().expect("poll bucket map poisoned");
+        let mut buckets = self.buckets.lock().expect("forge bucket map poisoned");
         let bucket = buckets
             .entry(forge_id)
             .or_insert_with(|| TokenBucket::per_minute(rate_budget, now));
@@ -359,18 +407,53 @@ impl SyncWorker {
         }
     }
 
-    /// Cool a forge down after it signalled a rate limit, returning when
-    /// its next poll should be attempted (past the cooldown).
-    fn cool_forge_down(&self, forge_id: i64, rate_budget: i32) -> Duration {
+    fn cool_down_for(&self, forge_id: i64, rate_budget: i32, cooldown: Duration) -> Duration {
         let now = Instant::now();
-        let mut buckets = self.poll_buckets.lock().expect("poll bucket map poisoned");
+        let mut buckets = self.buckets.lock().expect("forge bucket map poisoned");
         let bucket = buckets
             .entry(forge_id)
             .or_insert_with(|| TokenBucket::per_minute(rate_budget, now));
         bucket.update_rate(rate_budget, now);
-        bucket.cooldown(now + RATE_LIMIT_COOLDOWN);
+        bucket.cooldown(now + cooldown);
         bucket.retry_after(now)
     }
+}
+
+struct DiscoveryBudget<'a> {
+    budgets: &'a ForgeRequestBudgets,
+    forge_id: i64,
+    rate_budget: i32,
+}
+
+impl ForgeRequestBudget for DiscoveryBudget<'_> {
+    fn take(&self) -> Result<(), ForgeBudgetExhausted> {
+        self.budgets
+            .take(self.forge_id, self.rate_budget)
+            .map_err(|retry_after| ForgeBudgetExhausted { retry_after })
+    }
+}
+
+async fn list_org_repos_with_budget(
+    discovery: &dyn OrgDiscovery,
+    client: &reqwest::Client,
+    api_root: &str,
+    org: &str,
+    token: Option<&str>,
+    budget: &DiscoveryBudget<'_>,
+) -> anyhow::Result<Vec<ListedRepo>> {
+    let result = discovery
+        .list_org_repos_budgeted(client, api_root, org, token, budget)
+        .await;
+    if let Err(error) = &result
+        && let Some(rate_limit) = error.downcast_ref::<ForgeRateLimit>()
+    {
+        budget.budgets.cool_down_for(
+            budget.forge_id,
+            budget.rate_budget,
+            rate_limit.retry_after(),
+        );
+    }
+    result
 }
 
 enum ShutdownClaim<T, M> {
@@ -395,6 +478,16 @@ async fn claim_due_fetch_with_optional_shutdown<T, M>(
         return Ok(ShutdownClaim::Released { timer });
     }
     Ok(ShutdownClaim::Ready { job, timer })
+}
+
+async fn cancel_discovery_on_shutdown<T>(
+    mut shutdown: Shutdown,
+    discovery: impl Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<Option<T>> {
+    tokio::select! {
+        result = discovery => result.map(Some),
+        _ = shutdown.requested() => Ok(None),
+    }
 }
 
 /// How the poll loop is paced: the default interval between a repo's
@@ -432,8 +525,102 @@ mod tests {
 
     use tokio::time::Instant;
 
-    use super::{ShutdownClaim, claim_due_fetch_with_optional_shutdown};
+    use super::*;
     use crate::{ShutdownCause, shutdown_channel};
+
+    struct RateLimitedDiscovery;
+
+    impl OrgDiscovery for RateLimitedDiscovery {
+        fn list_org_repos<'a>(
+            &'a self,
+            _client: &'a reqwest::Client,
+            _api_root: &'a str,
+            _org: &'a str,
+            _token: Option<&'a str>,
+        ) -> crate::forge::BoxFuture<'a, anyhow::Result<Vec<ListedRepo>>> {
+            panic!("worker discovery must not use the unbudgeted listing path")
+        }
+
+        fn list_org_repos_budgeted<'a>(
+            &'a self,
+            _client: &'a reqwest::Client,
+            _api_root: &'a str,
+            _org: &'a str,
+            _token: Option<&'a str>,
+            budget: &'a dyn ForgeRequestBudget,
+        ) -> crate::forge::BoxFuture<'a, anyhow::Result<Vec<ListedRepo>>> {
+            Box::pin(async move {
+                budget.take()?;
+                Err(ForgeRateLimit::new(
+                    reqwest::StatusCode::TOO_MANY_REQUESTS,
+                    Duration::from_secs(30),
+                )
+                .into())
+            })
+        }
+    }
+
+    #[test]
+    fn discovery_and_polling_spend_the_same_forge_budget() {
+        let budgets = ForgeRequestBudgets::default();
+        assert!(
+            budgets.take(7, 1).is_ok(),
+            "the polling seam takes the burst token"
+        );
+
+        let discovery = DiscoveryBudget {
+            budgets: &budgets,
+            forge_id: 7,
+            rate_budget: 1,
+        };
+        let exhausted = discovery
+            .take()
+            .expect_err("discovery must observe the token polling already spent");
+        assert!(exhausted.retry_after > Duration::ZERO);
+    }
+
+    #[test]
+    fn adapter_cooldown_blocks_the_shared_forge_budget() {
+        let budgets = ForgeRequestBudgets::default();
+        let cooldown = Duration::from_secs(30);
+        let retry_after = budgets.cool_down_for(7, 60, cooldown);
+        assert!(retry_after <= cooldown);
+        assert!(retry_after > Duration::from_secs(29));
+
+        let discovery = DiscoveryBudget {
+            budgets: &budgets,
+            forge_id: 7,
+            rate_budget: 60,
+        };
+        assert!(discovery.take().is_err());
+    }
+
+    #[tokio::test]
+    async fn worker_dispatches_budgeted_discovery_and_applies_its_cooldown() {
+        let budgets = ForgeRequestBudgets::default();
+        let budget = DiscoveryBudget {
+            budgets: &budgets,
+            forge_id: 7,
+            rate_budget: 60,
+        };
+
+        let error = list_org_repos_with_budget(
+            &RateLimitedDiscovery,
+            &reqwest::Client::new(),
+            "https://api.example.test",
+            "acme",
+            None,
+            &budget,
+        )
+        .await
+        .expect_err("the adapter fixture returns a typed rate limit");
+
+        assert!(error.downcast_ref::<ForgeRateLimit>().is_some());
+        assert!(
+            budget.take().is_err(),
+            "the shared Forge bucket is cooling down"
+        );
+    }
 
     #[tokio::test]
     async fn fetch_claim_completing_after_shutdown_is_released_before_work_starts() {
@@ -464,5 +651,23 @@ mod tests {
             "shutdown claims must be released with their timer"
         );
         assert_eq!(released_job.load(Ordering::SeqCst), 41);
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_a_discovery_wait() {
+        let (trigger, shutdown) = shutdown_channel();
+        assert!(trigger.request(
+            Instant::now() + Duration::from_secs(30),
+            ShutdownCause::Signal,
+        ));
+
+        let result = cancel_discovery_on_shutdown(shutdown, async {
+            std::future::pending::<()>().await;
+            Ok(())
+        })
+        .await
+        .expect("shutdown-aware discovery wait");
+
+        assert!(result.is_none());
     }
 }

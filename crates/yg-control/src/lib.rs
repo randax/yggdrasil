@@ -152,6 +152,8 @@ impl StoredForgeKind {
 pub struct DueDiscovery {
     pub org_id: i64,
     pub forge_id: i64,
+    /// Maximum Forge requests per minute for this worker process.
+    pub rate_budget: i32,
     pub forge_kind: String,
     pub base_url: String,
     /// REST API root from the Forge record; `None` when the record
@@ -759,7 +761,8 @@ impl ControlPlane {
              SET next_discovery_at = now() + make_interval(secs => $1)
              FROM due, forges f
              WHERE o.id = due.id AND f.id = o.forge_id
-             RETURNING o.id AS org_id, f.id AS forge_id, f.kind AS forge_kind,
+             RETURNING o.id AS org_id, f.id AS forge_id, f.rate_budget,
+                       f.kind AS forge_kind,
                        f.base_url, f.api_root, o.org_slug,
                        coalesce(o.token_env, f.token_env) AS token_env",
         )

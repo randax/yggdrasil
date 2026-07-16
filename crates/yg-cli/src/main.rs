@@ -1640,9 +1640,12 @@ async fn run_workers(
     let discovery = yg_sync::DiscoveryConfig {
         interval: deploy.discovery_interval,
     };
+    let discovery_shutdown = shutdown.clone();
     let discover = supervise_worker_loop(
         shutdown_trigger.clone(),
-        drain_queue(shutdown.clone(), || sync.discover_once(&discovery)),
+        drain_queue(shutdown.clone(), || {
+            sync.discover_once_with_shutdown(&discovery, discovery_shutdown.clone())
+        }),
     );
     let fetch_shutdown = shutdown.clone();
     let fetch = supervise_worker_loop(
