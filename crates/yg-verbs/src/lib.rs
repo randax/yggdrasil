@@ -46,7 +46,7 @@ use yg_shard::graph_schema::{
 };
 
 pub use engine::{
-    Engine, HistoryCommitView, HistoryResponse, NeighborsResponse, ResolveError,
+    Engine, HistoryCommitView, HistoryResponse, NeighborsResponse, ResolveError, ResolvedFts,
     ResolvedFuzzyShard, ResolvedShard, ShardResolver, VerbError,
 };
 pub use fuzzy::{

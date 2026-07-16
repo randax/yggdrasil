@@ -37,7 +37,7 @@ Critical path: **#59 → {#60, #62, #64} → {#63, #65, #66}**.
 
 ### Independents
 
-- [ ] **#45** Shard cache: LRU eviction, single-flight cold fetches, streaming verification.
+- [x] **#45** Shard cache: LRU eviction, single-flight cold fetches, streaming verification.
 - [x] **#44** Cap hub-node fan-out in graph traversals; truncation markers (no schema bump).
 - [ ] **#58** API protection: per-token rate limits, token expiry, MCP batch caps, server/client timeouts.
 

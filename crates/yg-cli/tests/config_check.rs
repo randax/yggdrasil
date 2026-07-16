@@ -24,6 +24,7 @@ fn config_check_reports_resolved_config_without_starting_the_server() {
         .env("YG_BOOTSTRAP_TOKEN", "ygt_admin_credential")
         .env("YG_DATABASE_URL", "postgres://db.invalid:5432/yg")
         .env("YG_S3_ENDPOINT", "http://s3.invalid:9000")
+        .env("YG_SHARD_CACHE_MAX_BYTES", "1048576")
         .env("YG_POLL_INTERVAL", "30")
         .arg("config-check")
         .assert()
@@ -33,6 +34,8 @@ fn config_check_reports_resolved_config_without_starting_the_server() {
                 .and(contains("postgres://db.invalid:5432/yg"))
                 .and(contains("YG_POLL_INTERVAL"))
                 .and(contains("30s"))
+                .and(contains("YG_SHARD_CACHE_MAX_BYTES"))
+                .and(contains("1048576"))
                 .and(contains("(env)"))
                 // Untouched settings resolve to documented defaults.
                 .and(contains("YG_GC_INTERVAL"))
@@ -78,6 +81,7 @@ fn config_check_reports_every_validation_error_and_exits_nonzero() {
         // all three must be reported in one run.
         .env("YG_LISTEN", "not-an-address")
         .env("YG_GC_GRACE", "soon")
+        .env("YG_SHARD_CACHE_MAX_BYTES", "0")
         .arg("config-check")
         .assert()
         .failure()
@@ -86,7 +90,9 @@ fn config_check_reports_every_validation_error_and_exits_nonzero() {
                 .and(contains("YG_LISTEN"))
                 .and(contains("not-an-address"))
                 .and(contains("YG_GC_GRACE"))
-                .and(contains("soon")),
+                .and(contains("soon"))
+                .and(contains("YG_SHARD_CACHE_MAX_BYTES"))
+                .and(contains("positive whole number of bytes")),
         );
 }
 

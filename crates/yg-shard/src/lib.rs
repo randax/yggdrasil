@@ -5,14 +5,18 @@
 //! storage under `shards/<repo-id>/<revision>/` and never mutated
 //! afterwards.
 
+mod cache;
 pub mod metrics;
 
+pub use cache::{CacheCapacity, CacheLease, LeasedPath};
 pub use metrics::Metrics;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use anyhow::Context;
+use cache::{CacheKey, DiskLru, Flights, MemoryLru, Pins};
+use futures::StreamExt;
 use object_store::aws::AmazonS3Builder;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
 use serde::{Deserialize, Serialize};
@@ -841,11 +845,68 @@ pub struct ShardCache {
     dir: std::path::PathBuf,
     /// Manifests by manifest key. A std (not tokio) Mutex: these locks
     /// only ever guard map lookups and inserts, never I/O or `.await`.
-    manifests: std::sync::Mutex<std::collections::HashMap<String, Arc<Manifest>>>,
+    manifests: Arc<std::sync::Mutex<MemoryLru<String, Arc<Manifest>>>>,
     /// Checksums whose on-disk file this process has already verified.
-    verified: std::sync::Mutex<std::collections::HashSet<String>>,
+    verified: Arc<std::sync::Mutex<std::collections::HashSet<CacheKey>>>,
+    lru: Arc<std::sync::Mutex<DiskLru>>,
+    flights: Arc<Flights>,
+    pins: Arc<Pins>,
+    maintenance: Arc<tokio::sync::Mutex<()>>,
+    capacity: CacheCapacity,
     metrics: Metrics,
 }
+
+#[cfg(test)]
+struct FtsUnpackTestSeam {
+    repo_id: i64,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+static FTS_UNPACK_TEST_SEAM: std::sync::Mutex<Option<Arc<FtsUnpackTestSeam>>> =
+    std::sync::Mutex::new(None);
+
+/// A single cache artifact cannot fit under the configured byte ceiling.
+#[derive(Debug)]
+pub struct CacheArtifactTooLarge {
+    pub artifact_bytes: u64,
+    pub capacity: CacheCapacity,
+}
+
+impl std::fmt::Display for CacheArtifactTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Shard cache artifact is {} bytes, exceeding the configured {}-byte capacity",
+            self.artifact_bytes,
+            self.capacity.bytes()
+        )
+    }
+}
+
+impl std::error::Error for CacheArtifactTooLarge {}
+
+/// Pinned query artifacts leave insufficient unpinned space for a new one.
+#[derive(Debug)]
+pub struct CacheCapacityUnavailable {
+    pub artifact_bytes: u64,
+    pub capacity: CacheCapacity,
+    release_generation: u64,
+}
+
+impl std::fmt::Display for CacheCapacityUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Shard cache cannot retain a {}-byte artifact within its {}-byte capacity while query artifacts are in use",
+            self.artifact_bytes,
+            self.capacity.bytes()
+        )
+    }
+}
+
+impl std::error::Error for CacheCapacityUnavailable {}
 
 /// A revision whose manifest is not in object storage — distinct from
 /// transport or corruption errors because callers holding the revision
@@ -907,7 +968,16 @@ impl std::error::Error for SegmentNeedsManifestRefresh {}
 
 impl ShardCache {
     pub fn new(store: Arc<dyn ObjectStore>, dir: impl Into<std::path::PathBuf>) -> Self {
-        Self::with_metrics(store, dir, Metrics::unregistered())
+        Self::with_capacity(store, dir, CacheCapacity::DEFAULT)
+    }
+
+    /// Build a cache with an explicit non-zero on-disk byte capacity.
+    pub fn with_capacity(
+        store: Arc<dyn ObjectStore>,
+        dir: impl Into<std::path::PathBuf>,
+        capacity: CacheCapacity,
+    ) -> Self {
+        Self::with_metrics_and_capacity(store, dir, Metrics::unregistered(), capacity)
     }
 
     /// Build a cache using the supplied hit, miss, and eviction collectors.
@@ -916,11 +986,46 @@ impl ShardCache {
         dir: impl Into<std::path::PathBuf>,
         metrics: Metrics,
     ) -> Self {
+        Self::with_metrics_and_capacity(store, dir, metrics, CacheCapacity::DEFAULT)
+    }
+
+    /// Build a metrics-instrumented cache with an explicit byte capacity.
+    pub fn with_metrics_and_capacity(
+        store: Arc<dyn ObjectStore>,
+        dir: impl Into<std::path::PathBuf>,
+        metrics: Metrics,
+        capacity: CacheCapacity,
+    ) -> Self {
+        let dir = dir.into();
+        let (mut lru, startup_evictions, stale_paths) = DiskLru::scan(&dir, capacity);
+        for (path, artifact) in stale_paths {
+            if let Err(error) = cache::remove_cached_path(&path) {
+                let remaining = error.remaining_path().to_path_buf();
+                let bytes =
+                    cache::measure_paths(std::slice::from_ref(&remaining)).unwrap_or(u64::MAX);
+                lru.track_stale(remaining, bytes, artifact);
+            }
+        }
+        for mut eviction in startup_evictions {
+            let removed = remove_eviction_paths(&mut eviction).is_ok();
+            if removed {
+                metrics.capacity_eviction(eviction.key.artifact);
+            } else {
+                lru.restore_failed_eviction(eviction);
+            }
+        }
         Self {
             store,
-            dir: dir.into(),
-            manifests: Default::default(),
+            dir,
+            manifests: Arc::new(std::sync::Mutex::new(MemoryLru::new(
+                capacity.manifest_entries(),
+            ))),
             verified: Default::default(),
+            lru: Arc::new(std::sync::Mutex::new(lru)),
+            flights: Default::default(),
+            pins: Default::default(),
+            maintenance: Arc::new(tokio::sync::Mutex::new(())),
+            capacity,
             metrics,
         }
     }
@@ -953,6 +1058,46 @@ impl ShardCache {
         }
     }
 
+    /// Resolve and pin a graph segment until its consumer has opened it.
+    pub async fn leased_graph_path(
+        &self,
+        repo_id: i64,
+        revision: &str,
+    ) -> anyhow::Result<LeasedPath> {
+        loop {
+            let path = match self.graph_path(repo_id, revision).await {
+                Ok(path) => path,
+                Err(error) if error.downcast_ref::<CacheCapacityUnavailable>().is_some() => {
+                    let generation = error
+                        .downcast_ref::<CacheCapacityUnavailable>()
+                        .expect("the capacity error was just matched")
+                        .release_generation;
+                    self.pins.wait_for_lease_release(generation).await;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let key = CacheKey {
+                sha: checksum_from_cache_path(&path, ".sqlite")?,
+                artifact: metrics::Artifact::Graph,
+            };
+            let lease = match self.pins.try_pin(key) {
+                Ok(lease) => lease,
+                Err(generation) => {
+                    self.pins.wait_for_eviction(generation).await;
+                    continue;
+                }
+            };
+            if tokio::fs::try_exists(&path)
+                .await
+                .context("checking a leased graph segment")?
+            {
+                return Ok(LeasedPath { path, lease });
+            }
+            drop(lease);
+        }
+    }
+
     async fn graph_path_once(
         &self,
         repo_id: i64,
@@ -961,9 +1106,17 @@ impl ShardCache {
         let manifest = self.manifest(repo_id, revision).await?;
         let sha = checked_segment_sha(&manifest, revision, GRAPH_SEGMENT_FILE)?;
         let path = self.dir.join(format!("{sha}.sqlite"));
-        // The lock guards only the set lookup/insert — never I/O — so a
-        // cold fetch of one revision cannot stall queries for others.
-        if self.is_verified(&sha) {
+        let key = CacheKey {
+            sha: sha.clone(),
+            artifact: metrics::Artifact::Graph,
+        };
+        if self.is_verified(&key, &path).await? {
+            self.metrics.hit(metrics::Artifact::Graph);
+            return Ok(path);
+        }
+        let gate = self.flights.gate(&sha);
+        let _flight = gate.lock().await;
+        if self.is_verified(&key, &path).await? {
             self.metrics.hit(metrics::Artifact::Graph);
             return Ok(path);
         }
@@ -975,37 +1128,86 @@ impl ShardCache {
             metrics::Artifact::Graph,
         )
         .await?;
-        self.mark_verified(sha);
+        self.record_verified(key, vec![path.clone()]).await?;
         Ok(path)
     }
 
-    /// Whether this process has already verified the artifact named by
-    /// `sha` (segments are content-addressed and immutable, so once true
-    /// it stays true).
-    fn is_verified(&self, sha: &str) -> bool {
-        self.verified
+    /// Process verification is only a hashing shortcut. The filesystem
+    /// remains authoritative because operators and external cleaners may
+    /// remove cache files while the server is running.
+    async fn is_verified(
+        &self,
+        key: &CacheKey,
+        required_path: &std::path::Path,
+    ) -> anyhow::Result<bool> {
+        let remembered = self
+            .verified
             .lock()
             .expect("shard cache lock poisoned")
-            .contains(sha)
+            .contains(key);
+        if !remembered {
+            return Ok(false);
+        }
+        match tokio::fs::try_exists(required_path).await {
+            Ok(true) => {
+                self.lru
+                    .lock()
+                    .expect("shard cache lock poisoned")
+                    .touch(key);
+                Ok(true)
+            }
+            Ok(false) => {
+                self.forget_verified(key);
+                Ok(false)
+            }
+            Err(error) => Err(error).context("checking a verified Shard-cache artifact"),
+        }
     }
 
-    fn mark_verified(&self, sha: String) {
+    fn forget_verified(&self, key: &CacheKey) {
         self.verified
             .lock()
             .expect("shard cache lock poisoned")
-            .insert(sha);
+            .remove(key);
+    }
+
+    async fn record_verified(
+        &self,
+        key: CacheKey,
+        paths: Vec<std::path::PathBuf>,
+    ) -> anyhow::Result<()> {
+        let maintenance = self.maintenance.clone();
+        let context = CommitContext {
+            lru: self.lru.clone(),
+            verified: self.verified.clone(),
+            manifests: self.manifests.clone(),
+            pins: self.pins.clone(),
+            metrics: self.metrics.clone(),
+            capacity: self.capacity,
+        };
+        tokio::spawn(async move {
+            let maintenance = maintenance.lock_owned().await;
+            tokio::task::spawn_blocking(move || {
+                let _maintenance = maintenance;
+                let artifact_bytes =
+                    cache::measure_paths(&paths).context("measuring a Shard-cache artifact")?;
+                commit_record(&context, key, paths, artifact_bytes)
+            })
+            .await
+            .context("Shard-cache commit task panicked")?
+        })
+        .await
+        .context("Shard-cache record task panicked")?
     }
 
     /// Ensure the content-addressed cache file `local` holds the bytes
     /// whose sha256 is `sha`, fetching `object_key` from storage and
     /// verifying it whenever the local copy is absent or no longer matches.
     /// A segment storage no longer holds surfaces as [`RevisionMissing`].
-    /// Hashing and the staging write run off the runtime threads; two
-    /// requests racing one cold revision both fetch, harmlessly, since the
-    /// rename is idempotent and the artifact immutable. (Callers needn't
-    /// know whether a fetch happened: the file is content-addressed, so any
-    /// artifact derived from it — an unpacked directory named by the same
-    /// sha — is already correct for that sha.)
+    /// Fetch chunks are hashed and written directly to a staging file. The
+    /// per-checksum single-flight normally leaves one writer; the atomic
+    /// rename and destination verification remain the final correctness
+    /// fence across processes.
     async fn fetch_verify_into(
         &self,
         revision: &str,
@@ -1015,9 +1217,9 @@ impl ShardCache {
         artifact: metrics::Artifact,
     ) -> anyhow::Result<()> {
         let what = artifact.description();
-        let on_disk = match tokio::fs::read(local).await {
-            Ok(bytes) => {
-                if digest_off_thread(bytes).await?.1 == sha {
+        let on_disk = match digest_file(local).await {
+            Ok(digest) => {
+                if digest == sha {
                     self.metrics.hit(artifact);
                     true
                 } else {
@@ -1036,10 +1238,7 @@ impl ShardCache {
             return Ok(());
         }
         let fetched = match self.store.get(&object_key.as_str().into()).await {
-            Ok(get) => get
-                .bytes()
-                .await
-                .with_context(|| format!("fetching the {what}"))?,
+            Ok(get) => get,
             // A manifest without its segment: the revision is being (or
             // was partially) GC'd — gone for the caller's purposes, same
             // as a missing manifest.
@@ -1052,17 +1251,6 @@ impl ShardCache {
             }
             Err(e) => return Err(e).with_context(|| format!("fetching the {what}")),
         };
-        let (fetched, digest) = digest_off_thread(fetched).await?;
-        if digest != sha {
-            return Err(anyhow::Error::new(SegmentNeedsManifestRefresh {
-                revision: revision.to_string(),
-                message: format!(
-                    "the {what} for {revision} does not match its manifest \
-                     (manifest says sha256 {sha}, storage holds {digest}); refusing to serve it"
-                ),
-                missing: false,
-            }));
-        }
         tokio::fs::create_dir_all(&self.dir)
             .await
             .context("creating the shard cache directory")?;
@@ -1080,9 +1268,47 @@ impl ShardCache {
             std::process::id(),
             ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
-        tokio::fs::write(&tmp, &fetched)
-            .await
-            .with_context(|| format!("staging the {what} into the cache"))?;
+        let mut cleanup = cache::CleanupPath::new(tmp.clone());
+        let staged = async {
+            use tokio::io::AsyncWriteExt;
+
+            let mut file = tokio::fs::File::create(&tmp)
+                .await
+                .with_context(|| format!("staging the {what} into the cache"))?;
+            let mut digest = Sha256::new();
+            let mut stream = fetched.into_stream();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.with_context(|| format!("fetching the {what}"))?;
+                digest.update(&chunk);
+                file.write_all(&chunk)
+                    .await
+                    .with_context(|| format!("staging the {what} into the cache"))?;
+            }
+            file.flush()
+                .await
+                .with_context(|| format!("staging the {what} into the cache"))?;
+            drop(file);
+            Ok::<String, anyhow::Error>(hex::encode(digest.finalize()))
+        }
+        .await;
+        let digest = match staged {
+            Ok(digest) => digest,
+            Err(error) => {
+                let _ = tokio::fs::remove_file(&tmp).await;
+                return Err(error);
+            }
+        };
+        if digest != sha {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(anyhow::Error::new(SegmentNeedsManifestRefresh {
+                revision: revision.to_string(),
+                message: format!(
+                    "the {what} for {revision} does not match its manifest \
+                     (manifest says sha256 {sha}, storage holds {digest}); refusing to serve it"
+                ),
+                missing: false,
+            }));
+        }
         if let Err(e) = tokio::fs::rename(&tmp, local).await {
             // On platforms where rename cannot replace (Windows), the
             // loser of a cold-fetch race lands here with the winner's
@@ -1090,14 +1316,16 @@ impl ShardCache {
             // success if the destination actually holds the expected
             // bytes — a stale mismatched file (the very thing this fetch
             // replaces) must not be blessed by a failed rename.
-            let committed = match tokio::fs::read(local).await {
-                Ok(bytes) => digest_off_thread(bytes).await?.1 == sha,
+            let committed = match digest_file(local).await {
+                Ok(digest) => digest == sha,
                 Err(_) => false,
             };
             let _ = tokio::fs::remove_file(&tmp).await;
             if !committed {
                 return Err(e).with_context(|| format!("committing the {what} into the cache"));
             }
+        } else {
+            cleanup.disarm();
         }
         Ok(())
     }
@@ -1131,6 +1359,68 @@ impl ShardCache {
         }
     }
 
+    /// Resolve and pin an unpacked FTS segment until its consumer opens it.
+    pub async fn leased_fts_path(
+        &self,
+        repo_id: i64,
+        revision: &str,
+    ) -> anyhow::Result<LeasedPath> {
+        self.leased_fts_path_inner(repo_id, revision, true).await
+    }
+
+    /// Resolve FTS without waiting for another artifact pinned by this same
+    /// operation; used when a caller already holds a graph lease.
+    pub async fn leased_fts_path_without_wait(
+        &self,
+        repo_id: i64,
+        revision: &str,
+    ) -> anyhow::Result<LeasedPath> {
+        self.leased_fts_path_inner(repo_id, revision, false).await
+    }
+
+    async fn leased_fts_path_inner(
+        &self,
+        repo_id: i64,
+        revision: &str,
+        wait_for_capacity: bool,
+    ) -> anyhow::Result<LeasedPath> {
+        loop {
+            let path = match self.fts_path(repo_id, revision).await {
+                Ok(path) => path,
+                Err(error)
+                    if wait_for_capacity
+                        && error.downcast_ref::<CacheCapacityUnavailable>().is_some() =>
+                {
+                    let generation = error
+                        .downcast_ref::<CacheCapacityUnavailable>()
+                        .expect("the capacity error was just matched")
+                        .release_generation;
+                    self.pins.wait_for_lease_release(generation).await;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let key = CacheKey {
+                sha: checksum_from_cache_path(&path, ".fts")?,
+                artifact: metrics::Artifact::Fts,
+            };
+            let lease = match self.pins.try_pin(key) {
+                Ok(lease) => lease,
+                Err(generation) => {
+                    self.pins.wait_for_eviction(generation).await;
+                    continue;
+                }
+            };
+            if tokio::fs::try_exists(&path)
+                .await
+                .context("checking a leased fts segment")?
+            {
+                return Ok(LeasedPath { path, lease });
+            }
+            drop(lease);
+        }
+    }
+
     async fn fts_path_once(
         &self,
         repo_id: i64,
@@ -1140,9 +1430,50 @@ impl ShardCache {
         let sha = checked_segment_sha(&manifest, revision, FTS_SEGMENT_FILE)?;
         let archive_path = self.dir.join(format!("{sha}.tar"));
         let unpacked = self.dir.join(format!("{sha}.fts"));
+        let key = CacheKey {
+            sha: sha.clone(),
+            artifact: metrics::Artifact::Fts,
+        };
 
         // Warm: this process already verified the archive and unpacked it.
-        if self.is_verified(&sha) && tokio::fs::try_exists(&unpacked).await.unwrap_or(false) {
+        if self.is_verified(&key, &archive_path).await?
+            && tokio::fs::try_exists(&unpacked)
+                .await
+                .context("checking the unpacked fts segment")?
+        {
+            self.metrics.hit(metrics::Artifact::Fts);
+            return Ok(unpacked);
+        }
+        let task_cache = self.detached_task_handle();
+        let task_revision = revision.to_string();
+        tokio::spawn(async move {
+            task_cache
+                .materialize_fts(repo_id, task_revision, sha, key, archive_path, unpacked)
+                .await
+        })
+        .await
+        .context("FTS materialization task panicked")?
+    }
+
+    /// Own all work after the first possible cache-file commit. The caller
+    /// awaits this detached task, so dropping a cold request cannot strand a
+    /// committed archive or unpacked directory outside LRU accounting.
+    async fn materialize_fts(
+        &self,
+        repo_id: i64,
+        revision: String,
+        sha: String,
+        key: CacheKey,
+        archive_path: std::path::PathBuf,
+        unpacked: std::path::PathBuf,
+    ) -> anyhow::Result<std::path::PathBuf> {
+        let gate = self.flights.gate(&sha);
+        let _flight = gate.lock().await;
+        if self.is_verified(&key, &archive_path).await?
+            && tokio::fs::try_exists(&unpacked)
+                .await
+                .context("checking the unpacked fts segment")?
+        {
             self.metrics.hit(metrics::Artifact::Fts);
             return Ok(unpacked);
         }
@@ -1154,59 +1485,102 @@ impl ShardCache {
         // correct content — there is nothing to invalidate on a refetch,
         // and deleting it would yank it out from under a concurrent reader.
         self.fetch_verify_into(
-            revision,
+            &revision,
             &sha,
             &archive_path,
-            fts_segment_key(repo_id, revision),
+            fts_segment_key(repo_id, &revision),
             metrics::Artifact::Fts,
         )
         .await?;
 
-        // Unpack the verified archive into its directory if absent.
-        if !tokio::fs::try_exists(&unpacked).await.unwrap_or(false) {
-            let archive = tokio::fs::read(&archive_path)
-                .await
-                .context("reading the cached fts segment")?;
-            let dir_root = self.dir.clone();
-            let target = unpacked.clone();
-            let sha_for_tmp = sha.clone();
-            // Untarring is blocking fs work; keep it off the runtime threads.
-            tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                static ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                let tmp = dir_root.join(format!(
-                    "{sha_for_tmp}.fts.tmp-{}-{}",
-                    std::process::id(),
-                    ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                ));
-                // A previous crashed unpack may have left this temp dir.
-                let _ = std::fs::remove_dir_all(&tmp);
-                // Clean the temp dir on any failure (a partial unpack, a
-                // rename race) so a failed attempt never leaks it.
-                let unpack_and_commit = || -> anyhow::Result<()> {
-                    unpack_fts(&archive, &tmp)?;
-                    match std::fs::rename(&tmp, &target) {
-                        Ok(()) => Ok(()),
-                        // Another task unpacked the same revision first —
-                        // its directory is the complete one; ours is
-                        // redundant.
-                        Err(_) if target.exists() => Ok(()),
-                        Err(e) => {
-                            Err(e).context("committing the unpacked fts segment into the cache")
-                        }
-                    }
-                };
-                let result = unpack_and_commit();
-                if result.is_err() || tmp.exists() {
-                    let _ = std::fs::remove_dir_all(&tmp);
-                }
-                result
-            })
-            .await
-            .context("fts segment unpack task panicked")??;
+        #[cfg(test)]
+        let unpack_test_seam = {
+            FTS_UNPACK_TEST_SEAM
+                .lock()
+                .expect("FTS unpack test seam lock poisoned")
+                .clone()
+        };
+        #[cfg(test)]
+        if let Some(seam) = unpack_test_seam.filter(|seam| seam.repo_id == repo_id) {
+            seam.entered.notify_one();
+            seam.release.notified().await;
         }
 
-        self.mark_verified(sha);
+        // Unpack the verified archive into its directory if absent.
+        let unpack_result = match tokio::fs::try_exists(&unpacked)
+            .await
+            .context("checking the unpacked fts segment")
+        {
+            Ok(true) => Ok(()),
+            Ok(false) => {
+                let dir_root = self.dir.clone();
+                let target = unpacked.clone();
+                let sha_for_tmp = sha.clone();
+                let archive = archive_path.clone();
+                // Untarring is blocking fs work; keep it off the runtime threads.
+                tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                    static ATTEMPT: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(0);
+                    let tmp = dir_root.join(format!(
+                        "{sha_for_tmp}.fts.tmp-{}-{}",
+                        std::process::id(),
+                        ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    ));
+                    let mut cleanup = cache::CleanupPath::new(tmp.clone());
+                    // A previous crashed unpack may have left this temp dir.
+                    let _ = std::fs::remove_dir_all(&tmp);
+                    // Clean the temp dir on any failure (a partial unpack, a
+                    // rename race) so a failed attempt never leaks it.
+                    let unpack_and_commit = || -> anyhow::Result<()> {
+                        fts::unpack_fts_file(&archive, &tmp)?;
+                        match std::fs::rename(&tmp, &target) {
+                            Ok(()) => Ok(()),
+                            // Another task unpacked the same revision first —
+                            // its directory is the complete one; ours is
+                            // redundant.
+                            Err(_) if target.exists() => Ok(()),
+                            Err(e) => {
+                                Err(e).context("committing the unpacked fts segment into the cache")
+                            }
+                        }
+                    };
+                    let result = unpack_and_commit();
+                    if result.is_err() || tmp.exists() {
+                        let _ = std::fs::remove_dir_all(&tmp);
+                    } else {
+                        cleanup.disarm();
+                    }
+                    result
+                })
+                .await
+                .context("fts segment unpack task panicked")
+                .and_then(|result| result)
+            }
+            Err(error) => Err(error),
+        };
+
+        let mut committed_paths = vec![archive_path];
+        if unpacked.is_dir() {
+            committed_paths.push(unpacked.clone());
+        }
+        self.record_verified(key, committed_paths).await?;
+        unpack_result?;
         Ok(unpacked)
+    }
+
+    fn detached_task_handle(&self) -> Self {
+        Self {
+            store: self.store.clone(),
+            dir: self.dir.clone(),
+            manifests: self.manifests.clone(),
+            verified: self.verified.clone(),
+            lru: self.lru.clone(),
+            flights: self.flights.clone(),
+            pins: self.pins.clone(),
+            maintenance: self.maintenance.clone(),
+            capacity: self.capacity,
+            metrics: self.metrics.clone(),
+        }
     }
 
     fn forget_manifest(&self, repo_id: i64, revision: &str) {
@@ -1238,8 +1612,7 @@ impl ShardCache {
             .manifests
             .lock()
             .expect("shard cache lock poisoned")
-            .get(&key)
-            .cloned();
+            .get(&key);
         let manifest = match cached {
             Some(manifest) => {
                 self.metrics.hit(metrics::Artifact::Manifest);
@@ -1311,6 +1684,194 @@ impl ShardCache {
     }
 }
 
+struct EvictionMarker {
+    pins: Arc<Pins>,
+    key: CacheKey,
+}
+
+impl EvictionMarker {
+    fn begin(pins: Arc<Pins>, key: &CacheKey) -> Option<Self> {
+        pins.begin_eviction(key).then(|| Self {
+            pins,
+            key: key.clone(),
+        })
+    }
+}
+
+impl Drop for EvictionMarker {
+    fn drop(&mut self) {
+        self.pins.finish_eviction(&self.key);
+    }
+}
+
+struct CommitContext {
+    lru: Arc<std::sync::Mutex<DiskLru>>,
+    verified: Arc<std::sync::Mutex<std::collections::HashSet<CacheKey>>>,
+    manifests: Arc<std::sync::Mutex<MemoryLru<String, Arc<Manifest>>>>,
+    pins: Arc<Pins>,
+    metrics: Metrics,
+    capacity: CacheCapacity,
+}
+
+fn commit_record(
+    context: &CommitContext,
+    key: CacheKey,
+    paths: Vec<std::path::PathBuf>,
+    artifact_bytes: u64,
+) -> anyhow::Result<()> {
+    if artifact_bytes > context.capacity.bytes() {
+        let eviction = cache::Evicted::new(key, paths, artifact_bytes);
+        remove_eviction(
+            &context.lru,
+            &context.verified,
+            &context.manifests,
+            &context.pins,
+            &context.metrics,
+            eviction,
+        )?;
+        return Err(anyhow::Error::new(CacheArtifactTooLarge {
+            artifact_bytes,
+            capacity: context.capacity,
+        }));
+    }
+
+    let (pinned, release_generation) = context.pins.pinned();
+    let evictions = context
+        .lru
+        .lock()
+        .expect("shard cache lock poisoned")
+        .record(key.clone(), paths, artifact_bytes, &pinned);
+    let evicted_current = evictions.iter().any(|eviction| eviction.key == key);
+    let mut capacity_unavailable = false;
+    let mut first_error = None;
+
+    for eviction in evictions {
+        let Some(_marker) = EvictionMarker::begin(context.pins.clone(), &eviction.key) else {
+            context
+                .lru
+                .lock()
+                .expect("shard cache lock poisoned")
+                .restore(eviction);
+            capacity_unavailable = true;
+            continue;
+        };
+        if let Err(error) = remove_marked_eviction(
+            &context.lru,
+            &context.verified,
+            &context.manifests,
+            &context.metrics,
+            eviction,
+        ) {
+            first_error.get_or_insert(error);
+        }
+    }
+
+    if first_error.is_some() || capacity_unavailable {
+        if let Some(current) = context
+            .lru
+            .lock()
+            .expect("shard cache lock poisoned")
+            .take(&key)
+            && let Err(error) = remove_eviction(
+                &context.lru,
+                &context.verified,
+                &context.manifests,
+                &context.pins,
+                &context.metrics,
+                current,
+            )
+        {
+            first_error.get_or_insert(error);
+        }
+        if let Some(error) = first_error {
+            return Err(error.context("evicting a capacity-limited Shard-cache artifact"));
+        }
+        return Err(anyhow::Error::new(CacheCapacityUnavailable {
+            artifact_bytes,
+            capacity: context.capacity,
+            release_generation,
+        }));
+    }
+
+    if evicted_current {
+        return Err(anyhow::Error::new(CacheCapacityUnavailable {
+            artifact_bytes,
+            capacity: context.capacity,
+            release_generation,
+        }));
+    }
+    context
+        .verified
+        .lock()
+        .expect("shard cache lock poisoned")
+        .insert(key);
+    Ok(())
+}
+
+fn remove_eviction(
+    lru: &std::sync::Mutex<DiskLru>,
+    verified: &std::sync::Mutex<std::collections::HashSet<CacheKey>>,
+    manifests: &std::sync::Mutex<MemoryLru<String, Arc<Manifest>>>,
+    pins: &Arc<Pins>,
+    metrics: &Metrics,
+    eviction: cache::Evicted,
+) -> anyhow::Result<()> {
+    let Some(_marker) = EvictionMarker::begin(pins.clone(), &eviction.key) else {
+        lru.lock()
+            .expect("shard cache lock poisoned")
+            .restore(eviction);
+        anyhow::bail!("a Shard-cache artifact became pinned while it was being evicted");
+    };
+    remove_marked_eviction(lru, verified, manifests, metrics, eviction)
+}
+
+fn remove_marked_eviction(
+    lru: &std::sync::Mutex<DiskLru>,
+    verified: &std::sync::Mutex<std::collections::HashSet<CacheKey>>,
+    manifests: &std::sync::Mutex<MemoryLru<String, Arc<Manifest>>>,
+    metrics: &Metrics,
+    mut eviction: cache::Evicted,
+) -> anyhow::Result<()> {
+    let removal = remove_eviction_paths(&mut eviction);
+    verified
+        .lock()
+        .expect("shard cache lock poisoned")
+        .remove(&eviction.key);
+    manifests
+        .lock()
+        .expect("shard cache lock poisoned")
+        .retain(|_, manifest| {
+            !manifest
+                .segments
+                .values()
+                .any(|segment| segment.sha256 == eviction.key.sha)
+        });
+    if let Err(error) = removal {
+        lru.lock()
+            .expect("shard cache lock poisoned")
+            .restore_failed_eviction(eviction);
+        return Err(error);
+    }
+    if eviction.displaced_cached_entry() {
+        metrics.capacity_eviction(eviction.key.artifact);
+    }
+    Ok(())
+}
+
+fn remove_eviction_paths(eviction: &mut cache::Evicted) -> anyhow::Result<()> {
+    let mut first_error = None;
+    for path in &mut eviction.paths {
+        if let Err(error) = cache::remove_cached_path(path) {
+            *path = error.remaining_path().to_path_buf();
+            first_error.get_or_insert(error);
+        }
+    }
+    match first_error {
+        Some(error) => Err(error.into()),
+        None => Ok(()),
+    }
+}
+
 fn public_segment_error(error: anyhow::Error) -> anyhow::Error {
     match error.downcast_ref::<SegmentNeedsManifestRefresh>() {
         Some(refresh) if refresh.missing => anyhow::Error::new(RevisionMissing {
@@ -1370,6 +1931,31 @@ async fn digest_off_thread<B: AsRef<[u8]> + Send + 'static>(
     })
     .await
     .context("segment verification task panicked")
+}
+
+async fn digest_file(path: &std::path::Path) -> std::io::Result<String> {
+    use tokio::io::AsyncReadExt;
+
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut digest = Sha256::new();
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(hex::encode(digest.finalize()))
+}
+
+fn checksum_from_cache_path(path: &std::path::Path, suffix: &str) -> anyhow::Result<String> {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_suffix(suffix))
+        .filter(|sha| sha.len() == 64 && sha.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .map(str::to_string)
+        .context("a materialized Shard-cache path is not content-addressed")
 }
 
 /// Node/edge counts of a serialized graph segment, read back from its
@@ -1501,5 +2087,152 @@ mod tests {
         // rather than printing a blank author.
         assert_eq!(Node::contributor("x@example.com", "").name, None);
         assert_eq!(Node::contributor("y@example.com", "   ").name, None);
+    }
+
+    #[tokio::test]
+    async fn cancelled_fts_unpack_finishes_accounting_committed_paths() {
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let published = write_shard(
+            store.clone().as_ref(),
+            71,
+            "cancelled-unpack",
+            Graph {
+                nodes: vec![Node::file("cancelled.rs")],
+                edges: Vec::new(),
+            },
+            vec![SearchDoc {
+                node_id: "file:cancelled.rs".into(),
+                kind: NodeKind::File,
+                name: Some("cancelled.rs".into()),
+                path: Some("cancelled.rs".into()),
+                content: "fn materialize_even_if_the_request_goes_away() {}".into(),
+            }],
+        )
+        .await
+        .expect("publish cancellation fixture");
+        let directory = tempfile::tempdir().expect("cache directory");
+        let cache = Arc::new(ShardCache::new(store, directory.path()));
+        let seam = Arc::new(FtsUnpackTestSeam {
+            repo_id: 71,
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        *FTS_UNPACK_TEST_SEAM
+            .lock()
+            .expect("FTS unpack test seam lock poisoned") = Some(seam.clone());
+
+        let task_cache = cache.clone();
+        let revision = published.revision;
+        let request = tokio::spawn(async move { task_cache.fts_path(71, &revision).await });
+        seam.entered.notified().await;
+        let archive = std::fs::read_dir(directory.path())
+            .expect("read cache directory")
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| path.extension().is_some_and(|extension| extension == "tar"))
+            .expect("the archive is committed before unpack begins");
+        let sha = checksum_from_cache_path(&archive, ".tar").expect("content-addressed archive");
+
+        request.abort();
+        let _ = request.await;
+        *FTS_UNPACK_TEST_SEAM
+            .lock()
+            .expect("FTS unpack test seam lock poisoned") = None;
+        seam.release.notify_one();
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let accounted = cache
+                    .verified
+                    .lock()
+                    .expect("shard cache lock poisoned")
+                    .contains(&CacheKey {
+                        sha: sha.clone(),
+                        artifact: metrics::Artifact::Fts,
+                    });
+                let removed = !archive.exists();
+                if accounted || removed {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached FTS materialization must finish accounting or cleanup");
+
+        if archive.exists() {
+            assert!(
+                directory.path().join(format!("{sha}.fts")).is_dir(),
+                "an accounted successful materialization includes the unpacked index"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_fts_unpack_accounts_the_committed_archive() {
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let repo_id = 72;
+        let commit = "invalid-tar";
+        let revision = syntactic_revision(commit);
+        let invalid_archive = b"checksum-valid bytes that are not a tar archive".to_vec();
+        let sha = hex::encode(Sha256::digest(&invalid_archive));
+        let manifest = Manifest {
+            schema_version: SCHEMA_VERSION,
+            commit: commit.into(),
+            pass: SYNTACTIC_PASS.into(),
+            counts: Counts { nodes: 0, edges: 0 },
+            segments: BTreeMap::from([(
+                FTS_SEGMENT_FILE.into(),
+                Segment {
+                    sha256: sha.clone(),
+                    bytes: invalid_archive.len() as u64,
+                },
+            )]),
+        };
+        store
+            .put(
+                &fts_segment_key(repo_id, &revision).into(),
+                invalid_archive.into(),
+            )
+            .await
+            .expect("put invalid FTS fixture");
+        store
+            .put(
+                &manifest_key(repo_id, &revision).into(),
+                serde_json::to_vec(&manifest)
+                    .expect("serialize manifest")
+                    .into(),
+            )
+            .await
+            .expect("put manifest fixture");
+
+        let directory = tempfile::tempdir().expect("cache directory");
+        let cache = ShardCache::new(store, directory.path());
+        cache
+            .fts_path(repo_id, &revision)
+            .await
+            .expect_err("an invalid tar cannot materialize an FTS index");
+
+        let archive = directory.path().join(format!("{sha}.tar"));
+        assert!(archive.is_file(), "the committed archive remains on disk");
+        assert!(
+            cache
+                .verified
+                .lock()
+                .expect("shard cache lock poisoned")
+                .contains(&CacheKey {
+                    sha: sha.clone(),
+                    artifact: metrics::Artifact::Fts,
+                }),
+            "the failed materialization's committed archive is LRU-accounted"
+        );
+        assert!(!directory.path().join(format!("{sha}.fts")).exists());
+        assert!(
+            std::fs::read_dir(directory.path())
+                .expect("read cache directory")
+                .flatten()
+                .all(|entry| !entry.file_name().to_string_lossy().contains(".fts.tmp-")),
+            "failed unpack staging is removed"
+        );
     }
 }

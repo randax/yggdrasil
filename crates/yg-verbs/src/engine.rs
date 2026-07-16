@@ -55,6 +55,8 @@ pub enum ResolveError {
     RevisionMissing(#[source] anyhow::Error),
     #[error("the Shard predates the current index schema")]
     SchemaOutdated,
+    #[error("the Shard cache capacity is too small for the requested artifact")]
+    CacheCapacityUnavailable,
     #[error(transparent)]
     Internal(anyhow::Error),
 }
@@ -66,15 +68,23 @@ pub struct ResolvedShard {
     /// The immutable Shard revision the path holds — what a pagination
     /// cursor pins.
     pub revision: String,
+    /// Keeps capacity eviction from unlinking the path before it is opened.
+    pub cache_lease: Option<yg_shard::CacheLease>,
 }
 
-/// Matching graph and FTS segments for one immutable Shard revision.
-/// Only fuzzy addressing materializes both; exact ids retain the graph-only
-/// resolver path and its existing latency and failure behavior.
+/// A locally materialized FTS segment with an optional cache lease.
+pub struct ResolvedFts {
+    pub path: std::path::PathBuf,
+    pub cache_lease: Option<yg_shard::CacheLease>,
+}
+
+/// An FTS segment pinned to one immutable Shard revision for fuzzy addressing.
+/// The graph segment is resolved only after the FTS lookup identifies one id,
+/// so capacity need not accommodate both artifacts at once.
 pub struct ResolvedFuzzyShard {
-    pub graph_path: std::path::PathBuf,
     pub fts_path: std::path::PathBuf,
     pub revision: crate::ShardRevision,
+    pub fts_cache_lease: Option<yg_shard::CacheLease>,
 }
 
 /// How the engine reaches Shards: resolve a repo qualifier — via the
@@ -104,9 +114,11 @@ pub trait ShardResolver: Send + Sync {
     fn resolve_fts(
         &self,
         target: &SearchTarget,
-    ) -> impl Future<Output = Result<std::path::PathBuf, ResolveError>> + Send;
+    ) -> impl Future<Output = Result<ResolvedFts, ResolveError>> + Send;
 
-    /// Resolve matching graph and FTS segments for a fuzzy address.
+    /// Resolve the FTS segment and immutable revision for a fuzzy address.
+    /// After the lookup releases this artifact, the engine resolves the graph
+    /// through [`Self::resolve`] at the returned pinned revision.
     fn resolve_fuzzy(
         &self,
         _qualifier: &RepoQualifier,
@@ -167,6 +179,11 @@ fn resolve_error(qualifier: &str, from_cursor: bool, e: ResolveError) -> VerbErr
                 )
             }
         }
+        ResolveError::CacheCapacityUnavailable => VerbError::Unavailable(
+            "the Shard cache capacity is too small for the requested artifact; \
+             increase the cache capacity and try again"
+                .to_string(),
+        ),
         ResolveError::Internal(e) => VerbError::Internal(e),
     }
 }
@@ -366,7 +383,7 @@ impl<R: ShardResolver + 'static> Engine<R> {
         let ResolvedAddress::Exact { shard, id } = resolved else {
             return Ok(resolved.into_ambiguous());
         };
-        run_verb(shard.path, id, crate::node)
+        run_verb(shard.path, shard.cache_lease, id, crate::node)
             .await
             .map(AddressedResponse::Resolved)
     }
@@ -436,7 +453,7 @@ impl<R: ShardResolver + 'static> Engine<R> {
         };
 
         let verb_options = options.clone();
-        let page = run_verb(shard.path, id, move |conn, id| {
+        let page = run_verb(shard.path, shard.cache_lease, id, move |conn, id| {
             crate::neighbors(conn, id, &verb_options)
         })
         .await?;
@@ -521,7 +538,7 @@ impl<R: ShardResolver + 'static> Engine<R> {
                 .as_ref()
                 .map(|c| (c.after_committed_at, c.after_sha.clone())),
         };
-        let page = run_verb(shard.path, id, move |conn, id| {
+        let page = run_verb(shard.path, shard.cache_lease, id, move |conn, id| {
             crate::history(conn, id, &options)
         })
         .await?;
@@ -585,9 +602,15 @@ impl<R: ShardResolver + 'static> Engine<R> {
                 let name = address.name.as_str().to_string();
                 let path = address.path.as_ref().map(|path| path.as_str().to_string());
                 let fts_path = resolved.fts_path;
+                let fts_cache_lease = resolved.fts_cache_lease;
                 let symbols = tokio::task::spawn_blocking(move || {
                     let index = yg_shard::open_fts(&fts_path)?;
-                    yg_shard::symbols_named(&index, &name, path.as_deref())
+                    let symbols = yg_shard::symbols_named(&index, &name, path.as_deref());
+                    // Handle before lease: eviction is pin-gated, so the index
+                    // must close before its artifact becomes evictable.
+                    drop(index);
+                    drop(fts_cache_lease);
+                    symbols
                 })
                 .await
                 .map_err(|error| {
@@ -616,13 +639,20 @@ impl<R: ShardResolver + 'static> Engine<R> {
                         kind: NoSuchSymbolKind::NoSuchSymbol,
                         address,
                     })),
-                    1 => Ok(ResolvedAddress::Exact {
-                        shard: ResolvedShard {
-                            path: resolved.graph_path,
-                            revision: resolved.revision.as_str().to_string(),
-                        },
-                        id: candidates.pop().expect("one candidate").id,
-                    }),
+                    1 => {
+                        let revision = resolved.revision.as_str().to_string();
+                        let shard = self
+                            .resolver
+                            .resolve(qualifier.as_str(), Some(revision))
+                            .await
+                            .map_err(|error| {
+                                resolve_error(qualifier.as_str(), from_cursor, error)
+                            })?;
+                        Ok(ResolvedAddress::Exact {
+                            shard,
+                            id: candidates.pop().expect("one candidate").id,
+                        })
+                    }
                     _ => Ok(ResolvedAddress::Ambiguous(AmbiguousNodeAddress {
                         resolution: AmbiguousResolution::Ambiguous,
                         address,
@@ -653,7 +683,12 @@ impl ResolvedAddress {
 /// graph segment and run the (blocking, SQLite-bound) verb off the
 /// runtime threads — the open does filesystem syscalls, so it belongs
 /// in the closure too. The verb's `None` is the client's 404.
-async fn run_verb<T, F>(path: std::path::PathBuf, id: VerbId, verb: F) -> Result<T, VerbError>
+async fn run_verb<T, F>(
+    path: std::path::PathBuf,
+    cache_lease: Option<yg_shard::CacheLease>,
+    id: VerbId,
+    verb: F,
+) -> Result<T, VerbError>
 where
     T: Send + 'static,
     F: FnOnce(&rusqlite::Connection, &VerbId) -> anyhow::Result<Option<T>> + Send + 'static,
@@ -665,7 +700,13 @@ where
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
         )
         .context("opening the cached graph segment")?;
-        verb(&conn, &id)
+        let result = verb(&conn, &id);
+        // The connection must close before the lease releases: eviction
+        // is gated on pin counts, and an open handle past the pin would
+        // let the artifact vanish underneath it.
+        drop(conn);
+        drop(cache_lease);
+        result
     })
     .await;
     match outcome {
@@ -740,6 +781,11 @@ mod tests {
         assert!(matches!(
             resolve_error("q", false, ResolveError::NotIndexed),
             VerbError::NotFound(_)
+        ));
+        assert!(matches!(
+            resolve_error("q", false, ResolveError::CacheCapacityUnavailable),
+            VerbError::Unavailable(message)
+                if message.contains("cache capacity is too small")
         ));
     }
 
