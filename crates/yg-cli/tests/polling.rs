@@ -6,8 +6,10 @@
 mod common;
 
 use common::*;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, atomic::AtomicUsize};
 use std::time::Duration;
 
 /// A poll config with a real interval, for tests that drive `poll_once`
@@ -19,6 +21,96 @@ fn poll_config() -> yg_sync::PollConfig {
         default_interval: Duration::from_secs(300),
         jitter_fraction: 0.2,
     }
+}
+
+struct FakeHttpForge {
+    outcomes: Mutex<VecDeque<yg_sync::forge::RepoPollOutcome>>,
+    validators_seen: Mutex<Vec<yg_control::PollValidators>>,
+    calls: AtomicUsize,
+}
+
+impl FakeHttpForge {
+    fn new(outcomes: impl IntoIterator<Item = yg_sync::forge::RepoPollOutcome>) -> Self {
+        Self {
+            outcomes: Mutex::new(outcomes.into_iter().collect()),
+            validators_seen: Mutex::new(Vec::new()),
+            calls: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl yg_sync::forge::Forge for FakeHttpForge {
+    fn kind(&self) -> &'static str {
+        "fake-http"
+    }
+
+    fn claims_host(&self, _host: &str) -> bool {
+        false
+    }
+
+    fn default_token_env(&self) -> Option<&'static str> {
+        None
+    }
+
+    fn default_api_root(&self, _base_url: &str) -> Option<String> {
+        None
+    }
+
+    fn is_rate_limit(&self, _message: &str) -> bool {
+        false
+    }
+
+    fn discovery(&self) -> Option<&dyn yg_sync::forge::OrgDiscovery> {
+        None
+    }
+
+    fn repo_poller(&self) -> Option<&dyn yg_sync::forge::RepoPoller> {
+        Some(self)
+    }
+}
+
+impl yg_sync::forge::RepoPoller for FakeHttpForge {
+    fn poll_repo<'a>(
+        &'a self,
+        _client: &'a reqwest::Client,
+        _api_root: &'a yg_control::ForgeUrl,
+        _slug: &'a yg_sync::forge::RepoSlug,
+        _token: Option<&'a str>,
+        validators: &'a yg_control::PollValidators,
+    ) -> yg_sync::forge::BoxFuture<'a, anyhow::Result<yg_sync::forge::RepoPollOutcome>> {
+        Box::pin(async move {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.validators_seen
+                .lock()
+                .unwrap()
+                .push(validators.clone());
+            self.outcomes
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or_else(|| anyhow::anyhow!("fake HTTP Forge has no queued poll outcome"))
+        })
+    }
+}
+
+async fn http_poll_worker(
+    h: &Harness,
+    forge: Arc<FakeHttpForge>,
+    rate_budget: i32,
+) -> yg_sync::SyncWorker {
+    sqlx::query(
+        "UPDATE forges
+         SET kind = 'fake-http', api_root = 'https://api.example.test', rate_budget = $1",
+    )
+    .bind(rate_budget)
+    .execute(&h.pool().await)
+    .await
+    .unwrap();
+    yg_sync::SyncWorker::with_registry(
+        control_plane(&h.db_name).await,
+        h.cache.join("fake-http-cache"),
+        yg_sync::forge::ForgeRegistry::builtin().register(forge),
+    )
 }
 
 impl Harness {
@@ -203,6 +295,106 @@ async fn a_poll_that_races_an_existing_fetch_retries_soon_if_that_fetch_was_stal
 }
 
 #[tokio::test]
+async fn a_304_retries_a_moved_head_hidden_behind_a_stale_fetch_lease() {
+    let h = Harness::boot().await;
+    h.add_repo().await;
+    h.sync_and_index().await;
+    let first_head = h
+        .synced_commit()
+        .await
+        .expect("the fixture has been synced");
+    let repo_id: i64 = sqlx::query_scalar("SELECT id FROM repos")
+        .fetch_one(&h.pool().await)
+        .await
+        .unwrap();
+
+    h.add_repo().await;
+    let control = control_plane(&h.db_name).await;
+    let stale_fetch = control
+        .claim_due_fetch(Duration::from_secs(60))
+        .await
+        .unwrap()
+        .expect("the old-head fetch is leased before polling sees the move");
+
+    let moved_head =
+        yg_sync::forge::CommitSha::parse("0123456789abcdef0123456789abcdef01234567").unwrap();
+    let moved_validators = yg_control::PollValidators {
+        etag: Some(yg_control::PollEtag::new(b"\"head-b\"")),
+        last_modified: None,
+    };
+    let not_modified = || yg_sync::forge::RepoPollOutcome::NotModified {
+        validators: moved_validators.clone(),
+        rate: yg_sync::forge::ForgeRateObservation::default(),
+        accounting: yg_sync::forge::ConditionalRequestAccounting::AuthenticatedFree,
+    };
+    let forge = Arc::new(FakeHttpForge::new([
+        yg_sync::forge::RepoPollOutcome::Head {
+            head: moved_head.clone(),
+            validators: moved_validators.clone(),
+            rate: yg_sync::forge::ForgeRateObservation::default(),
+        },
+        not_modified(),
+        not_modified(),
+    ]));
+    let worker = http_poll_worker(&h, forge.clone(), 10).await;
+
+    assert!(worker.poll_once(&poll_config()).await.unwrap());
+    assert!(
+        control
+            .complete_fetch(&stale_fetch, &first_head)
+            .await
+            .unwrap(),
+        "the stale fetch completes without advancing the sync position"
+    );
+
+    sqlx::query("UPDATE repos SET next_poll_at = now() WHERE id = $1")
+        .bind(repo_id)
+        .execute(&h.pool().await)
+        .await
+        .unwrap();
+    assert!(
+        worker.poll_once(&poll_config()).await.unwrap(),
+        "the next 304 must enqueue the persisted moved head after the lease clears"
+    );
+    let moved_fetch = control
+        .claim_due_fetch(Duration::from_secs(60))
+        .await
+        .unwrap()
+        .expect("exactly one fresh fetch is queued for the moved head");
+    assert!(
+        control
+            .complete_fetch(&moved_fetch, moved_head.as_str())
+            .await
+            .unwrap()
+    );
+
+    sqlx::query("UPDATE repos SET next_poll_at = now() WHERE id = $1")
+        .bind(repo_id)
+        .execute(&h.pool().await)
+        .await
+        .unwrap();
+    assert!(worker.poll_once(&poll_config()).await.unwrap());
+    assert!(
+        control
+            .claim_due_fetch(Duration::from_secs(60))
+            .await
+            .unwrap()
+            .is_none(),
+        "once the moved head is synced, another 304 must not enqueue it again"
+    );
+    assert_eq!(forge.calls.load(Ordering::Relaxed), 3);
+    assert_eq!(
+        forge.validators_seen.lock().unwrap().as_slice(),
+        &[
+            yg_control::PollValidators::default(),
+            moved_validators.clone(),
+            moved_validators,
+        ],
+        "the moved validators advance while the observed head remains pending"
+    );
+}
+
+#[tokio::test]
 async fn an_unchanged_head_costs_only_a_conditional_request() {
     let h = Harness::boot().await;
     h.add_repo().await;
@@ -240,6 +432,223 @@ async fn an_unchanged_head_costs_only_a_conditional_request() {
         shards_before,
         "an unchanged head must publish no new Shard revision"
     );
+}
+
+#[tokio::test]
+async fn a_github_304_reuses_validators_queues_no_fetch_and_refunds_its_budget() {
+    let h = Harness::boot().await;
+    h.add_repo().await;
+    h.sync_and_index().await;
+    let repo_id: i64 = sqlx::query_scalar("SELECT id FROM repos")
+        .fetch_one(&h.pool().await)
+        .await
+        .unwrap();
+    let validators = yg_control::PollValidators {
+        etag: Some(yg_control::PollEtag::new(b"\"head-v1\"".to_vec())),
+        last_modified: None,
+    };
+    control_plane(&h.db_name)
+        .await
+        .record_poll_observation(
+            repo_id,
+            &validators,
+            &yg_control::PollHeadObservation::NotModified,
+        )
+        .await
+        .unwrap();
+    let unchanged = || yg_sync::forge::RepoPollOutcome::NotModified {
+        validators: validators.clone(),
+        rate: yg_sync::forge::ForgeRateObservation::default(),
+        accounting: yg_sync::forge::ConditionalRequestAccounting::AuthenticatedFree,
+    };
+    let forge = Arc::new(FakeHttpForge::new([unchanged(), unchanged()]));
+    let worker = http_poll_worker(&h, forge.clone(), 1).await;
+
+    assert!(worker.poll_once(&poll_config()).await.unwrap());
+    sqlx::query("UPDATE repos SET next_poll_at = now() WHERE id = $1")
+        .bind(repo_id)
+        .execute(&h.pool().await)
+        .await
+        .unwrap();
+    assert!(
+        worker.poll_once(&poll_config()).await.unwrap(),
+        "the second immediate 304 proves the one-token shared budget was refunded"
+    );
+
+    let pending_fetches: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM jobs WHERE kind = 'fetch' AND state <> 'done'")
+            .fetch_one(&h.pool().await)
+            .await
+            .unwrap();
+    assert_eq!(pending_fetches, 0, "304 must not enqueue a fetch");
+    assert_eq!(forge.calls.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        forge.validators_seen.lock().unwrap().as_slice(),
+        &[validators.clone(), validators],
+        "every conditional poll receives the persisted ETag"
+    );
+}
+
+#[tokio::test]
+async fn an_unauthenticated_304_consumes_the_configured_budget() {
+    let h = Harness::boot().await;
+    h.add_repo().await;
+    h.sync_and_index().await;
+    let repo_id: i64 = sqlx::query_scalar("SELECT id FROM repos")
+        .fetch_one(&h.pool().await)
+        .await
+        .unwrap();
+    let charged = || yg_sync::forge::RepoPollOutcome::NotModified {
+        validators: yg_control::PollValidators::default(),
+        rate: yg_sync::forge::ForgeRateObservation::default(),
+        accounting: yg_sync::forge::ConditionalRequestAccounting::Charged,
+    };
+    let forge = Arc::new(FakeHttpForge::new([charged(), charged()]));
+    let worker = http_poll_worker(&h, forge.clone(), 1).await;
+
+    assert!(worker.poll_once(&poll_config()).await.unwrap());
+    sqlx::query("UPDATE repos SET next_poll_at = now() WHERE id = $1")
+        .bind(repo_id)
+        .execute(&h.pool().await)
+        .await
+        .unwrap();
+    assert!(
+        !worker.poll_once(&poll_config()).await.unwrap(),
+        "a charged 304 must not restore the one-token budget"
+    );
+    assert_eq!(
+        forge.calls.load(Ordering::Relaxed),
+        1,
+        "the depleted budget blocks the second conditional request"
+    );
+}
+
+#[tokio::test]
+async fn a_free_304_still_honors_an_exhausted_primary_limit_reset() {
+    let h = Harness::boot().await;
+    h.add_repo().await;
+    h.sync_and_index().await;
+    let forge = Arc::new(FakeHttpForge::new([
+        yg_sync::forge::RepoPollOutcome::NotModified {
+            validators: yg_control::PollValidators::default(),
+            rate: yg_sync::forge::ForgeRateObservation {
+                remaining: Some(yg_sync::forge::RateLimitRemaining::new(0)),
+                reset: Some(yg_sync::forge::RateLimitReset::after(Duration::from_secs(
+                    30,
+                ))),
+            },
+            accounting: yg_sync::forge::ConditionalRequestAccounting::AuthenticatedFree,
+        },
+    ]));
+    let worker = http_poll_worker(&h, forge, 60).await;
+
+    assert!(
+        !worker.poll_once(&poll_config()).await.unwrap(),
+        "the reset cooldown stops the poll loop after processing the free 304"
+    );
+    let retry = h.next_poll_in_secs().await;
+    assert!(
+        (29.0..=35.0).contains(&retry),
+        "the repo must retry after the server reset plus refill, got {retry}s"
+    );
+}
+
+#[tokio::test]
+async fn a_github_200_persists_validators_and_enqueues_exactly_one_fetch() {
+    let h = Harness::boot().await;
+    h.add_repo().await;
+    h.sync_and_index().await;
+    let repo_id: i64 = sqlx::query_scalar("SELECT id FROM repos")
+        .fetch_one(&h.pool().await)
+        .await
+        .unwrap();
+    let validators = yg_control::PollValidators {
+        etag: Some(yg_control::PollEtag::new(b"\"head-v2\"".to_vec())),
+        last_modified: Some(yg_control::PollLastModified::new(
+            b"Thu, 22 Oct 2015 07:28:00 GMT".to_vec(),
+        )),
+    };
+    let moved = || yg_sync::forge::RepoPollOutcome::Head {
+        head: yg_sync::forge::CommitSha::parse("0123456789abcdef0123456789abcdef01234567").unwrap(),
+        validators: validators.clone(),
+        rate: yg_sync::forge::ForgeRateObservation::default(),
+    };
+    let forge = Arc::new(FakeHttpForge::new([moved(), moved()]));
+    let worker = http_poll_worker(&h, forge, 10).await;
+
+    assert!(worker.poll_once(&poll_config()).await.unwrap());
+    sqlx::query("UPDATE repos SET next_poll_at = now() WHERE id = $1")
+        .bind(repo_id)
+        .execute(&h.pool().await)
+        .await
+        .unwrap();
+    assert!(worker.poll_once(&poll_config()).await.unwrap());
+
+    let pending_fetches: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM jobs WHERE kind = 'fetch' AND state <> 'done'")
+            .fetch_one(&h.pool().await)
+            .await
+            .unwrap();
+    assert_eq!(
+        pending_fetches, 1,
+        "repeated moved-head observations coalesce to one in-flight fetch"
+    );
+    sqlx::query("UPDATE repos SET next_poll_at = now() WHERE id = $1")
+        .bind(repo_id)
+        .execute(&h.pool().await)
+        .await
+        .unwrap();
+    let claimed = control_plane(&h.db_name)
+        .await
+        .claim_due_poll(Duration::from_secs(300), 0.0)
+        .await
+        .unwrap()
+        .expect("the repo remains pollable while its fetch is queued");
+    assert_eq!(claimed.validators(), validators);
+}
+
+#[tokio::test]
+async fn http_poll_validators_survive_a_control_plane_restart() {
+    let h = Harness::boot().await;
+    h.add_repo().await;
+    h.sync_and_index().await;
+    let first = control_plane(&h.db_name).await;
+    let repo_id: i64 = sqlx::query_scalar("SELECT id FROM repos")
+        .fetch_one(&h.pool().await)
+        .await
+        .unwrap();
+    let expected = yg_control::PollValidators {
+        etag: Some(yg_control::PollEtag::new(b"W/\"head-v1\"".to_vec())),
+        last_modified: Some(yg_control::PollLastModified::new(
+            b"Wed, 21 Oct 2015 07:28:00 GMT".to_vec(),
+        )),
+    };
+    assert_eq!(
+        first
+            .record_poll_observation(
+                repo_id,
+                &expected,
+                &yg_control::PollHeadObservation::NotModified,
+            )
+            .await
+            .unwrap(),
+        yg_control::PollRecordOutcome::Unchanged,
+        "an unchanged observation must not enqueue a fetch"
+    );
+    drop(first);
+
+    sqlx::query("UPDATE repos SET next_poll_at = now() WHERE id = $1")
+        .bind(repo_id)
+        .execute(&h.pool().await)
+        .await
+        .unwrap();
+    let restarted = control_plane(&h.db_name).await;
+    let claimed = restarted
+        .claim_due_poll(Duration::from_secs(300), 0.0)
+        .await
+        .unwrap()
+        .expect("the restarted control plane reads the due repo");
+    assert_eq!(claimed.validators(), expected);
 }
 
 #[tokio::test]

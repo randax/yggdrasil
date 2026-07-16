@@ -104,6 +104,44 @@ async fn concurrent_workers_draw_from_one_forge_budget() {
 }
 
 #[tokio::test]
+async fn a_refunded_shared_reservation_is_immediately_available() {
+    let db_name = create_test_db().await;
+    let control = control_plane(&db_name).await;
+    let (_pool, forge_id) = low_budget_forge(&db_name).await;
+
+    assert_eq!(
+        control
+            .take_forge_budget(forge_id, NonZeroU32::MIN)
+            .await
+            .unwrap(),
+        ForgeBudgetTake::Granted
+    );
+    assert!(
+        matches!(
+            control
+                .take_forge_budget(forge_id, NonZeroU32::MIN)
+                .await
+                .unwrap(),
+            ForgeBudgetTake::RetryAfter(_)
+        ),
+        "the one-token bucket must be empty before the refund"
+    );
+
+    control
+        .refund_forge_budget(forge_id, NonZeroU32::MIN)
+        .await
+        .unwrap();
+    assert_eq!(
+        control
+            .take_forge_budget(forge_id, NonZeroU32::MIN)
+            .await
+            .unwrap(),
+        ForgeBudgetTake::Granted,
+        "a free response must restore its reserved shared token"
+    );
+}
+
+#[tokio::test]
 async fn a_reservation_larger_than_capacity_is_rejected_without_spending() {
     let db_name = create_test_db().await;
     let control = control_plane(&db_name).await;

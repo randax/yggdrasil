@@ -1,5 +1,6 @@
 //! The per-forge poll rate budget.
 
+use std::num::NonZeroU32;
 use std::time::{Duration, Instant};
 
 /// How long a forge stays cooled down after it signals a rate limit or
@@ -80,6 +81,13 @@ impl TokenBucket {
         }
     }
 
+    /// Return reserved request tokens that the Forge did not charge, capped
+    /// at the bucket's configured capacity.
+    pub(crate) fn refund(&mut self, token_count: NonZeroU32, now: Instant) {
+        self.refill(now);
+        self.tokens = (self.tokens + f64::from(token_count.get())).min(self.capacity);
+    }
+
     /// Back the forge off until at least `until` (extending, never
     /// shortening, an existing cooldown).
     pub(crate) fn cooldown(&mut self, until: Instant) {
@@ -138,6 +146,31 @@ mod tests {
         let t1 = t0 + Duration::from_secs(1);
         assert!(bucket.try_take(t1), "one token refills after a second");
         assert!(!bucket.try_take(t1), "but only one");
+    }
+
+    #[test]
+    fn refund_restores_a_spent_token() {
+        let t0 = Instant::now();
+        let mut bucket = TokenBucket::per_minute(1, t0);
+
+        assert!(bucket.try_take(t0));
+        assert!(!bucket.try_take(t0));
+
+        bucket.refund(NonZeroU32::MIN, t0);
+
+        assert!(bucket.try_take(t0));
+    }
+
+    #[test]
+    fn refund_never_exceeds_capacity() {
+        let t0 = Instant::now();
+        let mut bucket = TokenBucket::per_minute(2, t0);
+
+        bucket.refund(NonZeroU32::new(2).expect("two is non-zero"), t0);
+
+        assert!(bucket.try_take(t0));
+        assert!(bucket.try_take(t0));
+        assert!(!bucket.try_take(t0));
     }
 
     #[test]
