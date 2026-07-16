@@ -843,12 +843,13 @@ impl ControlPlane {
     ) -> anyhow::Result<Self> {
         // Sizing invariant: shard-operation guards each pin one dedicated
         // connection while the same task acquires a second, transient one
-        // for coordinated SQL. The worker wiring runs at most one index
-        // job and one GC sweep concurrently (two guards, four connections
-        // worst case), so five suffices. Raising worker concurrency
-        // requires raising this bound with it.
+        // for coordinated SQL (index publish + GC reclaim: four worst
+        // case), and a discovery sweep holds its coordination transaction
+        // plus one per-repo transaction (two more). Six concurrent holds
+        // worst case, plus headroom for the transient poll/fetch loops.
+        // Raising worker concurrency requires raising this bound with it.
         let pool = PgPoolOptions::new()
-            .max_connections(5)
+            .max_connections(8)
             .connect(database_url)
             .await
             .context("connecting to control-plane Postgres")?;
