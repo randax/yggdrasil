@@ -27,7 +27,7 @@ Critical path: **#59 → {#60, #62, #64} → {#63, #65, #66}**.
 
 - [x] **#60** Shared `Serialize + Deserialize` wire DTOs; typed CLI parsing (kill `unwrap_or("?")` fallbacks).
 - [x] **#61** Fuzzy node ids with ranked candidates (no-such-symbol vs ambiguous).
-- [ ] **#62** MCP tools call the Verb engine directly (remove 50MB re-buffer and flattened error strings).
+- [x] **#62** MCP tools call the Verb engine directly (remove 50MB re-buffer and flattened error strings).
 
 ### One shard schema bump (batch: one `SCHEMA_VERSION` bump, one reindex)
 
