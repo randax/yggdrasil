@@ -41,6 +41,7 @@ struct State {
     synced: Option<String>,
     token: u64,
     next_id: i64,
+    deferred: bool,
 }
 
 impl State {
@@ -58,6 +59,13 @@ impl State {
         if held {
             self.token += 1;
         }
+        held
+    }
+
+    /// Settle the lease and return the job to the queue.
+    fn defer(&mut self, job: &MemoryJob) -> bool {
+        let held = self.settle_lease(job);
+        self.deferred |= held;
         held
     }
 }
@@ -145,7 +153,7 @@ impl RevisionControl for MemoryControl {
             .row(shard.revision)
             .is_some_and(|row| row.state == ShardState::Reclaiming);
         if reclaiming {
-            state.settle_lease(job);
+            state.defer(job);
             return Ok(false);
         }
         if !state.settle_lease(job) {
@@ -179,7 +187,7 @@ impl RevisionControl for MemoryControl {
     }
 
     async fn defer_publication(&self, job: &MemoryJob) -> anyhow::Result<bool> {
-        Ok(self.state.lock().unwrap().settle_lease(job))
+        Ok(self.state.lock().unwrap().defer(job))
     }
 }
 
@@ -226,6 +234,18 @@ impl Harness for MemoryHarness {
         let job = self.claim_index(commit).await;
         self.control.state.lock().unwrap().token += 1;
         job
+    }
+
+    async fn claim_deferred_index(&self) -> Option<MemoryJob> {
+        let mut state = self.control.state.lock().unwrap();
+        if !std::mem::take(&mut state.deferred) {
+            return None;
+        }
+        state.token += 1;
+        Some(MemoryJob {
+            commit: state.synced.clone()?,
+            token: state.token,
+        })
     }
 
     async fn current_revision(&self) -> Option<String> {

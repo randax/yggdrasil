@@ -18,6 +18,7 @@ struct PostgresHarness {
     control: ControlPlane,
     store: Arc<dyn ObjectStore>,
     repo_id: i64,
+    db_name: String,
 }
 
 impl PostgresHarness {
@@ -31,6 +32,7 @@ impl PostgresHarness {
             control,
             store: dev_object_store(&db_name),
             repo_id,
+            db_name,
         }
     }
 
@@ -100,6 +102,17 @@ impl Harness for PostgresHarness {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    async fn claim_deferred_index(&self) -> Option<LeasedIndex> {
+        let pool = sqlx::PgPool::connect(&format!("{DEV_POSTGRES}/{}", self.db_name))
+            .await
+            .unwrap();
+        sqlx::query("UPDATE jobs SET run_after = now() WHERE kind = 'index' AND state = 'queued'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        self.control.claim_due_index(LEASE).await.unwrap()
     }
 
     async fn current_revision(&self) -> Option<String> {

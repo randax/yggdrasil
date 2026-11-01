@@ -39,6 +39,11 @@ pub trait Harness {
         commit: &str,
     ) -> impl Future<Output = <Self::Control as RevisionControl>::Job>;
 
+    /// Claim a job returned to the queue, once its retry delay has passed.
+    fn claim_deferred_index(
+        &self,
+    ) -> impl Future<Output = Option<<Self::Control as RevisionControl>::Job>>;
+
     /// The revision the repo's current-Shard pointer holds.
     fn current_revision(&self) -> impl Future<Output = Option<String>>;
 
@@ -58,7 +63,7 @@ pub async fn verify<H: Harness>(harness: impl AsyncFn() -> H) {
     a_result_after_the_lease_lapsed_is_not_applied(&harness().await).await;
     publishing_during_reclamation_republishes_after_it(&harness().await).await;
     a_settled_job_cannot_settle_again(&harness().await).await;
-    a_deferred_job_cannot_settle_again(&harness().await).await;
+    a_deferred_job_retries_once_reclamation_finishes(&harness().await).await;
     only_an_old_rowless_prefix_is_reclaimed_as_an_orphan(&harness().await).await;
 }
 
@@ -360,7 +365,7 @@ async fn a_settled_job_cannot_settle_again<H: Harness>(harness: &H) {
     }
 }
 
-async fn a_deferred_job_cannot_settle_again<H: Harness>(harness: &H) {
+async fn a_deferred_job_retries_once_reclamation_finishes<H: Harness>(harness: &H) {
     let superseded = supersede_a_with_b(harness).await;
     assert!(
         harness
@@ -369,15 +374,48 @@ async fn a_deferred_job_cannot_settle_again<H: Harness>(harness: &H) {
             .await
             .expect("begin reclaiming")
     );
-    let job = harness.claim_index(COMMIT_A).await;
-    for expected in [true, false] {
-        let deferred = harness
+    let deferred = harness.claim_index(COMMIT_A).await;
+    assert!(
+        harness
             .control()
-            .defer_publication(&job)
+            .defer_publication(&deferred)
             .await
-            .expect("defer");
-        assert_eq!(deferred, expected, "deferring consumes the job's lease");
-    }
+            .expect("defer")
+    );
+    assert!(
+        !harness
+            .control()
+            .defer_publication(&deferred)
+            .await
+            .expect("defer again"),
+        "deferring consumes the job's lease"
+    );
+    assert!(
+        reclaim_superseded(harness.control(), harness.store(), &superseded)
+            .await
+            .expect("finish reclaiming")
+    );
+
+    let retry = harness
+        .claim_deferred_index()
+        .await
+        .expect("a deferred job returns to the queue");
+    let publication = publish_revision(
+        harness.control(),
+        harness.store(),
+        harness.repo_id(),
+        COMMIT_A,
+        || prepared(COMMIT_A),
+    )
+    .await
+    .expect("publish");
+    let settled = settle_publication(harness.control(), &retry, COMMIT_A, publication)
+        .await
+        .expect("settle");
+
+    assert!(matches!(settled, PublicationSettlement::Applied { .. }));
+    assert_eq!(harness.current_revision().await, Some(revision(COMMIT_A)));
+    assert!(artifact_exists(harness, COMMIT_A).await);
 }
 
 async fn only_an_old_rowless_prefix_is_reclaimed_as_an_orphan<H: Harness>(harness: &H) {
