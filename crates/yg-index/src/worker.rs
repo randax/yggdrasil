@@ -10,6 +10,9 @@ use yg_control::ControlPlane;
 use crate::commit::CommitSha;
 use crate::history::{extract_history_for_commit, merge_history};
 use crate::pass::syntactic_pass;
+use crate::shard_lifecycle::{
+    Publication, PublicationSettlement, publish_revision, settle_publication,
+};
 
 /// How long a worker may hold an index job before a crashed run becomes
 /// claimable again. Budgeted for the worst case the path actually does:
@@ -26,78 +29,6 @@ pub struct IndexWorker {
     control: ControlPlane,
     store: Arc<dyn ObjectStore>,
     git_cache: PathBuf,
-}
-
-pub enum IndexAttempt {
-    Published {
-        shard: yg_shard::PublishedShard,
-        operation: yg_control::ShardOperationGuard,
-    },
-    ReclamationInProgress {
-        operation: yg_control::ShardOperationGuard,
-    },
-}
-
-enum PrePublication<Fence> {
-    Published {
-        shard: yg_shard::PublishedShard,
-        operation: Fence,
-    },
-    ReclamationInProgress {
-        operation: Fence,
-    },
-    Prepared(yg_shard::PreparedShard),
-}
-
-async fn prepare_or_reuse_published<
-    Fence,
-    StateProbe,
-    StateFuture,
-    PublishedProbe,
-    PublishedFuture,
-    Lock,
-    LockFuture,
-    Prepare,
-    PreparedFuture,
->(
-    mut state: StateProbe,
-    mut published: PublishedProbe,
-    lock: Lock,
-    prepare: Prepare,
-) -> anyhow::Result<PrePublication<Fence>>
-where
-    Fence: yg_control::ShardOperationFence,
-    StateProbe: FnMut() -> StateFuture,
-    StateFuture: Future<Output = anyhow::Result<Option<yg_control::ShardState>>>,
-    PublishedProbe: FnMut() -> PublishedFuture,
-    PublishedFuture: Future<Output = anyhow::Result<Option<yg_shard::PublishedShard>>>,
-    Lock: FnOnce() -> LockFuture,
-    LockFuture: Future<Output = anyhow::Result<Fence>>,
-    Prepare: FnOnce() -> PreparedFuture,
-    PreparedFuture: Future<Output = anyhow::Result<yg_shard::PreparedShard>>,
-{
-    // A reclaiming row must take the normal preparation path. Its state may
-    // change before preparation finishes, so only the later locked re-check
-    // is allowed to decide whether the job is deferred.
-    if state().await? == Some(yg_control::ShardState::Reclaiming) {
-        return Ok(PrePublication::Prepared(prepare().await?));
-    }
-    if published().await?.is_none() {
-        return Ok(PrePublication::Prepared(prepare().await?));
-    }
-
-    let operation = lock().await?;
-    if state().await? == Some(yg_control::ShardState::Reclaiming) {
-        return Ok(PrePublication::ReclamationInProgress { operation });
-    }
-    if let Some(shard) = published().await? {
-        return Ok(PrePublication::Published { shard, operation });
-    }
-
-    // GC may have removed the artifact after the lock-free probe. Never parse
-    // while holding the revision lock; release it and join the normal path.
-    operation.release().await;
-    Ok(PrePublication::Prepared(prepare().await?))
 }
 
 impl IndexWorker {
@@ -197,63 +128,19 @@ impl IndexWorker {
 
     /// Run the syntactic pass over the job's commit and publish the
     /// resulting Shard.
-    async fn index(&self, job: &yg_control::LeasedIndex) -> anyhow::Result<IndexAttempt> {
+    async fn index(
+        &self,
+        job: &yg_control::LeasedIndex,
+    ) -> anyhow::Result<Publication<yg_control::ShardOperationGuard>> {
         let commit = commit_for_job(&job.commit)?;
-        let revision = yg_shard::syntactic_revision(commit.as_str());
-        // This read-only probe is only an optimization. A complete current-
-        // schema artifact lets retries avoid checkout, parsing, and holding
-        // prepared segment bytes while they wait for the publication lock.
-        // Reclaiming revisions deliberately miss this fastpath: the locked
-        // state check below remains authoritative and decides deferral.
-        let before_lock = prepare_or_reuse_published(
-            || self.control.shard_state(job.repo_id, &revision),
-            || yg_shard::published_shard(self.store.as_ref(), job.repo_id, commit.as_str()),
-            || async {
-                self.control
-                    .lock_shard_operation(job.repo_id, &revision)
-                    .await
-                    .context("locking the Shard revision for publication")
-            },
+        publish_revision(
+            &self.control,
+            self.store.as_ref(),
+            job.repo_id,
+            commit.as_str(),
             || self.prepare(job, &commit),
         )
-        .await?;
-        let prepared = match before_lock {
-            PrePublication::Published { shard, operation } => {
-                return Ok(IndexAttempt::Published { shard, operation });
-            }
-            PrePublication::ReclamationInProgress { operation } => {
-                return Ok(IndexAttempt::ReclamationInProgress { operation });
-            }
-            PrePublication::Prepared(prepared) => prepared,
-        };
-        // Parsing and segment construction are deliberately outside the
-        // Shard-operation lock. Only publication needs serialization: after
-        // taking the lock, re-check reclamation and existing publication
-        // before the first object write.
-        let operation = self
-            .control
-            .lock_shard_operation(job.repo_id, &revision)
-            .await
-            .context("locking the Shard revision for publication")?;
-        if self.control.shard_state(job.repo_id, &revision).await?
-            == Some(yg_control::ShardState::Reclaiming)
-        {
-            return Ok(IndexAttempt::ReclamationInProgress { operation });
-        }
-        // Revisions are deterministic per commit: a publisher that won while
-        // this worker parsed lets us reuse its artifact without object writes.
-        if let Some(published) =
-            yg_shard::published_shard(self.store.as_ref(), job.repo_id, commit.as_str()).await?
-        {
-            return Ok(IndexAttempt::Published {
-                shard: published,
-                operation,
-            });
-        }
-        let shard =
-            yg_shard::publish_shard(self.store.as_ref(), job.repo_id, commit.as_str(), prepared)
-                .await?;
-        Ok(IndexAttempt::Published { shard, operation })
+        .await
     }
 
     async fn prepare(
@@ -334,56 +221,38 @@ impl IndexWorker {
 }
 
 impl yg_sync::LeasedWork<yg_control::LeasedIndex> for IndexWorker {
-    type Output = IndexAttempt;
+    type Output = Publication<yg_control::ShardOperationGuard>;
 
-    async fn run(&self, job: &yg_control::LeasedIndex) -> anyhow::Result<IndexAttempt> {
+    async fn run(&self, job: &yg_control::LeasedIndex) -> anyhow::Result<Self::Output> {
         self.index(job).await
     }
 
     async fn settle(
         &self,
         job: &yg_control::LeasedIndex,
-        attempt: IndexAttempt,
+        publication: Self::Output,
     ) -> anyhow::Result<yg_control::JobOutcome> {
-        match attempt {
-            IndexAttempt::Published { shard, operation } => {
-                let applied = yg_control::finish_shard_operation(
-                    operation,
-                    self.control.complete_index(
-                        job,
-                        yg_control::ShardRecord {
-                            revision: &shard.revision,
-                            manifest_key: &shard.manifest_key,
-                            commit_sha: &job.commit,
-                            provenance_level: yg_shard::SYNTACTIC_PASS,
-                            node_count: shard.node_count,
-                            edge_count: shard.edge_count,
-                        },
-                    ),
-                )
-                .await?;
-                if applied {
-                    tracing::info!(slug = %job.slug, revision = %shard.revision, "indexed");
-                    Ok(yg_control::JobOutcome::Success)
-                } else {
-                    tracing::warn!(slug = %job.slug, "index result was fenced or its lease lapsed; job will retry when needed");
-                    Ok(yg_control::JobOutcome::Discarded)
+        let slug = &job.slug;
+        Ok(
+            match settle_publication(&self.control, job, &job.commit, publication).await? {
+                PublicationSettlement::Applied { revision } => {
+                    tracing::info!(%slug, %revision, "indexed");
+                    yg_control::JobOutcome::Success
                 }
-            }
-            IndexAttempt::ReclamationInProgress { operation } => {
-                let deferred = yg_control::finish_shard_operation(
-                    operation,
-                    self.control.defer_index_for_reclamation(job),
-                )
-                .await?;
-                if deferred {
-                    tracing::info!(slug = %job.slug, "deferred index while its Shard revision is being reclaimed");
-                } else {
-                    tracing::warn!(slug = %job.slug, "index reclamation deferral lost its lease");
+                PublicationSettlement::NotApplied => {
+                    tracing::warn!(%slug, "index result was fenced or its lease lapsed; job will retry when needed");
+                    yg_control::JobOutcome::Discarded
                 }
-                Ok(yg_control::JobOutcome::Discarded)
-            }
-        }
+                PublicationSettlement::Deferred => {
+                    tracing::info!(%slug, "deferred index while its Shard revision is being reclaimed");
+                    yg_control::JobOutcome::Discarded
+                }
+                PublicationSettlement::DeferralLostLease => {
+                    tracing::warn!(%slug, "index reclamation deferral lost its lease");
+                    yg_control::JobOutcome::Discarded
+                }
+            },
+        )
     }
 }
 
@@ -538,21 +407,9 @@ async fn extract_tree_pipeline(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use super::*;
-    use yg_control::ShardOperationFence;
-
-    struct CountingFence<'a> {
-        releases: &'a AtomicUsize,
-    }
-
-    impl ShardOperationFence for CountingFence<'_> {
-        async fn release(self) {
-            self.releases.fetch_add(1, Ordering::SeqCst);
-        }
-    }
 
     #[tokio::test]
     async fn commit_probe_timeout_is_not_available() {
@@ -564,92 +421,6 @@ mod tests {
         .await;
 
         assert!(!available);
-    }
-
-    #[tokio::test]
-    async fn an_already_published_revision_rechecks_under_lock_without_preparation() {
-        let store = Arc::new(object_store::memory::InMemory::new());
-        let repo_id = 17;
-        let commit = "0123456789abcdef0123456789abcdef01234567";
-        let fixture = yg_shard::prepare_shard(yg_shard::Graph::default(), Vec::new())
-            .await
-            .expect("fixture segments build");
-        yg_shard::publish_shard(store.as_ref(), repo_id, commit, fixture)
-            .await
-            .expect("fixture shard publishes");
-
-        let state_probes = AtomicUsize::new(0);
-        let publication_probes = AtomicUsize::new(0);
-        let lock_acquisitions = AtomicUsize::new(0);
-        let lock_releases = AtomicUsize::new(0);
-        let preparation_runs = AtomicUsize::new(0);
-        let result = prepare_or_reuse_published(
-            || {
-                state_probes.fetch_add(1, Ordering::SeqCst);
-                std::future::ready(Ok(Some(yg_control::ShardState::Published)))
-            },
-            || {
-                publication_probes.fetch_add(1, Ordering::SeqCst);
-                let store = store.clone();
-                async move { yg_shard::published_shard(store.as_ref(), repo_id, commit).await }
-            },
-            || {
-                lock_acquisitions.fetch_add(1, Ordering::SeqCst);
-                std::future::ready(Ok(CountingFence {
-                    releases: &lock_releases,
-                }))
-            },
-            || async {
-                preparation_runs.fetch_add(1, Ordering::SeqCst);
-                yg_shard::prepare_shard(yg_shard::Graph::default(), Vec::new()).await
-            },
-        )
-        .await
-        .expect("the published fastpath succeeds");
-
-        let PrePublication::Published { shard, operation } = result else {
-            panic!("the current published shard must take the fastpath");
-        };
-        assert_eq!(shard.revision, yg_shard::syntactic_revision(commit));
-        assert_eq!(state_probes.load(Ordering::SeqCst), 2);
-        assert_eq!(publication_probes.load(Ordering::SeqCst), 2);
-        assert_eq!(lock_acquisitions.load(Ordering::SeqCst), 1);
-        assert_eq!(preparation_runs.load(Ordering::SeqCst), 0);
-        assert_eq!(lock_releases.load(Ordering::SeqCst), 0);
-        operation.release().await;
-        assert_eq!(lock_releases.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn a_reclaiming_revision_bypasses_the_published_fastpath() {
-        let publication_probes = AtomicUsize::new(0);
-        let lock_acquisitions = AtomicUsize::new(0);
-        let lock_releases = AtomicUsize::new(0);
-        let preparation_runs = AtomicUsize::new(0);
-        let result = prepare_or_reuse_published(
-            || std::future::ready(Ok(Some(yg_control::ShardState::Reclaiming))),
-            || {
-                publication_probes.fetch_add(1, Ordering::SeqCst);
-                std::future::ready(Ok(None::<yg_shard::PublishedShard>))
-            },
-            || {
-                lock_acquisitions.fetch_add(1, Ordering::SeqCst);
-                std::future::ready(Ok(CountingFence {
-                    releases: &lock_releases,
-                }))
-            },
-            || async {
-                preparation_runs.fetch_add(1, Ordering::SeqCst);
-                yg_shard::prepare_shard(yg_shard::Graph::default(), Vec::new()).await
-            },
-        )
-        .await
-        .expect("reclaiming joins the normal preparation path");
-
-        assert!(matches!(result, PrePublication::Prepared(_)));
-        assert_eq!(publication_probes.load(Ordering::SeqCst), 0);
-        assert_eq!(lock_acquisitions.load(Ordering::SeqCst), 0);
-        assert_eq!(preparation_runs.load(Ordering::SeqCst), 1);
     }
 
     #[test]

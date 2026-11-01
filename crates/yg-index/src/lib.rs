@@ -6,6 +6,7 @@ mod history;
 mod pass;
 mod reconcile;
 mod resolve;
+pub mod shard_lifecycle;
 mod worker;
 
 pub use history::extract_history;

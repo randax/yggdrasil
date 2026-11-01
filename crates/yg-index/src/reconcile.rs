@@ -3,12 +3,12 @@
 use std::collections::HashSet;
 use std::time::{Duration, SystemTime};
 
-use anyhow::Context;
 use futures::TryStreamExt;
 use futures::stream::BoxStream;
 use object_store::ObjectStore;
 use object_store::path::Path;
-use yg_control::ShardOperationFence;
+
+use crate::shard_lifecycle::{RevisionLocks, reclaim_orphan};
 
 /// Object age required before a rowless revision may be reclaimed. This is
 /// deliberately much longer than the publication critical section so object
@@ -26,34 +26,6 @@ const REVISION_DEDUP_CAP: usize = 4_096;
 pub(crate) struct ReconcileReport {
     pub(crate) reclaimed: u64,
     pub(crate) cap_reached: bool,
-}
-
-trait OrphanControl {
-    type Fence: ShardOperationFence;
-
-    async fn try_lock_revision(
-        &self,
-        repo_id: i64,
-        revision: &str,
-    ) -> anyhow::Result<Option<Self::Fence>>;
-
-    async fn shard_exists(&self, repo_id: i64, revision: &str) -> anyhow::Result<bool>;
-}
-
-impl OrphanControl for yg_control::ControlPlane {
-    type Fence = yg_control::ShardOperationGuard;
-
-    async fn try_lock_revision(
-        &self,
-        repo_id: i64,
-        revision: &str,
-    ) -> anyhow::Result<Option<Self::Fence>> {
-        self.try_lock_shard_operation(repo_id, revision).await
-    }
-
-    async fn shard_exists(&self, repo_id: i64, revision: &str) -> anyhow::Result<bool> {
-        Ok(self.shard_state(repo_id, revision).await?.is_some())
-    }
 }
 
 trait ReconcileEvents {
@@ -96,7 +68,7 @@ pub(crate) async fn reconcile_orphans(
     .await
 }
 
-async fn reconcile_orphans_at<C: OrphanControl, E: ReconcileEvents>(
+async fn reconcile_orphans_at<C: RevisionLocks, E: ReconcileEvents>(
     control: &C,
     store: &dyn ObjectStore,
     now: SystemTime,
@@ -117,7 +89,7 @@ async fn reconcile_orphans_at<C: OrphanControl, E: ReconcileEvents>(
     .await
 }
 
-async fn reconcile_listed_objects<C: OrphanControl, E: ReconcileEvents>(
+async fn reconcile_listed_objects<C: RevisionLocks, E: ReconcileEvents>(
     control: &C,
     store: &dyn ObjectStore,
     mut objects: BoxStream<'static, object_store::Result<object_store::ObjectMeta>>,
@@ -145,7 +117,17 @@ async fn reconcile_listed_objects<C: OrphanControl, E: ReconcileEvents>(
         if !examined.insert(revision.clone()) {
             continue;
         }
-        let outcome = match reconcile_candidate(control, store, &revision, now, grace).await {
+        let outcome = match reclaim_orphan(
+            control,
+            store,
+            revision.repo_id,
+            &revision.revision,
+            &revision.prefix(),
+            now,
+            grace,
+        )
+        .await
+        {
             Ok(outcome) => outcome,
             Err(error) => {
                 tracing::warn!(
@@ -177,76 +159,6 @@ async fn reconcile_listed_objects<C: OrphanControl, E: ReconcileEvents>(
         reclaimed: reclaimed.len() as u64,
         cap_reached: false,
     })
-}
-
-async fn reconcile_candidate<C: OrphanControl>(
-    control: &C,
-    store: &dyn ObjectStore,
-    revision: &ShardRevision,
-    now: SystemTime,
-    grace: Duration,
-) -> anyhow::Result<bool> {
-    // Unlocked fast path: most examined revisions are healthy, and a
-    // present row means "live, skip" — a decision that needs no lock and
-    // saves the per-revision prefix listing. The authoritative row check
-    // still happens under the lock before any deletion.
-    if control
-        .shard_exists(revision.repo_id, &revision.revision)
-        .await?
-    {
-        return Ok(false);
-    }
-
-    let prefix = revision.prefix();
-    if !prefix_is_past_grace(store, &prefix, now, grace).await? {
-        return Ok(false);
-    }
-
-    let Some(operation) = control
-        .try_lock_revision(revision.repo_id, &revision.revision)
-        .await
-        .with_context(|| format!("trying to lock orphan candidate {prefix}"))?
-    else {
-        return Ok(false);
-    };
-
-    yg_control::finish_shard_operation(operation, async {
-        // Re-list under the lock: the preliminary age check is only an
-        // optimization, and a publisher may have written another object
-        // before its operation lock became visible to this sweep.
-        if !prefix_is_past_grace(store, &prefix, now, grace).await? {
-            return Ok(false);
-        }
-        if control
-            .shard_exists(revision.repo_id, &revision.revision)
-            .await?
-        {
-            return Ok(false);
-        }
-        yg_shard::delete_shard(store, revision.repo_id, &revision.revision)
-            .await
-            .with_context(|| format!("deleting orphaned Shard prefix {prefix}"))?;
-        Ok(true)
-    })
-    .await
-}
-
-async fn prefix_is_past_grace(
-    store: &dyn ObjectStore,
-    prefix: &Path,
-    now: SystemTime,
-    grace: Duration,
-) -> anyhow::Result<bool> {
-    let newest = store
-        .list(Some(prefix))
-        .map_ok(|object| SystemTime::from(object.last_modified))
-        .try_fold(None, |newest, modified| async move {
-            Ok(Some(newest.map_or(modified, |current: SystemTime| {
-                current.max(modified)
-            })))
-        })
-        .await?;
-    Ok(newest.is_some_and(|modified| now.duration_since(modified).is_ok_and(|age| age >= grace)))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -287,6 +199,7 @@ mod tests {
     use object_store::memory::InMemory;
 
     use super::*;
+    use yg_control::ShardOperationFence;
 
     struct TestFence;
 
@@ -310,7 +223,7 @@ mod tests {
         }
     }
 
-    impl OrphanControl for TestControl {
+    impl RevisionLocks for TestControl {
         type Fence = TestFence;
 
         async fn try_lock_revision(
@@ -325,8 +238,14 @@ mod tests {
                 .then_some(TestFence))
         }
 
-        async fn shard_exists(&self, _repo_id: i64, _revision: &str) -> anyhow::Result<bool> {
-            Ok(self.shard_exists)
+        async fn revision_state(
+            &self,
+            _repo_id: i64,
+            _revision: &str,
+        ) -> anyhow::Result<Option<yg_control::ShardState>> {
+            Ok(self
+                .shard_exists
+                .then_some(yg_control::ShardState::Published))
         }
     }
 
@@ -554,7 +473,7 @@ mod tests {
         lock_attempts: AtomicU64,
     }
 
-    impl OrphanControl for RowAppearsControl {
+    impl RevisionLocks for RowAppearsControl {
         type Fence = TestFence;
 
         async fn try_lock_revision(
@@ -566,8 +485,13 @@ mod tests {
             Ok(Some(TestFence))
         }
 
-        async fn shard_exists(&self, _repo_id: i64, _revision: &str) -> anyhow::Result<bool> {
-            Ok(self.row_checks.fetch_add(1, Ordering::Relaxed) > 0)
+        async fn revision_state(
+            &self,
+            _repo_id: i64,
+            _revision: &str,
+        ) -> anyhow::Result<Option<yg_control::ShardState>> {
+            Ok((self.row_checks.fetch_add(1, Ordering::Relaxed) > 0)
+                .then_some(yg_control::ShardState::Published))
         }
     }
 
@@ -632,7 +556,7 @@ mod tests {
         store: Arc<InMemory>,
     }
 
-    impl OrphanControl for FreshWriteControl {
+    impl RevisionLocks for FreshWriteControl {
         type Fence = TestFence;
 
         async fn try_lock_revision(
@@ -649,8 +573,12 @@ mod tests {
             Ok(Some(TestFence))
         }
 
-        async fn shard_exists(&self, _repo_id: i64, _revision: &str) -> anyhow::Result<bool> {
-            Ok(false)
+        async fn revision_state(
+            &self,
+            _repo_id: i64,
+            _revision: &str,
+        ) -> anyhow::Result<Option<yg_control::ShardState>> {
+            Ok(None)
         }
     }
 
@@ -694,7 +622,7 @@ mod tests {
 
     struct PoisonFirstControl;
 
-    impl OrphanControl for PoisonFirstControl {
+    impl RevisionLocks for PoisonFirstControl {
         type Fence = TestFence;
 
         async fn try_lock_revision(
@@ -708,8 +636,12 @@ mod tests {
             Ok(Some(TestFence))
         }
 
-        async fn shard_exists(&self, _repo_id: i64, _revision: &str) -> anyhow::Result<bool> {
-            Ok(false)
+        async fn revision_state(
+            &self,
+            _repo_id: i64,
+            _revision: &str,
+        ) -> anyhow::Result<Option<yg_control::ShardState>> {
+            Ok(None)
         }
     }
 
