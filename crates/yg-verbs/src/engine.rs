@@ -7,7 +7,6 @@
 //! Transports stay thin: they decode a request, call the engine, and
 //! encode the typed result or the sanitized [`VerbError`].
 
-use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
 use crate::cursor::{CursorCodec, CursorError, CursorSecret, HistoryCursor, NeighborsCursor};
@@ -65,20 +64,17 @@ pub enum ResolveError {
 
 /// A repo's graph segment, resolved and verified on local disk.
 pub struct ResolvedShard {
-    /// Local path of the verified graph segment file.
-    pub path: std::path::PathBuf,
+    /// The verified graph segment, pinned until it is read.
+    pub artifact: yg_shard::PinnedArtifact,
     /// The immutable Shard revision the path holds — what a pagination
     /// cursor pins.
     pub repo_id: i64,
     pub revision: crate::ShardRevision,
-    /// Keeps capacity eviction from unlinking the path before it is opened.
-    pub cache_lease: Option<yg_shard::CacheLease>,
 }
 
-/// A locally materialized FTS segment with an optional cache lease.
+/// A locally materialized FTS segment, pinned until it is read.
 pub struct ResolvedFts {
-    pub path: std::path::PathBuf,
-    pub cache_lease: Option<yg_shard::CacheLease>,
+    pub artifact: yg_shard::PinnedArtifact,
 }
 
 /// An FTS segment pinned to one immutable Shard revision for fuzzy addressing.
@@ -86,9 +82,8 @@ pub struct ResolvedFts {
 /// so capacity need not accommodate both artifacts at once.
 pub struct ResolvedFuzzyShard {
     pub repo_id: i64,
-    pub fts_path: std::path::PathBuf,
+    pub fts: yg_shard::PinnedArtifact,
     pub revision: crate::ShardRevision,
-    pub fts_cache_lease: Option<yg_shard::CacheLease>,
 }
 
 /// Immutable control-plane identity carried by node-addressed cursors.
@@ -405,7 +400,7 @@ impl<R: ShardResolver + 'static> Engine<R> {
             drop(timer);
             return Ok(self.observed(crate::Verb::Node, resolved.into_ambiguous()));
         };
-        let response = run_verb(shard.path, shard.cache_lease, id, crate::node)
+        let response = run_verb(shard.artifact, id, crate::node)
             .await
             .map(AddressedResponse::Resolved)?;
         drop(timer);
@@ -487,7 +482,7 @@ impl<R: ShardResolver + 'static> Engine<R> {
         };
 
         let verb_options = options.clone();
-        let page = run_verb(shard.path, shard.cache_lease, id, move |conn, id| {
+        let page = run_verb(shard.artifact, id, move |conn, id| {
             crate::neighbors(conn, id, &verb_options)
         })
         .await?;
@@ -579,7 +574,7 @@ impl<R: ShardResolver + 'static> Engine<R> {
                 .as_ref()
                 .map(|c| (c.after_committed_at, c.after_sha.clone())),
         };
-        let page = run_verb(shard.path, shard.cache_lease, id, move |conn, id| {
+        let page = run_verb(shard.artifact, id, move |conn, id| {
             crate::history(conn, id, &options)
         })
         .await?;
@@ -645,23 +640,15 @@ impl<R: ShardResolver + 'static> Engine<R> {
                     .map_err(|error| resolve_error(qualifier.as_str(), from_cursor, error))?;
                 let name = address.name.as_str().to_string();
                 let path = address.path.as_ref().map(|path| path.as_str().to_string());
-                let fts_path = resolved.fts_path;
-                let fts_cache_lease = resolved.fts_cache_lease;
-                let symbols = tokio::task::spawn_blocking(move || {
-                    let index = yg_shard::open_fts(&fts_path)?;
-                    let symbols = yg_shard::symbols_named(&index, &name, path.as_deref());
-                    // Handle before lease: eviction is pin-gated, so the index
-                    // must close before its artifact becomes evictable.
-                    drop(index);
-                    drop(fts_cache_lease);
-                    symbols
-                })
-                .await
-                .map_err(|error| {
-                    VerbError::Internal(
-                        anyhow::Error::new(error).context("fuzzy resolution task panicked"),
-                    )
-                })?;
+                let symbols = resolved
+                    .fts
+                    .read_fts(move |index| yg_shard::symbols_named(index, &name, path.as_deref()))
+                    .await
+                    .map_err(|error| {
+                        VerbError::Internal(
+                            anyhow::Error::new(error).context("fuzzy resolution task panicked"),
+                        )
+                    })?;
                 let symbols = match symbols {
                     Ok(symbols) => symbols,
                     Err(error)
@@ -728,13 +715,11 @@ impl ResolvedAddress {
     }
 }
 
-/// The shared back half of every node-addressed Verb: open the resolved
-/// graph segment and run the (blocking, SQLite-bound) verb off the
-/// runtime threads — the open does filesystem syscalls, so it belongs
-/// in the closure too. The verb's `None` is the client's 404.
+/// The shared back half of every node-addressed Verb: read the resolved
+/// graph segment with the (blocking, SQLite-bound) verb. The verb's `None`
+/// is the client's 404.
 async fn run_verb<T, F>(
-    path: std::path::PathBuf,
-    cache_lease: Option<yg_shard::CacheLease>,
+    artifact: yg_shard::PinnedArtifact,
     id: VerbId,
     verb: F,
 ) -> Result<T, VerbError>
@@ -743,21 +728,9 @@ where
     F: FnOnce(&rusqlite::Connection, &VerbId) -> anyhow::Result<Option<T>> + Send + 'static,
 {
     let external = id.external();
-    let outcome = tokio::task::spawn_blocking(move || {
-        let conn = rusqlite::Connection::open_with_flags(
-            &path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .context("opening the cached graph segment")?;
-        let result = verb(&conn, &id);
-        // The connection must close before the lease releases: eviction
-        // is gated on pin counts, and an open handle past the pin would
-        // let the artifact vanish underneath it.
-        drop(conn);
-        drop(cache_lease);
-        result
-    })
-    .await;
+    let outcome = artifact
+        .read_graph(move |connection| verb(connection, &id))
+        .await;
     match outcome {
         Ok(Ok(Some(response))) => Ok(response),
         // "this", not "the current": a pagination cursor may have
