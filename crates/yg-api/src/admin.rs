@@ -6,6 +6,7 @@ use std::sync::Arc;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use yg_control::InFlightJobState;
 use yg_sync::RepoLocator;
 use yg_sync::forge::Forge;
 use yg_verbs::admin::{
@@ -228,21 +229,16 @@ pub(crate) async fn admin_rules_list(
     let rules = state.control.rules().await?;
     let rules = rules
         .into_iter()
-        .map(|rule| {
-            let action = RuleAction::parse(&rule.action).ok_or_else(|| {
-                ApiError::internal(anyhow::anyhow!(
-                    "stored discovery rule has unknown action {:?}",
-                    rule.action
-                ))
-            })?;
-            Ok(RuleResponse {
-                forge: ForgeBaseUrl::from_domain(rule.forge),
-                pattern: rule.pattern,
-                action,
-                applies_to_private: rule.applies_to_private,
-            })
+        .map(|rule| RuleResponse {
+            forge: ForgeBaseUrl::from_domain(rule.forge),
+            pattern: rule.pattern,
+            action: match rule.action {
+                yg_control::RuleAction::Include => RuleAction::Include,
+                yg_control::RuleAction::Exclude => RuleAction::Exclude,
+            },
+            applies_to_private: rule.applies_to_private,
         })
-        .collect::<Result<Vec<_>, ApiError>>()?;
+        .collect();
     Ok(Wire(RulesResponse { rules }).into_response())
 }
 
@@ -457,60 +453,56 @@ pub(crate) async fn admin_status(State(state): State<Arc<AppState>>) -> Result<R
     }
     let repos = repos
         .into_iter()
-        .map(|r| {
-            let discovery_state = DiscoveryState::parse(&r.discovery_state).ok_or_else(|| {
-                ApiError::internal(anyhow::anyhow!(
-                    "repository has unknown discovery state {:?}",
-                    r.discovery_state
-                ))
-            })?;
-            Ok(AdminRepoStatus {
-                sync: JobStatus {
-                    state: job_state(
-                        r.job_state.as_deref(),
-                        r.attempts,
-                        r.last_synced_commit.is_some(),
-                        StageWords {
-                            active: JobState::Syncing,
-                            done: JobState::Synced,
-                            never_ran: JobState::Registered,
-                        },
-                    ),
-                    attempts: r.attempts,
-                    last_error: r.last_error,
-                },
-                index: JobStatus {
-                    state: job_state(
-                        r.index_job_state.as_deref(),
-                        r.index_attempts,
-                        r.shard_revision.is_some(),
-                        StageWords {
-                            active: JobState::Indexing,
-                            done: JobState::Indexed,
-                            never_ran: JobState::Pending,
-                        },
-                    ),
-                    attempts: r.index_attempts,
-                    last_error: r.index_last_error,
-                },
-                shard: r.shard_revision.map(|revision| ShardStatus {
-                    revision,
-                    // Set together with the revision when a Shard is recorded.
-                    nodes: r.shard_node_count.unwrap_or(0),
-                    edges: r.shard_edge_count.unwrap_or(0),
-                }),
-                slug: RepoSlug::new(r.slug),
-                forge: ForgeBaseUrl::from_domain(r.forge),
-                visibility: match r.visibility {
-                    yg_control::RepoVisibility::Public => RepoVisibility::Public,
-                    yg_control::RepoVisibility::Internal => RepoVisibility::Internal,
-                    yg_control::RepoVisibility::Private => RepoVisibility::Private,
-                },
-                discovery_state,
-                last_synced_commit: r.last_synced_commit,
-            })
+        .map(|r| AdminRepoStatus {
+            sync: JobStatus {
+                state: job_state(
+                    r.job_state,
+                    r.attempts,
+                    r.last_synced_commit.is_some(),
+                    StageWords {
+                        active: JobState::Syncing,
+                        done: JobState::Synced,
+                        never_ran: JobState::Registered,
+                    },
+                ),
+                attempts: r.attempts,
+                last_error: r.last_error,
+            },
+            index: JobStatus {
+                state: job_state(
+                    r.index_job_state,
+                    r.index_attempts,
+                    r.shard_revision.is_some(),
+                    StageWords {
+                        active: JobState::Indexing,
+                        done: JobState::Indexed,
+                        never_ran: JobState::Pending,
+                    },
+                ),
+                attempts: r.index_attempts,
+                last_error: r.index_last_error,
+            },
+            shard: r.shard_revision.map(|revision| ShardStatus {
+                revision,
+                // Set together with the revision when a Shard is recorded.
+                nodes: r.shard_node_count.unwrap_or(0),
+                edges: r.shard_edge_count.unwrap_or(0),
+            }),
+            slug: RepoSlug::new(r.slug),
+            forge: ForgeBaseUrl::from_domain(r.forge),
+            visibility: match r.visibility {
+                yg_control::RepoVisibility::Public => RepoVisibility::Public,
+                yg_control::RepoVisibility::Internal => RepoVisibility::Internal,
+                yg_control::RepoVisibility::Private => RepoVisibility::Private,
+            },
+            discovery_state: match r.discovery_state {
+                yg_control::DiscoveryState::Discovered => DiscoveryState::Discovered,
+                yg_control::DiscoveryState::Included => DiscoveryState::Included,
+                yg_control::DiscoveryState::Excluded => DiscoveryState::Excluded,
+            },
+            last_synced_commit: r.last_synced_commit,
         })
-        .collect::<Result<Vec<_>, ApiError>>()?;
+        .collect();
     Ok(Wire(AdminStatusResponse {
         repos,
         visibility_counts,
@@ -521,6 +513,7 @@ pub(crate) async fn admin_status(State(state): State<Arc<AppState>>) -> Result<R
 
 /// The stage-specific words [`job_state`] fills in: what to call a
 /// leased job, a stage that finished, and one that never ran.
+#[derive(Clone, Copy)]
 struct StageWords {
     active: JobState,
     done: JobState,
@@ -532,16 +525,15 @@ struct StageWords {
 /// through failures (`fail_*` re-queues with a backoff), so a queued job
 /// with attempts is a retry, not a first run.
 fn job_state(
-    job_state: Option<&str>,
+    job_state: Option<InFlightJobState>,
     attempts: i32,
     has_output: bool,
     words: StageWords,
 ) -> JobState {
     match (job_state, attempts, has_output) {
-        (Some("leased"), ..) => words.active,
-        (Some("queued"), 0, _) => JobState::Queued,
-        (Some("queued"), ..) => JobState::Retrying,
-        (Some(_), ..) => JobState::Unknown,
+        (Some(InFlightJobState::Leased), ..) => words.active,
+        (Some(InFlightJobState::Queued), 0, _) => JobState::Queued,
+        (Some(InFlightJobState::Queued), ..) => JobState::Retrying,
         (None, _, true) => words.done,
         (None, _, false) => words.never_ran,
     }
@@ -566,6 +558,32 @@ mod tests {
                 "error": "forge kind custom is not supported by this endpoint"
             })
         );
+    }
+
+    #[test]
+    fn job_state_collapses_queue_position_into_the_status_word() {
+        let words = StageWords {
+            active: JobState::Syncing,
+            done: JobState::Synced,
+            never_ran: JobState::Registered,
+        };
+        let cases = [
+            (Some(InFlightJobState::Leased), 0, false, JobState::Syncing),
+            (Some(InFlightJobState::Leased), 3, true, JobState::Syncing),
+            (Some(InFlightJobState::Queued), 0, false, JobState::Queued),
+            (Some(InFlightJobState::Queued), 0, true, JobState::Queued),
+            (Some(InFlightJobState::Queued), 2, true, JobState::Retrying),
+            (None, 0, true, JobState::Synced),
+            (None, 4, true, JobState::Synced),
+            (None, 0, false, JobState::Registered),
+        ];
+        for (state, attempts, has_output, expected) in cases {
+            assert_eq!(
+                job_state(state, attempts, has_output, words),
+                expected,
+                "{state:?} after {attempts} attempts, has_output={has_output}"
+            );
+        }
     }
 
     #[test]

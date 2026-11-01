@@ -411,17 +411,66 @@ pub struct DiscoveredRepo<'a> {
     pub fetch_depth: Option<i32>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type)]
+#[sqlx(type_name = "text", rename_all = "lowercase")]
 pub enum RuleAction {
     Include,
     Exclude,
 }
 
 impl RuleAction {
+    #[cfg(test)]
+    const ALL: [Self; 2] = [Self::Include, Self::Exclude];
+
     fn as_str(self) -> &'static str {
         match self {
             Self::Include => "include",
             Self::Exclude => "exclude",
+        }
+    }
+}
+
+/// Whether a repo takes part in Sync. Only included repos are fetched
+/// and indexed; a discovered repo waits for a rule to include it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type)]
+#[sqlx(type_name = "text", rename_all = "lowercase")]
+pub enum DiscoveryState {
+    Discovered,
+    Included,
+    Excluded,
+}
+
+impl DiscoveryState {
+    #[cfg(test)]
+    const ALL: [Self; 3] = [Self::Discovered, Self::Included, Self::Excluded];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Discovered => "discovered",
+            Self::Included => "included",
+            Self::Excluded => "excluded",
+        }
+    }
+}
+
+/// Where an unfinished job sits in the queue. Settled jobs are `done` in
+/// storage, which status queries filter out, so it has no variant here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type)]
+#[sqlx(type_name = "text", rename_all = "lowercase")]
+pub enum InFlightJobState {
+    Queued,
+    Leased,
+}
+
+impl InFlightJobState {
+    #[cfg(test)]
+    const ALL: [Self; 2] = [Self::Queued, Self::Leased];
+
+    #[cfg(test)]
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Leased => "leased",
         }
     }
 }
@@ -638,7 +687,7 @@ pub fn member_token_id_is_valid(id: &str) -> bool {
 pub struct DiscoveryRule {
     pub forge: ForgeUrl,
     pub pattern: String,
-    pub action: String,
+    pub action: RuleAction,
     pub applies_to_private: bool,
 }
 
@@ -1079,14 +1128,14 @@ pub struct RepoSyncStatus {
     /// The forge's base URL.
     pub forge: ForgeUrl,
     pub visibility: RepoVisibility,
-    pub discovery_state: String,
+    pub discovery_state: DiscoveryState,
     pub last_synced_commit: Option<String>,
-    /// State of the in-flight fetch job (`queued` | `leased`), if any.
-    pub job_state: Option<String>,
+    /// State of the in-flight fetch job, if any.
+    pub job_state: Option<InFlightJobState>,
     pub attempts: i32,
     pub last_error: Option<String>,
-    /// State of the in-flight index job (`queued` | `leased`), if any.
-    pub index_job_state: Option<String>,
+    /// State of the in-flight index job, if any.
+    pub index_job_state: Option<InFlightJobState>,
     pub index_attempts: i32,
     pub index_last_error: Option<String>,
     /// The repo's current Shard, if it has ever been indexed.
@@ -1098,7 +1147,7 @@ pub struct RepoSyncStatus {
 #[derive(sqlx::FromRow)]
 struct RuleRow {
     pattern: String,
-    action: String,
+    action: RuleAction,
     applies_to_private: bool,
 }
 
@@ -1343,10 +1392,10 @@ impl ControlPlane {
         let discovery_state = discovery_state_for(repo.slug, visibility, &rules);
         sqlx::query("UPDATE repos SET discovery_state = $2 WHERE id = $1")
             .bind(repo_id)
-            .bind(discovery_state)
+            .bind(discovery_state.as_str())
             .execute(&mut *tx)
             .await?;
-        let fetch_queued = if discovery_state == "included" {
+        let fetch_queued = if discovery_state == DiscoveryState::Included {
             enqueue_job_unless_in_flight(&mut tx, JobKind::Fetch, repo_id).await?
         } else {
             false
@@ -1491,7 +1540,7 @@ impl ControlPlane {
             // no-op DO UPDATE cannot safely handle a row inserted by a BEFORE
             // INSERT trigger in the same command.
             let mut insert = tx.begin().await?;
-            let inserted: Result<Option<(i64, String)>, sqlx::Error> = sqlx::query_as(
+            let inserted: Result<Option<(i64, DiscoveryState)>, sqlx::Error> = sqlx::query_as(
                 "INSERT INTO repos
                     (forge_id, slug, visibility, discovery_state, fetch_depth, qualifier,
                      registration_base_url)
@@ -1502,7 +1551,7 @@ impl ControlPlane {
             .bind(forge_id)
             .bind(repo.slug)
             .bind(repo.visibility.as_str())
-            .bind(state)
+            .bind(state.as_str())
             .bind(repo.fetch_depth)
             .bind(&qualifier)
             .bind(base_url.as_str())
@@ -1514,7 +1563,7 @@ impl ControlPlane {
                     (repo_id, true, discovery_state)
                 }
                 Ok(None) => {
-                    let same_repo: Option<(i64, String)> = sqlx::query_as(
+                    let same_repo: Option<(i64, DiscoveryState)> = sqlx::query_as(
                         "SELECT id, discovery_state FROM repos
                          WHERE forge_id = $1 AND slug = $2
                          FOR UPDATE",
@@ -1559,7 +1608,7 @@ impl ControlPlane {
                 }
                 Err(error) => return Err(error.into()),
             };
-            let was_included = !created && previous_state == "included";
+            let was_included = !created && previous_state == DiscoveryState::Included;
             sqlx::query(
                 "UPDATE repos
                  SET visibility = $2,
@@ -1569,7 +1618,7 @@ impl ControlPlane {
             )
             .bind(repo_id)
             .bind(repo.visibility.as_str())
-            .bind(state)
+            .bind(state.as_str())
             .bind(repo.fetch_depth)
             .execute(&mut *tx)
             .await?;
@@ -1581,12 +1630,12 @@ impl ControlPlane {
             .bind(repo.slug)
             .execute(&mut *tx)
             .await?;
-            if state == "included"
+            if state == DiscoveryState::Included
                 && !was_included
                 && enqueue_job_unless_in_flight(&mut tx, JobKind::Fetch, repo_id).await?
             {
                 fetches_queued += 1;
-            } else if state != "included" && was_included {
+            } else if state != DiscoveryState::Included && was_included {
                 remove_repo_from_indexing(&mut tx, repo_id).await?;
             }
             tx.commit().await?;
@@ -1627,7 +1676,7 @@ impl ControlPlane {
         .await?;
 
         let rules = rules_for_forge(&mut tx, rule.forge_id).await?;
-        let repos: Vec<(i64, String, RepoVisibility, String)> = sqlx::query_as(
+        let repos: Vec<(i64, String, RepoVisibility, DiscoveryState)> = sqlx::query_as(
             "SELECT id, slug, visibility, discovery_state
              FROM repos
              WHERE forge_id = $1
@@ -1639,19 +1688,19 @@ impl ControlPlane {
         .await?;
         let mut fetches_queued = 0;
         for (repo_id, slug, visibility, previous_state) in &repos {
-            let was_included = previous_state == "included";
+            let was_included = *previous_state == DiscoveryState::Included;
             let state = discovery_state_for(slug, *visibility, &rules);
             sqlx::query("UPDATE repos SET discovery_state = $2 WHERE id = $1")
                 .bind(repo_id)
-                .bind(state)
+                .bind(state.as_str())
                 .execute(&mut *tx)
                 .await?;
-            if state == "included"
+            if state == DiscoveryState::Included
                 && !was_included
                 && enqueue_job_unless_in_flight(&mut tx, JobKind::Fetch, *repo_id).await?
             {
                 fetches_queued += 1;
-            } else if state != "included" && was_included {
+            } else if state != DiscoveryState::Included && was_included {
                 remove_repo_from_indexing(&mut tx, *repo_id).await?;
             }
         }
@@ -2014,12 +2063,12 @@ impl ControlPlane {
         // touches both (add_repo, complete_index). Mixed orders here
         // deadlock — e.g. holding a jobs entry while waiting on a repo
         // row another completion took first.
-        let (discovery_state,): (String,) =
+        let (discovery_state,): (DiscoveryState,) =
             sqlx::query_as("SELECT discovery_state FROM repos WHERE id = $1 FOR UPDATE")
                 .bind(job.repo_id)
                 .fetch_one(&mut *tx)
                 .await?;
-        if discovery_state != "included" {
+        if discovery_state != DiscoveryState::Included {
             settle_leased_job(&mut tx, job.job_id, &job.lease_token, true).await?;
             tx.commit().await?;
             return Ok(false);
@@ -2539,17 +2588,20 @@ impl ControlPlane {
         // Lock the repo row before reading its sync position so a
         // concurrent complete_fetch can't advance it between this check
         // and commit (its own repos UPDATE serializes behind this lock).
-        let (current_commit, old_shard_id, discovery_state): (Option<String>, Option<i64>, String) =
-            sqlx::query_as(
-                "SELECT last_synced_commit, current_shard_id, discovery_state
+        let (current_commit, old_shard_id, discovery_state): (
+            Option<String>,
+            Option<i64>,
+            DiscoveryState,
+        ) = sqlx::query_as(
+            "SELECT last_synced_commit, current_shard_id, discovery_state
              FROM repos
              WHERE id = $1
              FOR UPDATE",
-            )
-            .bind(job.repo_id)
-            .fetch_one(&mut *tx)
-            .await?;
-        if discovery_state != "included" {
+        )
+        .bind(job.repo_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if discovery_state != DiscoveryState::Included {
             settle_leased_job(&mut tx, job.job_id, &job.lease_token, true).await?;
             tx.commit().await?;
             return Ok(false);
@@ -3081,22 +3133,25 @@ async fn remove_repo_from_indexing(
 /// (longest pattern) wins, and the newest rule wins ties. Private repos
 /// only consider rules with `applies_to_private`, making private indexing
 /// an explicit opt-in path per ADR 0001.
-fn discovery_state_for(slug: &str, visibility: RepoVisibility, rules: &[RuleRow]) -> &'static str {
+fn discovery_state_for(
+    slug: &str,
+    visibility: RepoVisibility,
+    rules: &[RuleRow],
+) -> DiscoveryState {
     for rule in rules {
         if visibility == RepoVisibility::Private && !rule.applies_to_private {
             continue;
         }
         if glob_matches(&rule.pattern, slug) {
-            return if rule.action == "include" {
-                "included"
-            } else {
-                "excluded"
+            return match rule.action {
+                RuleAction::Include => DiscoveryState::Included,
+                RuleAction::Exclude => DiscoveryState::Excluded,
             };
         }
     }
     match visibility {
-        RepoVisibility::Private => "discovered",
-        RepoVisibility::Public | RepoVisibility::Internal => "included",
+        RepoVisibility::Private => DiscoveryState::Discovered,
+        RepoVisibility::Public | RepoVisibility::Internal => DiscoveryState::Included,
     }
 }
 
@@ -3213,13 +3268,14 @@ async fn settle_leased_job(
 #[cfg(test)]
 mod tests {
     use super::{
-        ForgeUrl, JobKind, MAX_MEMBER_TOKEN_LIFETIME_SECONDS, MemberName,
-        MemberTokenLifetimeSeconds, REPO_QUALIFIER_SQL, RepoVisibility, RuleRow,
-        SUPERSEDED_SHARDS_PAST_GRACE_QUERY, SUPERSEDED_SHARDS_PAST_GRACE_SQL, ShardState,
+        DiscoveryState, ForgeUrl, InFlightJobState, JobKind, MAX_MEMBER_TOKEN_LIFETIME_SECONDS,
+        MemberName, MemberTokenLifetimeSeconds, REPO_QUALIFIER_SQL, RepoVisibility, RuleAction,
+        RuleRow, SUPERSEDED_SHARDS_PAST_GRACE_QUERY, SUPERSEDED_SHARDS_PAST_GRACE_SQL, ShardState,
         discovery_state_for, forge_budget_retry_after, glob_matches, member_token_id_is_valid,
         repo_qualifier, shard_accepts_publication,
     };
 
+    const SYNC_TRACER_MIGRATION: &str = include_str!("../migrations/0002_sync_tracer.sql");
     const HYGIENE_MIGRATION: &str = include_str!("../migrations/0011_job_queue_hygiene.sql");
     const SHARD_STATE_MIGRATION: &str = include_str!("../migrations/0013_shard_reclaiming.sql");
     const MEMBER_TOKEN_EXPIRY_MIGRATION: &str =
@@ -3477,23 +3533,67 @@ mod tests {
         let rules = vec![
             RuleRow {
                 pattern: "acme/*".into(),
-                action: "include".into(),
+                action: RuleAction::Include,
                 applies_to_private: false,
             },
             RuleRow {
                 pattern: "acme/private-*".into(),
-                action: "include".into(),
+                action: RuleAction::Include,
                 applies_to_private: true,
             },
         ];
         assert_eq!(
             discovery_state_for("acme/private-widgets", RepoVisibility::Private, &rules),
-            "included"
+            DiscoveryState::Included
         );
         assert_eq!(
             discovery_state_for("acme/secret", RepoVisibility::Private, &rules),
-            "discovered",
+            DiscoveryState::Discovered,
             "private repos ignore rules not explicitly marked private"
+        );
+    }
+
+    #[test]
+    fn the_discovery_state_constraint_mirrors_the_rust_vocabulary() {
+        let clause = format!(
+            "discovery_state IN ({})",
+            DiscoveryState::ALL
+                .map(|state| format!("'{}'", state.as_str()))
+                .join(", ")
+        );
+        assert!(
+            SYNC_TRACER_MIGRATION.contains(&clause),
+            "migration 0002 must constrain discovery_state to {clause}"
+        );
+    }
+
+    #[test]
+    fn the_rule_action_constraint_mirrors_the_rust_vocabulary() {
+        let clause = format!(
+            "action IN ({})",
+            RuleAction::ALL
+                .map(|action| format!("'{}'", action.as_str()))
+                .join(", ")
+        );
+        assert!(
+            SYNC_TRACER_MIGRATION.contains(&clause),
+            "migration 0002 must constrain action to {clause}"
+        );
+    }
+
+    /// `done` is the one stored state with no variant: status queries
+    /// select only in-flight rows, so it must never reach this type.
+    #[test]
+    fn the_job_state_constraint_is_the_in_flight_vocabulary_plus_done() {
+        let clause = format!(
+            "state IN ({}, 'done')",
+            InFlightJobState::ALL
+                .map(|state| format!("'{}'", state.as_str()))
+                .join(", ")
+        );
+        assert!(
+            SYNC_TRACER_MIGRATION.contains(&clause),
+            "migration 0002 must constrain job state to {clause}"
         );
     }
 }

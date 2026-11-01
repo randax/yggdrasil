@@ -119,7 +119,10 @@ async fn discovery_keeps_private_repos_discovered_until_a_private_include_rule_m
 
     let repos = control.admin_status().await.unwrap();
     assert_eq!(repos[0].visibility, yg_control::RepoVisibility::Private);
-    assert_eq!(repos[0].discovery_state, "discovered");
+    assert_eq!(
+        repos[0].discovery_state,
+        yg_control::DiscoveryState::Discovered
+    );
     assert!(
         repos[0].job_state.is_none(),
         "a private repo must not queue fetch before opt-in"
@@ -136,10 +139,13 @@ async fn discovery_keeps_private_repos_discovered_until_a_private_include_rule_m
         .unwrap();
 
     let repos = control.admin_status().await.unwrap();
-    assert_eq!(repos[0].discovery_state, "included");
     assert_eq!(
-        repos[0].job_state.as_deref(),
-        Some("queued"),
+        repos[0].discovery_state,
+        yg_control::DiscoveryState::Included
+    );
+    assert_eq!(
+        repos[0].job_state,
+        Some(yg_control::InFlightJobState::Queued),
         "explicit private opt-in must queue the first fetch"
     );
 }
@@ -172,7 +178,7 @@ async fn admin_repo_add_opts_in_a_previously_discovered_private_repo() {
         .unwrap();
     assert_eq!(
         control.admin_status().await.unwrap()[0].discovery_state,
-        "discovered",
+        yg_control::DiscoveryState::Discovered,
         "private org discovery must not include the repo by itself"
     );
 
@@ -195,7 +201,10 @@ async fn admin_repo_add_opts_in_a_previously_discovered_private_repo() {
     );
     let repos = control.admin_status().await.unwrap();
     assert_eq!(repos[0].visibility, yg_control::RepoVisibility::Private);
-    assert_eq!(repos[0].discovery_state, "included");
+    assert_eq!(
+        repos[0].discovery_state,
+        yg_control::DiscoveryState::Included
+    );
     assert!(
         control
             .claim_due_fetch(std::time::Duration::from_secs(60))
@@ -306,7 +315,10 @@ async fn exclude_rules_cancel_pending_fetches_for_included_repos() {
         "an excluded repo must not keep its queued fetch"
     );
     let repos = control.admin_status().await.unwrap();
-    assert_eq!(repos[0].discovery_state, "excluded");
+    assert_eq!(
+        repos[0].discovery_state,
+        yg_control::DiscoveryState::Excluded
+    );
 }
 
 #[tokio::test]
@@ -341,7 +353,7 @@ async fn readding_a_repo_makes_its_exact_include_rule_newest_again() {
         .unwrap();
     assert_eq!(
         control.admin_status().await.unwrap()[0].discovery_state,
-        "excluded"
+        yg_control::DiscoveryState::Excluded
     );
 
     let added = control
@@ -360,7 +372,7 @@ async fn readding_a_repo_makes_its_exact_include_rule_newest_again() {
     assert!(added.fetch_queued);
     assert_eq!(
         control.admin_status().await.unwrap()[0].discovery_state,
-        "included",
+        yg_control::DiscoveryState::Included,
         "the latest equal-length rule must win the deterministic tie-break"
     );
 }
@@ -712,7 +724,10 @@ async fn a_registered_forge_double_discovers_repos_through_the_worker_loop() {
     let repos = control.admin_status().await.unwrap();
     assert_eq!(repos.len(), 1, "the double's listing must be reconciled");
     assert_eq!(repos[0].slug, "acme/discovered-widgets");
-    assert_eq!(repos[0].discovery_state, "included");
+    assert_eq!(
+        repos[0].discovery_state,
+        yg_control::DiscoveryState::Included
+    );
 }
 
 #[tokio::test]
@@ -1206,8 +1221,8 @@ async fn a_worker_that_outlived_its_lease_cannot_clobber_the_new_claim() {
         "a stale completion must not advance the synced commit"
     );
     assert_eq!(
-        repos[0].job_state.as_deref(),
-        Some("leased"),
+        repos[0].job_state,
+        Some(yg_control::InFlightJobState::Leased),
         "the job must still belong to worker B"
     );
 
@@ -1218,7 +1233,10 @@ async fn a_worker_that_outlived_its_lease_cannot_clobber_the_new_claim() {
     );
     let repos = control.admin_status().await.unwrap();
     assert_eq!(repos[0].attempts, 0, "stale failure must not count");
-    assert_eq!(repos[0].job_state.as_deref(), Some("leased"));
+    assert_eq!(
+        repos[0].job_state,
+        Some(yg_control::InFlightJobState::Leased)
+    );
 
     // B's own completion still lands.
     assert!(
@@ -1363,8 +1381,8 @@ async fn a_reclaimed_jobs_old_lease_token_can_neither_renew_nor_settle() {
     assert_eq!(repos[0].last_synced_commit, None);
     assert_eq!(repos[0].attempts, 0, "a fenced failure must not count");
     assert_eq!(
-        repos[0].job_state.as_deref(),
-        Some("leased"),
+        repos[0].job_state,
+        Some(yg_control::InFlightJobState::Leased),
         "the job must still belong to worker B"
     );
 
