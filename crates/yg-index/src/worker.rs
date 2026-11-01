@@ -28,7 +28,7 @@ pub struct IndexWorker {
     git_cache: PathBuf,
 }
 
-enum IndexAttempt {
+pub enum IndexAttempt {
     Published {
         shard: yg_shard::PublishedShard,
         operation: yg_control::ShardOperationGuard,
@@ -190,96 +190,9 @@ impl IndexWorker {
         &self,
         shutdown: Option<yg_sync::Shutdown>,
     ) -> anyhow::Result<bool> {
-        let (job, timer) = match claim_due_index_with_optional_shutdown(
-            shutdown.as_ref(),
-            self.control.claim_due_index(INDEX_LEASE),
-            async |job| self.control.release_index(job).await,
-            || self.control.start_job(yg_control::JobKind::Index),
-        )
-        .await?
-        {
-            ShutdownClaim::Empty => return Ok(false),
-            ShutdownClaim::Ready { job, timer } => (job, timer),
-            ShutdownClaim::Released { timer } => {
-                // The job was released untouched for a healthy retry: no
-                // work happened, so no outcome is recorded.
-                timer.disarm();
-                return Ok(true);
-            }
-        };
-        // A cold self-healing clone plus a long parse outlives the base
-        // lease; the heartbeat keeps the job ours while the work is alive.
-        let renew = async || self.control.renew_index(&job, INDEX_LEASE).await;
-        let indexed = if let Some(shutdown) = shutdown {
-            let release = async || self.control.release_index(&job).await;
-            match yg_sync::with_lease_heartbeat_until_shutdown(
-                INDEX_LEASE,
-                renew,
-                release,
-                shutdown,
-                self.index(&job),
-            )
-            .await?
-            {
-                yg_sync::LeaseShutdown::Finished(indexed) => indexed,
-                yg_sync::LeaseShutdown::Released => {
-                    timer.finish(yg_control::JobOutcome::Discarded);
-                    return Ok(true);
-                }
-            }
-        } else {
-            yg_sync::with_lease_heartbeat(INDEX_LEASE, renew, self.index(&job)).await
-        };
-        match indexed {
-            Ok(IndexAttempt::Published { shard, operation }) => {
-                let applied = yg_control::finish_shard_operation(
-                    operation,
-                    self.control.complete_index(
-                        &job,
-                        yg_control::ShardRecord {
-                            revision: &shard.revision,
-                            manifest_key: &shard.manifest_key,
-                            commit_sha: &job.commit,
-                            provenance_level: yg_shard::SYNTACTIC_PASS,
-                            node_count: shard.node_count,
-                            edge_count: shard.edge_count,
-                        },
-                    ),
-                )
-                .await?;
-                if applied {
-                    tracing::info!(slug = %job.slug, revision = %shard.revision, "indexed");
-                    timer.finish(yg_control::JobOutcome::Success);
-                } else {
-                    tracing::warn!(slug = %job.slug, "index result was fenced or its lease lapsed; job will retry when needed");
-                    timer.finish(yg_control::JobOutcome::Discarded);
-                }
-            }
-            Ok(IndexAttempt::ReclamationInProgress { operation }) => {
-                let deferred = yg_control::finish_shard_operation(
-                    operation,
-                    self.control.defer_index_for_reclamation(&job),
-                )
-                .await?;
-                if deferred {
-                    tracing::info!(slug = %job.slug, "deferred index while its Shard revision is being reclaimed");
-                } else {
-                    tracing::warn!(slug = %job.slug, "index reclamation deferral lost its lease");
-                }
-                timer.finish(yg_control::JobOutcome::Discarded);
-            }
-            Err(e) => {
-                let error = format!("{e:#}");
-                if self.control.fail_index(&job, &error).await? {
-                    tracing::warn!(slug = %job.slug, attempt = job.attempts + 1, error, "index failed");
-                    timer.finish(yg_control::JobOutcome::Failure);
-                } else {
-                    tracing::warn!(slug = %job.slug, "lease lapsed mid-index; failure discarded");
-                    timer.finish(yg_control::JobOutcome::Discarded);
-                }
-            }
-        }
-        Ok(true)
+        let queue =
+            yg_sync::ControlQueue::<yg_control::LeasedIndex>::new(&self.control, INDEX_LEASE);
+        yg_sync::run_leased_job(&queue, shutdown, self).await
     }
 
     /// Run the syntactic pass over the job's commit and publish the
@@ -420,28 +333,58 @@ impl IndexWorker {
     }
 }
 
-enum ShutdownClaim<T, M> {
-    Empty,
-    Ready { job: T, timer: M },
-    Released { timer: M },
-}
+impl yg_sync::LeasedWork<yg_control::LeasedIndex> for IndexWorker {
+    type Output = IndexAttempt;
 
-async fn claim_due_index_with_optional_shutdown<T, M>(
-    shutdown: Option<&yg_sync::Shutdown>,
-    claim: impl Future<Output = anyhow::Result<Option<T>>>,
-    release: impl AsyncFnOnce(&T) -> anyhow::Result<bool>,
-    start_timer: impl FnOnce() -> M,
-) -> anyhow::Result<ShutdownClaim<T, M>> {
-    let Some(job) = claim.await? else {
-        return Ok(ShutdownClaim::Empty);
-    };
-    let timer = start_timer();
-    if shutdown.is_some_and(|shutdown| shutdown.request().is_some()) {
-        let released = release(&job).await?;
-        tracing::info!(released, "released fresh index claim for shutdown");
-        return Ok(ShutdownClaim::Released { timer });
+    async fn run(&self, job: &yg_control::LeasedIndex) -> anyhow::Result<IndexAttempt> {
+        self.index(job).await
     }
-    Ok(ShutdownClaim::Ready { job, timer })
+
+    async fn settle(
+        &self,
+        job: &yg_control::LeasedIndex,
+        attempt: IndexAttempt,
+    ) -> anyhow::Result<yg_control::JobOutcome> {
+        match attempt {
+            IndexAttempt::Published { shard, operation } => {
+                let applied = yg_control::finish_shard_operation(
+                    operation,
+                    self.control.complete_index(
+                        job,
+                        yg_control::ShardRecord {
+                            revision: &shard.revision,
+                            manifest_key: &shard.manifest_key,
+                            commit_sha: &job.commit,
+                            provenance_level: yg_shard::SYNTACTIC_PASS,
+                            node_count: shard.node_count,
+                            edge_count: shard.edge_count,
+                        },
+                    ),
+                )
+                .await?;
+                if applied {
+                    tracing::info!(slug = %job.slug, revision = %shard.revision, "indexed");
+                    Ok(yg_control::JobOutcome::Success)
+                } else {
+                    tracing::warn!(slug = %job.slug, "index result was fenced or its lease lapsed; job will retry when needed");
+                    Ok(yg_control::JobOutcome::Discarded)
+                }
+            }
+            IndexAttempt::ReclamationInProgress { operation } => {
+                let deferred = yg_control::finish_shard_operation(
+                    operation,
+                    self.control.defer_index_for_reclamation(job),
+                )
+                .await?;
+                if deferred {
+                    tracing::info!(slug = %job.slug, "deferred index while its Shard revision is being reclaimed");
+                } else {
+                    tracing::warn!(slug = %job.slug, "index reclamation deferral lost its lease");
+                }
+                Ok(yg_control::JobOutcome::Discarded)
+            }
+        }
+    }
 }
 
 /// Parse the untyped control-plane payload before the worker performs storage,
@@ -599,7 +542,6 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use tokio::time::Instant;
     use yg_control::ShardOperationFence;
 
     struct CountingFence<'a> {
@@ -708,34 +650,6 @@ mod tests {
         assert_eq!(publication_probes.load(Ordering::SeqCst), 0);
         assert_eq!(lock_acquisitions.load(Ordering::SeqCst), 0);
         assert_eq!(preparation_runs.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn index_claim_completing_after_shutdown_is_released_before_work_starts() {
-        let (trigger, shutdown) = yg_sync::shutdown_channel();
-        let released_job = AtomicUsize::new(0);
-        let claim = async {
-            assert!(trigger.request(
-                Instant::now() + Duration::from_secs(30),
-                yg_sync::ShutdownCause::Signal,
-            ));
-            Ok(Some(43_usize))
-        };
-
-        let claimed = claim_due_index_with_optional_shutdown(
-            Some(&shutdown),
-            claim,
-            async |job| {
-                released_job.store(*job, Ordering::SeqCst);
-                Ok(true)
-            },
-            || 79_usize,
-        )
-        .await
-        .expect("post-claim shutdown check");
-
-        assert!(matches!(claimed, ShutdownClaim::Released { timer: 79 }));
-        assert_eq!(released_job.load(Ordering::SeqCst), 43);
     }
 
     #[test]

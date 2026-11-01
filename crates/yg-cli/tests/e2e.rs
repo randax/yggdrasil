@@ -1228,7 +1228,7 @@ async fn a_worker_that_outlived_its_lease_cannot_clobber_the_new_claim() {
 
     // A stale failure must not reset B's job either.
     assert!(
-        !control.fail_fetch(&stale, "boom").await.unwrap(),
+        !control.fail_job(&stale, "boom").await.unwrap(),
         "a stale failure must report that it was discarded"
     );
     let repos = control.admin_status().await.unwrap();
@@ -1281,7 +1281,7 @@ async fn a_heartbeating_worker_keeps_a_job_whose_work_outlives_the_base_lease() 
     // A heartbeat renews the lease before anyone reclaims the job…
     assert!(
         control
-            .renew_fetch(&job, std::time::Duration::from_secs(60))
+            .renew_job(&job, std::time::Duration::from_secs(60))
             .await
             .unwrap(),
         "the lease holder's renewal must apply"
@@ -1340,14 +1340,14 @@ async fn a_reclaimed_jobs_old_lease_token_can_neither_renew_nor_settle() {
         .expect("claimable");
     assert!(
         control
-            .renew_fetch(&stale, std::time::Duration::ZERO)
+            .renew_job(&stale, std::time::Duration::ZERO)
             .await
             .unwrap(),
         "a renewal chains off the claim's token"
     );
     assert!(
         control
-            .renew_fetch(&stale, std::time::Duration::ZERO)
+            .renew_job(&stale, std::time::Duration::ZERO)
             .await
             .unwrap(),
         "a renewal chains off the previous renewal's token"
@@ -1361,7 +1361,7 @@ async fn a_reclaimed_jobs_old_lease_token_can_neither_renew_nor_settle() {
     // A's old token is fenced out of every operation: renew, complete, fail.
     assert!(
         !control
-            .renew_fetch(&stale, std::time::Duration::from_secs(60))
+            .renew_job(&stale, std::time::Duration::from_secs(60))
             .await
             .unwrap(),
         "a reclaimed job's old token must not renew"
@@ -1374,7 +1374,7 @@ async fn a_reclaimed_jobs_old_lease_token_can_neither_renew_nor_settle() {
         "a reclaimed job's old token must not complete"
     );
     assert!(
-        !control.fail_fetch(&stale, "boom").await.unwrap(),
+        !control.fail_job(&stale, "boom").await.unwrap(),
         "a reclaimed job's old token must not fail the job"
     );
     let repos = control.admin_status().await.unwrap();
@@ -1389,7 +1389,7 @@ async fn a_reclaimed_jobs_old_lease_token_can_neither_renew_nor_settle() {
     // B's renewals and completion still land.
     assert!(
         control
-            .renew_fetch(&fresh, std::time::Duration::from_secs(60))
+            .renew_job(&fresh, std::time::Duration::from_secs(60))
             .await
             .unwrap(),
         "the live lease holder's renewal must apply"
@@ -1450,7 +1450,7 @@ async fn index_lease_renewal_is_fenced_the_same_way() {
     // A's old token can neither renew nor settle the job…
     assert!(
         !control
-            .renew_index(&stale, std::time::Duration::from_secs(60))
+            .renew_job(&stale, std::time::Duration::from_secs(60))
             .await
             .unwrap(),
         "a reclaimed index job's old token must not renew"
@@ -1473,7 +1473,7 @@ async fn index_lease_renewal_is_fenced_the_same_way() {
         "a reclaimed index job's old token must not complete"
     );
     assert!(
-        !control.fail_index(&stale, "boom").await.unwrap(),
+        !control.fail_job(&stale, "boom").await.unwrap(),
         "a reclaimed index job's old token must not settle"
     );
 
@@ -1481,7 +1481,7 @@ async fn index_lease_renewal_is_fenced_the_same_way() {
     // base lease, and its settlement lands.
     assert!(
         control
-            .renew_index(&fresh, std::time::Duration::from_secs(60))
+            .renew_job(&fresh, std::time::Duration::from_secs(60))
             .await
             .unwrap(),
         "the live lease holder's renewal must apply"
@@ -1495,7 +1495,7 @@ async fn index_lease_renewal_is_fenced_the_same_way() {
         "a renewed index lease must block other workers"
     );
     assert!(
-        control.fail_index(&fresh, "parse blew up").await.unwrap(),
+        control.fail_job(&fresh, "parse blew up").await.unwrap(),
         "the live lease holder's settlement must apply after renewing"
     );
 }
