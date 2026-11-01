@@ -5,9 +5,11 @@
 //! storage under `shards/<repo-id>/<revision>/` and never mutated
 //! afterwards.
 
+mod artifact;
 mod cache;
 pub mod metrics;
 
+pub use artifact::PinnedArtifact;
 pub use cache::{CacheCapacity, CacheLease, LeasedPath};
 pub use metrics::Metrics;
 

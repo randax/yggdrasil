@@ -88,10 +88,9 @@ impl ShardResolver for ShardAccess {
             .await
         {
             Ok(leased) => Ok(ResolvedShard {
-                path: leased.path,
+                artifact: leased.into(),
                 repo_id: target.repo_id,
                 revision,
-                cache_lease: Some(leased.lease),
             }),
             Err(error) => Err(map_cache_error(error)),
         }
@@ -158,8 +157,7 @@ impl ShardResolver for ShardAccess {
             .leased_fts_path(target.repo_id(), target.revision().as_str())
             .await
             .map(|leased| ResolvedFts {
-                path: leased.path,
-                cache_lease: Some(leased.lease),
+                artifact: leased.into(),
             })
             .map_err(map_cache_error)
     }
@@ -201,9 +199,8 @@ impl ShardResolver for ShardAccess {
             .map_err(map_cache_error)?;
         Ok(ResolvedFuzzyShard {
             repo_id: target.repo_id,
-            fts_path: fts.path,
+            fts: fts.into(),
             revision,
-            fts_cache_lease: Some(fts.lease),
         })
     }
 }
@@ -317,10 +314,9 @@ mod tests {
                 .await
                 .map_err(ResolveError::Internal)?;
             Ok(ResolvedShard {
-                path: leased.path,
+                artifact: leased.into(),
                 repo_id: TEST_REPO_ID,
                 revision,
-                cache_lease: Some(leased.lease),
             })
         }
 
@@ -368,9 +364,8 @@ mod tests {
                 .map_err(ResolveError::Internal)?;
             Ok(ResolvedFuzzyShard {
                 repo_id: TEST_REPO_ID,
-                fts_path: leased.path,
+                fts: leased.into(),
                 revision,
-                fts_cache_lease: Some(leased.lease),
             })
         }
     }

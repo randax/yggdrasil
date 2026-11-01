@@ -42,33 +42,12 @@ pub(super) async fn hydrate_snippets<R: ShardResolver + 'static>(
                 continue;
             }
         };
-        let path = resolved.path;
-        let cache_lease = resolved.cache_lease;
-        let (index, cache_lease) = match tokio::task::spawn_blocking(move || {
-            let index = yg_shard::open_fts(&path)?;
-            Ok::<_, anyhow::Error>((index, cache_lease))
-        })
-        .await
-        {
-            Ok(Ok(opened)) => opened,
-            Ok(Err(error)) => {
-                tracing::warn!(
-                    "fts reopen failed during snippet hydration; returning hits unhighlighted: {error:#}"
-                );
-                continue;
-            }
-            Err(error) => {
-                tracing::warn!("fts reopen task panicked; returning hits unhighlighted: {error}");
-                continue;
-            }
-        };
-        hydrate_repo(index, cache_lease, query, &indices, page).await;
+        hydrate_repo(resolved.artifact, query, &indices, page).await;
     }
 }
 
 async fn hydrate_repo(
-    index: yg_shard::FtsIndex,
-    cache_lease: Option<yg_shard::CacheLease>,
+    artifact: yg_shard::PinnedArtifact,
     query: &str,
     indices: &[usize],
     page: &mut [SearchHit],
@@ -84,15 +63,9 @@ async fn hydrate_repo(
         })
         .collect();
     let query = query.to_string();
-    let snippets = tokio::task::spawn_blocking(move || {
-        let snippets = yg_shard::snippets_for(&index, &query, &local_ids);
-        // Handle before lease: eviction is pin-gated, so the index must
-        // close before its artifact becomes evictable.
-        drop(index);
-        drop(cache_lease);
-        snippets
-    })
-    .await;
+    let snippets = artifact
+        .read_fts(move |index| yg_shard::snippets_for(index, &query, &local_ids))
+        .await;
     let snippets = match snippets {
         Ok(Ok(snippets)) => snippets,
         Ok(Err(error)) => {
@@ -158,8 +131,7 @@ mod tests {
                 self.control_revalidations.fetch_add(1, Ordering::SeqCst);
             }
             Ok(crate::ResolvedFts {
-                path: self.path.clone(),
-                cache_lease: None,
+                artifact: yg_shard::PinnedArtifact::unpinned(self.path.clone()),
             })
         }
     }

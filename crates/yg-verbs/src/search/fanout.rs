@@ -104,31 +104,26 @@ fn spawn_rank_task<R: ShardResolver + 'static>(
                 );
             }
         };
-        let path = resolved.path;
-        let cache_lease = resolved.cache_lease;
         let qualifier = target.qualifier.clone();
-        let outcome = tokio::task::spawn_blocking(move || -> anyhow::Result<RankedRepo> {
-            let index = yg_shard::open_fts(&path)?;
-            let mut local = yg_shard::search(
-                &index,
-                &yg_shard::SearchParams {
-                    query: &query,
-                    kinds: kinds.as_deref(),
-                    limit: super::MAX_SEARCH_WINDOW,
-                },
-            )?;
-            normalize_repo_scores(&mut local);
-            let hits = local
-                .into_iter()
-                .map(|hit| super::types::qualify_hit(qualifier.as_str(), hit))
-                .collect::<anyhow::Result<Vec<_>>>()?;
-            // Handle before lease: eviction is pin-gated, so the index
-            // must close before its artifact becomes evictable.
-            drop(index);
-            drop(cache_lease);
-            Ok(RankedRepo { target, hits })
-        })
-        .await;
+        let outcome = resolved
+            .artifact
+            .read_fts(move |index| {
+                let mut local = yg_shard::search(
+                    index,
+                    &yg_shard::SearchParams {
+                        query: &query,
+                        kinds: kinds.as_deref(),
+                        limit: super::MAX_SEARCH_WINDOW,
+                    },
+                )?;
+                normalize_repo_scores(&mut local);
+                let hits = local
+                    .into_iter()
+                    .map(|hit| super::types::qualify_hit(qualifier.as_str(), hit))
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                Ok(RankedRepo { target, hits })
+            })
+            .await;
         let result = match outcome {
             Ok(Ok(ranked)) => Ok(ranked),
             Ok(Err(error)) => Err(map_search_query_error(error)),
@@ -430,8 +425,10 @@ mod tests {
             }
             self.active.fetch_sub(1, Ordering::SeqCst);
             Ok(crate::ResolvedFts {
-                path: std::path::PathBuf::from(format!("/definitely-missing/{}", target.repo_id())),
-                cache_lease: None,
+                artifact: yg_shard::PinnedArtifact::unpinned(std::path::PathBuf::from(format!(
+                    "/definitely-missing/{}",
+                    target.repo_id()
+                ))),
             })
         }
     }
