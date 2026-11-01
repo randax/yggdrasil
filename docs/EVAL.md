@@ -56,8 +56,8 @@ Start the same services used by the other end-to-end suites, then run only the
 ignored target with output capture disabled:
 
 ```sh
-docker compose up -d --wait postgres minio
-docker compose run --rm minio-init
+docker compose up -d --wait postgres rustfs
+docker compose run --rm rustfs-init
 YG_EVAL_OUTPUT=target/orientation-efficiency.json \
   RUSTC_WRAPPER= cargo test -p yg-cli --test orientation_efficiency --locked -- --ignored
 ```

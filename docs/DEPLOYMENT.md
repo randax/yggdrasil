@@ -1,7 +1,7 @@
 # Deploying yggdrasil
 
 The reference deployment is one `yg serve --role=all` container with Postgres
-for control-plane state and MinIO for Shard objects. It is intended as a
+for control-plane state and RustFS for Shard objects. It is intended as a
 single-host starting point. Put TLS and any public access control in a reverse
 proxy in front of port 7311.
 
@@ -27,8 +27,8 @@ services. Generate and retain two independent secrets before starting it:
 ```sh
 export YG_BOOTSTRAP_TOKEN="$(openssl rand -hex 32)"
 export YG_CURSOR_SECRET="$(openssl rand -hex 32)"
-docker compose up -d --wait postgres minio
-docker compose run --rm minio-init
+docker compose up -d --wait postgres rustfs
+docker compose run --rm rustfs-init
 docker compose --profile deployment up -d --no-deps --wait server
 ```
 
@@ -50,7 +50,7 @@ the workers; without it only public repositories clone.
 The complete configuration table, including object-store, cache, protection,
 polling, and GC settings, is in [Development](DEVELOPMENT.md#running-the-index-server).
 
-The profile wires the container to `postgres:5432` and `minio:9000` on the
+The profile wires the container to `postgres:5432` and `rustfs:9000` on the
 Compose network and publishes the API at `http://127.0.0.1:7311`. Override the
 host port with `YG_SERVER_PORT`. To use a prebuilt image rather than the local
 build, set `YG_IMAGE` to its immutable tag or digest and use `--no-build`.
@@ -62,7 +62,7 @@ Run it against any image with `YG_IMAGE=<tag> scripts/deployment-smoke.sh`.
 
 > **Network boundary:** this profile intentionally reuses the unchanged local
 > development services. Their existing port mappings publish Postgres 5432,
-> the MinIO API 9000, and the MinIO console 9001 on all host interfaces with
+> the RustFS API 9000, and the RustFS console 9001 on all host interfaces with
 > development-only credentials. Do not expose those ports to an untrusted
 > network. Enforce a host firewall or an equivalent trusted-network boundary;
 > for a production platform, translate this topology to private backing-service
@@ -111,18 +111,18 @@ These named volumes must survive container replacement:
 | Volume | Contents | Required for recovery |
 |---|---|---|
 | `postgres-data` | registrations, job state, tokens, and current Shard pointers | Yes; back up consistently |
-| `minio-data` | authoritative Shard objects | Yes; back up consistently with Postgres |
+| `rustfs-data` | authoritative Shard objects | Yes; back up consistently with Postgres |
 | `server-git-cache` | worker cache of bare Git clones | No; speeds later syncs |
-| `server-shard-cache` | API cache of downloaded Shards | No; rebuilt from MinIO |
+| `server-shard-cache` | API cache of downloaded Shards | No; rebuilt from RustFS |
 
 Compose prefixes volume names with the project name (`yggdrasil-dev` by
 default). Never run `docker compose down --volumes` against a deployment whose
-data you intend to retain. Back up Postgres and MinIO as one recovery point so
+data you intend to retain. Back up Postgres and RustFS as one recovery point so
 database Shard pointers cannot outpace the stored objects.
 
 ## Upgrade
 
-1. Back up `postgres-data` and `minio-data` together.
+1. Back up `postgres-data` and `rustfs-data` together.
 2. Set `YG_IMAGE` to the new immutable image tag or digest, then pull it with
    `docker compose --profile deployment pull server`.
 3. Recreate only the application container with

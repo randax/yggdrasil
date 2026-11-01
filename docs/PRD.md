@@ -50,7 +50,7 @@ Yggdrasil is a self-hosted **Index Server** that syncs git repositories from **F
 
 ### Operations
 - G13. Designed and certified for **5000+ repos, 500+ Members**; object-storage-native Shards + Postgres control plane + stateless workers and query nodes (ADR 0005).
-- G14. Self-hosting floor: one binary (role modes) + Postgres + S3-compatible store (MinIO/Garage), via docker compose.
+- G14. Self-hosting floor: one binary (role modes) + Postgres + S3-compatible store (RustFS/Garage), via docker compose.
 
 ## Non-goals (v1)
 
