@@ -51,6 +51,15 @@ impl State {
     fn holds_lease(&self, job: &MemoryJob) -> bool {
         self.token == job.token
     }
+
+    /// Settling clears the lease, so the same job can never settle twice.
+    fn settle_lease(&mut self, job: &MemoryJob) -> bool {
+        let held = self.holds_lease(job);
+        if held {
+            self.token += 1;
+        }
+        held
+    }
 }
 
 #[derive(Default)]
@@ -135,7 +144,11 @@ impl RevisionControl for MemoryControl {
         let reclaiming = state
             .row(shard.revision)
             .is_some_and(|row| row.state == ShardState::Reclaiming);
-        if reclaiming || !state.holds_lease(job) {
+        if reclaiming {
+            state.settle_lease(job);
+            return Ok(false);
+        }
+        if !state.settle_lease(job) {
             return Ok(false);
         }
         let shard_id = match state.row(shard.revision) {
@@ -166,7 +179,7 @@ impl RevisionControl for MemoryControl {
     }
 
     async fn defer_publication(&self, job: &MemoryJob) -> anyhow::Result<bool> {
-        Ok(self.state.lock().unwrap().holds_lease(job))
+        Ok(self.state.lock().unwrap().settle_lease(job))
     }
 }
 

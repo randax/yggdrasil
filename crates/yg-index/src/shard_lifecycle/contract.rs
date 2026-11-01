@@ -1,8 +1,9 @@
-//! Behaviour every [`RevisionControl`] adapter must exhibit. Runs against the
+//! Behaviour every `RevisionControl` adapter must exhibit. Runs against the
 //! in-memory adapter in-crate, and against Postgres in the `yg-cli` e2e suite,
 //! so the fake cannot drift from the SQL without a test failing.
 
 use std::future::Future;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 
 use object_store::ObjectStore;
@@ -56,6 +57,8 @@ pub async fn verify<H: Harness>(harness: impl AsyncFn() -> H) {
     an_interrupted_reclamation_resumes(&harness().await).await;
     a_result_after_the_lease_lapsed_is_not_applied(&harness().await).await;
     publishing_during_reclamation_republishes_after_it(&harness().await).await;
+    a_settled_job_cannot_settle_again(&harness().await).await;
+    a_deferred_job_cannot_settle_again(&harness().await).await;
     only_an_old_rowless_prefix_is_reclaimed_as_an_orphan(&harness().await).await;
 }
 
@@ -300,14 +303,20 @@ async fn publishing_during_reclamation_republishes_after_it<H: Harness>(harness:
         );
         fence.release().await;
     };
+    let prepares = AtomicUsize::new(0);
     let publish = publish_revision(
         harness.control(),
         harness.store(),
         harness.repo_id(),
         COMMIT_A,
-        || prepared(COMMIT_A),
+        || {
+            prepares.fetch_add(1, Ordering::SeqCst);
+            prepared(COMMIT_A)
+        },
     );
-    let ((), publication) = futures::join!(reclaim, publish);
+    // Polling the publisher first parks it on the held fence wherever the
+    // adapter's earlier steps complete without yielding, as in-memory ones do.
+    let (publication, ()) = futures::join!(publish, reclaim);
     let settled = settle_publication(
         harness.control(),
         &job,
@@ -317,10 +326,58 @@ async fn publishing_during_reclamation_republishes_after_it<H: Harness>(harness:
     .await
     .expect("settle");
 
+    assert_eq!(
+        prepares.load(Ordering::SeqCst),
+        1,
+        "reclamation deleted the objects, so they must be built again"
+    );
     assert!(matches!(settled, PublicationSettlement::Applied { .. }));
     assert_eq!(harness.current_revision().await, Some(revision(COMMIT_A)));
     assert_eq!(state(harness, COMMIT_A).await, Some(ShardState::Published));
     assert!(artifact_exists(harness, COMMIT_A).await);
+}
+
+async fn a_settled_job_cannot_settle_again<H: Harness>(harness: &H) {
+    let job = harness.claim_index(COMMIT_A).await;
+    for expected_applied in [true, false] {
+        let publication = publish_revision(
+            harness.control(),
+            harness.store(),
+            harness.repo_id(),
+            COMMIT_A,
+            || prepared(COMMIT_A),
+        )
+        .await
+        .expect("publish");
+        let settled = settle_publication(harness.control(), &job, COMMIT_A, publication)
+            .await
+            .expect("settle");
+        assert_eq!(
+            matches!(settled, PublicationSettlement::Applied { .. }),
+            expected_applied,
+            "settling consumes the job's lease"
+        );
+    }
+}
+
+async fn a_deferred_job_cannot_settle_again<H: Harness>(harness: &H) {
+    let superseded = supersede_a_with_b(harness).await;
+    assert!(
+        harness
+            .control()
+            .begin_reclaiming(superseded.shard_id)
+            .await
+            .expect("begin reclaiming")
+    );
+    let job = harness.claim_index(COMMIT_A).await;
+    for expected in [true, false] {
+        let deferred = harness
+            .control()
+            .defer_publication(&job)
+            .await
+            .expect("defer");
+        assert_eq!(deferred, expected, "deferring consumes the job's lease");
+    }
 }
 
 async fn only_an_old_rowless_prefix_is_reclaimed_as_an_orphan<H: Harness>(harness: &H) {

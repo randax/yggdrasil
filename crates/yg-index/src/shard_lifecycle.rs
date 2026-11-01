@@ -141,10 +141,9 @@ enum Attempt<Fence> {
 }
 
 /// How a [`Publication`] ended.
-#[derive(Debug)]
 pub enum PublicationSettlement {
-    /// The row is recorded and the revision is `revision`.
-    Applied { revision: String },
+    /// The row is recorded for this published Shard.
+    Applied { shard: PublishedShard },
     /// The lease lapsed or the job's repo left indexing; retried when needed.
     NotApplied,
     /// The revision is being reclaimed; the job returned to the queue.
@@ -299,9 +298,7 @@ pub async fn settle_publication<C: RevisionControl>(
             )
             .await?;
             Ok(if applied {
-                PublicationSettlement::Applied {
-                    revision: shard.revision,
-                }
+                PublicationSettlement::Applied { shard }
             } else {
                 PublicationSettlement::NotApplied
             })

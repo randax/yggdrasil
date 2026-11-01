@@ -10,7 +10,7 @@ use std::time::Duration;
 use common::{DEV_POSTGRES, create_test_db, dev_object_store};
 use object_store::ObjectStore;
 use yg_control::{AddRepo, ControlPlane, LeasedIndex, SupersededShard};
-use yg_index::shard_lifecycle::contract::{Harness, verify};
+use yg_index::contract::{Harness, verify};
 
 const LEASE: Duration = Duration::from_secs(600);
 

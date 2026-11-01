@@ -235,8 +235,8 @@ impl yg_sync::LeasedWork<yg_control::LeasedIndex> for IndexWorker {
         let slug = &job.slug;
         Ok(
             match settle_publication(&self.control, job, &job.commit, publication).await? {
-                PublicationSettlement::Applied { revision } => {
-                    tracing::info!(%slug, %revision, "indexed");
+                PublicationSettlement::Applied { shard } => {
+                    tracing::info!(%slug, revision = %shard.revision, "indexed");
                     yg_control::JobOutcome::Success
                 }
                 PublicationSettlement::NotApplied => {
