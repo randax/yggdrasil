@@ -208,15 +208,29 @@ mod tests {
         disarmed: bool,
     }
 
-    struct FakeTimer(Arc<Mutex<Ledger>>);
+    /// Like the real timer, one dropped unsettled reports a failed attempt.
+    struct FakeTimer {
+        ledger: Arc<Mutex<Ledger>>,
+        recorded: bool,
+    }
 
     impl OutcomeTimer for FakeTimer {
-        fn finish(self, outcome: JobOutcome) {
-            self.0.lock().unwrap().outcome = Some(outcome);
+        fn finish(mut self, outcome: JobOutcome) {
+            self.recorded = true;
+            self.ledger.lock().unwrap().outcome = Some(outcome);
         }
 
-        fn disarm(self) {
-            self.0.lock().unwrap().disarmed = true;
+        fn disarm(mut self) {
+            self.recorded = true;
+            self.ledger.lock().unwrap().disarmed = true;
+        }
+    }
+
+    impl Drop for FakeTimer {
+        fn drop(&mut self) {
+            if !self.recorded {
+                self.ledger.lock().unwrap().outcome = Some(JobOutcome::Failure);
+            }
         }
     }
 
@@ -277,7 +291,10 @@ mod tests {
 
         fn start_timer(&self) -> FakeTimer {
             self.ledger().started_timers += 1;
-            FakeTimer(self.ledger.clone())
+            FakeTimer {
+                ledger: self.ledger.clone(),
+                recorded: false,
+            }
         }
 
         async fn renew(&self, _: &u32) -> anyhow::Result<bool> {
@@ -409,7 +426,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_settlement_error_propagates_without_recording_an_outcome() {
+    async fn a_settlement_error_propagates_and_reports_a_failed_attempt() {
         let queue = FakeQueue::with_job();
         let work = FakeWork {
             settles_as: Err(anyhow::anyhow!("control plane unreachable")),
@@ -421,7 +438,7 @@ mod tests {
             .expect_err("Err means the control plane is unreachable");
 
         assert_eq!(error.to_string(), "control plane unreachable");
-        assert_eq!(queue.ledger().outcome, None);
+        assert_eq!(queue.ledger().outcome, Some(JobOutcome::Failure));
     }
 
     #[tokio::test]
