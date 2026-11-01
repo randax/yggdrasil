@@ -25,6 +25,10 @@ yg-control = { version = "0.1.0", path = "../yg-control" }
 yg-shard = { version = "0.1.0", path = "../yg-shard" }
 yg-sync = { version = "0.1.0", path = "../yg-sync" }
 
+[features]
+# Exposes the Shard revision lifecycle contract cases to the e2e suite.
+contract = []
+
 [dev-dependencies]
 # `#[tokio::test]` for the async history-extraction tests.
-tokio = { version = "1.52.3", features = ["macros", "rt"] }
+tokio = { version = "1.52.3", features = ["macros", "rt", "sync"] }

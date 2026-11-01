@@ -3219,7 +3219,7 @@ mod tests {
         MemberName, MemberTokenLifetimeSeconds, REPO_QUALIFIER_SQL, RepoVisibility, RuleAction,
         RuleRow, SUPERSEDED_SHARDS_PAST_GRACE_QUERY, SUPERSEDED_SHARDS_PAST_GRACE_SQL, ShardState,
         discovery_state_for, forge_budget_retry_after, glob_matches, member_token_id_is_valid,
-        repo_qualifier, shard_accepts_publication,
+        repo_qualifier,
     };
 
     const SYNC_TRACER_MIGRATION: &str = include_str!("../migrations/0002_sync_tracer.sql");
@@ -3350,86 +3350,6 @@ mod tests {
             rendered_query, SUPERSEDED_SHARDS_PAST_GRACE_SQL,
             "the e2e query fixture must exactly render the production query's state bindings"
         );
-    }
-
-    #[tokio::test]
-    async fn republish_racing_reclamation_never_advances_the_current_pointer() {
-        use std::sync::Arc;
-
-        struct SeamFence(tokio::sync::OwnedMutexGuard<()>);
-
-        impl super::ShardOperationFence for SeamFence {
-            async fn release(self) {
-                drop(self.0);
-            }
-        }
-
-        #[derive(Clone, Copy)]
-        struct SeamState {
-            row: Option<ShardState>,
-            manifest: bool,
-            segment: bool,
-            current: bool,
-        }
-
-        let operation = Arc::new(tokio::sync::Mutex::new(()));
-        let state = Arc::new(tokio::sync::Mutex::new(SeamState {
-            row: Some(ShardState::Published),
-            manifest: true,
-            segment: true,
-            current: false,
-        }));
-        let gc_claimed = Arc::new(tokio::sync::Barrier::new(2));
-        let allow_gc_finish = Arc::new(tokio::sync::Barrier::new(2));
-
-        let gc = {
-            let operation = operation.clone();
-            let state = state.clone();
-            let gc_claimed = gc_claimed.clone();
-            let allow_gc_finish = allow_gc_finish.clone();
-            tokio::spawn(async move {
-                let fence = SeamFence(operation.lock_owned().await);
-                super::finish_shard_operation(fence, async {
-                    state.lock().await.row = Some(ShardState::Reclaiming);
-                    gc_claimed.wait().await;
-                    allow_gc_finish.wait().await;
-                    let mut state = state.lock().await;
-                    state.manifest = false;
-                    state.segment = false;
-                    assert!(!state.current);
-                    state.row = None;
-                })
-                .await;
-            })
-        };
-        gc_claimed.wait().await;
-        assert!(
-            operation.try_lock().is_err(),
-            "GC must retain the production fence while its transition is paused"
-        );
-        let publisher = {
-            let operation = operation.clone();
-            let state = state.clone();
-            tokio::spawn(async move {
-                let fence = SeamFence(operation.lock_owned().await);
-                super::finish_shard_operation(fence, async {
-                    let mut state = state.lock().await;
-                    assert!(shard_accepts_publication(state.row));
-                    state.segment = true;
-                    state.manifest = true;
-                    state.row = Some(ShardState::Published);
-                    state.current = true;
-                })
-                .await;
-            })
-        };
-
-        allow_gc_finish.wait().await;
-        gc.await.unwrap();
-        publisher.await.unwrap();
-        let state = state.lock().await;
-        assert_eq!(state.row, Some(ShardState::Published));
-        assert!(state.current && state.manifest && state.segment);
     }
 
     #[test]

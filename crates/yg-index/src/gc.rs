@@ -2,7 +2,6 @@
 
 use std::time::Duration;
 
-use anyhow::Context;
 use object_store::ObjectStore;
 use yg_control::ControlPlane;
 
@@ -14,7 +13,7 @@ pub(crate) async fn collect_superseded(
     let stale = control.superseded_shards_past_grace(grace).await?;
     let mut collected = 0;
     for shard in &stale {
-        match collect_shard(control, store, shard).await {
+        match crate::shard_lifecycle::reclaim_superseded(control, store, shard).await {
             Ok(true) => collected += 1,
             Ok(false) => {}
             Err(error) => tracing::warn!(
@@ -42,28 +41,4 @@ pub(crate) async fn retire_terminal_jobs(
         tracing::info!(jobs = deleted, "removed terminal jobs past retention");
     }
     Ok(deleted)
-}
-
-async fn collect_shard(
-    control: &ControlPlane,
-    store: &dyn ObjectStore,
-    shard: &yg_control::SupersededShard,
-) -> anyhow::Result<bool> {
-    let operation = control
-        .lock_shard_operation(shard.repo_id, &shard.revision)
-        .await
-        .context("locking the Shard revision for reclamation")?;
-    yg_control::finish_shard_operation(operation, async {
-        if !control.delete_superseded_shard(shard.shard_id).await? {
-            return Ok(false);
-        }
-        yg_shard::delete_shard(store, shard.repo_id, &shard.revision)
-            .await
-            .context("deleting the Shard's object-storage segments")?;
-        control
-            .finish_shard_reclamation(shard.shard_id)
-            .await
-            .context("reaping the reclaimed Shard row")
-    })
-    .await
 }
