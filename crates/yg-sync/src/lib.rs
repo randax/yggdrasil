@@ -6,6 +6,7 @@
 pub mod forge;
 mod git;
 mod lease;
+mod leased_run;
 mod locator;
 mod metrics;
 mod rate;
@@ -13,7 +14,7 @@ mod shutdown;
 mod worker;
 
 pub use git::{GitFetcher, MirrorGuard, forge_token, lock_mirror, mirror_path, remote_head_commit};
-pub use lease::{LeaseShutdown, with_lease_heartbeat, with_lease_heartbeat_until_shutdown};
+pub use leased_run::{ControlQueue, JobQueue, LeasedWork, OutcomeTimer, run_leased_job};
 pub use locator::{LocatorError, RepoLocator, UnclassifiedRepoLocator, join_clone_url};
 pub use metrics::Metrics;
 pub use shutdown::{Shutdown, ShutdownCause, ShutdownRequest, ShutdownTrigger, shutdown_channel};

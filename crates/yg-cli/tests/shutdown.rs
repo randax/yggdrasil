@@ -164,7 +164,7 @@ async fn released_index_lease_is_immediately_reclaimable_and_stays_fenced() {
         .await
         .unwrap()
         .expect("index job must be claimable");
-    assert!(control.release_index(&released).await.unwrap());
+    assert!(control.release_job(&released).await.unwrap());
 
     let retry = control
         .claim_due_index(std::time::Duration::from_secs(60))
@@ -174,10 +174,10 @@ async fn released_index_lease_is_immediately_reclaimable_and_stays_fenced() {
     assert_eq!(retry.job_id, released.job_id, "the same job must retry");
     assert_eq!(retry.attempts, 0, "shutdown is not a failed attempt");
     assert!(
-        !control.release_index(&released).await.unwrap(),
+        !control.release_job(&released).await.unwrap(),
         "the old claim must not release the healthy retry"
     );
-    assert!(control.release_index(&retry).await.unwrap());
+    assert!(control.release_job(&retry).await.unwrap());
 }
 
 #[cfg(unix)]

@@ -6,8 +6,8 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use yg_control::{
-    ControlPlane, ForgeBudgetTake, ForgeUrl, JobKind, JobOutcome, PollHeadObservation,
-    PollRecordOutcome, PollValidators,
+    ControlPlane, ForgeBudgetTake, ForgeUrl, JobOutcome, PollHeadObservation, PollRecordOutcome,
+    PollValidators,
 };
 
 use crate::forge::{
@@ -16,7 +16,7 @@ use crate::forge::{
     github::discovery_client,
 };
 use crate::git::{GitFetcher, forge_token, lock_mirror, remote_head_commit};
-use crate::lease::{LeaseShutdown, with_lease_heartbeat, with_lease_heartbeat_until_shutdown};
+use crate::leased_run::{ControlQueue, LeasedWork, run_leased_job};
 use crate::locator::{join_clone_url, normalize_repo_slug};
 use crate::metrics::Metrics;
 use crate::rate::{RATE_LIMIT_COOLDOWN, TokenBucket};
@@ -118,80 +118,8 @@ impl SyncWorker {
         &self,
         shutdown: Option<Shutdown>,
     ) -> anyhow::Result<bool> {
-        let (job, timer) = match claim_due_fetch_with_optional_shutdown(
-            shutdown.as_ref(),
-            self.control.claim_due_fetch(FETCH_LEASE),
-            async |job| self.control.release_fetch(job).await,
-            || self.control.start_job(JobKind::Fetch),
-        )
-        .await?
-        {
-            ShutdownClaim::Empty => return Ok(false),
-            ShutdownClaim::Ready { job, timer } => (job, timer),
-            ShutdownClaim::Released { timer } => {
-                // The job was released untouched for a healthy retry: no
-                // work happened, so no outcome is recorded.
-                timer.disarm();
-                return Ok(true);
-            }
-        };
-        let clone_url = join_clone_url(job.base_url.as_str(), &job.slug);
-        let forge = self.registry.for_kind(&job.forge_kind);
-        let auth = forge_token(job.token_env.as_deref(), &clone_url).map(|t| forge.git_auth(t));
-        // A lock failure (cache dir on a dead disk) is a failed fetch,
-        // not a dead worker: record it and let backoff retry.
-        let work = async {
-            let _serialize_same_mirror =
-                lock_mirror(self.fetcher.cache_dir(), job.repo_id, FETCH_LEASE).await?;
-            self.fetcher
-                .sync(job.repo_id, &clone_url, auth.as_ref(), job.fetch_depth)
-                .await
-        };
-        // A cold clone of a large repo outlives the base lease; the
-        // heartbeat keeps the job ours for as long as the work is alive.
-        let renew = async || self.control.renew_fetch(&job, FETCH_LEASE).await;
-        let synced = if let Some(shutdown) = shutdown {
-            let release = async || self.control.release_fetch(&job).await;
-            match with_lease_heartbeat_until_shutdown(
-                FETCH_LEASE,
-                renew,
-                release,
-                shutdown.clone(),
-                work,
-            )
-            .await?
-            {
-                LeaseShutdown::Finished(synced) => synced,
-                LeaseShutdown::Released => {
-                    timer.finish(JobOutcome::Discarded);
-                    return Ok(true);
-                }
-            }
-        } else {
-            with_lease_heartbeat(FETCH_LEASE, renew, work).await
-        };
-        match synced {
-            Ok(commit) => {
-                if self.control.complete_fetch(&job, &commit).await? {
-                    timer.finish(JobOutcome::Success);
-                    tracing::info!(slug = %job.slug, %commit, "synced");
-                } else {
-                    timer.finish(JobOutcome::Discarded);
-                    tracing::warn!(slug = %job.slug, "lease lapsed mid-fetch; result discarded");
-                }
-            }
-            Err(e) => {
-                let error = format!("{e:#}");
-                if self.control.fail_fetch(&job, &error).await? {
-                    timer.finish(JobOutcome::Failure);
-                    tracing::warn!(slug = %job.slug, attempt = job.attempts + 1, error, "fetch failed");
-                } else {
-                    timer.finish(JobOutcome::Discarded);
-                    tracing::warn!(slug = %job.slug, "lease lapsed mid-fetch; failure discarded");
-                }
-            }
-        }
-        Ok(true)
+        let queue = ControlQueue::<yg_control::LeasedFetch>::new(&self.control, FETCH_LEASE);
+        run_leased_job(&queue, shutdown, self).await
     }
 
     /// Claim one due forge org and reconcile its repositories through
@@ -882,28 +810,35 @@ async fn list_org_repos_with_budget(
     result
 }
 
-enum ShutdownClaim<T, M> {
-    Empty,
-    Ready { job: T, timer: M },
-    Released { timer: M },
-}
+impl LeasedWork<yg_control::LeasedFetch> for SyncWorker {
+    type Output = String;
 
-async fn claim_due_fetch_with_optional_shutdown<T, M>(
-    shutdown: Option<&Shutdown>,
-    claim: impl Future<Output = anyhow::Result<Option<T>>>,
-    release: impl AsyncFnOnce(&T) -> anyhow::Result<bool>,
-    start_timer: impl FnOnce() -> M,
-) -> anyhow::Result<ShutdownClaim<T, M>> {
-    let Some(job) = claim.await? else {
-        return Ok(ShutdownClaim::Empty);
-    };
-    let timer = start_timer();
-    if shutdown.is_some_and(|shutdown| shutdown.request().is_some()) {
-        let released = release(&job).await?;
-        tracing::info!(released, "released fresh fetch claim for shutdown");
-        return Ok(ShutdownClaim::Released { timer });
+    async fn run(&self, job: &yg_control::LeasedFetch) -> anyhow::Result<String> {
+        let clone_url = join_clone_url(job.base_url.as_str(), &job.slug);
+        let forge = self.registry.for_kind(&job.forge_kind);
+        let auth = forge_token(job.token_env.as_deref(), &clone_url).map(|t| forge.git_auth(t));
+        // A lock failure (cache dir on a dead disk) is a failed fetch,
+        // not a dead worker: record it and let backoff retry.
+        let _serialize_same_mirror =
+            lock_mirror(self.fetcher.cache_dir(), job.repo_id, FETCH_LEASE).await?;
+        self.fetcher
+            .sync(job.repo_id, &clone_url, auth.as_ref(), job.fetch_depth)
+            .await
     }
-    Ok(ShutdownClaim::Ready { job, timer })
+
+    async fn settle(
+        &self,
+        job: &yg_control::LeasedFetch,
+        commit: String,
+    ) -> anyhow::Result<JobOutcome> {
+        if self.control.complete_fetch(job, &commit).await? {
+            tracing::info!(slug = %job.slug, %commit, "synced");
+            Ok(JobOutcome::Success)
+        } else {
+            tracing::warn!(slug = %job.slug, "lease lapsed mid-fetch; result discarded");
+            Ok(JobOutcome::Discarded)
+        }
+    }
 }
 
 async fn cancel_discovery_on_shutdown<T>(
@@ -946,7 +881,6 @@ fn in_flight_fetch_repoll(due: &yg_control::DuePoll, cfg: &PollConfig) -> Durati
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use tokio::time::Instant;
@@ -1074,37 +1008,6 @@ mod tests {
         assert!(retry_after > Duration::from_secs(29));
 
         assert!(budgets.take(7, 60).is_err());
-    }
-
-    #[tokio::test]
-    async fn fetch_claim_completing_after_shutdown_is_released_before_work_starts() {
-        let (trigger, shutdown) = shutdown_channel();
-        let released_job = AtomicUsize::new(0);
-        let claim = async {
-            assert!(trigger.request(
-                Instant::now() + Duration::from_secs(30),
-                ShutdownCause::Signal,
-            ));
-            Ok(Some(41_usize))
-        };
-
-        let claimed = claim_due_fetch_with_optional_shutdown(
-            Some(&shutdown),
-            claim,
-            async |job| {
-                released_job.store(*job, Ordering::SeqCst);
-                Ok(true)
-            },
-            || 73_usize,
-        )
-        .await
-        .expect("post-claim shutdown check");
-
-        assert!(
-            matches!(claimed, ShutdownClaim::Released { timer: 73 }),
-            "shutdown claims must be released with their timer"
-        );
-        assert_eq!(released_job.load(Ordering::SeqCst), 41);
     }
 
     #[tokio::test]

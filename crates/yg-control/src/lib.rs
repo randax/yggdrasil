@@ -1,6 +1,9 @@
 //! Postgres models, job queue.
 
+mod leased_job;
 pub mod metrics;
+
+pub use leased_job::LeasedJob;
 pub use metrics::{JobOutcome, JobTimer, Metrics};
 
 use anyhow::Context;
@@ -722,7 +725,7 @@ pub struct LeasedFetch {
 /// a shared borrow of the same leased job. The mutex is uncontended —
 /// one worker task renews and settles sequentially — and no code panics
 /// while holding it, so poisoning is unreachable.
-struct LeaseToken(std::sync::Mutex<String>);
+pub struct LeaseToken(std::sync::Mutex<String>);
 
 impl LeaseToken {
     fn current(&self) -> String {
@@ -2091,47 +2094,6 @@ impl ControlPlane {
         Ok(true)
     }
 
-    /// Record a failed fetch: back the job off exponentially (30s
-    /// doubling per attempt, capped at an hour) and keep the error for
-    /// `yg admin status`. Jobs retry indefinitely — sync converges on its
-    /// own once the cause (rate limit, token rotation) clears. Returns
-    /// whether the failure was recorded; `false` means the lease had
-    /// lapsed and the job belongs to a newer claim.
-    pub async fn fail_fetch(&self, job: &LeasedFetch, error: &str) -> anyhow::Result<bool> {
-        self.fail_leased_job(job.job_id, &job.lease_token, error)
-            .await
-    }
-
-    /// Return a fetch claim to the immediately-due queue without
-    /// recording a failed attempt. The lease token fences shutdown from
-    /// releasing a job that a healthy worker has already reclaimed.
-    pub async fn release_fetch(&self, job: &LeasedFetch) -> anyhow::Result<bool> {
-        self.release_leased_job(job.job_id, &job.lease_token).await
-    }
-
-    /// Extend a fetch job's lease so work that outlives the base lease —
-    /// a cold full-history clone — is not reclaimed mid-run. Lease-fenced
-    /// like completion: `false` means the job was reclaimed and this
-    /// worker's token is dead, so it should abandon the run.
-    pub async fn renew_fetch(
-        &self,
-        job: &LeasedFetch,
-        lease: std::time::Duration,
-    ) -> anyhow::Result<bool> {
-        self.renew_leased_job(job.job_id, &job.lease_token, lease)
-            .await
-    }
-
-    /// Extend an index job's lease, exactly like [`Self::renew_fetch`].
-    pub async fn renew_index(
-        &self,
-        job: &LeasedIndex,
-        lease: std::time::Duration,
-    ) -> anyhow::Result<bool> {
-        self.renew_leased_job(job.job_id, &job.lease_token, lease)
-            .await
-    }
-
     /// Push a leased job's deadline out by `lease` from now, but only
     /// while the caller still holds the lease — after reclamation the old
     /// token matches nothing, so a lapsed worker cannot resurrect its
@@ -2817,21 +2779,6 @@ impl ControlPlane {
         .await?
         .rows_affected();
         Ok(deleted)
-    }
-
-    /// Record a failed index run: back the job off and keep the error
-    /// for `yg admin status`, exactly like [`Self::fail_fetch`]. Returns
-    /// whether the failure was recorded; `false` means the lease had
-    /// lapsed and the job belongs to a newer claim.
-    pub async fn fail_index(&self, job: &LeasedIndex, error: &str) -> anyhow::Result<bool> {
-        self.fail_leased_job(job.job_id, &job.lease_token, error)
-            .await
-    }
-
-    /// Return an index claim to the immediately-due queue without
-    /// recording a failed attempt. See [`Self::release_fetch`].
-    pub async fn release_index(&self, job: &LeasedIndex) -> anyhow::Result<bool> {
-        self.release_leased_job(job.job_id, &job.lease_token).await
     }
 
     async fn release_leased_job(
