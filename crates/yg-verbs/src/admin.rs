@@ -253,14 +253,6 @@ pub enum RuleAction {
 }
 
 impl RuleAction {
-    pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "include" => Some(Self::Include),
-            "exclude" => Some(Self::Exclude),
-            _ => None,
-        }
-    }
-
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Include => "include",
@@ -308,15 +300,6 @@ pub enum DiscoveryState {
 }
 
 impl DiscoveryState {
-    pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "discovered" => Some(Self::Discovered),
-            "included" => Some(Self::Included),
-            "excluded" => Some(Self::Excluded),
-            _ => None,
-        }
-    }
-
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Discovered => "discovered",
@@ -332,7 +315,7 @@ impl std::fmt::Display for DiscoveryState {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum JobState {
     Syncing,
@@ -343,7 +326,6 @@ pub enum JobState {
     Indexing,
     Indexed,
     Pending,
-    Unknown,
 }
 
 impl JobState {
@@ -357,7 +339,6 @@ impl JobState {
             Self::Indexing => "indexing",
             Self::Indexed => "indexed",
             Self::Pending => "pending",
-            Self::Unknown => "unknown",
         }
     }
 }

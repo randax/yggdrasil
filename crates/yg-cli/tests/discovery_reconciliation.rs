@@ -131,8 +131,8 @@ async fn qualifier_conflict_is_recorded_while_neighboring_repos_reconcile() {
             .iter()
             .find(|status| status.slug == slug)
             .unwrap_or_else(|| panic!("{slug} after the collision must reconcile"));
-        assert_eq!(status.discovery_state, "included");
-        assert_eq!(status.job_state.as_deref(), Some("queued"));
+        assert_eq!(status.discovery_state, yg_control::DiscoveryState::Included);
+        assert_eq!(status.job_state, Some(yg_control::InFlightJobState::Queued));
     }
     let conflicts = control_plane(&db_name)
         .await
@@ -264,7 +264,10 @@ async fn same_slug_insert_racing_reconciliation_is_upserted_without_a_false_conf
         .find(|status| status.slug == "acme/raced")
         .expect("the concurrently registered repo must be reconciled");
     assert_eq!(raced.visibility, yg_control::RepoVisibility::Private);
-    assert_eq!(raced.discovery_state, "discovered");
+    assert_eq!(
+        raced.discovery_state,
+        yg_control::DiscoveryState::Discovered
+    );
     let (fetch_depth,): (Option<i32>,) = sqlx::query_as(
         "SELECT fetch_depth FROM repos
          WHERE qualifier = 'same-slug-race.example/acme/raced'",
