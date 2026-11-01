@@ -511,6 +511,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_artifact_removed_after_the_probe_is_prepared_outside_the_lock() {
+        let releases = AtomicUsize::new(0);
+        let probes = AtomicUsize::new(0);
+        let attempt = prepare_or_reuse_published(
+            || async { Ok(Some(ShardState::Published)) },
+            || async {
+                // Present for the lock-free probe, gone once the lock is held.
+                let first = probes.fetch_add(1, Ordering::SeqCst) == 0;
+                Ok(first.then(|| PublishedShard {
+                    revision: "revision".to_string(),
+                    manifest_key: "manifest".to_string(),
+                    node_count: 0,
+                    edge_count: 0,
+                }))
+            },
+            || async {
+                Ok(CountingFence {
+                    releases: &releases,
+                })
+            },
+            || async {
+                assert_eq!(
+                    releases.load(Ordering::SeqCst),
+                    1,
+                    "parsing must never hold the revision lock"
+                );
+                yg_shard::prepare_shard(yg_shard::Graph::default(), Vec::new()).await
+            },
+        )
+        .await
+        .expect("prepared");
+
+        assert!(matches!(attempt, PrePublication::Prepared(_)));
+    }
+
+    #[tokio::test]
     async fn every_adapter_case_holds_for_the_in_memory_adapter() {
         contract::verify(async || memory::MemoryHarness::new()).await;
     }
