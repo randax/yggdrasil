@@ -15,24 +15,24 @@ upgrades, see [Deployment](DEPLOYMENT.md).
 | Service | Image | Endpoint | Credentials |
 |---|---|---|---|
 | Postgres (control plane) | `postgres:17` | `localhost:5432`, database `yggdrasil` | `yggdrasil` / `yggdrasil` |
-| MinIO S3 API (Shard storage) | `minio/minio` (pinned, see below) | `http://localhost:9000` | `yggdrasil` / `yggdrasil` |
-| MinIO console | — | `http://localhost:9001` | `yggdrasil` / `yggdrasil` |
+| RustFS S3 API (Shard storage) | `rustfs/rustfs` (pinned, see below) | `http://localhost:9000` | `yggdrasil` / `yggdrasil` |
+| RustFS console | — | `http://localhost:9001` | `yggdrasil` / `yggdrasil` |
 
 Connection string: `postgres://yggdrasil:yggdrasil@localhost:5432/yggdrasil`
 
-MinIO is pinned to `RELEASE.2025-04-22T22-12-26Z`, the last release with the
-full community console; the S3 API is what yggdrasil actually needs. A
-one-shot `minio-init` service creates the `yggdrasil` Shard bucket, so a
+RustFS is pinned to `1.0.4` by digest; the S3 API is what yggdrasil actually
+needs. It replaced MinIO when the `minio/minio` image stopped being pullable.
+A one-shot `rustfs-init` service creates the `yggdrasil` Shard bucket, so a
 clean stack is immediately usable. (Compose versions older than ~v2.22 fail
 `up --wait` when that one-shot exits; use the CI sequence instead:
-`docker compose up -d --wait postgres minio && docker compose run --rm minio-init`.)
+`docker compose up -d --wait postgres rustfs && docker compose run --rm rustfs-init`.)
 
 If a default host port collides with something already running, override it:
-`YG_POSTGRES_PORT`, `YG_MINIO_PORT`, `YG_MINIO_CONSOLE_PORT` (e.g.
+`YG_POSTGRES_PORT`, `YG_RUSTFS_PORT`, `YG_RUSTFS_CONSOLE_PORT` (e.g.
 `YG_POSTGRES_PORT=15432 docker compose up -d`).
 
 These credentials are for local development only. Data persists in named
-volumes (`yggdrasil-dev_postgres-data`, `yggdrasil-dev_minio-data`);
+volumes (`yggdrasil-dev_postgres-data`, `yggdrasil-dev_rustfs-data`);
 `docker compose down -v` resets everything.
 
 ## Running the Index Server
@@ -189,8 +189,8 @@ gets its own database, and its object-store keys are prefixed with that
 database's name, so parallel tests never share state):
 
 ```sh
-docker compose up -d --wait postgres minio
-docker compose run --rm minio-init
+docker compose up -d --wait postgres rustfs
+docker compose run --rm rustfs-init
 cargo test -p yg-cli --locked
 ```
 

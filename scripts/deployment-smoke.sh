@@ -17,8 +17,8 @@ export YG_CURSOR_SECRET="${YG_CURSOR_SECRET:-deploy-smoke-cursor-secret-32-bytes
 # Everything talks over the compose network; ephemeral host ports avoid
 # colliding with a developer's running dev stack.
 export YG_POSTGRES_PORT=0
-export YG_MINIO_PORT=0
-export YG_MINIO_CONSOLE_PORT=0
+export YG_RUSTFS_PORT=0
+export YG_RUSTFS_CONSOLE_PORT=0
 export YG_SERVER_PORT=0
 
 COMPOSE=(
@@ -34,8 +34,8 @@ cleanup() {
 trap cleanup EXIT
 cleanup
 
-"${COMPOSE[@]}" up -d --wait postgres minio
-"${COMPOSE[@]}" run --rm minio-init
+"${COMPOSE[@]}" up -d --wait postgres rustfs
+"${COMPOSE[@]}" run --rm rustfs-init
 "${COMPOSE[@]}" --profile deployment up -d --no-build --no-deps --wait server
 
 yg() {

@@ -42,6 +42,6 @@ Built in Rust. Postgres + S3-compatible object storage. AGPL-3.0.
 
 ## Developing
 
-`docker compose up -d` brings up dev Postgres + MinIO; see
+`docker compose up -d` brings up dev Postgres + RustFS; see
 [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) for ports, credentials, and the
 checks CI runs.

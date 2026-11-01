@@ -111,7 +111,7 @@ pub fn test_config(db_name: &str) -> ServerConfig {
     }
 }
 
-/// The dev compose stack's MinIO, keyed under `key_prefix` (empty
+/// The dev compose stack's RustFS, keyed under `key_prefix` (empty
 /// means the bucket root).
 pub fn dev_object_store_config(key_prefix: &str) -> ObjectStoreConfig {
     ObjectStoreConfig {
@@ -444,7 +444,7 @@ impl Harness {
         let store = config
             .object_store
             .connect()
-            .expect("dev MinIO must be reachable");
+            .expect("dev RustFS must be reachable");
         let server = serve(config).await.expect("boot");
         let base = format!("http://{}", server.local_addr());
         let sync = yg_sync::SyncWorker::new(control_plane(&db_name).await, &cache);

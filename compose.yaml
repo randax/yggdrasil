@@ -17,38 +17,48 @@ services:
       timeout: 3s
       retries: 12
 
-  minio:
-    # Last release with the full community console; the S3 API is what matters here.
-    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
-    command: server /data --console-address ":9001"
+  rustfs:
+    image: rustfs/rustfs:1.0.4@sha256:ed9210d6411d77ffceb70d94b964a3cb7d225983368bc25bebe01e995293dcc2
     environment:
-      MINIO_ROOT_USER: yggdrasil
-      MINIO_ROOT_PASSWORD: yggdrasil
+      RUSTFS_ACCESS_KEY: yggdrasil
+      RUSTFS_SECRET_KEY: yggdrasil
+      RUSTFS_VOLUMES: /data
+      RUSTFS_ADDRESS: ":9000"
+      RUSTFS_CONSOLE_ADDRESS: ":9001"
     ports:
-      - "${YG_MINIO_PORT:-9000}:9000"
-      - "${YG_MINIO_CONSOLE_PORT:-9001}:9001"
+      - "${YG_RUSTFS_PORT:-9000}:9000"
+      - "${YG_RUSTFS_CONSOLE_PORT:-9001}:9001"
     volumes:
-      - minio-data:/data
+      - rustfs-data:/data
     healthcheck:
-      # MinIO's documented container healthcheck. "local" is one of mc's
-      # built-in default aliases (http://localhost:9000) — no alias init is
-      # needed, and `mc ready` probes the unauthenticated health API.
-      test: ["CMD", "mc", "ready", "local"]
+      test: ["CMD", "curl", "-fsS", "http://localhost:9000/health"]
       interval: 5s
       timeout: 3s
       retries: 12
 
   # One-shot: creates the Shard bucket so a clean stack is immediately usable.
-  # Reuses the minio image because it ships mc; no extra image to pin.
-  minio-init:
-    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+  # Reuses the rustfs image because it ships curl; no extra image to pin.
+  # Healthy precedes S3-ready, so 503s retry; 409 means the bucket exists.
+  rustfs-init:
+    image: rustfs/rustfs:1.0.4@sha256:ed9210d6411d77ffceb70d94b964a3cb7d225983368bc25bebe01e995293dcc2
     depends_on:
-      minio:
+      rustfs:
         condition: service_healthy
     entrypoint:
       - /bin/sh
       - -c
-      - mc alias set dev http://minio:9000 yggdrasil yggdrasil && mc mb --ignore-existing dev/yggdrasil
+      - |
+        for attempt in $$(seq 1 30); do
+          code=$$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
+            --aws-sigv4 aws:amz:us-east-1:s3 --user yggdrasil:yggdrasil \
+            http://rustfs:9000/yggdrasil)
+          case "$$code" in
+            200|409) exit 0 ;;
+          esac
+          sleep 2
+        done
+        echo "creating the Shard bucket failed: HTTP $$code" >&2
+        exit 1
     restart: "no"
 
   # Reference single-node deployment. Profile-gated so the existing backing-
@@ -63,7 +73,7 @@ services:
     environment:
       YG_LISTEN: 0.0.0.0:7311
       YG_DATABASE_URL: postgres://yggdrasil:yggdrasil@postgres:5432/yggdrasil
-      YG_S3_ENDPOINT: http://minio:9000
+      YG_S3_ENDPOINT: http://rustfs:9000
       YG_S3_BUCKET: yggdrasil
       YG_S3_ACCESS_KEY: yggdrasil
       YG_S3_SECRET_KEY: yggdrasil
@@ -81,7 +91,7 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      minio-init:
+      rustfs-init:
         condition: service_completed_successfully
     healthcheck:
       test:
@@ -98,6 +108,6 @@ services:
 
 volumes:
   postgres-data:
-  minio-data:
+  rustfs-data:
   server-git-cache:
   server-shard-cache:

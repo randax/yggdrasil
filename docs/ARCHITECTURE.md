@@ -19,7 +19,7 @@ One Rust binary, three roles. Stateless compute around two stateful, self-hostab
                  ▼                          ▼
        ┌──────────────────┐      ┌───────────────────────┐
        │ Postgres          │      │ Object storage (S3/    │
-       │ control plane     │      │ MinIO/Garage):         │
+       │ control plane     │      │ RustFS/Garage):        │
        │ repos·jobs·tokens │      │ immutable per-repo     │
        │ cross-repo edges  │      │ Shards (graph+FTS+ANN) │
        └────────┬─────────┘      └──────────┬────────────┘
@@ -67,7 +67,7 @@ Serve the Verb engine over REST + MCP (Streamable HTTP). Hot Shards are cached m
 
 | Size | Topology |
 |---|---|
-| Dev / evaluation | `yg serve --role=all` + Postgres + MinIO (docker compose; the in-repo dev compose ships the two backing services — `yg` runs from cargo) |
+| Dev / evaluation | `yg serve --role=all` + Postgres + RustFS (docker compose; the in-repo dev compose ships the two backing services — `yg` runs from cargo) |
 | Standard org | 1–2 API/query nodes, 4–8 workers, managed Postgres, any S3 |
 | Large org (design point) | N query nodes behind LB, 20–40+ autoscaled workers, Postgres + read replica, object storage with NVMe cache volumes on query nodes |
 
