@@ -129,6 +129,13 @@ database Shard pointers cannot outpace the stored objects.
    `docker compose --profile deployment up -d --no-build --no-deps --wait server`.
 4. Check `docker compose logs server`, `GET /healthz`, and `yg status`.
 
+A stack created when this profile used MinIO cannot upgrade this way: there is
+no migration to RustFS, and the Postgres Shard pointers would reference objects
+RustFS does not have. Reset it with
+`docker compose --profile deployment down --volumes`, which deletes all
+deployment data, then follow the first-time steps above to re-register and
+re-index from the Forges.
+
 `yg-control` embeds SQLx migrations in the binary.
 `ControlPlane::connect_and_migrate` runs during server boot; applied versions
 are recorded in Postgres `_sqlx_migrations`, so a restart against an
