@@ -92,7 +92,7 @@ Targets as in the PRD: verb p95 < 300 ms warm, search p95 < 500 ms warm, syntact
 | Worker crash mid-index | Job lease expires, retried; immutable Shards mean no partial state visible |
 | Precise build fails | Repo stays at syntactic provenance; surfaced in `yg admin status` |
 | Query node loss | Stateless — LB routes around; cache rewarms from object storage |
-| Postgres loss | Restore from backup; Shard pointers re-validated against object storage manifests; from M2, Member-facing requests stay disabled until an Admin confirms current admission rules and Member grants and revocations, each repo stays hidden until its Forge visibility is re-checked, and Memory Verbs also until the retraction/erasure log is replayed (RFC 0001 §5.1) |
+| Postgres loss | Restore from backup; Shard pointers re-validated against object storage manifests; from M2, Member-facing requests stay disabled until an Admin confirms current admission rules, Member grants and revocations, and step-up enrollments, each repo stays hidden until its Forge visibility is re-checked, and Memory Verbs also until the retraction/erasure log is replayed (RFC 0001 §5.1) |
 | Object storage loss | Full re-index from Forges (overnight); control plane intact. The Memory retraction/erasure log is not rebuildable, so it is replicated or backed up separately; if it is lost, Memory Verbs stay disabled until an Admin proves completeness from an independent replica or discards every restored Memory body whose withdrawal status cannot be established; ordinary recall, history included, omits Memories whose shared status cannot be proven, and eligible publishers inspect them through `recall` with `unverified` set before re-affirming (RFC 0001 §5.1) |
 
 ## Why not …
