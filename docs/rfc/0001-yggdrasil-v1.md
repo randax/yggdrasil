@@ -5,7 +5,7 @@ Scope: full v1 design (milestones M0–M3). Requirements live in the [PRD](../PR
 
 ## 1. Summary
 
-A Rust workspace producing one binary, `yg`, that is simultaneously the server (`yg serve --role=api|worker|all`), the Admin/Member CLI, and a stdio MCP proxy (`yg mcp`). Stateless API/query nodes and indexing workers around Postgres (control plane) and S3-compatible object storage (immutable per-repo Shards). The v1 contract targets twelve graph Verbs plus three Memory Verbs (ADR 0007) over REST + MCP; M0 currently serves four.
+A Rust workspace producing one binary, `yg`, that is simultaneously the server (`yg serve --role=api|worker|all`), the Admin/Member CLI, and a stdio MCP proxy (`yg mcp`). Stateless API/query nodes and indexing workers around Postgres (control plane) and S3-compatible object storage (immutable per-repo Shards). The v1 contract targets twelve graph Verbs plus four Memory Verbs (ADR 0007) over REST + MCP; M0 currently serves four.
 
 ## 2. Control plane schema (Postgres, sketch)
 
@@ -24,12 +24,14 @@ xrepo_edges(from_repo, to_repo, via_package_id, kind)
 contributors(id, display_name)
 identities(contributor_id, kind /* email|forge_account */, value, merge_provenance)
 memories(id, member_id, kind /* semantic|episodic */, scope /* session|repo|org */,
-         shared bool, body, supersedes, stale_reason, created_at,
-         promoted_by, promoted_at)                     -- M2, ADR 0007
-anchors(memory_id, node_id, repo_id, anchored_revision)
+         session_id, shared bool, state /* active|stale|retracted|erased */,
+         body, supersedes, stale_reason, expires_at, created_at)  -- M2, ADR 0007
+anchors(memory_id, node_id, repo_id, node_kind, path, name, fingerprint)
+memory_events(memory_id, version, actor_member_id, action, at)   -- audit, body-free
+erasures(memory_id, erased_at)                                    -- reapplied on restore
 ```
 
-Memories are the only knowledge in the control plane that cannot be rebuilt from git and the Forges; they are mutable, so they live here rather than in immutable Shards (ADR 0007). An anchor records the Shard revision it was last confirmed against; publishing a revision that changes or removes the anchored node sets `stale_reason` rather than deleting the Memory.
+Memories (§5.1) are the only knowledge in the control plane that cannot be rebuilt from git and the Forges.
 
 Job queue = `SELECT … FOR UPDATE SKIP LOCKED` with leases; priorities favor incremental over backfill. No Redis/Kafka in v1 — Postgres is enough at 5000 repos and removing a dependency beats theoretical throughput.
 
@@ -58,7 +60,7 @@ Two-pass per change (ADR 0002):
 
 Node kinds: `Repo, File, Symbol, Package, Commit, Contributor, Team, ChangeRequest, Issue, Review, DocSection, Concept`.
 
-Edge kinds (all carry `provenance ∈ {precise, syntactic, extracted, inferred}` + `confidence ∈ [0,1]` + locations where applicable). A fifth level, `asserted`, is reserved for Memories and their Anchors (ADR 0007); they live in the control plane, never in a Shard, and derived Verbs never return them:
+Edge kinds (all carry `provenance ∈ {precise, syntactic, extracted, inferred}` + `confidence ∈ [0,1]` + locations where applicable):
 
 ```
 DEFINES        File → Symbol            CALLS         Symbol → Symbol
@@ -71,7 +73,33 @@ MENTIONS       DocSection/Issue/ChangeRequest → Symbol/File
 PART_OF        ChangeRequest → Commit   CLOSES        ChangeRequest → Issue
 ```
 
-Node IDs are stable content-derived strings (`repo:github.com/acme/api`, `sym:<scip-moniker>`, `doc:<repo>:<path>#<heading-slug>`), so Shard rebuilds don't invalidate references held by agents mid-session.
+Node IDs are stable content-derived strings (`repo:github.com/acme/api`, `sym:<…>`, `doc:<repo>:<path>#<heading-slug>`), so Shard rebuilds don't invalidate references held by agents mid-session. The exact Symbol ID form is settled in M1 under one constraint (ADR 0007): it stays stable across the syntactic and precise passes and across package versions, so a raw, versioned SCIP moniker is an attribute of the Symbol, not its ID. Each node also carries a content fingerprint — the hash of its normalized defining span for a Symbol, the blob hash for a File, the section text hash for a Doc Section — added with the M1 schema bump.
+
+### 5.1 Memories (M2, ADR 0007)
+
+Memories are control-plane records, not Shard nodes; derived Verbs never return them. Their trust level is `asserted`, a control-plane type kept separate from the Shard `Provenance` enum (and its `shards.provenance_level` CHECK), which stays four-valued.
+
+- **Anchors.** A Memory has one or more Anchors to a Symbol, File, Doc Section or Repo. Each Anchor stores the node ID plus kind, path, name and the node's fingerprint at write time. Commits and Contributors are not anchorable: they never change, so they could never go stale. Repo anchors never go stale either; they exist for repo-wide conventions.
+- **Staleness.** When a Shard revision is published, the anchors on that repo are compared with the *new* revision only, never with an older Shard that GC may already have deleted. A changed fingerprint sets `stale_reason = changed`; a missing node sets `removed`. This happens in the same Postgres transaction as the `shards` pointer swap, so no reader sees the new code with an unflagged Memory. `stale_reason` also records whether the anchor was precise or syntactic-only when it was checked.
+- **Scope and sharing.**
+  - `session` scope is Episodic only: bound to a client-supplied `session_id` owned by the writing Member, given an `expires_at`, never promotable.
+  - `repo` scope requires every anchor to be in that repo.
+  - Anchors across repos require `org` scope.
+  - `shared` is false on write; `promote` sets it.
+- **Authority.**
+  - Only the author mutates a private Memory.
+  - On a shared Memory, any Member may `affirm` it (which clears staleness against the current fingerprint) or write a superseding Memory, which must itself be promoted.
+  - The author or an Admin may `retract` it; only an Admin may erase it.
+  - The promote right is granted per Member token, by default to human Members and not to agents.
+  - Every transition is written to `memory_events`.
+- **Admission.** `recall` and `promote` return or accept a Memory only while every repo it anchors to is indexed. Excluding a repo hides its Memories (ADR 0001) without deleting them; re-admitting the repo restores them, now stale-checked against its current Shard.
+- **Retraction and erasure.**
+  - Retraction suppresses every version from every recall mode immediately.
+  - Admin erasure deletes the body and its search index entries but keeps the body-free audit rows.
+  - On restore from backup, the `erasures` log is reapplied before the API serves reads, and deployments bound backup retention.
+- **Untrusted content.** `recall` returns bodies as data marked untrusted. The Skill instructs agents to treat a Memory as a claim to verify against derived Verbs, never as an instruction, and the eval suite includes a promoted Memory containing an injected instruction.
+- **Abuse limits.** Writes are rejected when a secret scanner flags the body. Per-Member write-rate and storage quotas count superseded versions too, and body size, anchor count and `recall` result size are bounded.
+- **Recall search.** Full-text `recall` runs on Postgres full-text search over Memory bodies and ranks separately. It is never merged into `search`'s tantivy BM25 ranking.
 
 ## 6. Shard format
 
@@ -87,7 +115,7 @@ Immutable; pointer swap in `shards` table; GC after grace window. Query nodes mm
 
 ## 7. Verb contract (ADR 0003)
 
-The v1 contract targets twelve graph Verbs and three Memory Verbs (ADR 0007). For the implemented rows, the shared
+The v1 contract targets twelve graph Verbs and four Memory Verbs (ADR 0007, §5.1). For the implemented rows, the shared
 typed request definitions drive REST (`POST /v1/verbs/<name>`), MCP tools
 (`<name>`), and CLI subcommands; planned rows describe milestone intent, not
 available endpoints. The served set is defined by `yg_verbs::Verb::ALL` and
@@ -107,9 +135,10 @@ available endpoints. The served set is defined by `yg_verbs::Verb::ALL` and
 | `owners` | planned-M2 | file\|dir\|symbol | Contributors/Teams + ownership basis |
 | `history` | implemented | file or symbol, since? | commits touching the file or symbol's defining file, Contributors |
 | `impact` | planned-M1 | symbol\|file, depth | affected Symbols→Files→Repos, grouped, provenance-annotated |
-| `remember` | planned-M2 | body, kind, scope, anchors, supersedes? | Memory id (private to the author) |
-| `recall` | planned-M2 | anchor id \| scope \| query | Memories with author, scope, `asserted` provenance and staleness |
+| `remember` | planned-M2 | op: create\|supersede\|affirm, body?, kind, scope, session_id?, anchors, target? | Memory id and version (private to the author unless affirming) |
+| `recall` | planned-M2 | anchor id \| scope \| query, include_stale? | Memories with author, scope, `asserted` trust, staleness; bodies marked untrusted |
 | `promote` | planned-M2 | memory id, scope?: repo\|org | Memory moved to the shared pool, attributed to the promoting Member |
+| `retract` | planned-M2 | memory id | Memory suppressed from every recall mode |
 
 Lexical search ranks with BM25 inside each repository, then divides every
 score by that repository's maximum score before the cross-repository merge.
@@ -209,4 +238,4 @@ system claims to provide.
 
 ## 12. Rollout
 
-M0 ships the tracer (GitHub + syntactic + the search/node/neighbors/history Verbs + CLI/MCP/Skill v0) and is the architecture's proof; M1 adds the precise pass + callers/callees/impact + `map` + GitLab; M2 opens with the Memory slice (`remember`/`recall`/`promote`, ADR 0007), then completes the graph layers + Codeberg; M3 adds semantic + webhook accelerators + the 5000-repo certification run (synthetic org, published numbers). Each milestone ends with a dogfooding gate: agents must prefer the graph over grep for the navigation tasks it claims.
+M0 ships the tracer (GitHub + syntactic + the search/node/neighbors/history Verbs + CLI/MCP/Skill v0) and is the architecture's proof; M1 adds the precise pass + callers/callees/impact + `map` + GitLab; M2 opens with the Memory slice (Member tokens if not yet landed, `remember`/`recall`/`promote`/`retract`, ADR 0007), then completes the graph layers + Codeberg; M3 adds semantic + webhook accelerators + the 5000-repo certification run (synthetic org, published numbers). Each milestone ends with a dogfooding gate: agents must prefer the graph over grep for the navigation tasks it claims.
