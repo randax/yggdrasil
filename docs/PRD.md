@@ -45,7 +45,7 @@ Yggdrasil is a self-hosted **Index Server** that syncs git repositories from **F
 - G8. Doc Sections as nodes with doc→code edges; CODEOWNERS-derived ownership; LLM-extracted Concepts via pluggable provider (**off by default; no source leaves the server without Admin opt-in**).
 
 ### Query
-- G9. One Verb set as the entire public contract — the graph Verbs search, map, node, neighbors, path, callers, callees, deps, dependents, owners, history, impact, plus the Memory Verbs remember, recall, promote, retract (G15) — identical across CLI, MCP, HTTP. No query language (ADR 0003).
+- G9. One Verb set as the entire public contract — the graph Verbs search, map, node, neighbors, path, callers, callees, deps, dependents, owners, history, impact, plus the Memory Verbs remember, recall, promote, retract (G15) — identical across CLI, MCP, HTTP, except that human publishing acts, which need a step-up factor, are refused over MCP (ADR 0007). No query language (ADR 0003).
 - G10. Full-text search core (code, symbols, docs, commits, artifacts); semantic search via pluggable embedding provider (off by default; when enabled the local provider is the default, external APIs explicit opt-in), shipping in M3. Hybrid lexical+semantic is the target end state: Cursor's published evals ([semsearch](https://cursor.com/blog/semsearch)) show grep+semantic beats either alone, with gains concentrating in large codebases — exactly our design point. Scheduled after the core graph proves out, by explicit decision.
 
 ### Interfaces
