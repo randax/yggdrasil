@@ -93,7 +93,7 @@ Targets as in the PRD: verb p95 < 300 ms warm, search p95 < 500 ms warm, syntact
 | Precise build fails | Repo stays at syntactic provenance; surfaced in `yg admin status` |
 | Query node loss | Stateless — LB routes around; cache rewarms from object storage |
 | Postgres loss | Restore from backup; Shard pointers re-validated against object storage manifests; Memory Verbs stay disabled until the retraction/erasure log is replayed and an Admin confirms current admission rules and Member grants (RFC 0001 §5.1) |
-| Object storage loss | Full re-index from Forges (overnight); control plane intact. The Memory retraction/erasure log is not rebuildable, so it is replicated or backed up separately; if it is lost, Memory Verbs stay disabled until an Admin re-verifies (RFC 0001 §5.1) |
+| Object storage loss | Full re-index from Forges (overnight); control plane intact. The Memory retraction/erasure log is not rebuildable, so it is replicated or backed up separately; if it is lost, Memory Verbs stay disabled until an Admin proves completeness from an independent replica or discards every restored Memory body whose withdrawal status cannot be established (RFC 0001 §5.1) |
 
 ## Why not …
 

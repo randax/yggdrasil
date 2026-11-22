@@ -27,11 +27,11 @@ memories(id, member_id, kind /* semantic|episodic */, scope /* session|repo|org 
          session_id, state /* private|proposed|shared|retracted|erased */,
          body, supersedes, stale_reason, expires_at, created_at)  -- M2, ADR 0007
 anchors(memory_id, node_id, repo_id, node_kind, path, name, fingerprint)
-memory_events(memory_id, version, actor_member_id, action, at)   -- audit, body-free
+memory_events(memory_id, actor_member_id, action, at)            -- audit, body-free
 -- retractions and erasures are also appended to an object-storage log (§5.1)
 ```
 
-Memories (§5.1) are the only knowledge in the control plane that cannot be rebuilt from git and the Forges. Staleness is independent of lifecycle: a Memory in any state is stale while `stale_reason` is non-null.
+Memories (§5.1) are the only knowledge in the control plane that cannot be rebuilt from git and the Forges. Staleness is independent of lifecycle: a Memory in any state is stale while `stale_reason` is non-null. A Memory's body and anchors are immutable once written; every change is a new Memory linked through `supersedes`, so a Memory id *is* a version and a supersession chain is its history.
 
 Job queue = `SELECT … FOR UPDATE SKIP LOCKED` with leases; priorities favor incremental over backfill. No Redis/Kafka in v1 — Postgres is enough at 5000 repos and removing a dependency beats theoretical throughput.
 
@@ -90,24 +90,24 @@ Memories are control-plane records, not Shard nodes; derived Verbs never return 
   - Only the author mutates a private Memory.
   - On a shared Memory, affirming — which re-captures the current fingerprints and clears staleness — requires the promote right and requires every anchor to resolve in an indexed repo. Without the right, an affirm is recorded in `memory_events` but changes nothing.
   - Any Member may write a superseding Memory. It stays private and has no effect on shared recall until it is promoted.
-  - Retracting a private or proposed Memory affects only that Memory, never a shared Memory it supersedes. A shared Memory, together with its superseded versions, can be retracted only by the author of that shared Memory or by an Admin. Only an Admin may erase.
+  - Retracting a private or proposed Memory affects only that Memory, never a shared Memory it supersedes. A shared Memory, together with the Memories it supersedes, can be retracted only by the author of that shared Memory or by an Admin. Only an Admin may erase.
   - The promote right is a per-Member grant (`members.can_promote`), defaulting to true for human Members and false for agent Members. An Admin may grant it to an agent Member; that grant is explicit, audited and lets that agent publish without a human gate.
-  - A Member without the right may still `promote` its own Memory. That marks that exact version `proposed` for a reviewer the author names, who must hold the right. While pending, only the author and that reviewer see its body and anchors. The reviewer accepts or rejects by naming the Memory *and version*; a decision on a version that is no longer pending is refused. Accepting moves that version into the shared pool, and a later edit needs a new proposal. Rejecting returns it to its author's private overlay. This is how agent-written knowledge, most of what Memories will hold, reaches the team.
+  - A Member without the right may still `promote` its own Memory. That marks that Memory `proposed` for a reviewer the author names, who must hold the right. While pending, only the author and that reviewer see its body and anchors. The reviewer accepts or rejects by Memory id; a decision on a Memory that is no longer pending is refused. Since Memories are immutable, the reviewer always decides on exactly what was proposed, and a superseding Memory needs its own proposal. Accepting moves the Memory into the shared pool. Rejecting returns it to its author's private overlay. This is how agent-written knowledge, most of what Memories will hold, reaches the team.
   - Every transition is written to `memory_events`.
 - **Admission.**
   - `remember` rejects anchors to repos that are not indexed.
   - `recall` and `promote` return or accept a Memory only while every repo it anchors to is indexed. Excluding a repo hides its Memories (ADR 0001) without deleting them; re-admitting the repo restores them, stale-checked against its current Shard.
   - A Memory must anchor every repo whose non-public content its body discloses, so excluding that repo hides it. Promoting a Memory attests that its content is fit for org-wide visibility. This is a recorded obligation, not something the server can verify.
 - **Retraction and erasure.**
-  - Retraction immediately suppresses the retracted Memory from every recall mode. Retracting a shared Memory also suppresses the versions it supersedes.
+  - Retraction immediately suppresses the retracted Memory from every recall mode. Retracting a shared Memory also suppresses the Memories it supersedes.
   - Admin erasure (`yg admin memory erase`) deletes the body and its search index entries but keeps the body-free audit rows.
   - Each retraction and erasure is appended to a sequence-numbered, append-only log under a dedicated object-storage prefix, object-locked (WORM) where the store supports it. The append comes first: each entry claims the next sequence with a create-only conditional put and retries on conflict, so concurrent API nodes never collide. Postgres is updated after the append, and `retract` or erase succeeds only when both writes are done. Every API node continuously applies log entries past the recorded sequence, not only at boot. That prefix is excluded from Shard GC, bucket rebuilds and restores; it is the one object-storage item that is neither rebuildable nor ever rolled back.
-  - Postgres records the highest log sequence it has applied. On boot, the API refuses `recall` while the log holds entries past that number and replays them first, across every affected version and search entry. A Postgres snapshot from before a retraction or erasure therefore cannot republish the body.
-  - A retraction or erasure is acknowledged only once its log entry is durable in the log's replicated store. If the log itself has to be recovered from a backup, its completeness cannot be proven: Memory Verbs stay disabled until an Admin either re-verifies it or discards the bodies of every Memory changed after the backup point.
-  - After any Postgres restore, Memory Verbs also stay disabled until an Admin confirms, with `yg admin memory confirm-restore`, that the current repo admission rules and Member grants and revocations are in force, since a snapshot can predate an exclusion or a token revocation. `yg admin status` reports this.
+  - Postgres records the highest log sequence it has applied. On boot, the API refuses `recall` while the log holds entries past that number and replays them first, across every affected Memory in the chain and every search entry. A Postgres snapshot from before a retraction or erasure therefore cannot republish the body.
+  - A retraction or erasure is acknowledged only once its log entry is durable in the log's replicated store. If the log itself has to be recovered from a backup, its completeness cannot be proven from the restored data alone. Memory Verbs then stay disabled until an Admin either proves completeness from an independent replica of the log, or discards every restored Memory body and search entry whose withdrawal status cannot be established. Body-free audit rows are kept.
+  - After any Postgres restore, Memory Verbs also stay disabled until an Admin confirms, with `yg admin memory confirm-restore`, that the current repo admission rules and Member grants and revocations are in force, since a snapshot can predate an exclusion or a token revocation. Recovery also cancels every restored pending proposal, returning each to its author's private overlay, because a snapshot can predate a rejection. `yg admin status` reports all of this.
   - Deployments still bound backup retention, since old snapshots hold the erased bodies.
 - **Untrusted content.** `recall` returns bodies as data marked untrusted. The Skill instructs agents to treat a Memory as a claim to verify against derived Verbs, never as an instruction, and the eval suite includes a promoted Memory containing an injected instruction.
-- **Abuse limits.** Writes are rejected when a secret scanner flags the body. Per-Member write-rate and storage quotas count superseded versions too, and body size, anchor count and `recall` result size are bounded.
+- **Abuse limits.** Writes are rejected when a secret scanner flags the body. Per-Member write-rate and storage quotas count superseded Memories too, and body size, anchor count and `recall` result size are bounded.
 - **Recall search.** Full-text `recall` runs on Postgres full-text search over Memory bodies and ranks separately. It is never merged into `search`'s tantivy BM25 ranking.
 
 ## 6. Shard format
@@ -144,9 +144,9 @@ available endpoints. The served set is defined by `yg_verbs::Verb::ALL` and
 | `owners` | planned-M2 | file\|dir\|symbol | Contributors/Teams + ownership basis |
 | `history` | implemented | file or symbol, since? | commits touching the file or symbol's defining file, Contributors |
 | `impact` | planned-M1 | symbol\|file, depth | affected Symbols→Files→Repos, grouped, provenance-annotated |
-| `remember` | planned-M2 | op: create\|supersede\|affirm, body?, kind, scope, session_id?, anchors, target? | Memory id and version (private to the author unless affirming) |
+| `remember` | planned-M2 | op: create\|supersede\|affirm, body?, kind, scope, session_id?, anchors, target? | Memory id (private to the author unless affirming) |
 | `recall` | planned-M2 | anchor id \| scope \| query, session_id?, include_stale?, proposed? | Memories with author, scope, `asserted` trust, staleness; bodies marked untrusted. `proposed: true` lists the proposals awaiting the caller's review |
-| `promote` | planned-M2 | memory id, version?, scope?: repo\|org, reviewer?, decision?: accept\|reject | shared Memory, or `proposed` when the caller lacks the promote right; attributed and audited |
+| `promote` | planned-M2 | memory id, scope?: repo\|org, reviewer?, decision?: accept\|reject | shared Memory, or `proposed` when the caller lacks the promote right; attributed and audited |
 | `retract` | planned-M2 | memory id | Memory suppressed from every recall mode |
 
 Lexical search ranks with BM25 inside each repository, then divides every
