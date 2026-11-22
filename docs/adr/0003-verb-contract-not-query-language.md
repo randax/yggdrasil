@@ -1,4 +1,4 @@
-Status: extended by ADR-0007 (adds the Memory Verbs remember, recall, promote, retract)
+Status: extended by ADR-0007 (adds the Memory Verbs remember, recall, promote, retract, and one transport-parity exception for human step-up acts over MCP)
 
 # The query contract is a verb set, not a query language
 
