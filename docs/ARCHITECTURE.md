@@ -39,7 +39,7 @@ One Rust binary, three roles. Stateless compute around two stateful, self-hostab
 ## Components
 
 ### Control plane (Postgres)
-System of record: Forge connections, repo registry + discovery state, sync cursors, job queue (`SELECT … FOR UPDATE SKIP LOCKED`), Shard pointers, Members + bearer tokens, the cross-repo edge index (package → repo, repo → repo dependency edges; a global symbol tier is an open question, RFC 0001 Q5), and Contributor identity merges. Everything else is rebuildable; Postgres and object storage are the only backup targets.
+System of record: Forge connections, repo registry + discovery state, sync cursors, job queue (`SELECT … FOR UPDATE SKIP LOCKED`), Shard pointers, Members + bearer tokens, the cross-repo edge index (package → repo, repo → repo dependency edges; a global symbol tier is an open question, RFC 0001 Q5), Contributor identity merges, and (from M2) Memories — knowledge asserted by Members (human or agent) and anchored to graph nodes, the only graph knowledge that cannot be rebuilt from git and the Forges (ADR 0007). Everything else is rebuildable, except the Memory retraction/erasure log, which lives under a dedicated object-storage prefix (object-locked where the store supports it) and must never be rolled back (RFC 0001 §5.1); Postgres and object storage are the only backup targets.
 
 ### Sync service
 Per-Forge adapters behind one trait: discovery (orgs/groups → repos, include/exclude rules, private = opt-in), poll loop with conditional requests against rate-limit budgets, optional webhook receiver as accelerator (poll always reconciles, so missed webhooks only cost latency, never correctness). Emits jobs: `fetch`, `index_syntactic`, `index_precise`, `extract_{history,docs,owners,artifacts}`, `embed`.
@@ -92,9 +92,9 @@ Targets as in the PRD: verb p95 < 300 ms warm, search p95 < 500 ms warm, syntact
 | Worker crash mid-index | Job lease expires, retried; immutable Shards mean no partial state visible |
 | Precise build fails | Repo stays at syntactic provenance; surfaced in `yg admin status` |
 | Query node loss | Stateless — LB routes around; cache rewarms from object storage |
-| Postgres loss | Restore from backup; Shard pointers re-validated against object storage manifests |
-| Object storage loss | Full re-index from Forges (overnight); control plane intact |
+| Postgres loss | Restore from backup; Shard pointers re-validated against object storage manifests; from M2, Member-facing requests stay disabled until an Admin confirms current admission rules, Member grants and revocations, and step-up enrollments, each repo stays hidden until its Forge visibility is re-checked, and Memory Verbs also until the retraction/erasure log is replayed (RFC 0001 §5.1) |
+| Object storage loss | Full re-index from Forges (overnight); control plane intact. The Memory retraction/erasure log is not rebuildable, so it is replicated or backed up separately; if it is lost, every Member-facing route closes until bootstrap recovery re-establishes credentials or reissues them with uncertain grants cleared, and Memory Verbs stay disabled until an Admin proves completeness from an independent replica or discards every restored Memory body whose withdrawal status cannot be established; ordinary recall, history included, omits Memories whose shared status cannot be proven, and eligible publishers inspect them through `recall` with `unverified` set before re-affirming (RFC 0001 §5.1) |
 
 ## Why not …
 
-See ADRs: org-visible access (0001), precise-with-fallback extraction (0002), Verbs over a query language (0003), embedded-SQLite-on-one-box (0004, superseded), object-storage-native Shards (0005).
+See ADRs: org-visible access (0001), precise-with-fallback extraction (0002), Verbs over a query language (0003), embedded-SQLite-on-one-box (0004, superseded), object-storage-native Shards (0005), syntactic ambiguity as spread confidence (0006), the code-anchored team brain and Memories (0007).
