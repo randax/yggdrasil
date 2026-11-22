@@ -126,6 +126,7 @@ A **cold search** is the first query against a freshly published Shard with an e
   - code-driven staleness;
   - admission-bound recall;
   - retraction and Admin erasure.
+- **Agents acting under human credentials** — an agent that reaches a human's token can bypass the promotion gate. Mitigated by agent-only tokens for `yg mcp`, Skill guidance and an interactive step-up credential for human publishing acts (RFC 0001 §5.1). The server cannot fully verify who is at the keyboard, so the residual risk is stated, not hidden.
 - **Competitive window** — Graphify Cloud and Copilot Memory iterate quickly on adjacent ground. Mitigated by sequencing: precise core (M1), then anchored Memory (start of M2), with semantic search — table stakes elsewhere, not separation — left at M3 per G10.
 
 ## License & development
