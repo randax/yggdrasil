@@ -60,10 +60,10 @@ Yggdrasil is a self-hosted **Index Server** that syncs git repositories from **F
 - G15. Members (human or agent) `remember` a fact, decision, convention or gotcha anchored to graph nodes; `recall` it by anchor, scope or full-text query; `promote` it from the author's private overlay into the shared pool at repo or org scope; and affirm or supersede it (via `remember`) or `retract` it. Every Memory carries `asserted` trust, its author and its staleness. Derived Verbs never return Memories, and `recall` returns bodies as untrusted data — claims to verify, never instructions.
 - G16. Staleness follows the code: when a published Shard revision changes an anchored node's fingerprint or removes it, its Memories are flagged stale with a reason, never silently deleted. Semantic Memory never expires by time; Episodic Memory is session-bound and expires.
 - G17. Safe sharing:
-  - Memories are private on write. Promotion, and affirming a stale shared Memory, are explicit, audited and limited to Members granted the right (by default human Members). An agent's promotion becomes a proposal those Members accept or reject.
+  - Memories are private on write. Promotion, and affirming a stale shared Memory, are explicit, audited and limited to Members granted the right (by default human Members). By default an agent's promotion becomes a proposal to a named reviewer; an Admin may explicitly grant an agent the right.
   - Memories are recallable only while every repo they anchor to is indexed.
   - Writes a secret scanner flags are rejected; per-Member quotas apply.
-  - Retraction suppresses a Memory everywhere, and Admin erasure deletes its body. Both go to a locked, append-only object-storage log that is replayed before reads resume after a restore.
+  - Retraction suppresses a Memory everywhere, and Admin erasure deletes its body. Both go to an append-only object-storage log (object-locked where the store supports it) that is excluded from restores and replayed before reads resume.
   - Memories live in the control plane and are covered by its backups. They are the only graph knowledge that cannot be rebuilt from git and the Forges.
 
 ## Non-goals (v1)
