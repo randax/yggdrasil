@@ -27,11 +27,12 @@ memories(id, member_id, kind /* semantic|episodic */, scope /* session|repo|org 
          session_id, state /* private|proposed|shared|retracted|erased */,
          body, supersedes, stale_reason, expires_at, created_at)  -- M2, ADR 0007
 anchors(memory_id, node_id, repo_id, node_kind, path, name, fingerprint)
+affirmations(memory_id, actor_member_id, fingerprints, at)      -- latest is the staleness baseline
 memory_events(memory_id, actor_member_id, action, at)            -- audit, body-free
 -- retractions and erasures are also appended to an object-storage log (§5.1)
 ```
 
-Memories (§5.1) are the only knowledge in the control plane that cannot be rebuilt from git and the Forges. Staleness is independent of lifecycle: a Memory in any state is stale while `stale_reason` is non-null. A Memory's body and anchors are immutable once written; every change is a new Memory linked through `supersedes`, so a Memory id *is* a version and a supersession chain is its history.
+Memories (§5.1) are the only knowledge in the control plane that cannot be rebuilt from git and the Forges. Staleness is independent of lifecycle: a Memory in any state is stale while `stale_reason` is non-null. A Memory's body and anchors (targets and original fingerprints) are immutable once written. Only its lifecycle state and `stale_reason` change, and affirmations are appended as separate rows; every content change is a new Memory linked through `supersedes`, so a Memory id *is* a version and a supersession chain is its history.
 
 Job queue = `SELECT … FOR UPDATE SKIP LOCKED` with leases; priorities favor incremental over backfill. No Redis/Kafka in v1 — Postgres is enough at 5000 repos and removing a dependency beats theoretical throughput.
 
@@ -87,10 +88,10 @@ Memories are control-plane records, not Shard nodes; derived Verbs never return 
   - Anchors across repos require `org` scope.
   - A Memory is `private` on write; `promote` moves it to `proposed` or `shared`.
 - **Authority.**
-  - Only the author mutates a private Memory.
-  - On a shared Memory, affirming — which re-captures the current fingerprints and clears staleness — requires the promote right and requires every anchor to resolve in an indexed repo. Without the right, an affirm is recorded in `memory_events` but changes nothing.
-  - Any Member may write a superseding Memory. It stays private and has no effect on shared recall until it is promoted.
-  - Retracting a private or proposed Memory affects only that Memory, never a shared Memory it supersedes. A shared Memory, together with the Memories it supersedes, can be retracted only by the author of that shared Memory or by an Admin. Only an Admin may erase.
+  - Only the author may promote, supersede or retract a private Memory.
+  - On a shared Memory, affirming requires the promote right and requires every anchor to resolve in an indexed repo. It appends an `affirmations` row with the actor and the fingerprints they reviewed, clears staleness, and makes those fingerprints the baseline for later staleness checks; the anchor's original fingerprint is kept as evidence of what the claim first described. Without the right, an affirm is recorded in `memory_events` but changes nothing.
+  - A superseding Memory may target only the caller's own active Memory or a shared Memory the caller can currently see; an inaccessible target is refused with the same error as an unknown one. The superseding Memory stays private and has no effect on shared recall until it is promoted. `recall` returns only the head of a supersession chain unless the caller asks for history.
+  - Retraction by an author applies only to the named Memory, never to Memories it supersedes, whoever wrote them. Withdrawing a whole supersession chain is Admin-only. Only an Admin may erase.
   - The promote right is a per-Member grant (`members.can_promote`), defaulting to true for human Members and false for agent Members. An Admin may grant it to an agent Member; that grant is explicit, audited and lets that agent publish without a human gate.
   - A Member without the right may still `promote` its own Memory. That marks that Memory `proposed` for a reviewer the author names, who must hold the right. While pending, only the author and that reviewer see its body and anchors. The reviewer accepts or rejects by Memory id; a decision on a Memory that is no longer pending is refused. Since Memories are immutable, the reviewer always decides on exactly what was proposed, and a superseding Memory needs its own proposal. Accepting moves the Memory into the shared pool. Rejecting returns it to its author's private overlay. This is how agent-written knowledge, most of what Memories will hold, reaches the team.
   - Every transition is written to `memory_events`.
@@ -99,7 +100,7 @@ Memories are control-plane records, not Shard nodes; derived Verbs never return 
   - `recall` and `promote` return or accept a Memory only while every repo it anchors to is indexed. Excluding a repo hides its Memories (ADR 0001) without deleting them; re-admitting the repo restores them, stale-checked against its current Shard.
   - A Memory must anchor every repo whose non-public content its body discloses, so excluding that repo hides it. Promoting a Memory attests that its content is fit for org-wide visibility. This is a recorded obligation, not something the server can verify.
 - **Retraction and erasure.**
-  - Retraction immediately suppresses the retracted Memory from every recall mode. Retracting a shared Memory also suppresses the Memories it supersedes.
+  - Retraction immediately suppresses the retracted Memory from every recall mode; an Admin chain withdrawal suppresses every Memory in the chain.
   - Admin erasure (`yg admin memory erase`) deletes the body and its search index entries but keeps the body-free audit rows.
   - Each retraction and erasure is appended to a sequence-numbered, append-only log under a dedicated object-storage prefix, object-locked (WORM) where the store supports it. The append comes first: each entry claims the next sequence with a create-only conditional put and retries on conflict, so concurrent API nodes never collide. Postgres is updated after the append, and `retract` or erase succeeds only when both writes are done. Every API node continuously applies log entries past the recorded sequence, not only at boot. That prefix is excluded from Shard GC, bucket rebuilds and restores; it is the one object-storage item that is neither rebuildable nor ever rolled back.
   - Postgres records the highest log sequence it has applied. On boot, the API refuses `recall` while the log holds entries past that number and replays them first, across every affected Memory in the chain and every search entry. A Postgres snapshot from before a retraction or erasure therefore cannot republish the body.
