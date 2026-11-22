@@ -5,7 +5,7 @@ Scope: full v1 design (milestones M0–M3). Requirements live in the [PRD](../PR
 
 ## 1. Summary
 
-A Rust workspace producing one binary, `yg`, that is simultaneously the server (`yg serve --role=api|worker|all`), the Admin/Member CLI, and a stdio MCP proxy (`yg mcp`). Stateless API/query nodes and indexing workers around Postgres (control plane) and S3-compatible object storage (immutable per-repo Shards). The v1 contract targets twelve Verbs over REST + MCP; M0 currently serves four.
+A Rust workspace producing one binary, `yg`, that is simultaneously the server (`yg serve --role=api|worker|all`), the Admin/Member CLI, and a stdio MCP proxy (`yg mcp`). Stateless API/query nodes and indexing workers around Postgres (control plane) and S3-compatible object storage (immutable per-repo Shards). The v1 contract targets twelve graph Verbs plus three Memory Verbs (ADR 0007) over REST + MCP; M0 currently serves four.
 
 ## 2. Control plane schema (Postgres, sketch)
 
@@ -23,7 +23,13 @@ repo_packages(repo_id, package_id, version_range, relation /* provides|depends *
 xrepo_edges(from_repo, to_repo, via_package_id, kind)
 contributors(id, display_name)
 identities(contributor_id, kind /* email|forge_account */, value, merge_provenance)
+memories(id, member_id, kind /* semantic|episodic */, scope /* session|repo|org */,
+         shared bool, body, supersedes, stale_reason, created_at,
+         promoted_by, promoted_at)                     -- M2, ADR 0007
+anchors(memory_id, node_id, repo_id, anchored_revision)
 ```
+
+Memories are the only knowledge in the control plane that cannot be rebuilt from git and the Forges; they are mutable, so they live here rather than in immutable Shards (ADR 0007). An anchor records the Shard revision it was last confirmed against; publishing a revision that changes or removes the anchored node sets `stale_reason` rather than deleting the Memory.
 
 Job queue = `SELECT … FOR UPDATE SKIP LOCKED` with leases; priorities favor incremental over backfill. No Redis/Kafka in v1 — Postgres is enough at 5000 repos and removing a dependency beats theoretical throughput.
 
@@ -52,7 +58,7 @@ Two-pass per change (ADR 0002):
 
 Node kinds: `Repo, File, Symbol, Package, Commit, Contributor, Team, ChangeRequest, Issue, Review, DocSection, Concept`.
 
-Edge kinds (all carry `provenance ∈ {precise, syntactic, extracted, inferred}` + `confidence ∈ [0,1]` + locations where applicable):
+Edge kinds (all carry `provenance ∈ {precise, syntactic, extracted, inferred}` + `confidence ∈ [0,1]` + locations where applicable). A fifth level, `asserted`, is reserved for Memories and their Anchors (ADR 0007); they live in the control plane, never in a Shard, and derived Verbs never return them:
 
 ```
 DEFINES        File → Symbol            CALLS         Symbol → Symbol
@@ -81,7 +87,7 @@ Immutable; pointer swap in `shards` table; GC after grace window. Query nodes mm
 
 ## 7. Verb contract (ADR 0003)
 
-The v1 contract targets twelve Verbs. For the implemented rows, the shared
+The v1 contract targets twelve graph Verbs and three Memory Verbs (ADR 0007). For the implemented rows, the shared
 typed request definitions drive REST (`POST /v1/verbs/<name>`), MCP tools
 (`<name>`), and CLI subcommands; planned rows describe milestone intent, not
 available endpoints. The served set is defined by `yg_verbs::Verb::ALL` and
@@ -101,6 +107,9 @@ available endpoints. The served set is defined by `yg_verbs::Verb::ALL` and
 | `owners` | planned-M2 | file\|dir\|symbol | Contributors/Teams + ownership basis |
 | `history` | implemented | file or symbol, since? | commits touching the file or symbol's defining file, Contributors |
 | `impact` | planned-M1 | symbol\|file, depth | affected Symbols→Files→Repos, grouped, provenance-annotated |
+| `remember` | planned-M2 | body, kind, scope, anchors, supersedes? | Memory id (private to the author) |
+| `recall` | planned-M2 | anchor id \| scope \| query | Memories with author, scope, `asserted` provenance and staleness |
+| `promote` | planned-M2 | memory id, scope?: repo\|org | Memory moved to the shared pool, attributed to the promoting Member |
 
 Lexical search ranks with BM25 inside each repository, then divides every
 score by that repository's maximum score before the cross-repository merge.
@@ -200,4 +209,4 @@ system claims to provide.
 
 ## 12. Rollout
 
-M0 ships the tracer (GitHub + syntactic + the search/node/neighbors/history Verbs + CLI/MCP/Skill v0) and is the architecture's proof; M1 adds the precise pass + callers/callees/impact + `map` + GitLab; M2 completes the graph layers + Codeberg; M3 adds semantic + webhook accelerators + the 5000-repo certification run (synthetic org, published numbers). Each milestone ends with a dogfooding gate: agents must prefer the graph over grep for the navigation tasks it claims.
+M0 ships the tracer (GitHub + syntactic + the search/node/neighbors/history Verbs + CLI/MCP/Skill v0) and is the architecture's proof; M1 adds the precise pass + callers/callees/impact + `map` + GitLab; M2 opens with the Memory slice (`remember`/`recall`/`promote`, ADR 0007), then completes the graph layers + Codeberg; M3 adds semantic + webhook accelerators + the 5000-repo certification run (synthetic org, published numbers). Each milestone ends with a dogfooding gate: agents must prefer the graph over grep for the navigation tasks it claims.

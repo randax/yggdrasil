@@ -1,22 +1,26 @@
 # Yggdrasil — Product Requirements Document
 
-Status: Draft for review · Date: 2026-06-10 · Owner: Øyvind Randa
+Status: Draft for review · Date: 2026-06-10 · Amended 2026-11-22 (ADR 0007) · Owner: Øyvind Randa
 
 ## Problem
 
 AI coding agents navigate codebases the way 1970s tools do: grep, file listings, and whatever fits in a context window. That breaks down completely at organization scale — an agent working in one repo cannot answer *"who calls this API across our 5000 repos?"*, *"what breaks if I change this?"*, or *"who actually knows this code?"*. Humans have the same problem with worse patience.
 
-Existing tools each solve a fragment:
+Existing tools each solve a fragment ([landscape research, 2026-11](research/team-brain-landscape.md)):
 
-- **graphify** builds a knowledge graph of one checkout, once, with syntactic (tree-sitter) accuracy — no server, no sync, no org view, edges that can't be trusted for impact analysis.
-- **Sourcegraph** solved org-scale search and precise code intelligence, but as a heavyweight proprietary platform, not an agent-first, self-hostable graph.
+- **Graphify** builds a syntactic (tree-sitter) knowledge graph of a checkout on a developer's machine, shared by committing a JSON file. Its hosted Graphify Cloud (2026) adds push-driven sync, cross-repo graphs and agent memory, but stays syntactic, closed and SaaS-first (self-hosting is Enterprise early access): edges that can't be trusted for impact analysis.
+- **Sourcegraph** solved org-scale search and precise code intelligence, but as a heavyweight proprietary platform (closed since 2024, from $16K/year) with no write path and no non-code sources — not an agent-first, self-hostable graph.
+- **Answer engines** (Glean, Unblocked, Atlassian Rovo, Onyx) embed everything a team writes and answer with citations, but treat code as text: they cannot enumerate call sites or say what a change breaks.
+- **Memory engines** (Zep/Graphiti, mem0) and GitHub Copilot Memory let agents remember facts, but the facts float free of the code's structure. Copilot Memory re-checks code citations and expires memories after 90 days; it is GitHub-only SaaS with no graph.
 - **turbopuffer** proves the storage blueprint (object-storage-native indexes, cache tiers) but is a search primitive, not repo-aware.
 
-Nothing self-hostable continuously syncs an organization's repos from their forges and serves a **precise, queryable knowledge graph** designed for AI agents.
+Nothing self-hostable continuously syncs an organization's repos from their forges, serves a **precise, queryable knowledge graph** designed for AI agents, and lets the team's agents share what they learn about that code — anchored to the code it describes.
 
 ## Product
 
 Yggdrasil is a self-hosted **Index Server** that syncs git repositories from **Forges** (GitHub, GitLab, Codeberg), builds a **Knowledge Graph** of code, history, people, docs, and forge artifacts, and serves it to AI agents over **MCP** and to humans over a **CLI** — through one curated set of **Verbs**. A shipped **Skill** teaches agents the navigation method; a **Map** verb gives them fresh per-repo orientation.
+
+**Positioning: the team brain for code** (ADR 0007). The graph is the spine, and team knowledge enters only by attaching to it: Forge Artifacts, Doc Sections and ownership as derived layers, and **Memories** — what agents and engineers learned that the sources don't say — as anchored, attributed, lowest-trust claims that go stale when the code they describe changes. Yggdrasil does not become a company-wide answer engine; it is the code back end that agents, and the answer engines teams already run, call over MCP.
 
 *The world-tree connecting all the realms of your code.*
 
@@ -40,6 +44,11 @@ Yggdrasil is a self-hosted **Index Server** that syncs git repositories from **F
 - G7. Forge Artifacts: Change Requests, issues, reviews, linked to commits and code.
 - G8. Doc Sections as nodes with doc→code edges; CODEOWNERS-derived ownership; LLM-extracted Concepts via pluggable provider (**off by default; no source leaves the server without Admin opt-in**).
 
+### Memory (ADR 0007)
+- G15. Agents and Members `remember` a fact, decision, convention or gotcha anchored to graph nodes, `recall` it by anchor, scope or full-text query, and `promote` it from the author's private overlay into the shared pool, at repo or org scope. Every Memory carries `asserted` provenance, its author and its staleness; derived Verbs never return Memories.
+- G16. Staleness follows the code: when a published Shard revision changes or removes an anchored node, its Memories are flagged stale with a reason, never silently deleted. Semantic Memory never expires by time; Episodic Memory does.
+- G17. Safe sharing: Memories are private on write; Promotion is explicit and attributed; writes a secret scanner flags are rejected. Memories live in the control plane and are covered by its backups — the first Index Server data that cannot be rebuilt from the Forges.
+
 ### Query
 - G9. One Verb set as the entire public contract — search, map, node, neighbors, path, callers, callees, deps, dependents, owners, history, impact — identical across CLI, MCP, HTTP. No query language (ADR 0003).
 - G10. Full-text search core (code, symbols, docs, commits, artifacts); semantic search via pluggable embedding provider (off by default; when enabled the local provider is the default, external APIs explicit opt-in), shipping in M3. Hybrid lexical+semantic is the target end state: Cursor's published evals ([semsearch](https://cursor.com/blog/semsearch)) show grep+semantic beats either alone, with gains concentrating in large codebases — exactly our design point. Scheduled after the core graph proves out, by explicit decision.
@@ -58,6 +67,7 @@ Yggdrasil is a self-hosted **Index Server** that syncs git repositories from **F
 - A public graph query language (ADR 0003).
 - Indexing non-default branches or CR heads.
 - Code review, hosting, or CI features — Forges keep their jobs.
+- A company-wide answer engine (ADR 0007): no ingestion of chat, ticket systems outside the Forges, or documents outside indexed repos; no synthesized natural-language answers or chat/wiki front end. Agents compose answers from Verb results; answer engines can call Yggdrasil over MCP for the code questions they can't answer.
 - IDE plugins, web UI (CLI/MCP first; a read-only web viewer may ride along later).
 - SaaS offering — self-hosted only, for now.
 - Indexing local working trees / uncommitted edits (Cursor's territory) — yggdrasil serves org-truth from the default branch; the agent's local tools own working-tree truth. The Skill documents this division of labor.
@@ -83,12 +93,13 @@ A **cold search** is the first query against a freshly published Shard with an e
 - Precise coverage: % of org LOC under SCIP-precise indexing (target ≥ 60% for Go/TS/Python/Rust-dominant orgs).
 - Freshness SLO attainment ≥ 99%.
 - Time-to-orientation: agent answers "where is X handled and who owns it" in an unfamiliar repo in ≤ 3 Verb calls.
+- Compounding memory: on a repeated-task eval, an agent given a teammate's promoted Memories finishes with fewer Verb calls and tokens than one without, and every Memory whose anchor changed is flagged stale before it is used.
 
 ## Milestones
 
 - **M0 — Tracer (GitHub, syntactic).** One vertical slice: control plane → sync → worker → Shard on object storage → query node → search/node/neighbors/history Verbs → CLI + MCP + Skill v0. Proves the architecture end-to-end.
 - **M1 — Precise core.** SCIP workers (Go, TypeScript/JS, Python, Rust), provenance overlay, callers/callees/impact, `map` Verb, GitLab support.
-- **M2 — The whole graph.** History/people layers, CODEOWNERS, Doc Sections, cross-repo dependency resolution, Codeberg, Forge Artifacts.
+- **M2 — Shared memory and the whole graph.** Opens with the Memory slice (ADR 0007; needs Admin-issued Member tokens): `remember`/`recall`/`promote`, Anchors, code-driven staleness, Promotion. Then history/people layers, CODEOWNERS, Doc Sections, cross-repo dependency resolution, Codeberg, Forge Artifacts.
 - **M3 — Semantic + scale certification.** Embedding provider + vector Shards (opt-in), LLM Concept extraction (opt-in), webhook accelerators, 5000-repo load certification.
 
 ## Post-v1 directions
@@ -103,6 +114,8 @@ A **cold search** is the first query against a freshly published Shard with an e
 - **Builds are arbitrary code execution** — mitigated by containerized sandboxes with controlled egress; this is the security-critical surface.
 - **Scope weight** — mitigated by tracer-bullet staging; M0 is deliberately thin.
 - **Identity merge errors** (Contributors across Forges) — merges are tagged and reversible like all inferred data.
+- **Memory leakage and poisoning** — a promoted Memory is org-visible (ADR 0001), so a careless or wrong claim spreads. Mitigated by private-on-write, explicit attributed Promotion, secret scanning, `asserted` as the lowest trust level, code-driven staleness, and supersede/retract.
+- **Competitive window** — Graphify Cloud and Copilot Memory iterate quickly on adjacent ground. Mitigated by sequencing: precise core (M1), then anchored Memory (start of M2), with semantic search — which differentiates nothing — left at M3.
 
 ## License & development
 

@@ -39,7 +39,7 @@ One Rust binary, three roles. Stateless compute around two stateful, self-hostab
 ## Components
 
 ### Control plane (Postgres)
-System of record: Forge connections, repo registry + discovery state, sync cursors, job queue (`SELECT … FOR UPDATE SKIP LOCKED`), Shard pointers, Members + bearer tokens, the cross-repo edge index (package → repo, repo → repo dependency edges; a global symbol tier is an open question, RFC 0001 Q5), and Contributor identity merges. Everything else is rebuildable; Postgres and object storage are the only backup targets.
+System of record: Forge connections, repo registry + discovery state, sync cursors, job queue (`SELECT … FOR UPDATE SKIP LOCKED`), Shard pointers, Members + bearer tokens, the cross-repo edge index (package → repo, repo → repo dependency edges; a global symbol tier is an open question, RFC 0001 Q5), Contributor identity merges, and (from M2) Memories — agent- and Member-asserted knowledge anchored to graph nodes, the one control-plane record that cannot be rebuilt from the Forges (ADR 0007). Everything else is rebuildable; Postgres and object storage are the only backup targets.
 
 ### Sync service
 Per-Forge adapters behind one trait: discovery (orgs/groups → repos, include/exclude rules, private = opt-in), poll loop with conditional requests against rate-limit budgets, optional webhook receiver as accelerator (poll always reconciles, so missed webhooks only cost latency, never correctness). Emits jobs: `fetch`, `index_syntactic`, `index_precise`, `extract_{history,docs,owners,artifacts}`, `embed`.
@@ -97,4 +97,4 @@ Targets as in the PRD: verb p95 < 300 ms warm, search p95 < 500 ms warm, syntact
 
 ## Why not …
 
-See ADRs: org-visible access (0001), precise-with-fallback extraction (0002), Verbs over a query language (0003), embedded-SQLite-on-one-box (0004, superseded), object-storage-native Shards (0005).
+See ADRs: org-visible access (0001), precise-with-fallback extraction (0002), Verbs over a query language (0003), embedded-SQLite-on-one-box (0004, superseded), object-storage-native Shards (0005), syntactic ambiguity as spread confidence (0006), the code-anchored team brain and Memories (0007).
