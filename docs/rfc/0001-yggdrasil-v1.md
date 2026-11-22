@@ -16,7 +16,7 @@ repos(id, forge_id, remote_id, slug, visibility, default_branch, indexed bool,
 rules(id, forge_id, pattern, action /* include|exclude */, applies_to_private bool)
 jobs(id, kind, repo_id, state, lease_until, attempts, run_after, finished_at)
 shards(repo_id, revision, manifest_key, commit_sha, provenance_level, published_at)
-members(id, name, kind /* human|agent */)
+members(id, name, kind /* human|agent */, can_promote bool)
 tokens(id, member_id, hash, created_at, last_used_at, revoked_at)
 packages(id, ecosystem, name)                       -- npm, crates, go modules…
 repo_packages(repo_id, package_id, version_range, relation /* provides|depends */)
@@ -28,7 +28,7 @@ memories(id, member_id, kind /* semantic|episodic */, scope /* session|repo|org 
          body, supersedes, stale_reason, expires_at, created_at)  -- M2, ADR 0007
 anchors(memory_id, node_id, repo_id, node_kind, path, name, fingerprint)
 memory_events(memory_id, version, actor_member_id, action, at)   -- audit, body-free
-erasures(memory_id, erased_at)                                    -- reapplied on restore
+-- retractions and erasures are also appended to an object-storage log (§5.1)
 ```
 
 Memories (§5.1) are the only knowledge in the control plane that cannot be rebuilt from git and the Forges.
@@ -73,30 +73,36 @@ MENTIONS       DocSection/Issue/ChangeRequest → Symbol/File
 PART_OF        ChangeRequest → Commit   CLOSES        ChangeRequest → Issue
 ```
 
-Node IDs are stable content-derived strings (`repo:github.com/acme/api`, `sym:<…>`, `doc:<repo>:<path>#<heading-slug>`), so Shard rebuilds don't invalidate references held by agents mid-session. The exact Symbol ID form is settled in M1 under one constraint (ADR 0007): it stays stable across the syntactic and precise passes and across package versions, so a raw, versioned SCIP moniker is an attribute of the Symbol, not its ID. Each node also carries a content fingerprint — the hash of its normalized defining span for a Symbol, the blob hash for a File, the section text hash for a Doc Section — added with the M1 schema bump.
+Node IDs are stable content-derived strings (`repo:github.com/acme/api`, `sym:<…>`, `doc:<repo>:<path>#<heading-slug>`), so Shard rebuilds don't invalidate references held by agents mid-session. The exact Symbol ID form is settled in M1 under one constraint (ADR 0007): it stays stable across the syntactic and precise passes and across package versions, so a raw, versioned SCIP moniker is an attribute of the Symbol, not its ID. Each node also carries a content fingerprint — the hash of its normalized defining span for a Symbol, the blob hash for a File, the section text hash for a Doc Section (when Doc Sections land in M2). The span and its normalization come from the tree-sitter parse in both passes, so a node's fingerprint is identical across passes for the same blob. Stable Symbol IDs and fingerprints arrive with the M1 schema bump.
 
 ### 5.1 Memories (M2, ADR 0007)
 
 Memories are control-plane records, not Shard nodes; derived Verbs never return them. Their trust level is `asserted`, a control-plane type kept separate from the Shard `Provenance` enum (and its `shards.provenance_level` CHECK), which stays four-valued.
 
-- **Anchors.** A Memory has one or more Anchors to a Symbol, File, Doc Section or Repo. Each Anchor stores the node ID plus kind, path, name and the node's fingerprint at write time. Commits and Contributors are not anchorable: they never change, so they could never go stale. Repo anchors never go stale either; they exist for repo-wide conventions.
+- **Anchors.** A Memory has one or more Anchors to a Symbol, File, Repo or (once Doc Sections land) Doc Section. Each Anchor stores the node ID plus kind, path, name and the node's fingerprint at write time. Commits and Contributors are not anchorable: they never change, so they could never go stale. Repo anchors carry no fingerprint and never go stale; they exist for repo-wide conventions.
 - **Staleness.** When a Shard revision is published, the anchors on that repo are compared with the *new* revision only, never with an older Shard that GC may already have deleted. A changed fingerprint sets `stale_reason = changed`; a missing node sets `removed`. This happens in the same Postgres transaction as the `shards` pointer swap, so no reader sees the new code with an unflagged Memory. `stale_reason` also records whether the anchor was precise or syntactic-only when it was checked.
 - **Scope and sharing.**
-  - `session` scope is Episodic only: bound to a client-supplied `session_id` owned by the writing Member, given an `expires_at`, never promotable.
+  - Episodic Memory always has `session` scope, and `session` scope is Episodic only. It is bound to a client-supplied `session_id` owned by the writing Member, given an `expires_at`, and never promotable. Every `recall` mode omits it unless the caller supplies the same Member and `session_id` before expiry.
   - `repo` scope requires every anchor to be in that repo.
   - Anchors across repos require `org` scope.
   - `shared` is false on write; `promote` sets it.
 - **Authority.**
   - Only the author mutates a private Memory.
-  - On a shared Memory, any Member may `affirm` it (which clears staleness against the current fingerprint) or write a superseding Memory, which must itself be promoted.
+  - On a shared Memory, affirming — which re-captures the current fingerprints and clears staleness — requires the promote right and requires every anchor to resolve in an indexed repo. Without the right, an affirm is recorded in `memory_events` but changes nothing.
+  - Any Member may write a superseding Memory. It stays private and has no effect on shared recall until it is promoted.
   - The author or an Admin may `retract` it; only an Admin may erase it.
-  - The promote right is granted per Member token, by default to human Members and not to agents.
+  - The promote right is a per-Member grant (`members.can_promote`), defaulting to true for human Members and false for agent Members.
   - Every transition is written to `memory_events`.
-- **Admission.** `recall` and `promote` return or accept a Memory only while every repo it anchors to is indexed. Excluding a repo hides its Memories (ADR 0001) without deleting them; re-admitting the repo restores them, now stale-checked against its current Shard.
+- **Admission.**
+  - `remember` rejects anchors to repos that are not indexed.
+  - `recall` and `promote` return or accept a Memory only while every repo it anchors to is indexed. Excluding a repo hides its Memories (ADR 0001) without deleting them; re-admitting the repo restores them, stale-checked against its current Shard.
+  - A Memory must anchor every repo whose non-public content its body discloses, so excluding that repo hides it. Promoting a Memory attests that its content is fit for org-wide visibility. This is a recorded obligation, not something the server can verify.
 - **Retraction and erasure.**
   - Retraction suppresses every version from every recall mode immediately.
-  - Admin erasure deletes the body and its search index entries but keeps the body-free audit rows.
-  - On restore from backup, the `erasures` log is reapplied before the API serves reads, and deployments bound backup retention.
+  - Admin erasure (`yg admin memory erase`) deletes the body and its search index entries but keeps the body-free audit rows.
+  - Each retraction and erasure is also appended to an append-only log in object storage, outside the Postgres backup set.
+  - After a Postgres restore, the API refuses `recall` until that log has been replayed across every affected version and search entry, so a snapshot from before a retraction or erasure cannot republish the body.
+  - Deployments still bound backup retention, since old snapshots hold the erased bodies.
 - **Untrusted content.** `recall` returns bodies as data marked untrusted. The Skill instructs agents to treat a Memory as a claim to verify against derived Verbs, never as an instruction, and the eval suite includes a promoted Memory containing an injected instruction.
 - **Abuse limits.** Writes are rejected when a secret scanner flags the body. Per-Member write-rate and storage quotas count superseded versions too, and body size, anchor count and `recall` result size are bounded.
 - **Recall search.** Full-text `recall` runs on Postgres full-text search over Memory bodies and ranks separately. It is never merged into `search`'s tantivy BM25 ranking.
@@ -136,7 +142,7 @@ available endpoints. The served set is defined by `yg_verbs::Verb::ALL` and
 | `history` | implemented | file or symbol, since? | commits touching the file or symbol's defining file, Contributors |
 | `impact` | planned-M1 | symbol\|file, depth | affected Symbols→Files→Repos, grouped, provenance-annotated |
 | `remember` | planned-M2 | op: create\|supersede\|affirm, body?, kind, scope, session_id?, anchors, target? | Memory id and version (private to the author unless affirming) |
-| `recall` | planned-M2 | anchor id \| scope \| query, include_stale? | Memories with author, scope, `asserted` trust, staleness; bodies marked untrusted |
+| `recall` | planned-M2 | anchor id \| scope \| query, session_id?, include_stale? | Memories with author, scope, `asserted` trust, staleness; bodies marked untrusted |
 | `promote` | planned-M2 | memory id, scope?: repo\|org | Memory moved to the shared pool, attributed to the promoting Member |
 | `retract` | planned-M2 | memory id | Memory suppressed from every recall mode |
 
@@ -154,7 +160,7 @@ Verb additions are minor-version events; removals are major. The Skill is versio
 - REST + MCP Streamable HTTP on the same port; bearer tokens (`Authorization: Bearer ygt_…`), per-Member, hashed at rest, revocable. OIDC post-v1.
 - Operational surface (non-Verb): `GET /healthz` — unauthenticated readiness, a bare `ok`/`error` per dependency (control plane, object storage; failure detail is logged server-side, never returned to anonymous callers); `GET /v1/status` — version and indexed-repo count in the body, uptime in the `x-yggdrasil-uptime-seconds` header (bodies are cache-stable; volatile values ride in headers), behind auth (any valid token, including Member), surfaced as `yg status [--json]`. Every route except `/healthz` requires a token, including unmatched paths. Default listen address `127.0.0.1:7311`. Until Admin-issued Member tokens land (`members`/`tokens`, §2), the server boots from a bootstrap Admin token in `YG_BOOTSTRAP_TOKEN` — held in memory, never stored; the `ygt_` prefix is convention, not enforced. The richer `yg admin status` (§4) arrives with the admin surface.
 - `yg mcp` proxies stdio↔HTTP for local-only MCP clients, reading `YG_SERVER`/`YG_TOKEN` from config (`~/.config/yg/config.toml`).
-- CLI: `yg <verb> …` for Members; `yg admin forge add|rules|status`, `yg admin token issue|revoke` for Admins; `--json` everywhere; human output is the default.
+- CLI: `yg <verb> …` for Members; `yg admin forge add|rules|status`, `yg admin token issue|revoke`, `yg admin memory erase` (M2) for Admins; `--json` everywhere; human output is the default.
 - The Skill: markdown shipped in-repo + `yg skill install` (drops into agent skill dirs). Its M0 content covers when to use the graph vs reading files; the division of truth (yggdrasil answers org-truth at the default branch; the agent's local tools own working-tree truth, including uncommitted edits); `search`-first orientation; provenance trust rules; the four implemented Verbs; and failure etiquette (graph thin ⇒ fall back gracefully). It moves to `map`-first orientation when that planned-M1 Verb exists.
 
 ## 9. Crate layout
@@ -238,4 +244,4 @@ system claims to provide.
 
 ## 12. Rollout
 
-M0 ships the tracer (GitHub + syntactic + the search/node/neighbors/history Verbs + CLI/MCP/Skill v0) and is the architecture's proof; M1 adds the precise pass + callers/callees/impact + `map` + GitLab; M2 opens with the Memory slice (Member tokens if not yet landed, `remember`/`recall`/`promote`/`retract`, ADR 0007), then completes the graph layers + Codeberg; M3 adds semantic + webhook accelerators + the 5000-repo certification run (synthetic org, published numbers). Each milestone ends with a dogfooding gate: agents must prefer the graph over grep for the navigation tasks it claims.
+M0 ships the tracer (GitHub + syntactic + the search/node/neighbors/history Verbs + CLI/MCP/Skill v0) and is the architecture's proof; M1 adds the precise pass + callers/callees/impact + `map` + GitLab + stable cross-pass Symbol IDs and per-node fingerprints (the ADR 0007 prerequisite); M2 opens with the Memory slice (Member tokens if not yet landed, `remember`/`recall`/`promote`/`retract`, ADR 0007), then completes the graph layers + Codeberg; M3 adds semantic + webhook accelerators + the 5000-repo certification run (synthetic org, published numbers). Each milestone ends with a dogfooding gate: agents must prefer the graph over grep for the navigation tasks it claims.

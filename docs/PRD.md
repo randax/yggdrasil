@@ -60,10 +60,10 @@ Yggdrasil is a self-hosted **Index Server** that syncs git repositories from **F
 - G15. Members (human or agent) `remember` a fact, decision, convention or gotcha anchored to graph nodes; `recall` it by anchor, scope or full-text query; `promote` it from the author's private overlay into the shared pool at repo or org scope; and affirm or supersede it (via `remember`) or `retract` it. Every Memory carries `asserted` trust, its author and its staleness. Derived Verbs never return Memories, and `recall` returns bodies as untrusted data — claims to verify, never instructions.
 - G16. Staleness follows the code: when a published Shard revision changes an anchored node's fingerprint or removes it, its Memories are flagged stale with a reason, never silently deleted. Semantic Memory never expires by time; Episodic Memory is session-bound and expires.
 - G17. Safe sharing:
-  - Memories are private on write. Promotion is explicit, audited and limited to Members granted the right (by default human Members).
+  - Memories are private on write. Promotion, and affirming a stale shared Memory, are explicit, audited and limited to Members granted the right (by default human Members).
   - Memories are recallable only while every repo they anchor to is indexed.
   - Writes a secret scanner flags are rejected; per-Member quotas apply.
-  - Retraction suppresses a Memory everywhere; Admin erasure survives backup restore.
+  - Retraction suppresses a Memory everywhere, and Admin erasure deletes its body. Both are logged outside the Postgres backup set and replayed before reads resume after a restore.
   - Memories live in the control plane and are covered by its backups. They are the only graph knowledge that cannot be rebuilt from git and the Forges.
 
 ## Non-goals (v1)
@@ -103,7 +103,7 @@ A **cold search** is the first query against a freshly published Shard with an e
 ## Milestones
 
 - **M0 — Tracer (GitHub, syntactic).** One vertical slice: control plane → sync → worker → Shard on object storage → query node → search/node/neighbors/history Verbs → CLI + MCP + Skill v0. Proves the architecture end-to-end.
-- **M1 — Precise core.** SCIP workers (Go, TypeScript/JS, Python, Rust), provenance overlay, callers/callees/impact, `map` Verb, GitLab support.
+- **M1 — Precise core.** SCIP workers (Go, TypeScript/JS, Python, Rust), provenance overlay, stable cross-pass Symbol IDs and per-node content fingerprints (prerequisite for ADR 0007), callers/callees/impact, `map` Verb, GitLab support.
 - **M2 — Shared memory and the whole graph.** Opens with the Memory slice (ADR 0007): Admin-issued Member tokens if not already landed, then `remember`/`recall`/`promote`/`retract`, Anchors, code-driven staleness, Promotion. Then history/people layers, CODEOWNERS, Doc Sections, cross-repo dependency resolution, Codeberg, Forge Artifacts.
 - **M3 — Semantic + scale certification.** Embedding provider + vector Shards (opt-in), LLM Concept extraction (opt-in), webhook accelerators, 5000-repo load certification.
 

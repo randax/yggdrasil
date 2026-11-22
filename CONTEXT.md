@@ -33,7 +33,7 @@ Data synced from a forge's API rather than from git: change requests, issues, re
 _Avoid_: Metadata
 
 **Provenance**:
-How a graph edge was derived: precise (compiler-grade indexer), syntactic (heuristic parsing), extracted (deterministically derived from non-code sources: manifests, forge data, identity matches), inferred (heuristic guess, reversible), or asserted (claimed by a Member as a Memory — lowest trust, held in the control plane and never in a Shard). Every edge carries it, with a confidence tag.
+How a graph edge was derived: precise (compiler-grade indexer), syntactic (heuristic parsing), extracted (deterministically derived from non-code sources: manifests, forge data, identity matches), or inferred (heuristic guess, reversible). Every edge carries it, with a confidence tag. Memories carry a separate control-plane trust level, asserted, which is lower than all of these.
 _Avoid_: Source, origin (both overloaded in this domain)
 
 **Doc Section**:
@@ -75,7 +75,7 @@ The immutable per-repo index artifact (graph, full-text, vectors) produced by in
 _Avoid_: Index file, snapshot
 
 **Memory**:
-A unit of knowledge a Member (human or agent) asserts about a repository — a fact it learned, a decision, a gotcha — stored as a control-plane record anchored to graph nodes and recallable in later sessions. Member-authored and revisable, carrying asserted provenance; not extracted from source. Contrast the Knowledge Graph, which is derived and immutable.
+A unit of knowledge a Member (human or agent) asserts about a repository — a fact it learned, a decision, a gotcha — stored as a control-plane record anchored to graph nodes and recallable in later sessions. Member-authored and revisable, carrying asserted trust; not extracted from source. Contrast the Knowledge Graph, which is derived and immutable.
 _Avoid_: Note, fact, observation (these name parts of a Memory, not the whole)
 
 **Semantic Memory**:
@@ -85,7 +85,7 @@ A Memory holding durable knowledge that compounds: a fact, decision, convention,
 A Memory holding task- or session-scoped working state — what an agent was doing and where it left off — meant to be resumed after compaction and then archived or expired.
 
 **Anchor**:
-A link from a Memory to the graph node it concerns (a Symbol, File, Doc Section, or Repo), carrying that node's content fingerprint, making the Memory recallable from that node and detectably stale when it changes.
+A link from a Memory to the graph node it concerns (a Symbol, File, Repo, or — once Doc Sections land — Doc Section), carrying that node's content fingerprint (none for Repo anchors), making the Memory recallable from that node and detectably stale when it changes.
 _Avoid_: Reference, mention (a memory→memory connection is a link, not an Anchor)
 
 **Promotion**:
