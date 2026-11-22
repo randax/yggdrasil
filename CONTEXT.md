@@ -59,7 +59,7 @@ The continuous process by which an Index Server converges with forge reality: gi
 _Avoid_: Mirror, import, crawl
 
 **Verb**:
-A named operation in the public contract — a graph query (e.g. callers, impact, owners) or a Memory operation (remember, recall, promote, retract) — exposed identically via CLI, MCP, and HTTP, except that a human Member's step-up publishing acts (promote, accept, shared affirm) are refused over MCP (ADR 0007).
+A named operation in the public contract — a graph query (e.g. callers, impact, owners) or a Memory operation (remember, recall, promote, retract) — exposed identically via CLI, MCP, and HTTP, except that step-up acts (a human Member's promote, accept and shared affirm, and an Admin's chain-wide retract) are refused over MCP (ADR 0007).
 _Avoid_: Endpoint, command, tool (interface-specific words for the same thing)
 
 **Skill**:
