@@ -59,7 +59,7 @@ An authenticated human or agent authorized to query an Index Server.
 _Avoid_: User, client
 
 **Personal Agent**:
-An agent Member bound to one human Member, its principal. It belongs to exactly its principal's Teams, never sees more than its principal, and loses access when its principal does. It holds no promote right through its principal.
+An agent Member bound to one human Member, its principal. It belongs to exactly its principal's Teams, never sees more than its principal, and loses access when its principal does. It shares its principal's private overlay: each recalls the other's private Memories, while every Memory keeps its true author. It holds no promote right through its principal.
 _Avoid_: Bot, assistant, delegate
 
 **Service Agent**:
@@ -121,7 +121,7 @@ Where a Memory is recalled, bounded by its Anchors: session (Episodic only), rep
 _Avoid_: Visibility, reach, org scope
 
 **Audience**:
-Who may recall a Memory: only its author (the private overlay), one or more Teams, or the whole Organization. A Memory whose Audience is wider than its author is *shared*. Audience is independent of Scope.
+Who may recall a Memory: only its author's private overlay (which a human shares with their Personal Agents), one or more Teams, or the whole Organization. A Memory whose Audience is wider than the private overlay is *shared*. Audience is independent of Scope.
 _Avoid_: Visibility (reserved for which repositories a Member may see), sharing level
 
 **Proposal**:
