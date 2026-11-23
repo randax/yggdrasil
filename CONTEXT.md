@@ -70,6 +70,14 @@ _Avoid_: Bot, system user, robot account
 A named set of Members within the Organization, and an Audience for shared Memories: a Memory promoted to a Team is recalled by that Team's Members, in addition to its author and any other Audience it has. A Member may belong to several Teams, and a Memory's Audience may include several Teams, each added by its own Promotion. Teams are flat: a Team has no parent, and its Members are exactly the Members it lists. A Team decides *who* sees a Memory; it never changes *where* the Memory is recalled, which is its Scope.
 _Avoid_: Group, squad, workspace
 
+**Visibility**:
+Which repositories a Member may see, decided per repository and never per path. An Open repository is visible to every Member. A Restricted repository is visible only to Members of the Teams granted it. A Team is granted a repository either by its Forge, when the Team is synced from a Forge team that can read the repository, or explicitly by an Admin. Visibility is separate from a Memory's Audience.
+_Avoid_: Access, permission, audience (reserved for Memories)
+
+**Break-glass Session**:
+A time-boxed, audited exception that lets a human Admin see named Restricted repositories their Teams do not grant. It requires step-up and a stated reason, it expires quickly, and the repositories' Owning Teams are told it happened. Being an Admin grants no Visibility by itself.
+_Avoid_: Override, sudo, impersonation
+
 **Owning Team**:
 A Team responsible for a piece of code. Ownership is derived from the code where possible: a CODEOWNERS entry naming a team defined on a Forge that is synced as a Team. Where no such entry exists, ownership is assigned by an Admin-set rule. Ownership routes notices and impact reports, but it never decides who may see the code.
 _Avoid_: Steward, maintainer team, code owner (a code owner may be an individual Contributor)
@@ -121,7 +129,7 @@ Where a Memory is recalled, bounded by its Anchors: session (Episodic only), rep
 _Avoid_: Visibility, reach, org scope
 
 **Audience**:
-Who may recall a Memory: only its author's private overlay (which a human shares with their Personal Agents), one or more Teams, or the whole Organization. A Memory whose Audience is wider than the private overlay is *shared*. Audience is independent of Scope.
+Who may recall a Memory: only its author's private overlay (which a human shares with their Personal Agents), one or more Teams, or the whole Organization. A Memory whose Audience is wider than the private overlay is *shared*. A Member recalls a Memory only when they are in its Audience and can see every repository it is anchored to. Audience is independent of Scope.
 _Avoid_: Visibility (reserved for which repositories a Member may see), sharing level
 
 **Proposal**:
