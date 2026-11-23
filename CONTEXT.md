@@ -70,8 +70,12 @@ _Avoid_: Bot, system user, robot account
 A named set of Members within the Organization, and an Audience for shared Memories: a Memory promoted to a Team is recalled by that Team's Members who can see every repository it is anchored to, in addition to its author and any other Audience it has. A Team may be synced from a Forge team (a GitHub or Codeberg team, a GitLab group). A Member may belong to several Teams, and a Memory's Audience may include several Teams, each added by its own Promotion. Teams are flat: a Team has no parent, and its Members are exactly the Members it lists. A Team decides *who* sees a Memory; it never changes *where* the Memory is recalled, which is its Scope.
 _Avoid_: Group, squad, workspace
 
+**Admission**:
+An Admin's choice, made by rule, of which discovered repositories are indexed. A repository that is not admitted is indexed for no one and visible to no one.
+_Avoid_: Inclusion, onboarding
+
 **Visibility**:
-Which repositories a Member may see, decided per repository and never per path. An Open repository is visible to every Member. A Restricted repository is visible only to Members of the Teams granted it. A Team is granted a repository either by its Forge, when the Team is synced from a Forge team that can read the repository, or explicitly by an Admin. A Forge's own public, internal or private setting informs whether a repository starts Open or Restricted, but it is not Visibility. Visibility is separate from a Memory's Audience.
+Which admitted repositories a Member may see, decided per repository and never per path. An Open repository is visible to every Member. A Restricted repository is visible only to Members of the Teams granted it. A Team is granted a repository either by its Forge, when the Team is synced from a Forge team that can read the repository, or explicitly by an Admin. A Forge's own public, internal or private setting informs whether a repository starts Open or Restricted, but it is not Visibility. Visibility is separate from a Memory's Audience.
 _Avoid_: Access, permission, audience (reserved for Memories)
 
 **Break-glass Session**:
