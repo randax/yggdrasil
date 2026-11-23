@@ -13,7 +13,7 @@ A git hosting platform that yggdrasil syncs from: GitHub, GitLab, or Codeberg.
 _Avoid_: Provider, platform, host
 
 **Organization**:
-The single entity an Index Server deployment serves. It owns every Forge connection, Member, Team and repository in the deployment, and it is the widest audience a Memory can be promoted to. Separate companies run separate deployments.
+The single entity an Index Server deployment serves. It owns every Forge connection, Member, Team and repository in the deployment, and it is the widest Audience a Memory can be promoted to. Separate companies run separate deployments.
 _Avoid_: Org (also used for a Forge Namespace), tenant, workspace, company
 
 **Forge Namespace**:
@@ -59,7 +59,7 @@ An authenticated human or agent authorized to query an Index Server.
 _Avoid_: User, client
 
 **Personal Agent**:
-An agent Member bound to one human Member, its principal. It belongs to exactly its principal's Teams, never sees more than its principal, and loses access when its principal does.
+An agent Member bound to one human Member, its principal. It belongs to exactly its principal's Teams, never sees more than its principal, and loses access when its principal does. It holds no promote right through its principal.
 _Avoid_: Bot, assistant, delegate
 
 **Service Agent**:
@@ -67,19 +67,19 @@ An agent Member that acts for no particular human, such as the Ask bot, a CI job
 _Avoid_: Bot, system user, robot account
 
 **Team**:
-A named group of Members within the Organization, and an audience for shared Memories: a Memory promoted to a Team is recalled only by that Team's Members. A Member may belong to several Teams, and a Memory's audience may include several Teams, each added by its own Promotion. Teams are flat: a Team has no parent, and its Members are exactly the Members it lists. A Team decides *who* sees a Memory; it never changes *where* the Memory is recalled, which is its scope.
+A named set of Members within the Organization, and an Audience for shared Memories: a Memory promoted to a Team is recalled by that Team's Members, in addition to its author and any other Audience it has. A Member may belong to several Teams, and a Memory's Audience may include several Teams, each added by its own Promotion. Teams are flat: a Team has no parent, and its Members are exactly the Members it lists. A Team decides *who* sees a Memory; it never changes *where* the Memory is recalled, which is its Scope.
 _Avoid_: Group, squad, workspace
 
 **Owning Team**:
-A Team responsible for a piece of code. Ownership is derived from the code where possible: a CODEOWNERS entry naming a Forge team that is synced as a Team. Where no such entry exists, ownership is assigned by a stewardship rule. Ownership routes notices and impact reports, but it never decides who may see the code.
+A Team responsible for a piece of code. Ownership is derived from the code where possible: a CODEOWNERS entry naming a team defined on a Forge that is synced as a Team. Where no such entry exists, ownership is assigned by an Admin-set rule. Ownership routes notices and impact reports, but it never decides who may see the code.
 _Avoid_: Steward, maintainer team, code owner (a code owner may be an individual Contributor)
 
 **Team Maintainer**:
-A human Member, named by an Admin, who manages one Team. A Team Maintainer adds and removes its human Members and grants or revokes that Team's promote right. The role has no power over other Teams, the Organization-wide right, Service Agents or Admin grants.
+A human Member, named by an Admin, who manages one Team. A Team Maintainer adds and removes that Team's human Members and grants or revokes that Team's promote right. The role has no power over other Teams, the Organization-wide right, Service Agents or the Admin role.
 _Avoid_: Team admin, team owner, lead
 
 **Admin**:
-The person who operates an Index Server deployment: configures forges, chooses what gets indexed, wires up providers.
+A human Member who operates the Index Server deployment for the Organization: configures forges, chooses what gets indexed, wires up providers.
 _Avoid_: Operator, owner
 
 **Sync**:
@@ -103,7 +103,7 @@ The immutable per-repo index artifact (graph, full-text, vectors) produced by in
 _Avoid_: Index file, snapshot
 
 **Memory**:
-A unit of knowledge a Member (human or agent) asserts about a repository — a fact it learned, a decision, a gotcha — stored as a control-plane record anchored to graph nodes and recallable in later sessions. Member-authored and revisable, carrying asserted trust; not extracted from source. Contrast the Knowledge Graph, which is derived and immutable.
+A unit of knowledge a Member (human or agent) asserts about one or more repositories — a fact it learned, a decision, a gotcha — stored as a control-plane record anchored to graph nodes and recallable in later sessions. Member-authored and revisable, carrying asserted trust; not extracted from source. Contrast the Knowledge Graph, which is derived and immutable.
 _Avoid_: Note, fact, observation (these name parts of a Memory, not the whole)
 
 **Semantic Memory**:
@@ -117,17 +117,17 @@ A link from a Memory to the graph node it concerns (a Symbol, File, Repo, or —
 _Avoid_: Reference, mention (a memory→memory connection is a link, not an Anchor)
 
 **Scope**:
-Where a Memory is recalled, set by its Anchors: session (Episodic only), repo (every Anchor in one repository) or cross-repo (Anchors span repositories). Scope never decides who sees a Memory; its audience does.
+Where a Memory is recalled, bounded by its Anchors: session (Episodic only), repo (every Anchor in one repository) or cross-repo (required when Anchors span repositories; a repo-scoped Memory may be widened to it by Promotion). Scope never decides who sees a Memory; its Audience does.
 _Avoid_: Visibility, reach, org scope
 
 **Audience**:
-Who may recall a Memory: only its author (the private overlay), one or more Teams, or the whole Organization. Audience is independent of Scope.
+Who may recall a Memory: only its author (the private overlay), one or more Teams, or the whole Organization. A Memory whose Audience is wider than its author is *shared*. Audience is independent of Scope.
 _Avoid_: Visibility (reserved for which repositories a Member may see), sharing level
 
 **Proposal**:
-A request to promote a Memory into an audience whose promote right its author lacks. It waits in that audience's review queue, where every holder of the right can see it, until one of them accepts or rejects it.
+A Memory offered for Promotion into an Audience whose promote right its author lacks. It waits in that Audience's review queue, where every holder of the right can see it, until one of them accepts or rejects it.
 _Avoid_: Request, submission, pull request
 
 **Promotion**:
-Widening a Memory's reach. Its audience can grow from its author's private overlay to one or more Teams, then to the whole Organization. Its scope can also widen from repo to cross-repo. Promotion makes knowledge learned narrowly available to more Members. The promote right is held per audience: for each Team, and for the Organization as a whole. A Member without the right for the target audience can only propose, and a holder of that right decides. Episodic (session-scoped) Memory is never promoted; a lesson worth keeping from a session is written as a new Semantic Memory.
+Widening a Memory's Audience, its Scope, or both. Its Audience can grow from its author's private overlay to one or more Teams, or to the whole Organization. Its Scope can widen from repo to cross-repo. Promotion makes knowledge learned narrowly available to more Members. The promote right is held per Audience: for each Team, and for the Organization as a whole. A Team's human Members hold its right by default; agent Members hold none unless explicitly granted. A Member without the right for the target Audience can only propose, and a holder of that right decides. Episodic (session-scoped) Memory is never promoted; a lesson worth keeping from a session is written as a new Semantic Memory.
 _Avoid_: Publish, share, merge
