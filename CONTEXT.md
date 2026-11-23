@@ -67,23 +67,23 @@ An agent Member that acts for no particular human, such as the Ask bot, a CI job
 _Avoid_: Bot, system user, robot account
 
 **Team**:
-A named set of Members within the Organization, and an Audience for shared Memories: a Memory promoted to a Team is recalled by that Team's Members, in addition to its author and any other Audience it has. A Member may belong to several Teams, and a Memory's Audience may include several Teams, each added by its own Promotion. Teams are flat: a Team has no parent, and its Members are exactly the Members it lists. A Team decides *who* sees a Memory; it never changes *where* the Memory is recalled, which is its Scope.
+A named set of Members within the Organization, and an Audience for shared Memories: a Memory promoted to a Team is recalled by that Team's Members who can see every repository it is anchored to, in addition to its author and any other Audience it has. A Team may be synced from a Forge team (a GitHub or Codeberg team, a GitLab group). A Member may belong to several Teams, and a Memory's Audience may include several Teams, each added by its own Promotion. Teams are flat: a Team has no parent, and its Members are exactly the Members it lists. A Team decides *who* sees a Memory; it never changes *where* the Memory is recalled, which is its Scope.
 _Avoid_: Group, squad, workspace
 
 **Visibility**:
-Which repositories a Member may see, decided per repository and never per path. An Open repository is visible to every Member. A Restricted repository is visible only to Members of the Teams granted it. A Team is granted a repository either by its Forge, when the Team is synced from a Forge team that can read the repository, or explicitly by an Admin. Visibility is separate from a Memory's Audience.
+Which repositories a Member may see, decided per repository and never per path. An Open repository is visible to every Member. A Restricted repository is visible only to Members of the Teams granted it. A Team is granted a repository either by its Forge, when the Team is synced from a Forge team that can read the repository, or explicitly by an Admin. A Forge's own public, internal or private setting informs whether a repository starts Open or Restricted, but it is not Visibility. Visibility is separate from a Memory's Audience.
 _Avoid_: Access, permission, audience (reserved for Memories)
 
 **Break-glass Session**:
-A time-boxed, audited exception that lets a human Admin see named Restricted repositories their Teams do not grant. It requires step-up and a stated reason, it expires quickly, and the repositories' Owning Teams are told it happened. Being an Admin grants no Visibility by itself.
+A time-boxed, audited exception that lets a human Admin see named Restricted repositories their Teams do not grant. It requires step-up (a factor outside any agent's environment, ADR 0007) and a stated reason, it expires quickly, and the repositories' Owning Teams are told it happened. Being an Admin grants no Visibility by itself.
 _Avoid_: Override, sudo, impersonation
 
 **Owning Team**:
-A Team responsible for a piece of code. Ownership is derived from the code where possible: a CODEOWNERS entry naming a team defined on a Forge that is synced as a Team. Where no such entry exists, ownership is assigned by an Admin-set rule. Ownership routes notices and impact reports, but it never decides who may see the code.
+A Team responsible for a piece of code. Ownership is derived from the code where possible: a CODEOWNERS entry naming a Forge team that is synced as a Team. Where no such entry exists, ownership is assigned by an Admin-set rule. Ownership routes notices and impact reports, but it never decides who may see the code.
 _Avoid_: Steward, maintainer team, code owner (a code owner may be an individual Contributor)
 
 **Team Maintainer**:
-A human Member, named by an Admin, who manages one Team. A Team Maintainer adds and removes that Team's human Members and grants or revokes that Team's promote right. The role has no power over other Teams, the Organization-wide right, Service Agents or the Admin role.
+A human Member, named by an Admin, who manages one Team. A Team Maintainer adds and removes that Team's human Members and grants or revokes that Team's promote right. For a Team synced from a Forge team, the Forge decides membership, and the Team Maintainer can only remove Members. The role has no power over other Teams, the Organization-wide right, Service Agents or the Admin role.
 _Avoid_: Team admin, team owner, lead
 
 **Admin**:
@@ -133,7 +133,7 @@ Who may recall a Memory: only its author's private overlay (which a human shares
 _Avoid_: Visibility (reserved for which repositories a Member may see), sharing level
 
 **Proposal**:
-A Memory offered for Promotion into an Audience whose promote right its author lacks. It waits in that Audience's review queue, where every holder of the right can see it, until one of them accepts or rejects it.
+A Memory offered for Promotion into an Audience whose promote right its author lacks. It waits in that Audience's review queue, where every holder of the right who can see every repository it is anchored to can see it, until one of them accepts or rejects it.
 _Avoid_: Request, submission, pull request
 
 **Promotion**:
