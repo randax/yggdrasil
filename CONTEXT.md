@@ -79,7 +79,7 @@ An agent Member bound to one human Member, its principal. It belongs to exactly 
 _Avoid_: Bot, assistant, delegate
 
 **Service Agent**:
-An agent Member that acts for no particular human, such as the Ask bot, a CI job or the impact reporter. An Admin assigns its Teams explicitly, and it does not hold the promote right by default.
+An agent Member that acts for no particular human, such as a CI job or the impact reporter. An Admin assigns its Teams explicitly, and it does not hold the promote right by default. Ask is a Service Agent of a special kind: it has no Teams and answers each person within their own view.
 _Avoid_: Bot, system user, robot account
 
 **Team**:
@@ -105,6 +105,14 @@ _Avoid_: Steward, maintainer team, code owner (a code owner may be an individual
 **Team Maintainer**:
 A human Member, named by an Admin, who manages one Team. A Team Maintainer adds and removes that Team's human Members and grants or revokes that Team's promote right. For a Team synced from a Forge team, the Forge decides membership, and the Team Maintainer can only remove Members. The role has no power over other Teams, the Organization-wide right, Service Agents or the Admin role.
 _Avoid_: Team admin, team owner, lead
+
+**Ask**:
+The answering agent Yggdrasil ships for Slack, Waddle and the web GUI. It answers on behalf of the person asking, never seeing more than they could, cites only what it retrieved, and captures a Memory only when a person asks it to. It is a Service Agent and a client of the Index Server, which itself never composes answers.
+_Avoid_: Bot, assistant, chatbot
+
+**Chat-account Binding**:
+A proven link between a person's chat account (Slack or Waddle) and their Member, made by that person through a one-time link and a passkey, or set by an Admin. Ask answers within a person's own view, and captures for them, only through their binding; an unbound chat account gets at most public answers.
+_Avoid_: Chat identity, account mapping
 
 **Admin**:
 A human Member who operates the Index Server deployment for the Organization: configures forges, chooses what gets indexed, wires up providers. Only another Admin, or the deployment's bootstrap credential, makes someone an Admin; no Forge or IdP role does.
