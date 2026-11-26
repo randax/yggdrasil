@@ -1,0 +1,24 @@
+{
+ "bytes": 1439061,
+ "distinct_src_dst_kind": 395,
+ "edges": 4356,
+ "edges_by_kind": {
+  "CALLS": 4355,
+  "DEFINES": 1
+ },
+ "edges_touching_origin": 2717,
+ "edges_with_location": 4355,
+ "example_edge": {
+  "confidence": 1.0,
+  "dst": "sym:github.com/etcd-io/etcd:server/etcdserver/api/rafthttp/stream.go#streamWriter.run",
+  "kind": "DEFINES",
+  "provenance": "syntactic",
+  "src": "file:github.com/etcd-io/etcd:server/etcdserver/api/rafthttp/stream.go"
+ },
+ "max_parallel_edges_one_pair": 28,
+ "mean_edge_json_bytes": 336.1,
+ "nodes": 100,
+ "origin": "sym:github.com/etcd-io/etcd:server/etcdserver/api/rafthttp/stream.go#streamWriter.run",
+ "slug": "etcd-io/etcd",
+ "status": 200
+}

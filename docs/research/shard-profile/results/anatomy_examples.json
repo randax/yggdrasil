@@ -1,0 +1,116 @@
+{
+ "history.hot_file": {
+  "approx_tokens": 5120,
+  "body": {
+   "id": "file:github.com/etcd-io/etcd:go.mod"
+  },
+  "bytes": 20483,
+  "bytes_by_part": {
+   "cursor": 340,
+   "json_keys": 3824,
+   "node_id_strings": 6630,
+   "of_which_repo_qualifier": 2300,
+   "other_strings": 8841,
+   "punctuation_numbers_bools": 848
+  },
+  "share": {
+   "cursor": 0.017,
+   "json_keys": 0.187,
+   "node_id_strings": 0.324,
+   "of_which_repo_qualifier": 0.112,
+   "other_strings": 0.432,
+   "punctuation_numbers_bools": 0.041
+  },
+  "top_level_bytes": {
+   "commits": 21221,
+   "next_cursor": 340
+  }
+ },
+ "neighbors.top_any.d1": {
+  "approx_tokens": 359765,
+  "body": {
+   "id": "sym:github.com/etcd-io/etcd:server/etcdserver/api/rafthttp/stream.go#streamWriter.run"
+  },
+  "bytes": 1439061,
+  "bytes_by_part": {
+   "cursor": 416,
+   "json_keys": 246560,
+   "node_id_strings": 770288,
+   "of_which_repo_qualifier": 202676,
+   "other_strings": 299237,
+   "punctuation_numbers_bools": 122560
+  },
+  "share": {
+   "cursor": 0.0,
+   "json_keys": 0.171,
+   "node_id_strings": 0.535,
+   "of_which_repo_qualifier": 0.141,
+   "other_strings": 0.208,
+   "punctuation_numbers_bools": 0.085
+  },
+  "top_level_bytes": {
+   "edges": 1472882,
+   "next_cursor": 416,
+   "nodes": 18778,
+   "truncated": 4
+  }
+ },
+ "node.top_symbol": {
+  "approx_tokens": 99,
+  "body": {
+   "id": "sym:github.com/etcd-io/etcd:server/etcdserver/api/rafthttp/stream.go#streamWriter.run"
+  },
+  "bytes": 398,
+  "bytes_by_part": {
+   "cursor": 0,
+   "json_keys": 172,
+   "node_id_strings": 87,
+   "of_which_repo_qualifier": 23,
+   "other_strings": 91,
+   "punctuation_numbers_bools": 48
+  },
+  "share": {
+   "cursor": 0.0,
+   "json_keys": 0.432,
+   "node_id_strings": 0.219,
+   "of_which_repo_qualifier": 0.058,
+   "other_strings": 0.229,
+   "punctuation_numbers_bools": 0.121
+  },
+  "top_level_bytes": {
+   "edges": 216,
+   "node": 193
+  }
+ },
+ "search.common_name": {
+  "approx_tokens": 957,
+  "body": {
+   "query": "init",
+   "repos": [
+    "github.com/etcd-io/etcd"
+   ]
+  },
+  "bytes": 3830,
+  "bytes_by_part": {
+   "cursor": 301,
+   "json_keys": 841,
+   "node_id_strings": 1174,
+   "of_which_repo_qualifier": 460,
+   "other_strings": 1290,
+   "punctuation_numbers_bools": 224
+  },
+  "share": {
+   "cursor": 0.079,
+   "json_keys": 0.22,
+   "node_id_strings": 0.307,
+   "of_which_repo_qualifier": 0.12,
+   "other_strings": 0.337,
+   "punctuation_numbers_bools": 0.058
+  },
+  "top_level_bytes": {
+   "hits": 3744,
+   "next_cursor": 301
+  }
+ },
+ "slug": "etcd-io/etcd"
+}

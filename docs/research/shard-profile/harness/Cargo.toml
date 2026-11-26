@@ -1,0 +1,18 @@
+# Scratch profiling harness for docs/research/shard-profile.md. Deliberately
+# its own workspace (the empty [workspace] table) so it is never a member of
+# the product workspace and never touches crates/.
+[package]
+name = "shard-profile-harness"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+anyhow = "1.0.102"
+object_store = "0.13.2"
+serde_json = "1.0.150"
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "process"] }
+yg-index = { path = "../../../../crates/yg-index" }
+yg-shard = { path = "../../../../crates/yg-shard" }

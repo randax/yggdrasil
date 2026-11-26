@@ -1,0 +1,177 @@
+# HELP yggdrasil_job_queue_depth Current non-terminal job queue depth..
+# TYPE yggdrasil_job_queue_depth gauge
+yggdrasil_job_queue_depth{kind="index"} 0
+yggdrasil_job_queue_depth{kind="fetch"} 0
+# HELP yggdrasil_job_claim_latency_seconds Seconds from a job becoming eligible until it is claimed..
+# TYPE yggdrasil_job_claim_latency_seconds histogram
+# HELP yggdrasil_job_outcomes Terminal outcomes of claimed jobs..
+# TYPE yggdrasil_job_outcomes counter
+# HELP yggdrasil_job_duration_seconds Seconds spent executing and settling claimed jobs..
+# TYPE yggdrasil_job_duration_seconds histogram
+# HELP yggdrasil_forge_poll_lag_observations_seconds Distribution of repo poll lag in seconds for each Forge..
+# TYPE yggdrasil_forge_poll_lag_observations_seconds histogram
+# HELP yggdrasil_shard_cache_hits Shard-cache hits..
+# TYPE yggdrasil_shard_cache_hits counter
+yggdrasil_shard_cache_hits_total{artifact="graph"} 28876
+yggdrasil_shard_cache_hits_total{artifact="fts"} 0
+yggdrasil_shard_cache_hits_total{artifact="manifest"} 28876
+# HELP yggdrasil_shard_cache_misses Shard-cache misses..
+# TYPE yggdrasil_shard_cache_misses counter
+yggdrasil_shard_cache_misses_total{artifact="graph"} 36
+yggdrasil_shard_cache_misses_total{artifact="fts"} 0
+yggdrasil_shard_cache_misses_total{artifact="manifest"} 36
+# HELP yggdrasil_shard_cache_evictions Corrupt Shard-cache artifacts rejected..
+# TYPE yggdrasil_shard_cache_evictions counter
+yggdrasil_shard_cache_evictions_total{artifact="fts"} 0
+yggdrasil_shard_cache_evictions_total{artifact="manifest"} 0
+yggdrasil_shard_cache_evictions_total{artifact="graph"} 0
+# HELP yggdrasil_shard_cache_capacity_evictions Shard-cache artifacts removed to enforce the configured byte capacity..
+# TYPE yggdrasil_shard_cache_capacity_evictions counter
+yggdrasil_shard_cache_capacity_evictions_total{artifact="graph"} 5
+yggdrasil_shard_cache_capacity_evictions_total{artifact="manifest"} 0
+yggdrasil_shard_cache_capacity_evictions_total{artifact="fts"} 0
+# HELP yggdrasil_verb_request_duration_seconds Verb request latency in seconds..
+# TYPE yggdrasil_verb_request_duration_seconds histogram
+yggdrasil_verb_request_duration_seconds_sum{verb="node"} 0.0
+yggdrasil_verb_request_duration_seconds_count{verb="node"} 0
+yggdrasil_verb_request_duration_seconds_bucket{le="0.0005",verb="node"} 0
+yggdrasil_verb_request_duration_seconds_bucket{le="0.001",verb="node"} 0
+yggdrasil_verb_request_duration_seconds_bucket{le="0.0025",verb="node"} 0
+yggdrasil_verb_request_duration_seconds_bucket{le="0.005",verb="node"} 0
+yggdrasil_verb_request_duration_seconds_bucket{le="0.01",verb="node"} 0
+yggdrasil_verb_request_duration_seconds_bucket{le="0.025",verb="node"} 0
+yggdrasil_verb_request_duration_seconds_bucket{le="0.05",verb="node"} 0
+yggdrasil_verb_request_duration_seconds_bucket{le="0.1",verb="node"} 0
+yggdrasil_verb_request_duration_seconds_bucket{le="0.25",verb="node"} 0
+yggdrasil_verb_request_duration_seconds_bucket{le="0.5",verb="node"} 0
+yggdrasil_verb_request_duration_seconds_bucket{le="1.0",verb="node"} 0
+yggdrasil_verb_request_duration_seconds_bucket{le="2.5",verb="node"} 0
+yggdrasil_verb_request_duration_seconds_bucket{le="5.0",verb="node"} 0
+yggdrasil_verb_request_duration_seconds_bucket{le="10.0",verb="node"} 0
+yggdrasil_verb_request_duration_seconds_bucket{le="+Inf",verb="node"} 0
+yggdrasil_verb_request_duration_seconds_sum{verb="neighbors"} 715.3537748739984
+yggdrasil_verb_request_duration_seconds_count{verb="neighbors"} 28912
+yggdrasil_verb_request_duration_seconds_bucket{le="0.0005",verb="neighbors"} 0
+yggdrasil_verb_request_duration_seconds_bucket{le="0.001",verb="neighbors"} 998
+yggdrasil_verb_request_duration_seconds_bucket{le="0.0025",verb="neighbors"} 5167
+yggdrasil_verb_request_duration_seconds_bucket{le="0.005",verb="neighbors"} 8077
+yggdrasil_verb_request_duration_seconds_bucket{le="0.01",verb="neighbors"} 14875
+yggdrasil_verb_request_duration_seconds_bucket{le="0.025",verb="neighbors"} 20066
+yggdrasil_verb_request_duration_seconds_bucket{le="0.05",verb="neighbors"} 26303
+yggdrasil_verb_request_duration_seconds_bucket{le="0.1",verb="neighbors"} 27763
+yggdrasil_verb_request_duration_seconds_bucket{le="0.25",verb="neighbors"} 28689
+yggdrasil_verb_request_duration_seconds_bucket{le="0.5",verb="neighbors"} 28898
+yggdrasil_verb_request_duration_seconds_bucket{le="1.0",verb="neighbors"} 28905
+yggdrasil_verb_request_duration_seconds_bucket{le="2.5",verb="neighbors"} 28907
+yggdrasil_verb_request_duration_seconds_bucket{le="5.0",verb="neighbors"} 28911
+yggdrasil_verb_request_duration_seconds_bucket{le="10.0",verb="neighbors"} 28912
+yggdrasil_verb_request_duration_seconds_bucket{le="+Inf",verb="neighbors"} 28912
+yggdrasil_verb_request_duration_seconds_sum{verb="search"} 0.0
+yggdrasil_verb_request_duration_seconds_count{verb="search"} 0
+yggdrasil_verb_request_duration_seconds_bucket{le="0.0005",verb="search"} 0
+yggdrasil_verb_request_duration_seconds_bucket{le="0.001",verb="search"} 0
+yggdrasil_verb_request_duration_seconds_bucket{le="0.0025",verb="search"} 0
+yggdrasil_verb_request_duration_seconds_bucket{le="0.005",verb="search"} 0
+yggdrasil_verb_request_duration_seconds_bucket{le="0.01",verb="search"} 0
+yggdrasil_verb_request_duration_seconds_bucket{le="0.025",verb="search"} 0
+yggdrasil_verb_request_duration_seconds_bucket{le="0.05",verb="search"} 0
+yggdrasil_verb_request_duration_seconds_bucket{le="0.1",verb="search"} 0
+yggdrasil_verb_request_duration_seconds_bucket{le="0.25",verb="search"} 0
+yggdrasil_verb_request_duration_seconds_bucket{le="0.5",verb="search"} 0
+yggdrasil_verb_request_duration_seconds_bucket{le="1.0",verb="search"} 0
+yggdrasil_verb_request_duration_seconds_bucket{le="2.5",verb="search"} 0
+yggdrasil_verb_request_duration_seconds_bucket{le="5.0",verb="search"} 0
+yggdrasil_verb_request_duration_seconds_bucket{le="10.0",verb="search"} 0
+yggdrasil_verb_request_duration_seconds_bucket{le="+Inf",verb="search"} 0
+yggdrasil_verb_request_duration_seconds_sum{verb="history"} 0.0
+yggdrasil_verb_request_duration_seconds_count{verb="history"} 0
+yggdrasil_verb_request_duration_seconds_bucket{le="0.0005",verb="history"} 0
+yggdrasil_verb_request_duration_seconds_bucket{le="0.001",verb="history"} 0
+yggdrasil_verb_request_duration_seconds_bucket{le="0.0025",verb="history"} 0
+yggdrasil_verb_request_duration_seconds_bucket{le="0.005",verb="history"} 0
+yggdrasil_verb_request_duration_seconds_bucket{le="0.01",verb="history"} 0
+yggdrasil_verb_request_duration_seconds_bucket{le="0.025",verb="history"} 0
+yggdrasil_verb_request_duration_seconds_bucket{le="0.05",verb="history"} 0
+yggdrasil_verb_request_duration_seconds_bucket{le="0.1",verb="history"} 0
+yggdrasil_verb_request_duration_seconds_bucket{le="0.25",verb="history"} 0
+yggdrasil_verb_request_duration_seconds_bucket{le="0.5",verb="history"} 0
+yggdrasil_verb_request_duration_seconds_bucket{le="1.0",verb="history"} 0
+yggdrasil_verb_request_duration_seconds_bucket{le="2.5",verb="history"} 0
+yggdrasil_verb_request_duration_seconds_bucket{le="5.0",verb="history"} 0
+yggdrasil_verb_request_duration_seconds_bucket{le="10.0",verb="history"} 0
+yggdrasil_verb_request_duration_seconds_bucket{le="+Inf",verb="history"} 0
+# HELP yggdrasil_verb_response_size_bytes Serialized successful Verb response payload size in bytes..
+# TYPE yggdrasil_verb_response_size_bytes histogram
+yggdrasil_verb_response_size_bytes_sum{verb="history"} 0.0
+yggdrasil_verb_response_size_bytes_count{verb="history"} 0
+yggdrasil_verb_response_size_bytes_bucket{le="64.0",verb="history"} 0
+yggdrasil_verb_response_size_bytes_bucket{le="128.0",verb="history"} 0
+yggdrasil_verb_response_size_bytes_bucket{le="256.0",verb="history"} 0
+yggdrasil_verb_response_size_bytes_bucket{le="512.0",verb="history"} 0
+yggdrasil_verb_response_size_bytes_bucket{le="1024.0",verb="history"} 0
+yggdrasil_verb_response_size_bytes_bucket{le="2048.0",verb="history"} 0
+yggdrasil_verb_response_size_bytes_bucket{le="4096.0",verb="history"} 0
+yggdrasil_verb_response_size_bytes_bucket{le="8192.0",verb="history"} 0
+yggdrasil_verb_response_size_bytes_bucket{le="16384.0",verb="history"} 0
+yggdrasil_verb_response_size_bytes_bucket{le="32768.0",verb="history"} 0
+yggdrasil_verb_response_size_bytes_bucket{le="65536.0",verb="history"} 0
+yggdrasil_verb_response_size_bytes_bucket{le="131072.0",verb="history"} 0
+yggdrasil_verb_response_size_bytes_bucket{le="262144.0",verb="history"} 0
+yggdrasil_verb_response_size_bytes_bucket{le="524288.0",verb="history"} 0
+yggdrasil_verb_response_size_bytes_bucket{le="1048576.0",verb="history"} 0
+yggdrasil_verb_response_size_bytes_bucket{le="+Inf",verb="history"} 0
+yggdrasil_verb_response_size_bytes_sum{verb="node"} 0.0
+yggdrasil_verb_response_size_bytes_count{verb="node"} 0
+yggdrasil_verb_response_size_bytes_bucket{le="64.0",verb="node"} 0
+yggdrasil_verb_response_size_bytes_bucket{le="128.0",verb="node"} 0
+yggdrasil_verb_response_size_bytes_bucket{le="256.0",verb="node"} 0
+yggdrasil_verb_response_size_bytes_bucket{le="512.0",verb="node"} 0
+yggdrasil_verb_response_size_bytes_bucket{le="1024.0",verb="node"} 0
+yggdrasil_verb_response_size_bytes_bucket{le="2048.0",verb="node"} 0
+yggdrasil_verb_response_size_bytes_bucket{le="4096.0",verb="node"} 0
+yggdrasil_verb_response_size_bytes_bucket{le="8192.0",verb="node"} 0
+yggdrasil_verb_response_size_bytes_bucket{le="16384.0",verb="node"} 0
+yggdrasil_verb_response_size_bytes_bucket{le="32768.0",verb="node"} 0
+yggdrasil_verb_response_size_bytes_bucket{le="65536.0",verb="node"} 0
+yggdrasil_verb_response_size_bytes_bucket{le="131072.0",verb="node"} 0
+yggdrasil_verb_response_size_bytes_bucket{le="262144.0",verb="node"} 0
+yggdrasil_verb_response_size_bytes_bucket{le="524288.0",verb="node"} 0
+yggdrasil_verb_response_size_bytes_bucket{le="1048576.0",verb="node"} 0
+yggdrasil_verb_response_size_bytes_bucket{le="+Inf",verb="node"} 0
+yggdrasil_verb_response_size_bytes_sum{verb="neighbors"} 4847061423.0
+yggdrasil_verb_response_size_bytes_count{verb="neighbors"} 28912
+yggdrasil_verb_response_size_bytes_bucket{le="64.0",verb="neighbors"} 4070
+yggdrasil_verb_response_size_bytes_bucket{le="128.0",verb="neighbors"} 4070
+yggdrasil_verb_response_size_bytes_bucket{le="256.0",verb="neighbors"} 4094
+yggdrasil_verb_response_size_bytes_bucket{le="512.0",verb="neighbors"} 4624
+yggdrasil_verb_response_size_bytes_bucket{le="1024.0",verb="neighbors"} 4958
+yggdrasil_verb_response_size_bytes_bucket{le="2048.0",verb="neighbors"} 5303
+yggdrasil_verb_response_size_bytes_bucket{le="4096.0",verb="neighbors"} 5634
+yggdrasil_verb_response_size_bytes_bucket{le="8192.0",verb="neighbors"} 6147
+yggdrasil_verb_response_size_bytes_bucket{le="16384.0",verb="neighbors"} 7745
+yggdrasil_verb_response_size_bytes_bucket{le="32768.0",verb="neighbors"} 10515
+yggdrasil_verb_response_size_bytes_bucket{le="65536.0",verb="neighbors"} 19386
+yggdrasil_verb_response_size_bytes_bucket{le="131072.0",verb="neighbors"} 21345
+yggdrasil_verb_response_size_bytes_bucket{le="262144.0",verb="neighbors"} 23868
+yggdrasil_verb_response_size_bytes_bucket{le="524288.0",verb="neighbors"} 26388
+yggdrasil_verb_response_size_bytes_bucket{le="1048576.0",verb="neighbors"} 28031
+yggdrasil_verb_response_size_bytes_bucket{le="+Inf",verb="neighbors"} 28912
+yggdrasil_verb_response_size_bytes_sum{verb="search"} 0.0
+yggdrasil_verb_response_size_bytes_count{verb="search"} 0
+yggdrasil_verb_response_size_bytes_bucket{le="64.0",verb="search"} 0
+yggdrasil_verb_response_size_bytes_bucket{le="128.0",verb="search"} 0
+yggdrasil_verb_response_size_bytes_bucket{le="256.0",verb="search"} 0
+yggdrasil_verb_response_size_bytes_bucket{le="512.0",verb="search"} 0
+yggdrasil_verb_response_size_bytes_bucket{le="1024.0",verb="search"} 0
+yggdrasil_verb_response_size_bytes_bucket{le="2048.0",verb="search"} 0
+yggdrasil_verb_response_size_bytes_bucket{le="4096.0",verb="search"} 0
+yggdrasil_verb_response_size_bytes_bucket{le="8192.0",verb="search"} 0
+yggdrasil_verb_response_size_bytes_bucket{le="16384.0",verb="search"} 0
+yggdrasil_verb_response_size_bytes_bucket{le="32768.0",verb="search"} 0
+yggdrasil_verb_response_size_bytes_bucket{le="65536.0",verb="search"} 0
+yggdrasil_verb_response_size_bytes_bucket{le="131072.0",verb="search"} 0
+yggdrasil_verb_response_size_bytes_bucket{le="262144.0",verb="search"} 0
+yggdrasil_verb_response_size_bytes_bucket{le="524288.0",verb="search"} 0
+yggdrasil_verb_response_size_bytes_bucket{le="1048576.0",verb="search"} 0
+yggdrasil_verb_response_size_bytes_bucket{le="+Inf",verb="search"} 0
+# EOF
