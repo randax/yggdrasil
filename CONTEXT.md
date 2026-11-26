@@ -79,7 +79,7 @@ An agent Member bound to one human Member, its principal. It belongs to exactly 
 _Avoid_: Bot, assistant, delegate
 
 **Service Agent**:
-An agent Member that acts for no particular human, such as the Ask bot, a CI job or the impact reporter. An Admin assigns its Teams explicitly, and it does not hold the promote right by default.
+An agent Member that acts for no particular human, such as a CI job or the impact reporter. An Admin assigns its Teams explicitly, and it does not hold the promote right by default. Ask is a Service Agent of a special kind: it has no Teams and answers each person within their own view.
 _Avoid_: Bot, system user, robot account
 
 **Team**:
