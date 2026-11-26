@@ -111,7 +111,7 @@ The answering agent Yggdrasil ships for Slack, Waddle and the web GUI. It answer
 _Avoid_: Bot, assistant, chatbot
 
 **Chat-account Binding**:
-A proven link between a person's chat account (Slack or Waddle) and their Member, made by that person through a one-time link and a passkey, or set by an Admin. Ask answers and captures for a chat account only through its binding.
+A proven link between a person's chat account (Slack or Waddle) and their Member, made by that person through a one-time link and a passkey, or set by an Admin. Ask answers within a person's own view, and captures for them, only through their binding; an unbound chat account gets at most public answers.
 _Avoid_: Chat identity, account mapping
 
 **Admin**:

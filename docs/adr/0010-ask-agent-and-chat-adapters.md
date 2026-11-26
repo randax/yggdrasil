@@ -19,8 +19,8 @@ Three ideas run through the rules:
 
 ### On whose behalf
 
-- Every Ask query names the **asker**, identified by an active Chat-account Binding (or, for the web box, by their web session), and the **surface** it will be published on. The server computes the effective view as the asker's view intersected with the surface's ceiling (ADR 0008) and with the egress set (below). Ask's own token grants no repositories and no Audiences; it grants only the right to act on behalf of bound accounts on surfaces an Admin registered.
-- A chat user with no binding gets, as an Admin chooses per surface, either nothing or the narrowest ceiling: Forge-public repos and no Memories.
+- Every Ask query names the **asker**, identified by an active Chat-account Binding (or, for the web box, by their web session), and the **surface** it will be published on. The server computes the effective view as the asker's view intersected with the surface's ceiling (ADR 0008) and with the egress set (below). Ask's own token grants no repositories and no Audiences; it grants only the right to act on behalf of bound accounts on surfaces an Admin registered, and to serve the public fallback where an Admin enabled it.
+- A chat user with no binding gets, as an Admin chooses per surface, either only the private binding prompt or the narrowest ceiling: Forge-public repos and no Memories. That public fallback acts for no Member: it is rate-limited per chat account, charged to the surface's budget, and audited by platform user key.
 - Ask is a trusted deputy for *which* bound account is asking; it can never exceed that account's view or the surface's ceiling. Every on-behalf-of call is audited with the asker, the surface and the ceiling applied.
 - Ask is not a Personal Agent, so it never recalls an asker's private overlay (ADR 0008), even in a direct message.
 
@@ -41,7 +41,8 @@ Three ideas run through the rules:
 ### LLM provider and egress
 
 - Ask talks to a model through a provider trait with two adapters: the Anthropic Messages API, and an OpenAI-compatible Chat Completions endpoint, which also covers Azure OpenAI and self-hosted servers such as vLLM and Ollama. It is off by default.
-- An Admin opts in with step-up, choosing the provider, model, endpoint and key, and marking the provider **external** (a vendor's API) or **in-deployment** (a model on infrastructure the Organization controls). The admin console states what leaves the deployment: the asker's question and the snippets and Memory bodies retrieved under that answer's ceiling, never whole repositories. Changing any of these is the same Admin act.
+- An Admin opts in with step-up and a reason, choosing the provider, model, endpoint and key, and marking the provider **external** (a vendor's API) or **in-deployment** (a model on infrastructure the Organization controls). The admin console states what leaves the deployment: the asker's question and the snippets and Memory bodies retrieved under that answer's ceiling, never whole repositories. Changing any of these is the same Admin act.
+- Sending code to an external provider widens who can see it, so egress approvals belong to one recipient: the provider and endpoint. Opting into an external recipient sends ADR 0008 widening notices, batched, for every Forge-private repo that is Open in Yggdrasil and so enters its egress set. Switching to a different external recipient clears every per-repo approval, which must be granted afresh for the new one.
 - The server keeps an **egress set** and intersects every Ask query with it, so Ask cannot override it. With an in-deployment provider it is everything. With an external provider it holds Open repos and the Memories anchored only to them; a Restricted repo joins only when an Admin allows it with step-up and a reason, which is audited and notifies that repo's Owning Teams. A repo outside the egress set is absent from Ask's results exactly as a hidden repo is.
 
 ### What Ask may call
@@ -80,13 +81,13 @@ Retrieved code, comments, documents, Memory bodies and the chat question are all
 ### What Ask keeps
 
 - **Always:** a body-free audit of each answer: asker, surface, ceiling, cited ids, tokens and whether it abstained.
-- **Only if an Admin opts in** with step-up: transcripts, retained 30 days by default. A stored transcript keeps its ceiling. Its asker may read it, and an Admin may read it only if their own view covers every repo it cited; anything further needs a Break-glass Session.
+- **Only if an Admin opts in** with step-up: transcripts, retained 30 days by default. A stored transcript keeps its ceiling. Every read of a transcript, evaluation copies included, is checked against the reader's current access to every repo it drew on and every Memory it cited, Audience included, as `recall` would be. That holds for the asker too, and an Admin is no exception; a Break-glass Session adds repos but never Memory Audiences.
 - **With the asker's consent:** a thumbs-down with "share this answer" stores that one transcript for evaluation.
 
 ### Follow-ups
 
 - For each thread, Ask holds in memory, for 30 minutes and never on disk, the asker's messages addressed to it and its own answers. It never reads other people's messages in the thread.
-- Every turn recomputes the ceiling. If the ceiling narrowed or a different person is asking, earlier context is dropped and the turn starts fresh, so nothing retrieved for one reader is carried into another's answer. Earlier citations are re-checked before reuse.
+- Every turn recomputes the ceiling. If the ceiling narrowed or a different person is asking, earlier context is dropped and the turn starts fresh, so nothing retrieved for one reader is carried into another's answer. Earlier citations are re-checked before reuse, and before any retained context is sent to a model, every source behind it must still be permitted under the current asker, Audiences, ceiling, provider and egress set; otherwise, or if its sources are unknown, the turn starts fresh.
 
 ### The chat-adapter contract
 
@@ -100,10 +101,12 @@ Retrieved code, comments, documents, Memory bodies and the chat question are all
 
 ### Who can read a conversation
 
-- The adapter lists the conversation's members (Slack `conversations.members`, Waddle room occupants) and checks each against active Chat-account Bindings. This replaces ADR 0008's "workspace that admits only Organization Members" with a check Yggdrasil can make itself:
-  - every member is a bound, active Member: the Members-only channel row;
-  - additionally, every member belongs to the Team an Admin bound the channel to: the Team row;
-  - anyone unbound, a guest, an external organisation's user, or any bot other than Ask: the guest row (Forge-public repos, no Memories).
+- The adapter establishes who can *read* the conversation, not only who has joined it. For a Slack public channel that is every member of the workspace, since anyone there can find its messages through search; for a private channel or a Waddle members-only room it is the member list (Slack `conversations.members`, Waddle room occupants). Each reader is checked against active Chat-account Bindings. This replaces ADR 0008's "workspace that admits only Organization Members" with a check Yggdrasil can make itself:
+  - every reader is a bound, active Member: the Members-only channel row;
+  - additionally, every reader belongs to the Team an Admin bound the channel to: the Team row;
+  - any reader unbound, a guest, an external organisation's user, or any bot other than Ask: the guest row (Forge-public repos, no Memories).
+
+  In practice a public channel gets a wider row only when every full member of the workspace is bound; Team-bound channels are private ones.
 - Facts the adapter cannot establish fall to the narrower row. Results are cached per conversation, invalidated by join and leave events, and re-checked when older than 5 minutes at the moment an answer is posted.
 - When a conversation's row is narrower than the asker wants, Ask offers "answer me privately", which continues in a direct message under that row of ADR 0008.
 
