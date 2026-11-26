@@ -106,6 +106,14 @@ _Avoid_: Steward, maintainer team, code owner (a code owner may be an individual
 A human Member, named by an Admin, who manages one Team. A Team Maintainer adds and removes that Team's human Members and grants or revokes that Team's promote right. For a Team synced from a Forge team, the Forge decides membership, and the Team Maintainer can only remove Members. The role has no power over other Teams, the Organization-wide right, Service Agents or the Admin role.
 _Avoid_: Team admin, team owner, lead
 
+**Ask**:
+The answering agent Yggdrasil ships for Slack, Waddle and the web GUI. It answers on behalf of the person asking, never seeing more than they could, cites only what it retrieved, and captures a Memory only when a person asks it to. It is a Service Agent and a client of the Index Server, which itself never composes answers.
+_Avoid_: Bot, assistant, chatbot
+
+**Chat-account Binding**:
+A proven link between a person's chat account (Slack or Waddle) and their Member, made by that person through a one-time link and a passkey, or set by an Admin. Ask answers and captures for a chat account only through its binding.
+_Avoid_: Chat identity, account mapping
+
 **Admin**:
 A human Member who operates the Index Server deployment for the Organization: configures forges, chooses what gets indexed, wires up providers. Only another Admin, or the deployment's bootstrap credential, makes someone an Admin; no Forge or IdP role does.
 _Avoid_: Operator, owner
