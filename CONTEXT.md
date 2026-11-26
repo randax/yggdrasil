@@ -79,7 +79,7 @@ Which admitted repositories a Member may see, decided per repository and never p
 _Avoid_: Access, permission, audience (reserved for Memories)
 
 **Break-glass Session**:
-A time-boxed, audited exception that lets a human Admin see named Restricted repositories their Teams do not grant. It requires step-up (a factor outside any agent's environment, ADR 0007) and a stated reason, it expires quickly, and the repositories' Owning Teams are told it happened. Being an Admin grants no Visibility by itself.
+A time-boxed, audited exception that lets a human Admin see named Restricted repositories their Teams do not grant. It requires step-up (a factor outside any agent's environment, ADR 0007) and a stated reason, it expires quickly, and the people responsible for the repositories are told it happened. Being an Admin grants no Visibility by itself.
 _Avoid_: Override, sudo, impersonation
 
 **Owning Team**:
