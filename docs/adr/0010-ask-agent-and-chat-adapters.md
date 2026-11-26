@@ -125,7 +125,7 @@ Retrieved code, comments, documents, Memory bodies and the chat question are all
 
 ### Restore
 
-Ask's authority state is under the restore gate (RFC 0001 §5.1), like ADR 0009's tables: the LLM provider configuration and its locality, per-repo egress approvals, Chat-account Bindings and shared-account declarations, registered surfaces, Team-bound channels, non-reader bot registrations and the Ask token. Pending binding ceremonies are bound to the deployment's generation, so a restore invalidates them. Where the authority-revision log cannot prove this state complete, it fails closed: the provider is disabled and its egress approvals cleared, and bindings, Team-bound channels and non-reader registrations are disabled, each to be re-established afresh under its usual rules.
+Ask's authority state is under the restore gate (RFC 0001 §5.1), like ADR 0009's tables: the LLM provider configuration and its locality, per-repo egress approvals, Chat-account Bindings and shared-account declarations, registered surfaces, Team-bound channels, non-reader bot registrations and the Ask token. Pending binding ceremonies are bound to the deployment's generation, so a restore invalidates them. Where the authority-revision log cannot prove this state complete, it fails closed: the provider is disabled and its egress approvals cleared; the Ask token is revoked and must be issued afresh as a widening; every registered surface is disabled until re-registered; bindings, Team-bound channels and non-reader registrations are disabled; and self-binding stays closed until an Admin re-confirms the shared-account declarations. Each is re-established under its usual rules.
 
 ### Eval
 
