@@ -75,7 +75,7 @@ An Admin's choice, made by rule, of which discovered repositories are indexed. A
 _Avoid_: Inclusion, onboarding
 
 **Visibility**:
-Which admitted repositories a Member may see, decided per repository and never per path. An Open repository is visible to every Member. A Restricted repository is visible only to Members of the Teams granted it. A Team is granted a repository either by its Forge, when the Team is synced from a Forge team that can read the repository, or explicitly by an Admin. A Forge's own public, internal or private setting informs whether a repository starts Open or Restricted, but it is not Visibility. Visibility is separate from a Memory's Audience.
+Which admitted repositories a Member may see, decided per repository and never per path. An Open repository is visible to every Member. A Restricted repository is visible only to Members of the Teams granted it. A Team is granted a repository either by its Forge, when the Team is synced from a Forge team that has itself been given access to the repository (never access that comes only from the repository being public or internal), or explicitly by an Admin. A Forge's own public, internal or private setting informs whether a repository starts Open or Restricted, but it is not Visibility. Visibility is separate from a Memory's Audience.
 _Avoid_: Access, permission, audience (reserved for Memories)
 
 **Break-glass Session**:
