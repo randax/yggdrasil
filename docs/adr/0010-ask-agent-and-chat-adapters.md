@@ -161,6 +161,6 @@ An Ask eval runs on the Shard profile's 36-repo corpus, shared with the agent-ef
 - Each answer pays for a citation check and a ceiling recomputation, and channel answers pay for member listing; caches keep these off the common path.
 - Ask needs its own eval corpus and gold set, maintained with the agent-efficiency evals.
 - Waddle support depends on work in Waddle's repository.
-- **Accepted residual risks:** a compromised Ask host reads what its bound Members could, within surface ceilings and the egress set; and a person can type short confidential text into a question that goes to an external provider, which no span check can catch.
+- **Accepted residual risks:** a compromised Ask host reads what its bound Members could, within surface ceilings and the egress set; a person can type short confidential text into a question that goes to an external provider, which no span check can catch; a shared chat account that is neither marked by the platform nor declared by an Admin gives everyone using it the binder's view; and an asker who shares a transcript for evaluation discloses whatever they pasted into it.
 - How notices reach people (chat channels, direct messages, the web inbox) and how a cited answer looks on each platform are not decided here; they stay on the map as notification plumbing and chat answer presentation.
 - RFC 0001 does not yet describe Ask. It is added in the map's RFC consolidation step; until then this ADR wins.
