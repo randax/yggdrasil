@@ -55,11 +55,27 @@ A person appearing in synced repositories' history or forge artifacts, identity-
 _Avoid_: User, author, committer (git-mechanical terms)
 
 **Member**:
-An authenticated human or agent authorized to query an Index Server.
+An authenticated human or agent authorized to query an Index Server. A human becomes a Member by matching a Member Admission Rule when they log in, or by an Admin's approval.
 _Avoid_: User, client
 
+**Login Provider**:
+An identity provider an Admin allows humans to log in with: a corporate IdP, or a Forge acting as one. A person is known to a Login Provider by its stable account identifier, never by an email or a login name.
+_Avoid_: IdP (a Forge can be one too), SSO, auth provider
+
+**Member Admission Rule**:
+An Admin's rule naming who becomes a Member on logging in: everyone in an IdP group, everyone with a verified email domain, or everyone active in a Forge Namespace. A login that matches no rule waits for an Admin and grants nothing meanwhile. A rule never makes anyone an Admin.
+_Avoid_: Allowlist, invitation
+
+**Forge Link**:
+A proven binding between a Member and one of their Forge accounts, made by the Member signing in to that Forge or set by an Admin. Synced Team membership reaches a Member only through their Forge Links, and so does their link to Contributors. A Member may have several; a Forge account links to at most one Member.
+_Avoid_: Identity merge (that is how Contributors are combined, and never makes a Forge Link), account mapping
+
+**Liveness Window**:
+How long a human Member may go without logging in before their Membership, and every Personal Agent bound to them, is suspended.
+_Avoid_: Session timeout, inactivity timeout
+
 **Personal Agent**:
-An agent Member bound to one human Member, its principal. It belongs to exactly its principal's Teams, never sees more than its principal, and loses access when its principal does. It shares its principal's private overlay: each recalls the other's private Memories, while every Memory keeps its true author. It holds no promote right through its principal.
+An agent Member bound to one human Member, its principal. It belongs to exactly its principal's Teams, never sees more than its principal, and loses access when its principal does. It shares its principal's private overlay: each recalls the other's private Memories, while every Memory keeps its true author. It holds no promote right through its principal. Its principal is the human who approved its token, and that never changes.
 _Avoid_: Bot, assistant, delegate
 
 **Service Agent**:
@@ -91,7 +107,7 @@ A human Member, named by an Admin, who manages one Team. A Team Maintainer adds 
 _Avoid_: Team admin, team owner, lead
 
 **Admin**:
-A human Member who operates the Index Server deployment for the Organization: configures forges, chooses what gets indexed, wires up providers.
+A human Member who operates the Index Server deployment for the Organization: configures forges, chooses what gets indexed, wires up providers. Only another Admin, or the deployment's bootstrap credential, makes someone an Admin; no Forge or IdP role does.
 _Avoid_: Operator, owner
 
 **Sync**:
