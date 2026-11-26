@@ -71,7 +71,7 @@ A proven binding between a Member and one of their Forge accounts, made by the M
 _Avoid_: Identity merge (that is how Contributors are combined, and never makes a Forge Link), account mapping
 
 **Liveness Window**:
-How long a Member admitted through an IdP may go without logging in before their Membership, and every Personal Agent bound to them, is suspended.
+How long a human Member may go without logging in before their Membership, and every Personal Agent bound to them, is suspended.
 _Avoid_: Session timeout, inactivity timeout
 
 **Personal Agent**:
