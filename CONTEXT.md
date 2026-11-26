@@ -67,7 +67,7 @@ An agent Member that acts for no particular human, such as the Ask bot, a CI job
 _Avoid_: Bot, system user, robot account
 
 **Team**:
-A named set of Members within the Organization, and an Audience for shared Memories: a Memory promoted to a Team is recalled by that Team's Members who can see every repository it is anchored to, in addition to its author and any other Audience it has. A Team may be synced from a Forge team (a GitHub or Codeberg team, a GitLab group). A Member may belong to several Teams, and a Memory's Audience may include several Teams, each added by its own Promotion. Teams are flat: a Team has no parent, and its Members are exactly the Members it lists. A Team decides *who* sees a Memory; it never changes *where* the Memory is recalled, which is its Scope.
+A named set of Members within the Organization, and an Audience for shared Memories: a Memory promoted to a Team is recalled by that Team's Members, in addition to its author and any other Audience it has, always subject to the Audience rule that the recaller must see every repository it is anchored to. A Team may be synced from a Forge team (a GitHub or Codeberg team, a GitLab group). A Member may belong to several Teams, and a Memory's Audience may include several Teams, each added by its own Promotion. Teams are flat: a Team has no parent, and its Members are exactly the Members it lists. A Team decides *who* sees a Memory; it never changes *where* the Memory is recalled, which is its Scope.
 _Avoid_: Group, squad, workspace
 
 **Admission**:
