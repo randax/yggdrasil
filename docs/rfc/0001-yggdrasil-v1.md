@@ -21,8 +21,11 @@ tokens(id, member_id, hash, created_at, last_used_at, revoked_at)
 packages(id, ecosystem, name)                       -- npm, crates, go modules…
 repo_packages(repo_id, package_id, version_range, relation /* provides|depends */)
 xrepo_edges(from_repo, to_repo, via_package_id, kind)
-xrepo_refs(target /* version-free moniker | package + name */, from_repo, kind, provenance,
-           referencing_symbols)                     -- diffed per repo in the pointer-swap transaction (ADR 0012)
+xrepo_exports(key /* import binding | version-free moniker */, provider_repo, revision, symbol_id)
+xrepo_refs(key /* import binding | version-free moniker */, from_repo, revision, kind,
+           symbols_any, symbols_precise, symbols_syntactic)
+                                                    -- both written in the pointer-swap transaction,
+                                                    -- kept for the retention window (ADR 0012)
 contributors(id, display_name)
 identities(contributor_id, kind /* email|forge_account */, value, merge_provenance)
 memories(id, member_id, kind /* semantic|episodic */, scope /* session|repo|org */,
@@ -54,11 +57,11 @@ Job queue = `SELECT … FOR UPDATE SKIP LOCKED` with leases; priorities favor in
 
 Two-pass per change (ADR 0002):
 
-**Pass 1 — syntactic (target: minutes).** tree-sitter parse of every file whose blob misses the per-blob extraction cache (keyed by blob id, language, and extractor, grammar and schema versions; ADR 0012): Symbols, heuristic call/import/extends edges with confidence; markdown → Doc Sections + `MENTIONS` edges (lexical match against symbol names, tagged); CODEOWNERS → `OWNS` edges; `git log <previous>..<new>` delta merged with the previous revision's history rows (full walk after a force-push or rewrite) → commits, `TOUCHES`/`AUTHORED` edges; manifest parse → `packages`/`repo_packages`/`xrepo_edges`. Every candidate at an ambiguous call site is stored. Publishes a complete Shard immediately, using the stored precise artifact of every Precise Root whose input hash still matches. Every job records per-stage timings.
+**Pass 1 — syntactic (target: minutes).** tree-sitter parse of every file whose blob misses the per-blob extraction cache (keyed by blob id, language, and extractor, grammar and schema versions; ADR 0012): Symbols, heuristic call/import/extends edges with confidence; markdown → Doc Sections + `MENTIONS` edges (lexical match against symbol names, tagged); CODEOWNERS → `OWNS` edges; `git log <previous>..<new>` delta merged with the previous revision's unfiltered commit/path facts, projected onto the current tree at compose (full walk after a force-push or rewrite) → commits, `TOUCHES`/`AUTHORED` edges; manifest parse → `packages`/`repo_packages`/`xrepo_edges`. Every candidate at an ambiguous call site is stored; calls through imported names are kept as external evidence keyed by import binding, and exported bindings are recorded. Publishes a complete Shard immediately, using the stored precise output of every Precise Root whose input hash still matches. Every job records per-stage timings.
 
-**Pass 2 — precise (target: same hour).** Language detection → SCIP indexer matrix (M1: scip-go, scip-typescript, scip-python, rust-analyzer/scip; M2+: scip-java family, scip-clang, scip-ruby, scip-dotnet). Runs in a sandbox: container, read-only source, egress allowlist (package registries), no credentials, CPU/mem/time limits, per-language dependency caches (e.g. shared module/crate caches) to hit the ~4-min average. Builds run per Precise Root (one per build manifest) whenever the current revision has no stored artifact matching the root's input hash (its files, manifest and lockfile, workspace-level build inputs, sandbox image, indexer and ingest versions, and in-repo dependency roots' hashes). Output SCIP → a per-root artifact of occurrences + precise evidence → a compose job publishes a new revision of the current commit in which precise evidence replaces syntactic evidence per call site, in the files the build indexed. Publication is a compare-and-swap on the base revision. Build failure ⇒ the root stays syntactic, surfaced per root in admin status (ADR 0012).
+**Pass 2 — precise (target: same hour).** Language detection → SCIP indexer matrix (M1: scip-go, scip-typescript, scip-python, rust-analyzer/scip; M2+: scip-java family, scip-clang, scip-ruby, scip-dotnet). Runs in a sandbox: container, read-only source, egress allowlist (package registries), no credentials, CPU/mem/time limits, per-language dependency caches (e.g. shared module/crate caches) to hit the ~4-min average. Builds run per Precise Root (the unit each ecosystem builds) whenever the current revision has no stored output matching the root's input hash (its files, manifest and lockfile, workspace-level build inputs, sandbox image, indexer version, and in-repo dependency roots' hashes, with cycles hashed as one unit). Raw SCIP output is stored per root and input hash; precise evidence is derived from it per schema and ingest version → a compose job publishes a new revision of the desired head in which precise evidence replaces syntactic evidence per call site, in files the root owns and its build indexed. Publication holds a per-repo lease and compare-and-swaps on the base revision and the desired-head generation. Infrastructure failures retry until success; deterministic failures retry daily or on Admin request, the root staying syntactic and surfaced per root in admin status (ADR 0012).
 
-**Cross-repo linking.** SCIP symbol monikers (ecosystem + package + version + descriptor) identify external Symbols; their version-free form is the global join key, and Shards resolve external edges per view at read time (ADR 0012). Workers emit `provides`/`depends` package facts, which the control plane resolves to `xrepo_edges` for `deps` and `dependents`, and one `xrepo_refs` row per external symbol a repo references, which bounds symbol-level cross-repo fan-out (`callers`, `impact`) to the repos that reference the Symbol, filtered to the caller's view (ADR 0012).
+**Cross-repo linking.** A call into another repo is keyed by its import binding (ecosystem, import specifier as written, imported name path), which both passes derive; only references the precise pass alone can see are keyed by version-free SCIP moniker. Shards resolve external edges per view at read time (ADR 0012). Workers emit `provides`/`depends` package facts, which the control plane resolves to `xrepo_edges` for `deps` and `dependents`, and per-revision `xrepo_exports` and `xrepo_refs` rows, which bound symbol-level cross-repo fan-out (`callers`, `impact`) to the repos that reference the Symbol, filtered to the caller's view and read at one pinned set of revisions (ADR 0012).
 
 **Identity merge.** Same email or .mailmap entry ⇒ merge (provenance `extracted`); same forge account across Forges via profile URLs ⇒ merge (`extracted`); name+similar-email heuristics ⇒ merge (`inferred`, reversible via `identities.merge_provenance`).
 
@@ -147,7 +150,7 @@ shards/<repo-id>/<revision>/
   trigram/…          # reserved for regex search after v1
 ```
 
-Immutable; loose files, no archive; pointer swap in `shards` table; GC deletes a revision prefix after a grace window. Query nodes download only the files a Verb needs, as parallel byte-range GETs verified by sha256, into an NVMe cache that keeps one copy, and pre-warm a new revision before switching to it. SQLite survives ADR 0004's supersession as the *graph segment format* — single-file, mmap-friendly, queryable in-process — while object storage + Postgres carry the multi-node story (ADR 0005). Layout, fetch and incremental indexing: ADR 0012.
+Immutable; loose files, no archive; pointer swap in `shards` table; GC deletes a revision prefix after a grace window. Query nodes download only the files a Verb needs, as parallel byte-range GETs verified by sha256, into an NVMe cache keyed by sha256 that keeps one copy. A publisher holds a per-repo lease, lets holding nodes pre-warm the new revision, then swaps the pointer for every node at once; requests open exactly the revisions their Postgres snapshot names. SQLite survives ADR 0004's supersession as the *graph segment format* — single-file, mmap-friendly, queryable in-process — while object storage + Postgres carry the multi-node story (ADR 0005). Layout, fetch and incremental indexing: ADR 0012.
 
 ## 7. Verb contract (ADR 0003)
 
@@ -258,7 +261,9 @@ read path refuses older-schema artifacts, and each indexing worker checks at
 boot for repositories whose current Shard lacks the new suffix, queues one
 index job per repository (without duplicating work already in flight), and
 publishes a current-schema Shard before swapping the pointer. Schema evolution
-therefore means re-indexing the fleet, not migrating a Shard on read.
+therefore means re-indexing the fleet, not migrating a Shard on read. Precise
+evidence is re-derived from stored SCIP output rather than rebuilt in sandboxes,
+and cursors issued under the old schema expire at the cutover (ADR 0012).
 
 The cost is intentionally explicit: every schema bump requires one full
 syntactic rebuild and new Shard publication for each included repository that
