@@ -55,31 +55,67 @@ A person appearing in synced repositories' history or forge artifacts, identity-
 _Avoid_: User, author, committer (git-mechanical terms)
 
 **Member**:
-An authenticated human or agent authorized to query an Index Server.
+An authenticated human or agent authorized to query an Index Server. A human becomes a Member by matching a Member Admission Rule when they log in, or by an Admin's approval.
 _Avoid_: User, client
 
+**Login Provider**:
+An identity provider an Admin allows humans to log in with: a corporate IdP, or a Forge acting as one. A person is known to a Login Provider by its stable account identifier, never by an email or a login name.
+_Avoid_: IdP (a Forge can be one too), SSO, auth provider
+
+**Member Admission Rule**:
+An Admin's rule naming who becomes a Member on logging in: everyone in an IdP group, everyone with a verified email domain, or everyone active in a Forge Namespace. A login that matches no rule waits for an Admin and grants nothing meanwhile. A rule never makes anyone an Admin.
+_Avoid_: Allowlist, invitation
+
+**Forge Link**:
+A proven binding between a Member and one of their Forge accounts, made by the Member signing in to that Forge or set by an Admin. Synced Team membership reaches a Member only through their Forge Links, and so does their link to Contributors. A Member may have several; a Forge account links to at most one Member.
+_Avoid_: Identity merge (that is how Contributors are combined, and never makes a Forge Link), account mapping
+
+**Liveness Window**:
+How long a human Member may go without logging in before their Membership, and every Personal Agent bound to them, is suspended.
+_Avoid_: Session timeout, inactivity timeout
+
 **Personal Agent**:
-An agent Member bound to one human Member, its principal. It belongs to exactly its principal's Teams, never sees more than its principal, and loses access when its principal does. It shares its principal's private overlay: each recalls the other's private Memories, while every Memory keeps its true author. It holds no promote right through its principal.
+An agent Member bound to one human Member, its principal. It belongs to exactly its principal's Teams, never sees more than its principal, and loses access when its principal does. It shares its principal's private overlay: each recalls the other's private Memories, while every Memory keeps its true author. It holds no promote right through its principal. Its principal is the human who approved its token, and that never changes.
 _Avoid_: Bot, assistant, delegate
 
 **Service Agent**:
-An agent Member that acts for no particular human, such as the Ask bot, a CI job or the impact reporter. An Admin assigns its Teams explicitly, and it does not hold the promote right by default.
+An agent Member that acts for no particular human, such as a CI job or the impact reporter. An Admin assigns its Teams explicitly, and it does not hold the promote right by default. Ask is a Service Agent of a special kind: it has no Teams and answers each person within their own view.
 _Avoid_: Bot, system user, robot account
 
 **Team**:
-A named set of Members within the Organization, and an Audience for shared Memories: a Memory promoted to a Team is recalled by that Team's Members, in addition to its author and any other Audience it has. A Member may belong to several Teams, and a Memory's Audience may include several Teams, each added by its own Promotion. Teams are flat: a Team has no parent, and its Members are exactly the Members it lists. A Team decides *who* sees a Memory; it never changes *where* the Memory is recalled, which is its Scope.
+A named set of Members within the Organization, and an Audience for shared Memories: a Memory promoted to a Team is recalled by that Team's Members, in addition to its author and any other Audience it has, always subject to the Audience rule that the recaller must see every repository it is anchored to. A Team may be synced from a Forge team (a GitHub or Codeberg team, a GitLab group). A Member may belong to several Teams, and a Memory's Audience may include several Teams, each added by its own Promotion. Teams are flat: a Team has no parent, and its Members are exactly the Members it lists. A Team decides *who* sees a Memory; it never changes *where* the Memory is recalled, which is its Scope.
 _Avoid_: Group, squad, workspace
 
+**Admission**:
+An Admin's choice, made by rule, of which discovered repositories are indexed. A repository that is not admitted is indexed for no one and visible to no one.
+_Avoid_: Inclusion, onboarding
+
+**Visibility**:
+Which admitted repositories a Member may see, decided per repository and never per path. An Open repository is visible to every Member. A Restricted repository is visible only to Members of the Teams granted it. A Team is granted a repository either by its Forge, when the Team is synced from a Forge team that has itself been given access to read the repository's code (never access that comes only from the repository being public or internal), or explicitly by an Admin. A Forge's own public, internal or private setting informs whether a repository starts Open or Restricted, but it is not Visibility. Visibility is separate from a Memory's Audience.
+_Avoid_: Access, permission, audience (reserved for Memories)
+
+**Break-glass Session**:
+A time-boxed, audited exception that lets a human Admin see named Restricted repositories their Teams do not grant. It requires step-up (a factor outside any agent's environment, ADR 0007) and a stated reason, it expires quickly, and the people responsible for the repositories are told it happened. Being an Admin grants no Visibility by itself.
+_Avoid_: Override, sudo, impersonation
+
 **Owning Team**:
-A Team responsible for a piece of code. Ownership is derived from the code where possible: a CODEOWNERS entry naming a team defined on a Forge that is synced as a Team. Where no such entry exists, ownership is assigned by an Admin-set rule. Ownership routes notices and impact reports, but it never decides who may see the code.
+A Team responsible for a piece of code. Ownership is derived from the code where possible: a CODEOWNERS entry naming a Forge team that is synced as a Team. Where no such entry exists, ownership is assigned by an Admin-set rule. Ownership routes notices and impact reports, but it never decides who may see the code.
 _Avoid_: Steward, maintainer team, code owner (a code owner may be an individual Contributor)
 
 **Team Maintainer**:
-A human Member, named by an Admin, who manages one Team. A Team Maintainer adds and removes that Team's human Members and grants or revokes that Team's promote right. The role has no power over other Teams, the Organization-wide right, Service Agents or the Admin role.
+A human Member, named by an Admin, who manages one Team. A Team Maintainer adds and removes that Team's human Members and grants or revokes that Team's promote right. For a Team synced from a Forge team, the Forge decides membership, and the Team Maintainer can only remove Members. The role has no power over other Teams, the Organization-wide right, Service Agents or the Admin role.
 _Avoid_: Team admin, team owner, lead
 
+**Ask**:
+The answering agent Yggdrasil ships for Slack, Waddle and the web GUI. It answers on behalf of the person asking, never seeing more than they could, cites only what it retrieved, and captures a Memory only when a person asks it to. It is a Service Agent and a client of the Index Server, which itself never composes answers.
+_Avoid_: Bot, assistant, chatbot
+
+**Chat-account Binding**:
+A proven link between a person's chat account (Slack or Waddle) and their Member, made by that person through a one-time link and a passkey, or set by an Admin. Ask answers within a person's own view, and captures for them, only through their binding; an unbound chat account gets at most public answers.
+_Avoid_: Chat identity, account mapping
+
 **Admin**:
-A human Member who operates the Index Server deployment for the Organization: configures forges, chooses what gets indexed, wires up providers.
+A human Member who operates the Index Server deployment for the Organization: configures forges, chooses what gets indexed, wires up providers. Only another Admin, or the deployment's bootstrap credential, makes someone an Admin; no Forge or IdP role does.
 _Avoid_: Operator, owner
 
 **Sync**:
@@ -121,11 +157,11 @@ Where a Memory is recalled, bounded by its Anchors: session (Episodic only), rep
 _Avoid_: Visibility, reach, org scope
 
 **Audience**:
-Who may recall a Memory: only its author's private overlay (which a human shares with their Personal Agents), one or more Teams, or the whole Organization. A Memory whose Audience is wider than the private overlay is *shared*. Audience is independent of Scope.
+Who may recall a Memory: only its author's private overlay (which a human shares with their Personal Agents), one or more Teams, or the whole Organization. A Memory whose Audience is wider than the private overlay is *shared*. A Member recalls a Memory only when they are in its Audience and can see every repository it is anchored to. Audience is independent of Scope.
 _Avoid_: Visibility (reserved for which repositories a Member may see), sharing level
 
 **Proposal**:
-A Memory offered for Promotion into an Audience whose promote right its author lacks. It waits in that Audience's review queue, where every holder of the right can see it, until one of them accepts or rejects it.
+A Memory offered for Promotion into an Audience whose promote right its author lacks. It waits in that Audience's review queue, where every holder of the right who can see every repository it is anchored to can see it, until one of them accepts or rejects it.
 _Avoid_: Request, submission, pull request
 
 **Promotion**:
