@@ -92,3 +92,46 @@ realistic corpora, and both now measurable:
 Regressions to watch: `verb_bytes` growing across releases for the same
 scenarios, or `verb_calls` increasing. Re-run the command above and
 compare against this table.
+
+## Targets (ADR 0011)
+
+These are the decided targets for the reworked yardstick. The harness changes
+below land with ADR 0011's payload changes, at the start of M1. The
+percentages are opening targets, to be tightened after the first baseline run.
+
+### Yardstick
+
+- **`grep_lines_bytes`**: what the scenario's literal `grep -rn` prints
+  (`path:line:text`), which is what a grep-and-read agent actually sees.
+- **`followup_read_bytes`**: the bytes an agent must still read to verify the
+  answer after the Verb calls or after grep. `total_bytes` is the payload plus
+  the follow-up.
+- **Tokens**: counted with the provider's token-counting endpoint when an API
+  key is present; bytes stay the CI metric.
+- **Mid-size tier**: repos from the Shard profile's corpus
+  (`docs/research/shard-profile/corpus.tsv` on `research/shard-profile`),
+  pinned, chosen for common names such as `New` and `String`. The four-file
+  fixture stays as the small tier.
+- **Scenarios**: callers on common names, hub `neighbors`, `impact`, a
+  cross-repo question, locate definition, and the `node` Symbol card.
+
+### Tier 1: deterministic, in CI
+
+- `correct` is 100% on every scenario.
+- p95 payload is within the request's budget, including hub scenarios.
+- On relationship scenarios (callers, hub `neighbors`, `impact`,
+  cross-repo, the Symbol card) at the mid-size tier, `total_bytes` is no
+  more than grep-and-read's `total_bytes`.
+- On exact-string scenarios (locate definition), `total_bytes` is at most
+  1.5× grep's, since grep is built for exactly that.
+
+### Tier 2: agent in the loop, at release
+
+- A fixed model runs about 40 natural-language tasks on the profile corpus,
+  in two arms: grep and read only, and Verbs plus grep and read. Each task
+  runs several times and the median is scored.
+- On relationship tasks, the Verb arm uses at least 30% fewer input tokens
+  and at least 20% fewer tool calls, at equal or better accuracy.
+- On exact-string tasks, it is no more than 10% worse on either measure.
+- The corpus and harness are shared with Ask's eval (ADR 0010). This tier is
+  not run in CI.
