@@ -116,6 +116,11 @@ percentages are opening targets, to be tightened after the first baseline run.
   the answer key reaches 0.9 or the results run out. Everything received up
   to that point counts toward `total_bytes` and `verb_calls`. Grep-and-read is
   held to the same recall floor.
+- **The grep arm's procedure** is fixed per scenario and uses only bytes
+  that arm received: for a multi-step question such as `impact`, it greps the
+  target name, reads the enclosing declarations of each match, then greps
+  each enclosing name it found, to the scenario's depth. Every search and
+  read is charged. Gold only scores the answer and decides when to stop.
 - **Staged gates.** A scenario is enabled when its Verb and the Provenance it
   depends on exist. Recall 0.9 gates from then on. Precision at the stopping
   point is reported from the start and becomes a gate (at least 0.5) once
