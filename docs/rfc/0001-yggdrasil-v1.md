@@ -10,7 +10,8 @@ A Rust workspace producing one binary, `yg`, that is simultaneously the server (
 ## 2. Control plane schema (Postgres, sketch)
 
 ```sql
-forges(id, kind /* github|gitlab|codeberg */, base_url, token_ref, rate_budget)
+forges(id, kind /* github|gitlab|codeberg */, base_url, token_ref, write_token_ref?, world_readable bool,
+       rate_budget)                                 -- write credential and attestation: ADR 0013
 repos(id, forge_id, remote_id, slug, visibility, default_branch, indexed bool,
       discovery_state /* discovered|included|excluded */, last_synced_commit, …)
 rules(id, forge_id, pattern, action /* include|exclude */, applies_to_private bool)
@@ -18,6 +19,10 @@ jobs(id, kind, repo_id, state, lease_until, attempts, run_after, finished_at)
 shards(repo_id, revision, manifest_key /* per upload incarnation */, commit_sha,
        provenance_level /* weakest across Precise Roots */, published_at,
        valid_from_seq, valid_to_seq)                -- pointer history by publish sequence (ADR 0012)
+cr_heads(repo_id, cr_number, head_sha, generation, state /* pending|live|not_resident|too_large|closed|ineligible */,
+         revision, manifest_key, merge_base, lease_until)          -- per-CR pointer (ADR 0013)
+impact_comments(repo_id, cr_number, forge_comment_id, drew_on_repos /* union since last delete */,
+                authority_generation, last_visible_change_at)     -- ADR 0013
 members(id, name, kind /* human|agent */, can_promote bool, is_admin bool)
 tokens(id, member_id, hash, created_at, last_used_at, revoked_at)
 packages(id, ecosystem, name)                       -- npm, crates, go modules…
@@ -55,7 +60,7 @@ Job queue = `SELECT … FOR UPDATE SKIP LOCKED` with leases; priorities favor in
 - **Discovery loop** (per Forge connection, ~hourly + on demand): list orgs/groups → upsert `repos` with `discovery_state`. Public/internal → `included` unless an exclude rule matches; private → `discovered` until an include rule with `applies_to_private` covers it (ADR 0001). Rule precedence is longest matching glob first, then newest rule for equal-length matches.
 - **Poll loop** (default 5 min/repo, jittered, conditional requests): compare branch head via cheap API call; on change enqueue `fetch`. Rate budgeting per Forge token; backoff on 429/abuse signals.
 - **Webhook receiver** (optional accelerator): push/CR/issue events → enqueue the same jobs. Secrets per Forge; idempotent with poll (poll is truth, webhooks are latency).
-- **Fetch job**: incremental fetch into a persistent, bare, blobless partial clone on the worker (full commit and tree history; blobs fetched on demand for the tree being indexed; `--depth` per-repo override) (ADR 0012). Forge Artifacts synced via API cursors (updated-since), normalized to common shapes (Change Request, Issue, Review).
+- **Fetch job**: incremental fetch into a persistent, bare, blobless partial clone on the worker (full commit and tree history; blobs fetched on demand for the tree being indexed; `--depth` per-repo override) (ADR 0012). Forge Artifacts synced via API cursors (updated-since), normalized to common shapes (Change Request, Issue, Review). For each open CR targeting the default branch, the head ref (`refs/pull/N/head`, `refs/merge-requests/IID/head`) is fetched into the same mirror, newest push only (ADR 0013).
 
 ## 4. Indexing pipeline
 
@@ -64,6 +69,8 @@ Two-pass per change (ADR 0002):
 **Pass 1 — syntactic (target: minutes).** tree-sitter parse of every file whose blob misses the per-blob extraction cache (keyed by blob id, language, and extractor, grammar and schema versions; ADR 0012): Symbols, heuristic call/import/extends edges with confidence; markdown → Doc Sections + `MENTIONS` edges (lexical match against symbol names, tagged); CODEOWNERS → `OWNS` edges; `git log <previous>..<new>` delta merged with the previous revision's unfiltered commit/path facts, projected onto the current tree at compose (full walk after a force-push or rewrite) → commits, `TOUCHES`/`AUTHORED` edges; manifest parse → `packages`/`repo_packages`/`xrepo_edges`. Every candidate at an ambiguous call site is stored; calls through imported names are kept as external evidence keyed by import binding, and exported bindings are recorded. Publishes a complete Shard immediately, using the stored precise output of every Precise Root whose input hash still matches. Every job records per-stage timings.
 
 **Pass 2 — precise (target: same hour).** Language detection → SCIP indexer matrix (M1: scip-go, scip-typescript, scip-python, rust-analyzer/scip; M2+: scip-java family, scip-clang, scip-ruby, scip-dotnet). Runs in a sandbox: container, read-only source, egress allowlist (package registries), no credentials, CPU/mem/time limits, per-language dependency caches (e.g. shared module/crate caches) to hit the ~4-min average. Builds run per Precise Root (the unit each ecosystem builds) whenever the current revision has no stored output matching the root's input hash (its files, manifest and lockfile, workspace-level build inputs, sandbox image, indexer version, and in-repo dependency roots' hashes, with cycles hashed as one unit). Raw SCIP output is stored by its own digest and found by the root's input hash; precise evidence is derived from it per schema and ingest version → a compose job publishes a new revision of the desired head in which precise evidence replaces syntactic evidence per call site, in files the root owns and its build indexed. Publication holds a per-repo lease and compare-and-swaps on the base revision and the desired-head generation. Infrastructure failures retry until success; deterministic failures retry daily or on Admin request, the root staying syntactic and surfaced per root in admin status (ADR 0012).
+
+**CR heads.** Each eligible CR head is built as a complete syntactic revision (changed files parsed, the rest from the blob cache, unchanged Precise Roots reusing stored precise output) under a per-CR pointer, never current: no Memory staleness checks, no cross-repo rows. Each CR pointer has its own generation and lease; the poll loop lists open CRs per repo independently of default-branch changes. Head builds queue below default-branch jobs, with CRs by authors with write access or a linked Member first; limits are 50 live heads per repo (40 reserved for those authors), 30 days idle and 5,000 changed files, all Admin-configurable. Each head carries a change set and its own export, reference and package facts. The report's graph result is the `impact` Verb on the head seeded with the change set, deterministic in its inputs, recomputed on push, on narrowing, when the merge-base moves and hourly on drift when a dependency changed; the reporter, a built-in server principal, posts one revocable comment per CR and, on GitHub, an advisory status with fixed content (ADR 0013).
 
 **Cross-repo linking.** A call into another repo is keyed by its import binding (ecosystem, provider-facing import specifier canonicalised through the referencing root's alias tables, imported name path), which both passes derive; only references the precise pass alone can see are keyed by version-free SCIP moniker. Shards resolve external edges per view at read time (ADR 0012). Workers emit `provides`/`depends` package facts, which the control plane resolves to `xrepo_edges` for `deps` and `dependents`, and per-revision `xrepo_exports` and `xrepo_refs` rows, which bound symbol-level cross-repo fan-out (`callers`, `impact`) to the repos that reference the Symbol, filtered to the caller's view and read at one pinned set of revisions (ADR 0012).
 
@@ -190,6 +197,8 @@ ratios, and avoids comparing corpus-dependent raw BM25 scales. The final merge
 is deterministic: normalized score descending, then repository and node id
 ascending.
 
+Graph Verbs accept `revision: {repo, cr: <n>}` to read a CR's head revision of that repo, after the visibility check (`head_unavailable` names why a head cannot be read); cross-repo hops from a head read the other repos' current revisions at the same publish sequence. Memory Verbs read only default-branch revisions, and `remember` refuses a `cr:` anchor (ADR 0013).
+
 Verb additions are minor-version events; removals are major. The Skill is versioned against this table.
 
 ## 8. API, auth, clients
@@ -254,7 +263,7 @@ Recorded as ADRs: org-visible vs ACL mirroring (0001); precise+fallback vs tree-
 3. Build caching strategy for the precise pass (shared registry caches vs sccache-style vs Nix) — biggest lever on worker fleet size.
 4. Monorepo sub-projects: storage is settled as one Shard per repo with Precise Roots inside it (ADR 0012); whether `map` groups giant repos by root stays open.
 5. Org-wide search tiering, lexical *and* vector: pure fan-out with early termination vs a small global "top symbols" index in the control plane; vector fan-out across thousands of per-repo ANN segments may want repo-scoping hints or a coarse global tier.
-6. CR-head indexing (the rejected compute bonfire) — revisit as opt-in per-repo flag post-v1?
+6. ~~CR-head indexing~~ — closed by ADR 0013: syntactic head revisions for every eligible CR, no precise pass on heads.
 7. Webhook ingress hardening for internet-exposed deployments (signature schemes differ per Forge).
 8. Local default embedding model selection: benchmark open code-retrieval models (and chunking-context variants) at M3, together with the ANN-library decision.
 
