@@ -35,7 +35,7 @@ Yggdrasil is a self-hosted **Index Server** that syncs git repositories from **F
 ### Sync
 - G1. Connect GitHub, GitLab, and Codeberg orgs/groups; auto-discover repos; include/exclude rules. Public and internal repos auto-index; **private repos are explicit opt-in** (ADR 0001).
 - G2. Poll-based convergence (default 5 min, configurable) plus optional webhook accelerator (RFC 0001 §3).
-- G3. Default branch fully indexed; full history by default (shallow configurable). Change Requests appear as Forge Artifacts without head indexing.
+- G3. Default branch fully indexed; full history by default (shallow configurable). Every open Change Request targeting the default branch of an admitted repo gets a syntactic head revision, queryable with `revision: cr:<n>`, and a deterministic PR impact report: one narrow comment and one advisory commit status on the Forge, with the full report in the web GUI (ADR 0013).
 
 ### Knowledge Graph
 - G4. Code structure with **compiler-precise** call/reference edges via SCIP indexers, tree-sitter fallback where SCIP can't reach; every edge carries Provenance + confidence (ADR 0002).
@@ -70,8 +70,8 @@ Yggdrasil is a self-hosted **Index Server** that syncs git repositories from **F
 
 - Mirroring forge ACLs / per-user visibility — org-visible by design (ADR 0001).
 - A public graph query language (ADR 0003).
-- Indexing non-default branches or CR heads.
-- Code review, hosting, or CI features — Forges keep their jobs.
+- Indexing non-default branches other than open CR heads, and running the precise pass on CR heads.
+- Code review, hosting, CI or merge gating — Forges keep their jobs. Yggdrasil writes only the impact report's comment and advisory status (ADR 0013).
 - A company-wide answer engine (ADR 0007): no ingestion of chat, ticket systems outside the Forges, or documents outside indexed repos; no synthesized natural-language answers or chat/wiki front end. Agents compose answers from Verb results; answer engines that accept custom MCP sources can call Yggdrasil for the code questions they can't answer.
 - IDE plugins, web UI (CLI/MCP first; a read-only web viewer may ride along later).
 - SaaS offering — self-hosted only, for now.

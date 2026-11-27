@@ -36,6 +36,14 @@ _Avoid_: Link, reference
 A proposed set of commits under review on a forge — GitHub/Codeberg "pull request", GitLab "merge request".
 _Avoid_: PR, MR (forge-specific)
 
+**Head Revision**:
+A Shard revision built from a Change Request's head commit. It can be queried like the default branch, but it is never the repo's current revision and Memories never anchor to it.
+_Avoid_: PR shard, branch index
+
+**Impact Report**:
+The deterministic, graph-derived answer to "what breaks if this Change Request merges now": changed exported API, cross-repo callers and dependents, affected tests, owners and Teams, and (for signed-in Members only) the Memories it would make stale. It appears as a narrow comment on the Forge and in full in the web GUI.
+_Avoid_: PR review, bot review (it gives no opinion)
+
 **Forge Artifact**:
 Data synced from a forge's API rather than from git: change requests, issues, reviews.
 _Avoid_: Metadata
