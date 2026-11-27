@@ -1,72 +1,104 @@
-# The PR impact report: syntactic head revisions, one revocable comment, a pure function
+# The PR impact report: syntactic head revisions, one revocable comment, a deterministic graph result
 
-Status: accepted. Builds on [ADR 0008](0008-team-granted-repository-visibility.md) (the narrow PR comment, the GUI report behind a link, recompute on narrowing), [ADR 0011](0011-aggregated-budgeted-decisive-payloads.md) (budgeted, aggregated shapes) and [ADR 0012](0012-shard-layout-and-incremental-indexing.md) (complete revisions, the blob cache, publish sequences). Moves CR-head indexing from a post-v1 question (RFC 0001 §11 Q6) into the plan, and makes Yggdrasil write to Forges for the first time.
+Status: accepted. Builds on [ADR 0008](0008-team-granted-repository-visibility.md) (the narrow PR comment, the GUI report behind a link, recompute on narrowing, private impact notices), [ADR 0011](0011-aggregated-budgeted-decisive-payloads.md) (budgeted, aggregated shapes) and [ADR 0012](0012-shard-layout-and-incremental-indexing.md) (complete revisions, the blob cache, publish sequences), and amends ADR 0008, [ADR 0009](0009-human-login-agent-binding-forge-sync.md) and ADR 0012 where stated. Moves CR-head indexing from a post-v1 question (RFC 0001 §11 Q6) into the plan, and makes Yggdrasil write to Forges for the first time.
 
-The report answers one reviewer question: what breaks if this Change Request merges now. It is deterministic and graph-derived, with no model opinion. The [forge research](https://github.com/randax/yggdrasil/blob/5fcd7d45db11042a5f49cf2f396b317575f97d9f/docs/research/pr-impact-forge-apis.md) found that most of it needs no head data: callers, owners and Memory staleness come from base Shards plus the changed Symbols. Head data matters for edges and Symbols the CR adds, and for agents reviewing the CR. ADR 0012 makes a head cheap: with the per-blob cache only changed files are parsed.
+The report answers one reviewer question: what breaks if this Change Request merges now. It is deterministic and graph-derived, with no model opinion. The [forge research](https://github.com/randax/yggdrasil/blob/5fcd7d45db11042a5f49cf2f396b317575f97d9f/docs/research/pr-impact-forge-apis.md) found that most of it needs no head data: callers, owners and Memory staleness come from base Shards plus the changed Symbols. Head data matters for edges, Symbols and exports the CR adds or removes, and for agents reviewing the CR. ADR 0012 makes a head cheaper to build: unchanged files come from the per-blob cache, though resolution, segment build and upload stay proportional to the repo.
 
 ## The decisions
 
-### Each CR head is a complete syntactic revision, never current
+### Each CR head is a complete syntactic revision under its own pointer
 
-A CR head is built as a complete Shard revision of the head commit, exactly as ADR 0012 builds the default branch, and published under a per-CR pointer instead of the repo's pointer. It is never made current, so it never runs Memory staleness checks and writes no cross-repo rows: other repos never see a head's references. Its outbound edges into other repos resolve per view at read time like any revision's.
+A CR head is built as a complete Shard revision of the head commit, as ADR 0012 builds the default branch, and published under a per-CR pointer instead of the repo's pointer. It is never the repo's current revision: it runs no Memory staleness checks and writes no cross-repo rows, so other repos never see a head's references.
 
-Heads get no precise pass: it would cost about 4 worker-minutes per push (around 67 worker-hours a day at 1,000 pushes, a fifth of the fleet budget) and would run build code on every push. A head does reuse ADR 0012's stored precise output for every Precise Root whose input hash the CR leaves unchanged, so untouched roots stay precise and only changed roots are syntactic. Every edge carries its Provenance, so the report never overstates.
+Heads get no precise pass: it would cost about 4 worker-minutes per push (around 67 worker-hours a day at 1,000 pushes, a fifth of the fleet budget) and would run build code on every push. A head reuses ADR 0012's stored precise output for every Precise Root that passes ADR 0012's full reuse test (input hash, outside-file hashes, and expiry for roots without a lockfile); when a reused output expires, the head is recomposed with that root syntactic, as the default branch is. Every edge carries its Provenance.
 
-### Which CRs, and the limits
+This amends ADR 0012 for per-CR pointers:
 
-- Every open CR that targets the default branch of an admitted repo gets a head revision, drafts and fork CRs included. Fork CRs are safe: nothing on a head runs code.
-- Only a CR's newest push is built; a later push cancels a pending build. Head builds queue below default-branch jobs, so they never cost the syntactic freshness target.
-- A repo keeps head revisions for at most its 50 most recently pushed CRs; a CR idle for 30 days loses its head revision until its next push; a CR changing more than 5,000 files gets a report marked as truncated. An Admin can change all three.
-- A head revision belongs to its base repo and inherits its Visibility. It is deleted when the CR closes or merges, after ADR 0012's retention window.
+- **Publication.** Each CR pointer has its own desired generation, bumped by every push, force-push, retarget, close and reopen, and its own lease; heads never take the repo's lease and skip pre-warm. A head swap is a compare-and-swap on that generation, so a build that finishes after a newer push, a close or an eviction never publishes. A head swap takes a publish sequence value like any swap.
+- **GC.** Every live or pending CR pointer is a GC root. An incarnation's retention starts when the last pointer referencing it retires it (a push, eviction, idleness or close), and then ADR 0012's retention rules apply.
+- **Cursors.** A `cr:` cursor pins the head revision and the publish sequence, like any cross-repo cursor.
+- **Schema and policy bumps.** Live heads are rebuilt after a bump, queued below default-branch rebuilds; until then a head is pending.
+- **History.** A head's history facts are the default revision's facts plus `git log <merge-base>..<head>`.
+- **Head-scoped facts.** Each head revision carries, as a manifest-listed object that is never served, its own exports, references and package facts. A request that reads a head overlays these for the CR's repo, privately to that request; every hop into the CR's repo reads the head, so a response never mixes head and default nodes of the same repo, and `deps`, `dependents` and re-export chains reflect the CR.
+- **Change set.** Each head also carries a change-set object keyed by (head revision, merge-base commit): Symbols added, removed, signature-changed and body-only-changed; the exported keys added, removed and redirected; and the fingerprints Memory prediction needs. Query nodes read it, so the GUI report needs no mirror or blob cache.
 
-### What the report is a function of
+### Which CRs, the limits, and the lifecycle
 
-The report is a pure function of the head revision, the merge-base commit, one ADR 0012 publish sequence, and the reader's ceiling (for the comment) or effective view (for the GUI report):
+- Every open CR that targets the default branch of an admitted repo is eligible, drafts and fork CRs included: nothing on a head runs code. An Admin can turn the report off per repo.
+- The poll loop lists open CRs per repo on its own conditional request, independent of default-branch changes, so opens, pushes, force-pushes, retargets, closes and reopens are seen without webhooks; webhooks only make it faster. Eligibility changes bump the CR's generation.
+- Only a CR's newest push is built. Head builds queue below default-branch jobs, so they never cost the syntactic freshness target, and within the head queue CRs by authors with write access or a linked Member come before others, so a flood of outside CRs cannot starve the rest.
+- A repo keeps at most 50 live heads (40 of them reserved for CRs by authors with write access or a linked Member); the most recently pushed win. A CR idle for 30 days loses its head until its next push. A CR changing more than 5,000 files gets no head. An Admin can change all three.
+- A head revision inherits its base repo's Visibility.
 
-- **What changed** is head against merge-base. The merge-base's per-file facts come from the blob cache and are built in memory, so the report shows only the CR's own changes, never what the default branch gained since it branched.
-- **Who is affected** (callers, dependents, owners, tests, Memories) comes from every repo's current default-branch revision at that publish sequence.
+| Head state | Comment | Status | GUI report | head `revision` |
+|---|---|---|---|---|
+| pending (queued, building, awaiting rebuild) | unchanged, or none yet | none yet | "being built" | `head_unavailable` (pending) |
+| live | current report | success | computed at read time | served |
+| not resident (evicted, idle) | last report, recomputed only when the head returns | unchanged | "not resident"; opening it queues a rebuild | `head_unavailable` (not resident) |
+| too large | "too large to analyse: N files changed" | success | the same notice | `head_unavailable` (too large) |
+| closed or merged | left as is; withdrawn on narrowing | unchanged | "closed"; no report | `head_unavailable` (closed) |
+| no longer eligible | deleted | unchanged | "not eligible" | `head_unavailable` (not eligible) |
 
-Identical inputs give an identical report, so the pipeline is snapshot-tested on fixture repos and an unchanged result is never reposted. The comment states the head sha and an "as of" time.
+### What the graph result is a function of
 
-The report is recomputed on every push; on ADR 0008 narrowing; and on drift, when the publish sequence has moved, at most hourly per CR and only if the result changed.
+The merge-base is computed between the head and the target commit of the default revision current at the pinned publish sequence, using git's deterministic choice when histories criss-cross. If a shallow mirror lacks it, the worker deepens the mirror; if it still cannot be established, the report says the impact is undetermined, never zero. A default-branch change that moves the merge-base (a stacked CR whose parent merged) recomputes the change set.
+
+The graph result is the `impact` Verb on the head revision, seeded with the change set's changed Symbols and removed or redirected exported keys, at `impact`'s default depth and work cap, under the comment's ceiling or the reader's effective view. Same-repo callers and tests come from the head, other repos' from their current default revisions at the pinned publish sequence. Counts follow ADR 0011: when a work cap stops discovery, a count says "at least N". Its inputs are the change set, the publish sequence, the ceiling or view, the ownership facts (CODEOWNERS from the Shards; Team membership and Admin ownership rules, with the control-plane generation that changes them) and the budget. Identical inputs give an identical result: it is ordered totally (ranking keys, then repo and Symbol ids), snapshot-tested on fixture repos, and an unchanged result is never reposted.
+
+The Memory part is not cached or shared. On each GUI read it is projected for that Member with ADR 0008's ordinary rules (Audience, private overlay, lifecycle, suppression, every anchored repo in view, counts included). A Memory is predicted to go stale when the CR changes or removes an anchored Symbol, File or Doc Section and the default branch has not changed that node since the merge-base: the head's content is then compared with the Memory's latest baseline (its latest affirmation, otherwise its original fingerprint). Where the default branch has also changed the node, the prediction is shown as undetermined.
+
+The report is recomputed on every push; on ADR 0008 narrowing; when the merge-base moves; and on drift, at most hourly per CR, only when a revision it read or a key it looked up has changed (ADR 0012's cached-result rule), and posted only when the ceiling-filtered result itself differs. A change seen only outside the ceiling produces no Forge write. The comment states the head sha and "unchanged since" the time its visible content last changed.
 
 ### What the report contains
 
-Each changed Symbol is classified as added, removed, signature-changed or body-only-changed. That needs a second per-node hash: alongside ADR 0007's fingerprint of the normalised defining span, which stays the staleness fingerprint, each Symbol gets an interface hash of its normalised declaration without the body. Both come from the tree-sitter parse in both passes.
+Each changed Symbol is classified as added, removed, signature-changed or body-only-changed. Alongside ADR 0007's fingerprint of the normalised defining span, which stays the staleness fingerprint, each Symbol gets an interface hash, defined per kind from the tree-sitter parse: a function's or method's declared signature; a type's declaration with its public members (fields, variants, method signatures); a constant's declaration and declared type. "Body-only" is shown as "signature syntactically unchanged", because an inferred return type can change under a body edit. Symbols moved to another path are matched by exported key or fingerprint, so a move is not reported as a removal plus an addition. The interface hash rides the M1 schema bump with ADR 0012's changes.
+
+The exported surface is diffed too: exported keys (bindings, aliases, re-exports, package export maps, specifiers) between merge-base and head. Removing `export { foo }`, a name from `__all__` or a `pub use` breaks consumers without changing any declaration, and a removed or redirected key seeds the caller search.
 
 Sections, in order:
 
-1. **Summary:** counts of Symbols added, removed, signature-changed and body-only-changed, and of repos, owners and tests affected.
-2. **Changed exported API:** `EXPORTS` Symbols whose signature changed or that were removed, first because they break callers.
-3. **Cross-repo callers and dependents:** grouped by repo, ranked by caller count and then Provenance, aggregated as ADR 0011 requires (a precise caller says so; an ambiguous one shows "1 of N"), with signature-change impact ahead of body-only impact.
+1. **Summary:** counts of Symbols and exported keys changed by class, and of repos, owners and tests affected.
+2. **Changed exported API:** removed or redirected exported keys and signature-changed or removed exported Symbols, first because they break callers.
+3. **Cross-repo callers and dependents:** grouped by repo, ranked by caller count and then Provenance, then by ids, aggregated as ADR 0011 requires (a precise caller says so; an ambiguous one shows "1 of N"), with breaking-change impact ahead of body-only impact.
 4. **Affected tests** per repo, through `TESTS` edges.
-5. **Owners and Teams** of the affected code, by name. The comment never @-mentions anyone: mentions notify irrevocably and would fire on every push to a busy library. Reaching people is the notification plumbing's job.
+5. **Owners** of the affected code, by name and without @-mentions: mentions notify irrevocably, and reaching people belongs to the notification plumbing. The comment names only owners taken from CODEOWNERS files in repos inside its ceiling; Team names and ownership by Admin rule are control-plane facts and appear only in the GUI report.
 6. **A truncation notice and the GUI link.**
 
-The comment applies this to ADR 0008's narrow ceiling (Forge-public and Open repos plus the CR's own repo, never Memories), with a default budget of about 1,500 tokens and truncation always stated. The GUI report applies it to the signed-in Member's own effective view at read time, and adds the Memories the CR would make stale (anchors whose fingerprint differs between merge-base and head, or whose Symbol the CR removes) and the head graph to browse.
+The comment applies this to ADR 0008's narrow ceiling, with a default budget of about 1,500 tokens and truncation always stated. The GUI report applies it to the signed-in Member's effective view at read time, adds the Memory predictions, and lets the Member browse the head graph.
+
+### Private impact notices for hidden impact
+
+ADR 0008's private notice pass runs separately from the report, asynchronously, and is never ordered before or after any Forge write, so the comment's timing reveals nothing. It runs once per head sha, as if the CR's author were the caller; an author with no linked Member is treated as a caller whose view is the comment's ceiling. It runs again on drift only when the set of hidden affected repos changes. Notices keep ADR 0008's recipients and its per-change, per-day dedup, and notices caused by CRs from authors without a linked Member are additionally rate-limited per repo, not per account, so throwaway accounts cannot flood Owning Teams.
 
 ### Where it is posted
 
-One comment per CR, plus an advisory commit status, on every Forge:
+**Forge-public** means readable by anyone on the internet: a public repo on github.com, gitlab.com or codeberg.org, or on a self-managed Forge whose connection an Admin has attested as world-readable (off by default). Internal repos never count. A repo's Forge visibility is read at sync and checked again before each post; if the Forge cannot answer, the repo is treated as not Forge-public.
 
-- **The comment** is updated in place while the result is no narrower. When access narrows (ADR 0008), it is deleted and reposted, or replaced by a short "report withdrawn; see the GUI" note if the CR is closed. The control plane records which repos each live comment drew on, for open and closed CRs alike, so narrowing finds every comment it affects.
-- **The commit status** always reports success or neutral, says how many repos and owners are affected, and links to the GUI report. It never fails, so it never gates a merge: a gate could only weigh impact inside the narrow ceiling, and a gate that silently ignores Restricted impact would mislead.
-- **The GUI link** has the same shape (`/cr/<forge>/<repo>/<n>`) whether or not anything lies beyond the ceiling, so neither the comment nor its link reveals hidden impact.
-- **A repo's Forge Visibility** (public, internal, private) is read at sync and checked again before each post; if the Forge cannot answer, the repo is treated as not public.
+**The comment.** One per CR. Before each Forge write, the control plane records the repos the new revision draws on, and the record for a comment is the union over every revision since it was last deleted, because Forges keep edit history readable. While a result is no narrower, the comment is edited in place. When access narrows (ADR 0008) for any repo in that union, the whole comment is deleted, never edited into a withdrawal; an open CR then gets a fresh comment, and a closed CR a new comment with fixed text saying the report was withdrawn.
 
-The reporter is a Service Agent per Forge installation, with its ceiling enforced by the server (ADR 0008, [ADR 0009](0009-human-login-agent-binding-forge-sync.md)). It writes with:
+**Ordering.** Writes for one CR are serialised under a per-CR write lease and fenced by the CR's generation and an authority generation that every narrowing bumps (a repo leaving Forge-public or Open, an un-admission, a change to the reporter's ceiling). A write computed under an older generation is dropped. A withdrawal is complete only once in-flight writes have resolved and the bot's comments have been re-listed from the Forge. Withdrawals go ahead of every other write in the installation's queue.
 
-- **GitHub:** a GitHub App with Issues or Pull requests write and Commit statuses write, using one-hour installation tokens. The same App delivers webhooks.
-- **GitLab:** a project or group access token, which creates a bot user (Premium or higher on GitLab.com), or a dedicated bot user's token on self-managed Free.
-- **Forgejo and Codeberg:** a bot user's token, limited to the repos it serves.
+**Reconciliation and failure.** Before creating a comment the reporter lists its own comments on the CR, so a create whose response was lost is not duplicated. A comment a human deleted is not recreated for the same head sha. When a write or delete fails (rate limits, an archived repo, an expired token, a revoked installation, a locked conversation), it is retried with backoff, and admin status lists every comment whose withdrawal is overdue, so an Admin can remove it by hand. Copies already delivered by Forge email notifications cannot be withdrawn; that residue is accepted, as for chat answers in ADR 0008.
 
-The Forge seam gains its first write path and app-token refresh. Writes per installation are queued under the Forge's secondary rate limits (GitHub allows about 500 content-generating writes an hour); coalescing pushes and posting only changed results keep a busy organisation inside them.
+**The commit status.** Posted on GitHub with context `yggdrasil/impact (#<n>)`, state `success`, fixed text ("Impact report") and the GUI link, once the report is first posted. It carries nothing derived from impact, so its unrevocable history leaks nothing, and it is never pending or failing. The documentation tells repo admins not to make it a required check. On GitLab and Forgejo a status needs a credential that can push code, so it is off by default there; an Admin can enable it per connection.
+
+**The GUI link** is `/cr/<forge-id>/<remote-repo-id>/<n>`, keyed by immutable Forge identity, the same whether or not anything lies beyond the ceiling.
+
+**The reporter** is a built-in server principal, like ADR 0008's notice pass: its own view is every admitted repo, and everything it posts is computed under the comment's ceiling, enforced by the server. It is not an Admin-issued Service Agent and needs no Team grants, so a Restricted repo's own CR is reported without a widening. This amends ADR 0008's description of the reporter as a Service Agent with an adapter credential and ADR 0009's list of Service Agents.
+
+**Write credentials** are separate from sync credentials, at least privilege, and optional per Forge connection (this amends ADR 0009's read-only credential list):
+
+- **GitHub:** a GitHub App with Issues or Pull requests write and Commit statuses write, using one-hour installation tokens. Existing installations must approve the new permissions.
+- **GitLab:** a project or group access token with the Reporter role, which can comment but not push (Premium or higher on GitLab.com), or a dedicated bot user's token on self-managed Free.
+- **Forgejo and Codeberg:** a bot user's token with `write:issue`, limited to the repos it serves.
+
+A connection without a write credential still gets head revisions, the GUI report and `cr:` Verbs; nothing is posted.
 
 ### Head revisions in the Verb contract
 
-Every graph Verb (`node`, `neighbors`, `search`, `callers`, `callees`, `impact`, `map`, `history`, and later `path`, `deps`, `dependents`, `owners`) accepts `revision: cr:<n>` for the CR's repo, so an agent reviewing a CR can browse its head graph. The caller must have the base repo in view. Cross-repo hops from a head read the other repos' current revisions at the same publish sequence, so `impact` on a head means "what breaks if this merges now". Responses state the head sha, and ADR 0011's cursors bind the head revision like any other.
+Graph Verbs accept `revision: {repo, cr: <n>}`, bound to the base repo's identity: `node`, `neighbors`, `callers`, `callees`, `impact`, `map` and `history` on that repo, `search` scoped to it (or applying the head to that repo among several), and later `path`, `deps`, `dependents` and `owners`. The caller must have the base repo in view, and the visibility check comes first: a hidden repo and a repo without that CR return the same not-found error, and only then are the `head_unavailable` reasons in the table given. Cross-repo hops read other repos' current revisions at the same publish sequence. Responses state the head sha.
 
-Memory Verbs ignore heads. `remember` anchors only to Symbols in the default-branch revision and refuses a `cr:` anchor with a typed error; ADR 0007's anchor model is unchanged. The Concept doc gains a short "reviewing a CR" method that starts from `impact` on `cr:<n>`.
+Memory Verbs ignore heads. `remember` anchors only to Symbols in the default-branch revision and refuses a head anchor with a typed error; ADR 0007's anchor model is unchanged. The Concept doc gains a short "reviewing a CR" method that starts from `impact` on the head.
 
 ## Considered options
 
@@ -75,14 +107,16 @@ Memory Verbs ignore heads. `remember` anchors only to Symbols in the default-bra
 - **A delta Shard over the base revision.** ADR 0012 rejected read-time layer merging.
 - **Opt-in per repo, or skipping drafts and forks.** Most repos would never get the report, and fork CRs are the outside contributions whose impact maintainers least expect.
 - **A GitHub check run with line annotations instead of the comment.** Two report shapes, and whether a check run's output can be fully withdrawn on narrowing is unverified.
+- **A commit status carrying impact counts.** Statuses cannot be deleted and their history stays listable, so a count that included a since-hidden repo would stay readable forever.
 - **Merge gating on impact rules.** A gate can only see the narrow ceiling, so it would ignore exactly the Restricted impact that matters.
 - **Counts and a link only, or @-mentioning owners.** The first gives outside readers nothing; the second pings irrevocably on every push.
 - **Diffing head against the current default branch.** Changes merged since the CR branched would show as reverted by the CR.
-- **Computing impact against the revisions current when the CR branched.** Those revisions are deleted after the retention window, and the report would describe callers that may no longer exist.
+- **Computing impact against the revisions current when the CR branched.** Those revisions are deleted after the retention window.
+- **The reporter as an Admin-issued Service Agent.** Reporting on a Restricted repo's own CR would need a Team grant, a widening, for every Restricted repo.
 - **Pending Memory anchors on head Symbols, activated on merge.** Review-time Memories, at the cost of a new anchor state, merge-time mapping and orphan handling, redesigning ADR 0007's anchors.
 
 ## Consequences
 
-- The PRD drops "indexing non-default branches or CR heads" from its non-goals, amends G3, and narrows "Forges keep their jobs": Yggdrasil writes one comment and one advisory status per CR, and still does no code review, hosting or CI.
-- The report depends on M1 (`impact`, `callers`, stable Symbol IDs, fingerprints, `TESTS` and `EXPORTS` edges) and on owners and CODEOWNERS (M2), and needs the GitLab and Codeberg adapters for those Forges. Where it lands is part of milestone resequencing.
-- Head revisions add one syntactic build per CR push, roughly 3 worker-hours a day at 1,000 pushes, and storage of one tuned Shard per live head.
+- The PRD drops CR heads from its non-goals and from post-v1, amends G3, and narrows "Forges keep their jobs": Yggdrasil writes one comment per CR, and on GitHub one advisory status, and still does no code review, hosting, CI or gating.
+- The report depends on M1 (`impact`, `callers`, stable Symbol IDs, fingerprints, the interface hash, `TESTS` and `EXPORTS` edges), on owners and CODEOWNERS (M2), on the web GUI for the full report, and on the GitLab and Codeberg adapters for those Forges. Where it lands is part of milestone resequencing.
+- Cost, as estimates until ADR 0012's per-stage metrics measure them: one head build per CR push, at the profile's median of 61 ms per kLOC end to end, about 3 worker-hours a day at 1,000 pushes of median-sized repos; storage of at most 50 tuned Shards per repo; drift recomputes bounded by the cached-result rule; one notice pass per head sha.

@@ -10,7 +10,8 @@ A Rust workspace producing one binary, `yg`, that is simultaneously the server (
 ## 2. Control plane schema (Postgres, sketch)
 
 ```sql
-forges(id, kind /* github|gitlab|codeberg */, base_url, token_ref, rate_budget)
+forges(id, kind /* github|gitlab|codeberg */, base_url, token_ref, write_token_ref?, world_readable bool,
+       rate_budget)                                 -- write credential and attestation: ADR 0013
 repos(id, forge_id, remote_id, slug, visibility, default_branch, indexed bool,
       discovery_state /* discovered|included|excluded */, last_synced_commit, …)
 rules(id, forge_id, pattern, action /* include|exclude */, applies_to_private bool)
@@ -18,6 +19,10 @@ jobs(id, kind, repo_id, state, lease_until, attempts, run_after, finished_at)
 shards(repo_id, revision, manifest_key /* per upload incarnation */, commit_sha,
        provenance_level /* weakest across Precise Roots */, published_at,
        valid_from_seq, valid_to_seq)                -- pointer history by publish sequence (ADR 0012)
+cr_heads(repo_id, cr_number, head_sha, generation, state /* pending|live|not_resident|too_large|closed|ineligible */,
+         revision, manifest_key, merge_base, lease_until)          -- per-CR pointer (ADR 0013)
+impact_comments(repo_id, cr_number, forge_comment_id, drew_on_repos /* union since last delete */,
+                authority_generation, last_visible_change_at)     -- ADR 0013
 members(id, name, kind /* human|agent */, can_promote bool, is_admin bool)
 tokens(id, member_id, hash, created_at, last_used_at, revoked_at)
 packages(id, ecosystem, name)                       -- npm, crates, go modules…
@@ -65,7 +70,7 @@ Two-pass per change (ADR 0002):
 
 **Pass 2 — precise (target: same hour).** Language detection → SCIP indexer matrix (M1: scip-go, scip-typescript, scip-python, rust-analyzer/scip; M2+: scip-java family, scip-clang, scip-ruby, scip-dotnet). Runs in a sandbox: container, read-only source, egress allowlist (package registries), no credentials, CPU/mem/time limits, per-language dependency caches (e.g. shared module/crate caches) to hit the ~4-min average. Builds run per Precise Root (the unit each ecosystem builds) whenever the current revision has no stored output matching the root's input hash (its files, manifest and lockfile, workspace-level build inputs, sandbox image, indexer version, and in-repo dependency roots' hashes, with cycles hashed as one unit). Raw SCIP output is stored by its own digest and found by the root's input hash; precise evidence is derived from it per schema and ingest version → a compose job publishes a new revision of the desired head in which precise evidence replaces syntactic evidence per call site, in files the root owns and its build indexed. Publication holds a per-repo lease and compare-and-swaps on the base revision and the desired-head generation. Infrastructure failures retry until success; deterministic failures retry daily or on Admin request, the root staying syntactic and surfaced per root in admin status (ADR 0012).
 
-**CR heads.** Each eligible CR head is built as a complete syntactic revision (changed files parsed, the rest from the blob cache, unchanged Precise Roots reusing stored precise output) under a per-CR pointer, never current: no Memory staleness checks, no cross-repo rows. Head builds queue below default-branch jobs; limits are 50 live heads per repo, 30 days idle and 5,000 changed files, all Admin-configurable. The impact report is a pure function of (head revision, merge-base, publish sequence, ceiling or view), recomputed on push, on narrowing and hourly on drift when changed; the reporter posts one comment and one advisory commit status per CR (ADR 0013).
+**CR heads.** Each eligible CR head is built as a complete syntactic revision (changed files parsed, the rest from the blob cache, unchanged Precise Roots reusing stored precise output) under a per-CR pointer, never current: no Memory staleness checks, no cross-repo rows. Each CR pointer has its own generation and lease; the poll loop lists open CRs per repo independently of default-branch changes. Head builds queue below default-branch jobs, with CRs by authors with write access or a linked Member first; limits are 50 live heads per repo (40 reserved for those authors), 30 days idle and 5,000 changed files, all Admin-configurable. Each head carries a change set and its own export, reference and package facts. The report's graph result is the `impact` Verb on the head seeded with the change set, deterministic in its inputs, recomputed on push, on narrowing, when the merge-base moves and hourly on drift when a dependency changed; the reporter, a built-in server principal, posts one revocable comment per CR and, on GitHub, an advisory status with fixed content (ADR 0013).
 
 **Cross-repo linking.** A call into another repo is keyed by its import binding (ecosystem, provider-facing import specifier canonicalised through the referencing root's alias tables, imported name path), which both passes derive; only references the precise pass alone can see are keyed by version-free SCIP moniker. Shards resolve external edges per view at read time (ADR 0012). Workers emit `provides`/`depends` package facts, which the control plane resolves to `xrepo_edges` for `deps` and `dependents`, and per-revision `xrepo_exports` and `xrepo_refs` rows, which bound symbol-level cross-repo fan-out (`callers`, `impact`) to the repos that reference the Symbol, filtered to the caller's view and read at one pinned set of revisions (ADR 0012).
 
@@ -192,7 +197,7 @@ ratios, and avoids comparing corpus-dependent raw BM25 scales. The final merge
 is deterministic: normalized score descending, then repository and node id
 ascending.
 
-Every graph Verb accepts `revision: cr:<n>` to read a CR's head revision of that repo; cross-repo hops from a head read the other repos' current revisions at the same publish sequence. Memory Verbs read only default-branch revisions, and `remember` refuses a `cr:` anchor (ADR 0013).
+Graph Verbs accept `revision: {repo, cr: <n>}` to read a CR's head revision of that repo, after the visibility check (`head_unavailable` names why a head cannot be read); cross-repo hops from a head read the other repos' current revisions at the same publish sequence. Memory Verbs read only default-branch revisions, and `remember` refuses a `cr:` anchor (ADR 0013).
 
 Verb additions are minor-version events; removals are major. The Skill is versioned against this table.
 
