@@ -53,7 +53,7 @@ Pull jobs from the queue. Two-pass indexing:
 Every edge records Provenance (`precise` | `syntactic` | `extracted` | `inferred`; RFC 0001 §5) + confidence (ADR 0002). A failed build degrades a repo to syntactic — never to absent.
 
 ### Shard store (object storage)
-One immutable Shard per repo per revision: graph segment (SQLite file as artifact format), full-text segment (tantivy), vector segment (ANN index, M3), plus a manifest. Content-addressed keys; re-index publishes a new Shard and atomically swaps the pointer in Postgres; old Shards garbage-collected after a grace window. No locks, no partial states, trivially cacheable (ADR 0005).
+One immutable Shard per repo per revision: graph segment (SQLite file as artifact format), full-text segment (tantivy), vector segment (ANN index, M3), plus a source-contents segment, as loose files under a manifest that lists each file's sha256 (ADR 0012). Query-node caches are keyed by file sha256; re-index publishes a new Shard, lets holding nodes pre-warm, and atomically swaps the pointer in Postgres with a compare-and-swap; old Shards garbage-collected after a grace window. No locks, no partial states, trivially cacheable (ADR 0005).
 
 ### Query Nodes (stateless, horizontal)
 Serve the Verb engine over REST + MCP (Streamable HTTP). Hot Shards are cached memory → NVMe → object storage (turbopuffer/Zoekt pattern). Single-repo Verbs touch one Shard. Cross-repo Verbs (`dependents`, `impact`, org-wide `callers`) consult the control-plane edge index first, then fan out only to the bounded set of implicated Shards. Org-wide `search` fans out across cached tantivy segments with early termination.
