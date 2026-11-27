@@ -15,17 +15,21 @@ repos(id, forge_id, remote_id, slug, visibility, default_branch, indexed bool,
       discovery_state /* discovered|included|excluded */, last_synced_commit, …)
 rules(id, forge_id, pattern, action /* include|exclude */, applies_to_private bool)
 jobs(id, kind, repo_id, state, lease_until, attempts, run_after, finished_at)
-shards(repo_id, revision, manifest_key, commit_sha, provenance_level /* weakest across Precise Roots */, published_at)
+shards(repo_id, revision, manifest_key /* per upload incarnation */, commit_sha,
+       provenance_level /* weakest across Precise Roots */, published_at,
+       valid_from_seq, valid_to_seq)                -- pointer history by publish sequence (ADR 0012)
 members(id, name, kind /* human|agent */, can_promote bool, is_admin bool)
 tokens(id, member_id, hash, created_at, last_used_at, revoked_at)
 packages(id, ecosystem, name)                       -- npm, crates, go modules…
 repo_packages(repo_id, package_id, version_range, relation /* provides|depends */)
 xrepo_edges(from_repo, to_repo, via_package_id, kind)
-xrepo_exports(key /* import binding | version-free moniker */, provider_repo, revision, symbol_id)
+xrepo_exports(key /* import binding | version-free moniker */, provider_repo, revision,
+              denotes /* symbol_id | forwarded binding */, valid_from_seq, valid_to_seq)
 xrepo_refs(key /* import binding | version-free moniker */, from_repo, revision, kind,
-           symbols_any, symbols_precise, symbols_syntactic)
-                                                    -- both written in the pointer-swap transaction,
-                                                    -- kept for the retention window (ADR 0012)
+           symbols_any, symbols_precise, symbols_syntactic, valid_from_seq, valid_to_seq)
+                                                    -- written in the pointer-swap transaction with
+                                                    -- repo_packages/xrepo_edges, which carry the same
+                                                    -- sequence range; kept for retention (ADR 0012)
 contributors(id, display_name)
 identities(contributor_id, kind /* email|forge_account */, value, merge_provenance)
 memories(id, member_id, kind /* semantic|episodic */, scope /* session|repo|org */,

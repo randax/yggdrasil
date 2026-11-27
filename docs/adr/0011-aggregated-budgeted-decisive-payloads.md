@@ -55,7 +55,7 @@ ADR 0006 keeps every candidate of an ambiguous call site. How a payload shows th
 
 ### Cursors
 
-- A cursor is a short opaque handle to state kept in Postgres, so any stateless query node can resume it. The state binds the requester (the issuing Member, or for Ask's public fallback the adapter installation and platform user key, with the fallback re-checked as still enabled on every continuation), the fingerprint of their effective view (ADR 0008), the Shard revisions the first page read, and the request's shape (Verb, seed, direction, kinds, depth, detail and filters). It expires after an hour.
+- A cursor is a short opaque handle to state kept in Postgres, so any stateless query node can resume it. The state binds the requester (the issuing Member, or for Ask's public fallback the adapter installation and platform user key, with the fallback re-checked as still enabled on every continuation), the fingerprint of their effective view (ADR 0008), the Shard revisions the first page read (for a cross-repo request, the publish sequence it read at, [ADR 0012](0012-shard-layout-and-incremental-indexing.md)), and the request's shape (Verb, seed, direction, kinds, depth, detail and filters). It expires after an hour.
 - Presented by another Member, after the view has changed, or with a different request shape, it is refused with the same expired-cursor error ADR 0008 defines. `budget` may change between pages, because the order is fixed by the pinned shape and revisions.
 - This replaces ADR 0008's signed, self-describing cursor with a handle that binds the same things and more.
 
