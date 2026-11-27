@@ -108,7 +108,9 @@ percentages are opening targets, to be tightened after the first baseline run.
   caller (or callee) ids for "who calls this?"; `(revision, path, line,
   column)` for "where is it called?"; the precise resolver's edge set for the
   seed in hub `neighbors`; the precise transitive caller set to the stated
-  depth for `impact`; and each Symbol card section scored separately. Each
+  depth for `impact`; and each Symbol card section the scenario requests,
+  scored separately, with `history` graded against the commits Git reports
+  at the pinned revision for the `history` Verb's scope. Each
   arm's output is mapped to keys and deduplicated; evidence-span coverage is
   scored separately as `followup_read_bytes`.
 - **The answer an arm gives** is defined the same way for both arms: its
@@ -158,6 +160,9 @@ percentages are opening targets, to be tightened after the first baseline run.
   One such scenario's hidden edges alone exceed the traversal work cap.
 - Every id in every response, used as input with its stated repo context,
   resolves to the same node.
+- Every paged scenario's cursor is drained to exhaustion, and the ordered
+  sequence of items, before any deduplication, equals an independently
+  enumerated expected sequence: nothing lost, nothing repeated.
 - On relationship scenarios at the mid-size tier (callers, hub `neighbors`,
   `impact`, cross-repo, the Symbol card), the Verb arm's `total_bytes` is no
   more than grep-and-read's.
@@ -179,9 +184,11 @@ percentages are opening targets, to be tightened after the first baseline run.
 - On exact-string tasks, it is no more than 10% worse on tokens and tool
   calls, and again no more than 5 points lower on accuracy.
 - Each comparison is a paired bootstrap 95% confidence interval that resamples
-  tasks, keeping each task's runs together. A reduction target is met when the
-  interval's bound closest to no reduction clears it. An accuracy target is
-  met when the interval's lower bound on Verb-minus-grep accuracy is above
-  −5 points.
+  tasks, keeping each task's runs together. Costs are compared as the ratio of
+  the Verb arm's mean to the grep arm's, and a cost target is met when the
+  interval's upper bound is within it: at most 0.70 for relationship tokens,
+  0.80 for relationship tool calls, and 1.10 for exact-string tokens and tool
+  calls. An accuracy target is met when the interval's lower bound on
+  Verb-minus-grep accuracy is above −5 points.
 - The corpus and harness are shared with Ask's eval. This tier is not run in
   CI.
