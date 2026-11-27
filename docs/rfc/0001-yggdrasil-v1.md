@@ -21,8 +21,8 @@ tokens(id, member_id, hash, created_at, last_used_at, revoked_at)
 packages(id, ecosystem, name)                       -- npm, crates, go modules…
 repo_packages(repo_id, package_id, version_range, relation /* provides|depends */)
 xrepo_edges(from_repo, to_repo, via_package_id, kind)
-xrepo_refs(moniker /* version-free */, from_repo, kind, referencing_symbols)
-                                                    -- precise only; diffed per repo in the pointer-swap transaction (ADR 0012)
+xrepo_refs(target /* version-free moniker | package + name */, from_repo, kind, provenance,
+           referencing_symbols)                     -- diffed per repo in the pointer-swap transaction (ADR 0012)
 contributors(id, display_name)
 identities(contributor_id, kind /* email|forge_account */, value, merge_provenance)
 memories(id, member_id, kind /* semantic|episodic */, scope /* session|repo|org */,
