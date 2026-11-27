@@ -103,20 +103,25 @@ percentages are opening targets, to be tightened after the first baseline run.
 
 - **Gold answers**: for the mid-size tier, each scenario's expected answer
   comes from a precise resolver (SCIP, or `go/types` for Go), with the
-  evidence that proves it: the enclosing declarations and line ranges. A
-  scenario passes when the answer meets its recall and precision thresholds,
-  stated per scenario.
+  evidence that proves it: the enclosing declarations and line ranges.
+- **The answer an arm gives** is defined the same way for both arms: its
+  results are consumed in the order returned, page by page, until gold recall
+  reaches 0.9 or the results run out. Everything received up to that point
+  counts toward `total_bytes` and `verb_calls`. A scenario passes when recall
+  reaches 0.9 and precision at that stopping point is at least 0.5.
+  Grep-and-read is held to the same recall floor.
 - **`grep_lines_bytes`**: what the scenario's literal `grep -rn` prints
   (`path:line:text`), which is what a grep-and-read agent actually sees.
 - **`followup_read_bytes`**: computed mechanically, the same way for both
-  arms: the bytes of the gold evidence ranges that are not already present
-  verbatim in what that arm has received. `total_bytes` is everything the arm
-  received, every page included, plus its follow-up bytes. `verb_calls`
-  counts every page.
-- **Tokens**: the budget invariant is measured on the MCP rendering with
-  ADR 0011's cost model. Model-exact tokens are counted with the provider's
-  token-counting endpoint when an API key is present; bytes stay the CI
-  metric for totals.
+  arms. Coverage is keyed by pinned repo revision, path and source byte
+  interval, and only the intersection of delivered spans with gold spans is
+  credited. The follow-up is the union of the uncovered gold bytes per file,
+  so an identical line from another file never counts. `total_bytes` is
+  everything the arm received plus its follow-up bytes.
+- **Tokens**: the budget is enforced with ADR 0011's cost model and calibrated
+  against the MCP rendering, counted with a pinned offline tokenizer.
+  Model-exact tokens are counted with the provider's token-counting endpoint
+  when an API key is present; bytes stay the CI metric for totals.
 - **Mid-size tier**: pinned repos from the Shard profile's corpus
   (`docs/research/shard-profile/corpus.tsv` on `research/shard-profile`). The
   four-file fixture stays as the small tier.
@@ -127,11 +132,15 @@ percentages are opening targets, to be tightened after the first baseline run.
 
 ### Tier 1: deterministic, in CI
 
-- Every scenario meets its gold thresholds.
-- Every response is within its budget, measured as above: a hard invariant,
-  not a percentile.
-- Each scenario renders byte for byte the same with and without an extra
-  hidden repo that has edges into its results (ADR 0011, ADR 0008).
+- Every scenario passes its gold check as defined above.
+- Every response is within its budget by the cost model, as a hard invariant,
+  and its MCP rendering is within 1.1× the budget by the pinned tokenizer.
+- Each scenario renders byte for byte the same, cursor handles replaced by a
+  placeholder, with and without an extra hidden repo that has edges into its
+  results, and returns the same items across all pages (ADR 0011, ADR 0008).
+  One such scenario's hidden edges alone exceed the traversal work cap.
+- Every id in every response, used as input with its stated repo context,
+  resolves to the same node.
 - On relationship scenarios at the mid-size tier (callers, hub `neighbors`,
   `impact`, cross-repo, the Symbol card), the Verb arm's `total_bytes` is no
   more than grep-and-read's.
@@ -147,11 +156,15 @@ percentages are opening targets, to be tightened after the first baseline run.
 - A task's answer is graded against gold citations, as in Ask's eval
   (ADR 0010). Input tokens are the cumulative uncached input across the
   task's turns.
-- On relationship tasks, the Verb arm uses at least 30% fewer input tokens
-  and at least 20% fewer tool calls, at equal or better accuracy.
+- On relationship tasks, the Verb arm uses at least 30% fewer input tokens and
+  at least 20% fewer tool calls, and is non-inferior on accuracy: no more than
+  5 points lower.
 - On exact-string tasks, it is no more than 10% worse on tokens and tool
-  calls, and its accuracy is no more than 5 points lower.
-- Each comparison is reported with a paired bootstrap 95% confidence
-  interval, and a target counts as met only when the interval clears it.
+  calls, and again no more than 5 points lower on accuracy.
+- Each comparison is a paired bootstrap 95% confidence interval that resamples
+  tasks, keeping each task's runs together. A reduction target is met when the
+  interval's bound closest to no reduction clears it. An accuracy target is
+  met when the interval's lower bound on Verb-minus-grep accuracy is above
+  −5 points.
 - The corpus and harness are shared with Ask's eval. This tier is not run in
   CI.
