@@ -19,7 +19,7 @@ Every count, `sites: n`, `+N` figure, degree, hub decision, ranking penalty, can
 ### Edges are aggregated
 
 - `neighbors` returns one edge per `(src, dst, kind)`. Distinct call sites are distinct `(line, column)` locations (ADR 0006). An edge that stands for several sites carries `sites: n` and the first few (about 3), each with its line number, column, line text, Provenance and confidence. `detail: sites` returns every site, paged under the budget.
-- An aggregated edge's Provenance and confidence are those of its strongest site, and it states how many of its sites are at each Provenance ("5 sites: 2 precise, 3 syntactic"). Provenance and confidence filters in the request apply to sites before aggregation.
+- Provenance and confidence filters in the request apply to the evidence first. The surviving evidence is then grouped by site, so a site seen by both the precise and the syntactic pass is one site, shown with its strongest surviving observation. An aggregated edge's Provenance and confidence are those of its strongest site, and it states how many of its sites are at each Provenance ("5 sites: 2 precise, 3 syntactic"), which always sums to `sites: n`.
 
 ### Ambiguity is ranked and counted, never dropped
 
@@ -31,7 +31,7 @@ ADR 0006 keeps every candidate of an ambiguous call site. How a payload shows th
 
 ### Identity is stated once
 
-- A response states its repo context once, and ids inside it are repo-relative (`sym:server/etcdserver/api/rafthttp/stream.go#streamWriter.run`). A cross-repo response is ordered by global rank, and restates the repo context at the start of each run of consecutive results from one repo. Any id outside the current context, including the far end of an edge that crosses repos, is always written fully qualified.
+- A response states its repo context once, and ids inside it are repo-relative. A relative id has an empty repo segment (`sym::server/etcdserver/api/rafthttp/stream.go#streamWriter.run`), a form no fully qualified id (`sym:<repo>:<path>#<name>`) can take, so the two never collide. A cross-repo response is ordered by global rank, and restates the repo context at the start of each run of consecutive results from one repo. Any id outside the current context, including the far end of an edge that crosses repos, is always written fully qualified.
 - Every Verb accepts both forms on input: a fully qualified id, or a relative id together with a `repo` parameter. Every id in a response, used as input with its stated context, resolves to the same node; that is a Tier 1 check.
 - Fields an id already encodes are not repeated: no separate `name`, `path` or `kind` beside an id that carries them, no `SearchHit.repo`, no null cursors. A line number is kept, because ids do not carry it.
 
@@ -47,9 +47,10 @@ ADR 0006 keeps every candidate of an ambiguous call site. How a payload shows th
 - `node`, `neighbors`, `search`, `history` and every `detail:` page take a `budget` in tokens: 4,000 by default, 20,000 at most, and at least 500; below that the request is refused with a typed error. `budget` replaces `limit` on all of them.
 - The budget is spent against one **cost model** on the typed response, independent of transport: a fixed cost per node, per edge and per site, plus the length of every character it will render, ids, repo headers and Provenance included, divided by four. The cut is made once, before rendering, so MCP and REST return the same items and the same cursor position. Room is always kept for the cursor and the truncation notice. Tier 1 calibrates the model: the MCP rendering, counted with a pinned offline tokenizer, stays within 1.1× the budget on every scenario.
 - The seed comes first and is never cut; if its own text would exceed the budget, that text is clipped as above. Each Verb has its own order: a traversal by hop, then Provenance and confidence, then a penalty for high-degree nodes, then qualified id; `search` by normalised relevance (ADR 0008), then qualified id; `history` by commit time, newest first, then id. A cursor resumes its Verb's order.
+- A traversal that reaches its work cap stops: results are ranked and paged only over what it discovered, and the nodes it did not explore are listed separately as a frontier, with a narrower call (a single seed, kind or depth) that would explore them. The cursor never pages into undiscovered results.
 - At depth 2 and beyond, a node whose visible degree is above a threshold is not expanded. It is listed as a hub with its visible edge count and the call that would expand it, so a deep traversal never returns hundreds of nodes with no edges.
 - Truncation is always stated: how many nodes and edges were cut, exactly or as "at least N" when the traversal stopped early, and the budget that would include them all, but only when that budget is within the maximum; otherwise the notice points to the cursor.
-- Every successful continuation returns at least one item, so paging always advances. If the next item will not fit the budget asked for, the request is refused with a typed insufficient-budget error that keeps the cursor valid and states the smallest budget that fits. An id too long to fit even the maximum is replaced by a short reference, bound to the cursor's state, that `node` resolves losslessly.
+- Every successful continuation returns at least one item, so paging always advances. If the next item will not fit the budget asked for, the request is refused with a typed insufficient-budget error that keeps the cursor valid and states the smallest budget that fits. Every item has a representation that fits the maximum budget: when an item, with its headers and notices, would not, its ids are replaced by short references, bound to the cursor's state and resolvable by `node` losslessly for as long as that state lives, final page included.
 
 ### Cursors
 
@@ -60,7 +61,7 @@ ADR 0006 keeps every candidate of an ambiguous call site. How a payload shows th
 ### One call can describe a Symbol
 
 - `node` takes `include` and returns a card: the Symbol's signature and doc summary, then each requested section, ranked and cut under one shared budget. Every requested section is guaranteed a minimum share of the budget, divided by twice the number of sections requested; the remainder goes by rank, and each section ends with its own "+N more" and the call that fetches the rest.
-- The sections are defined by edges and Verbs that already exist: `callers` and `callees` (CALLS), `tests` (TESTS edges), `exports` (EXPORTS edges), `history` (the `history` Verb). `owners` (CODEOWNERS) and `memories` (`recall`, under its Audience and visibility rules) arrive in M2. A section is not advertised in the tool schema until its data exists; requesting it earlier is refused with a typed unsupported-section error, never answered with an empty section that would read as "none".
+- The sections are defined by edges and Verbs: `callers` and `callees` (CALLS) and `history` (the `history` Verb) exist today. `tests` (a `TESTS` edge kind) and `exports` (an `EXPORTS` edge kind) are decided in M1 by the parity decision on the map. `owners` (CODEOWNERS) and `memories` (`recall`, under its Audience and visibility rules) arrive in M2. A section is not advertised in the tool schema until its data exists; requesting it earlier is refused with a typed unsupported-section error, never answered with an empty section that would read as "none".
 
 ### MCP gets one compact rendering
 

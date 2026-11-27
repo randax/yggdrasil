@@ -104,12 +104,24 @@ percentages are opening targets, to be tightened after the first baseline run.
 - **Gold answers**: for the mid-size tier, each scenario's expected answer
   comes from a precise resolver (SCIP, or `go/types` for Go), with the
   evidence that proves it: the enclosing declarations and line ranges.
+- **Answer keys**, fixed per scenario and applied to both arms: distinct
+  caller (or callee) ids for "who calls this?"; `(revision, path, line,
+  column)` for "where is it called?"; the precise resolver's edge set for the
+  seed in hub `neighbors`; the precise transitive caller set to the stated
+  depth for `impact`; and each Symbol card section scored separately. Each
+  arm's output is mapped to keys and deduplicated; evidence-span coverage is
+  scored separately as `followup_read_bytes`.
 - **The answer an arm gives** is defined the same way for both arms: its
-  results are consumed in the order returned, page by page, until gold recall
-  reaches 0.9 or the results run out. Everything received up to that point
-  counts toward `total_bytes` and `verb_calls`. A scenario passes when recall
-  reaches 0.9 and precision at that stopping point is at least 0.5.
-  Grep-and-read is held to the same recall floor.
+  results are consumed in the order returned, page by page, until recall over
+  the answer key reaches 0.9 or the results run out. Everything received up
+  to that point counts toward `total_bytes` and `verb_calls`. Grep-and-read is
+  held to the same recall floor.
+- **Staged gates.** A scenario is enabled when its Verb and the Provenance it
+  depends on exist. Recall 0.9 gates from then on. Precision at the stopping
+  point is reported from the start and becomes a gate (at least 0.5) once
+  precise edges exist for that scenario's language. The common-name callers
+  scenario is a method call with at least 20 same-named candidates, so the
+  ambiguity rules are always exercised.
 - **`grep_lines_bytes`**: what the scenario's literal `grep -rn` prints
   (`path:line:text`), which is what a grep-and-read agent actually sees.
 - **`followup_read_bytes`**: computed mechanically, the same way for both
@@ -132,7 +144,7 @@ percentages are opening targets, to be tightened after the first baseline run.
 
 ### Tier 1: deterministic, in CI
 
-- Every scenario passes its gold check as defined above.
+- Every enabled scenario passes its gates as staged above.
 - Every response is within its budget by the cost model, as a hard invariant,
   and its MCP rendering is within 1.1× the budget by the pinned tokenizer.
 - Each scenario renders byte for byte the same, cursor handles replaced by a
