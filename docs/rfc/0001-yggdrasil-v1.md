@@ -21,6 +21,8 @@ tokens(id, member_id, hash, created_at, last_used_at, revoked_at)
 packages(id, ecosystem, name)                       -- npm, crates, go modules…
 repo_packages(repo_id, package_id, version_range, relation /* provides|depends */)
 xrepo_edges(from_repo, to_repo, via_package_id, kind)
+xrepo_refs(moniker /* version-free */, from_repo, ref_count, provenance, confidence)
+                                                    -- replaced per repo in the pointer-swap transaction (ADR 0012)
 contributors(id, display_name)
 identities(contributor_id, kind /* email|forge_account */, value, merge_provenance)
 memories(id, member_id, kind /* semantic|episodic */, scope /* session|repo|org */,
@@ -46,17 +48,17 @@ Job queue = `SELECT … FOR UPDATE SKIP LOCKED` with leases; priorities favor in
 - **Discovery loop** (per Forge connection, ~hourly + on demand): list orgs/groups → upsert `repos` with `discovery_state`. Public/internal → `included` unless an exclude rule matches; private → `discovered` until an include rule with `applies_to_private` covers it (ADR 0001). Rule precedence is longest matching glob first, then newest rule for equal-length matches.
 - **Poll loop** (default 5 min/repo, jittered, conditional requests): compare branch head via cheap API call; on change enqueue `fetch`. Rate budgeting per Forge token; backoff on 429/abuse signals.
 - **Webhook receiver** (optional accelerator): push/CR/issue events → enqueue the same jobs. Secrets per Forge; idempotent with poll (poll is truth, webhooks are latency).
-- **Fetch job**: bare clone/fetch into worker-local cache (full history default; `--depth` per-repo override). Forge Artifacts synced via API cursors (updated-since), normalized to common shapes (Change Request, Issue, Review).
+- **Fetch job**: incremental fetch into a persistent, bare, blobless partial clone on the worker (full commit and tree history; blobs fetched on demand for the tree being indexed; `--depth` per-repo override) (ADR 0012). Forge Artifacts synced via API cursors (updated-since), normalized to common shapes (Change Request, Issue, Review).
 
 ## 4. Indexing pipeline
 
 Two-pass per change (ADR 0002):
 
-**Pass 1 — syntactic (target: minutes).** tree-sitter parse of changed files (full parse on first index): Symbols, heuristic call/import/extends edges with confidence; markdown → Doc Sections + `MENTIONS` edges (lexical match against symbol names, tagged); CODEOWNERS → `OWNS` edges; `git log` delta → commits, `TOUCHES`/`AUTHORED` edges; manifest parse → `packages`/`repo_packages`/`xrepo_edges`. Publishes a Shard immediately.
+**Pass 1 — syntactic (target: minutes).** tree-sitter parse of every file whose blob misses the per-blob extraction cache (keyed by blob id plus extractor, grammar and schema versions; ADR 0012): Symbols, heuristic call/import/extends edges with confidence; markdown → Doc Sections + `MENTIONS` edges (lexical match against symbol names, tagged); CODEOWNERS → `OWNS` edges; `git log <previous>..<new>` delta merged with the previous revision's history rows (full walk after a force-push or rewrite) → commits, `TOUCHES`/`AUTHORED` edges; manifest parse → `packages`/`repo_packages`/`xrepo_edges`. Every candidate at an ambiguous call site is stored, once per site. Publishes a complete Shard immediately, carrying forward the precise edges of every Precise Root whose input hash is unchanged. Every job records per-stage timings.
 
-**Pass 2 — precise (target: same hour).** Language detection → SCIP indexer matrix (M1: scip-go, scip-typescript, scip-python, rust-analyzer/scip; M2+: scip-java family, scip-clang, scip-ruby, scip-dotnet). Runs in a sandbox: container, read-only source, egress allowlist (package registries), no credentials, CPU/mem/time limits, per-language dependency caches (e.g. shared module/crate caches) to hit the ~4-min average. Output SCIP → occurrences + precise edges → new Shard revision overlaying provenance. Build failure ⇒ stay syntactic, surface in admin status.
+**Pass 2 — precise (target: same hour).** Language detection → SCIP indexer matrix (M1: scip-go, scip-typescript, scip-python, rust-analyzer/scip; M2+: scip-java family, scip-clang, scip-ruby, scip-dotnet). Runs in a sandbox: container, read-only source, egress allowlist (package registries), no credentials, CPU/mem/time limits, per-language dependency caches (e.g. shared module/crate caches) to hit the ~4-min average. Builds run per Precise Root (one per build manifest), and only for roots whose input hash (files, lockfile, indexer version, in-repo dependency roots' hashes) changed. Output SCIP → occurrences + precise edges → new Shard revision in which they replace that root's syntactic edges, applied only if the root's input hash still matches; otherwise the result is discarded and the root rebuilt. Build failure ⇒ the root stays syntactic, surfaced per root in admin status (ADR 0012).
 
-**Cross-repo linking.** SCIP symbol monikers (ecosystem + package + version + descriptor) are the global join key. Workers emit `provides`/`depends` package facts; the control plane resolves them to `xrepo_edges`, which bound all cross-repo query fan-out.
+**Cross-repo linking.** SCIP symbol monikers (ecosystem + package + version + descriptor) are the global join key. Workers emit `provides`/`depends` package facts, which the control plane resolves to `xrepo_edges` for `deps` and `dependents`, and one `xrepo_refs` row per external symbol a repo references, which bounds symbol-level cross-repo fan-out (`callers`, `impact`) to the repos that reference the Symbol, filtered to the caller's view (ADR 0012).
 
 **Identity merge.** Same email or .mailmap entry ⇒ merge (provenance `extracted`); same forge account across Forges via profile URLs ⇒ merge (`extracted`); name+similar-email heuristics ⇒ merge (`inferred`, reversible via `identities.merge_provenance`).
 
@@ -136,13 +138,16 @@ Memories are control-plane records, not Shard nodes; derived Verbs never return 
 
 ```
 shards/<repo-id>/<revision>/
-  manifest.json      # commit, pass level, segment checksums, schema version
-  graph.sqlite       # nodes, edges, occurrences (SQLite as *artifact format*)
-  fts/               # tantivy segment directory
-  vec.*              # ANN segment (M3; library/format open — §11 Q2)
+  manifest.json      # commit, pass level, schema version, size + sha256 of every file,
+                     # input hash of every Precise Root, embedding model + version
+  graph.sqlite       # tuned: integer ids, interned strings, clustered WITHOUT ROWID edges
+  fts/…              # tantivy files, merged to one segment; bodies indexed, not stored
+  contents/…         # zstd file contents + line offsets: the only copy of source text
+  vectors/…          # int8 vectors + mmap ANN graph (when semantic lands; library open, §11 Q2)
+  trigram/…          # reserved for regex search after v1
 ```
 
-Immutable; pointer swap in `shards` table; GC after grace window. Query nodes mmap segments from an NVMe cache keyed by checksum. SQLite survives ADR 0004's supersession as the *graph segment format* — single-file, mmap-friendly, queryable in-process — while object storage + Postgres carry the multi-node story (ADR 0005).
+Immutable; loose files, no archive; pointer swap in `shards` table; GC deletes a revision prefix after a grace window. Query nodes download only the files a Verb needs, as parallel byte-range GETs verified by sha256, into an NVMe cache that keeps one copy, and pre-warm a new revision before switching to it. SQLite survives ADR 0004's supersession as the *graph segment format* — single-file, mmap-friendly, queryable in-process — while object storage + Postgres carry the multi-node story (ADR 0005). Layout, fetch and incremental indexing: ADR 0012.
 
 ## 7. Verb contract (ADR 0003)
 
@@ -240,7 +245,7 @@ Recorded as ADRs: org-visible vs ACL mirroring (0001); precise+fallback vs tree-
 1. SCIP language priority beyond M1's four — Java family next, or C/C++ (hardest, big payoff)?
 2. ANN library: usearch vs hnsw_rs vs lance — decide at M3 with benchmarks.
 3. Build caching strategy for the precise pass (shared registry caches vs sccache-style vs Nix) — biggest lever on worker fleet size.
-4. Monorepo sub-projects: one Shard per repo or per workspace member? (Affects `map` quality in giant repos.)
+4. Monorepo sub-projects: storage is settled as one Shard per repo with Precise Roots inside it (ADR 0012); whether `map` groups giant repos by root stays open.
 5. Org-wide search tiering, lexical *and* vector: pure fan-out with early termination vs a small global "top symbols" index in the control plane; vector fan-out across thousands of per-repo ANN segments may want repo-scoping hints or a coarse global tier.
 6. CR-head indexing (the rejected compute bonfire) — revisit as opt-in per-repo flag post-v1?
 7. Webhook ingress hardening for internet-exposed deployments (signature schemes differ per Forge).

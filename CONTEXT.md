@@ -135,8 +135,12 @@ The generated per-repo orientation returned by the map verb: entry points, landm
 _Avoid_: Overview, summary, report
 
 **Shard**:
-The immutable per-repo index artifact (graph, full-text, vectors) produced by indexing and swapped atomically on re-index.
+The immutable per-repo index artifact (graph, source contents, full-text, vectors) produced by indexing and swapped atomically on re-index. Every revision is complete.
 _Avoid_: Index file, snapshot
+
+**Precise Root**:
+A project inside a repo, defined by one build manifest, that the precise pass builds as a unit. A Precise Root is precise or syntactic on its own, so one repo can be precise in some roots and syntactic in others.
+_Avoid_: Module, package, workspace (each means something narrower in some ecosystem)
 
 **Memory**:
 A unit of knowledge a Member (human or agent) asserts about one or more repositories — a fact it learned, a decision, a gotcha — stored as a control-plane record anchored to graph nodes and recallable in later sessions. Member-authored and revisable, carrying asserted trust; not extracted from source. Contrast the Knowledge Graph, which is derived and immutable.

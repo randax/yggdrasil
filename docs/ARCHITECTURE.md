@@ -39,7 +39,7 @@ One Rust binary, three roles. Stateless compute around two stateful, self-hostab
 ## Components
 
 ### Control plane (Postgres)
-System of record: Forge connections, repo registry + discovery state, sync cursors, job queue (`SELECT … FOR UPDATE SKIP LOCKED`), Shard pointers, Members + bearer tokens, the cross-repo edge index (package → repo, repo → repo dependency edges; a global symbol tier is an open question, RFC 0001 Q5), Contributor identity merges, and (from M2) Memories — knowledge asserted by Members (human or agent) and anchored to graph nodes, the only graph knowledge that cannot be rebuilt from git and the Forges (ADR 0007). Everything else is rebuildable, except the Memory retraction/erasure log, which lives under a dedicated object-storage prefix (object-locked where the store supports it) and must never be rolled back (RFC 0001 §5.1); Postgres and object storage are the only backup targets.
+System of record: Forge connections, repo registry + discovery state, sync cursors, job queue (`SELECT … FOR UPDATE SKIP LOCKED`), Shard pointers, Members + bearer tokens, the cross-repo indexes (package → repo and repo → repo dependency edges for `deps`/`dependents`, and a symbol-level reference index that bounds `callers`/`impact` fan-out to the repos that reference a Symbol, ADR 0012), Contributor identity merges, and (from M2) Memories — knowledge asserted by Members (human or agent) and anchored to graph nodes, the only graph knowledge that cannot be rebuilt from git and the Forges (ADR 0007). Everything else is rebuildable, except the Memory retraction/erasure log, which lives under a dedicated object-storage prefix (object-locked where the store supports it) and must never be rolled back (RFC 0001 §5.1); Postgres and object storage are the only backup targets.
 
 ### Sync service
 Per-Forge adapters behind one trait: discovery (orgs/groups → repos, include/exclude rules, private = opt-in), poll loop with conditional requests against rate-limit budgets, optional webhook receiver as accelerator (poll always reconciles, so missed webhooks only cost latency, never correctness). Emits jobs: `fetch`, `index_syntactic`, `index_precise`, `extract_{history,docs,owners,artifacts}`, `embed`.
@@ -48,7 +48,7 @@ Per-Forge adapters behind one trait: discovery (orgs/groups → repos, include/e
 Pull jobs from the queue. Two-pass indexing:
 
 1. **Syntactic pass** (fast, always succeeds): tree-sitter parse, heuristic edges, docs/history/owners extraction → publish Shard within minutes of a change.
-2. **Precise pass** (slow, best-effort): SCIP indexer runs the repo's build inside a **sandbox** (container, controlled egress for dependency fetch, no credentials beyond read-only clone token); on success its edges overlay the syntactic ones in a new Shard revision.
+2. **Precise pass** (slow, best-effort): SCIP indexer runs the repo's build inside a **sandbox** (container, controlled egress for dependency fetch, no credentials beyond read-only clone token); it builds per Precise Root and only roots whose inputs changed; on success a root's precise edges replace its syntactic ones in a new, complete Shard revision, and unchanged roots' precise edges carry forward (ADR 0012).
 
 Every edge records Provenance (`precise` | `syntactic` | `extracted` | `inferred`; RFC 0001 §5) + confidence (ADR 0002). A failed build degrades a repo to syntactic — never to absent.
 
