@@ -184,7 +184,7 @@ available endpoints. The served set is defined by `yg_verbs::Verb::ALL` and
 | `dependents` | planned-M2 | repo\|package\|symbol | dependency closure (xrepo-bounded) |
 | `owners` | planned-M2 | file\|dir\|symbol | Contributors/Teams + ownership basis |
 | `history` | implemented | file or symbol, since? | commits touching the file or symbol's defining file, Contributors |
-| `impact` | planned-M1 | symbol\|file, depth | affected Symbols→Files→Repos, grouped, provenance-annotated |
+| `impact` | planned-M1 | symbol\|file\|CR change set (`{repo, cr}`), depth | affected Symbols→Files→Repos, grouped, provenance-annotated |
 | `remember` | planned-M2 | op: create\|supersede\|affirm, body?, kind, scope, session_id?, anchors, target?, expected_head? (required when affirming an unverified Memory; null = no verified head) | Memory id (private to the author unless affirming) |
 | `recall` | planned-M2 | anchor id \| scope \| query, session_id?, include_stale?, history?, proposed?, unverified? | Memories with author, scope, lifecycle state, supersession links (only where the caller may see both ends; hidden links are omitted without placeholder or count), `asserted` trust, staleness; bodies marked untrusted. `proposed: true` lists pending proposals awaiting the caller's review, each with its proposal id, Memory, requested scope and expected head; `unverified: true` lists only unverified Memories, for callers with the promote right, so they can be re-affirmed |
 | `promote` | planned-M2 | memory id, scope?: repo\|org, expected_head (null = none), reviewer? — or proposal id, decision: accept\|reject | receipt: Memory id, proposal id if any, resulting state and scope (never the body; bodies are read only through `recall`); attributed and audited |
