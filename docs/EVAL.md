@@ -101,37 +101,57 @@ percentages are opening targets, to be tightened after the first baseline run.
 
 ### Yardstick
 
+- **Gold answers**: for the mid-size tier, each scenario's expected answer
+  comes from a precise resolver (SCIP, or `go/types` for Go), with the
+  evidence that proves it: the enclosing declarations and line ranges. A
+  scenario passes when the answer meets its recall and precision thresholds,
+  stated per scenario.
 - **`grep_lines_bytes`**: what the scenario's literal `grep -rn` prints
   (`path:line:text`), which is what a grep-and-read agent actually sees.
-- **`followup_read_bytes`**: the bytes an agent must still read to verify the
-  answer after the Verb calls or after grep. `total_bytes` is the payload plus
-  the follow-up.
-- **Tokens**: counted with the provider's token-counting endpoint when an API
-  key is present; bytes stay the CI metric.
-- **Mid-size tier**: repos from the Shard profile's corpus
-  (`docs/research/shard-profile/corpus.tsv` on `research/shard-profile`),
-  pinned, chosen for common names such as `New` and `String`. The four-file
-  fixture stays as the small tier.
-- **Scenarios**: callers on common names, hub `neighbors`, `impact`, a
-  cross-repo question, locate definition, and the `node` Symbol card.
+- **`followup_read_bytes`**: computed mechanically, the same way for both
+  arms: the bytes of the gold evidence ranges that are not already present
+  verbatim in what that arm has received. `total_bytes` is everything the arm
+  received, every page included, plus its follow-up bytes. `verb_calls`
+  counts every page.
+- **Tokens**: the budget invariant is measured on the MCP rendering with
+  ADR 0011's cost model. Model-exact tokens are counted with the provider's
+  token-counting endpoint when an API key is present; bytes stay the CI
+  metric for totals.
+- **Mid-size tier**: pinned repos from the Shard profile's corpus
+  (`docs/research/shard-profile/corpus.tsv` on `research/shard-profile`). The
+  four-file fixture stays as the small tier.
+- **Scenarios**: callers on a common name (where grep is noisy) and on a
+  unique name (where grep is exact), hub `neighbors`, `impact`, a cross-repo
+  question, locate definition, and the `node` Symbol card. A hidden-repo
+  variant of each runs too (below).
 
 ### Tier 1: deterministic, in CI
 
-- `correct` is 100% on every scenario.
-- p95 payload is within the request's budget, including hub scenarios.
-- On relationship scenarios (callers, hub `neighbors`, `impact`,
-  cross-repo, the Symbol card) at the mid-size tier, `total_bytes` is no
-  more than grep-and-read's `total_bytes`.
-- On exact-string scenarios (locate definition), `total_bytes` is at most
-  1.5× grep's, since grep is built for exactly that.
+- Every scenario meets its gold thresholds.
+- Every response is within its budget, measured as above: a hard invariant,
+  not a percentile.
+- Each scenario renders byte for byte the same with and without an extra
+  hidden repo that has edges into its results (ADR 0011, ADR 0008).
+- On relationship scenarios at the mid-size tier (callers, hub `neighbors`,
+  `impact`, cross-repo, the Symbol card), the Verb arm's `total_bytes` is no
+  more than grep-and-read's.
+- On exact-string scenarios (locate definition, callers on a unique name),
+  the Verb arm's `total_bytes` is at most 1.5× grep's, since grep is built for
+  exactly that.
 
 ### Tier 2: agent in the loop, at release
 
-- A fixed model runs about 40 natural-language tasks on the profile corpus,
-  in two arms: grep and read only, and Verbs plus grep and read. Each task
-  runs several times and the median is scored.
+- A fixed model runs natural-language tasks on the profile corpus, at least
+  20 relationship tasks and at least 20 exact-string tasks, in two arms: grep
+  and read only, and Verbs plus grep and read. Each task runs 5 times.
+- A task's answer is graded against gold citations, as in Ask's eval
+  (ADR 0010). Input tokens are the cumulative uncached input across the
+  task's turns.
 - On relationship tasks, the Verb arm uses at least 30% fewer input tokens
   and at least 20% fewer tool calls, at equal or better accuracy.
-- On exact-string tasks, it is no more than 10% worse on either measure.
-- The corpus and harness are shared with Ask's eval (ADR 0010). This tier is
-  not run in CI.
+- On exact-string tasks, it is no more than 10% worse on tokens and tool
+  calls, and its accuracy is no more than 5 points lower.
+- Each comparison is reported with a paired bootstrap 95% confidence
+  interval, and a target counts as met only when the interval clears it.
+- The corpus and harness are shared with Ask's eval. This tier is not run in
+  CI.

@@ -1,6 +1,6 @@
 # Verb payloads are aggregated, budgeted and decisive
 
-Status: accepted. Refines the response shape of [ADR 0003](0003-verb-contract-not-query-language.md): the Verb set is unchanged, and this ADR fixes what each Verb returns and how much.
+Status: accepted. Refines the response shape of [ADR 0003](0003-verb-contract-not-query-language.md): the Verb set is unchanged, and this ADR fixes what each Verb returns and how much. Replaces [ADR 0008](0008-team-granted-repository-visibility.md)'s signed cursor with a server-held handle that binds the same things.
 
 The navigation claim is that an agent orients through bounded Verb responses instead of reading files. Today it does not hold. The [token-efficiency research](https://github.com/randax/yggdrasil/blob/d0a86b57a2ef094d629188caa4ba1dac20ac0748/docs/research/agent-token-efficiency.md) found that payloads carry identity and no answer, so an agent reads the file anyway and Verb bytes add to file reads instead of replacing them. The [Shard profile](https://github.com/randax/yggdrasil/blob/563e9b4c3b6a42e9583452055150a2154173b0c3/docs/research/shard-profile.md) found where the bytes go:
 
@@ -12,44 +12,60 @@ Every peer that does better converges on the same few techniques: compact render
 
 ## The rules
 
+### Everything is computed on the caller's view
+
+Every count, `sites: n`, `+N` figure, degree, hub decision, ranking penalty, candidate denominator and budget estimate below is computed after the caller's effective view has been applied (their view, intersected with any reader ceiling and egress set, ADR 0008 and ADR 0010), never from a total precomputed in the Shard. A node whose visible degree is under the hub threshold is expanded normally. The same query run with and without an extra hidden repo that has edges into the result must render byte for byte the same; that is a Tier 1 check.
+
 ### Edges are aggregated
 
-- `neighbors` returns one edge per `(src, dst, kind)`. An edge that stands for several call sites carries `sites: n` and the first few (about 3), each with its line number and the line's text. `detail: sites` returns every site, paged.
-- Page and budget limits count aggregated edges.
+- `neighbors` returns one edge per `(src, dst, kind)`. Distinct call sites are distinct `(line, column)` locations (ADR 0006). An edge that stands for several sites carries `sites: n` and the first few (about 3), each with its line number, column, line text, Provenance and confidence. `detail: sites` returns every site, paged under the budget.
+- An aggregated edge's Provenance and confidence are those of its strongest site, and it states how many of its sites are at each Provenance ("5 sites: 2 precise, 3 syntactic"). Provenance and confidence filters in the request apply to sites before aggregation.
 
 ### Ambiguity is ranked and counted, never dropped
 
-- At a call site with several same-named candidates (ADR 0006), a payload returns the best few (about 3), ranked by confidence and then locality (same package, imported scope, same repo), and states `+N other candidates` with their highest confidence. `detail: candidates` returns all of them.
-- The Shard still stores every candidate, and `impact` still counts them in its reach, marked as low-confidence. Only what a payload shows by default changes.
+ADR 0006 keeps every candidate of an ambiguous call site. How a payload shows them depends on direction:
+
+- **Outbound** (what does this call?): for each site, the best few candidate destinations (about 3), ranked by confidence and then locality (same package, imported scope, same repo), and `+N other candidates` with their highest confidence.
+- **Inbound** (who calls this?): a site whose candidates include the seed always appears, never suppressed, marked "1 of N candidates at this site" with its confidence. Low-confidence callers rank lower; they never vanish.
+- Candidates not shown are counted separately from budget-cut results, and are reached only through `detail: candidates`, which has its own cursor. The Shard still stores every candidate, and `impact` still counts them in its reach, marked as low-confidence.
 
 ### Identity is stated once
 
-- A response states its repo context once, and ids inside it are repo-relative (`sym:server/etcdserver/api/rafthttp/stream.go#streamWriter.run`). A cross-repo response groups results by repo.
+- A response states its repo context once, and ids inside it are repo-relative (`sym:server/etcdserver/api/rafthttp/stream.go#streamWriter.run`). A cross-repo response is ordered by global rank, and restates the repo context at the start of each run of consecutive results from one repo.
 - Fields an id already encodes are not repeated: no separate `name`, `path` or `kind` beside an id that carries them, no `SearchHit.repo`, no null cursors. A line number is kept, because ids do not carry it.
-- Cursors are short opaque handles kept on the server with a time to live, bound to the caller's effective-view fingerprint (ADR 0008), never self-describing blobs.
 
 ### Payloads carry the text that ends the search
 
 - Every Symbol a Verb returns (from `node`, `neighbors` or `search`) carries its declaration line and line number, for example `func (w *streamWriter) run()`. `detail: doc` adds the first sentence of its doc comment.
 - Call sites carry their line text (above). Search snippets are plain text with line numbers, never HTML-escaped fragments.
+- Text longer than a fixed cap (for example 400 characters, as with a generated declaration) is clipped, marked as clipped and given its source location.
 - The Shard therefore keeps each Symbol's declaration line and each call site's line text; how is decided with the rest of the Shard layout.
 
 ### Every list is budgeted and ranked
 
-- `neighbors` and `search` take a `budget` in tokens: 4,000 by default, 20,000 at most. The server estimates tokens from the rendering it returns.
-- The seed comes first and is never cut. After it, results are ordered by hop, then Provenance and confidence, then a penalty for high-degree nodes, then id.
-- At depth 2 and beyond, a node above a degree threshold is not expanded. It is listed as a hub with its edge count and the call that would expand it, so a deep traversal never returns hundreds of nodes with no edges.
-- Truncation is always stated: how many nodes and edges were cut, and the budget that would include them all. The cursor continues in the same order.
+- `neighbors`, `search`, `history` and every `detail:` page take a `budget` in tokens: 4,000 by default, 20,000 at most, and at least 500; below that the request is refused with a typed error. On `neighbors` and `search`, `budget` replaces `limit`.
+- The budget is spent against one **cost model** on the typed response, independent of transport: a fixed cost per node, per edge and per site, plus text length divided by four. The cut is made once, before rendering, so MCP and REST return the same items and the same cursor position. Room is always kept for the cursor and the truncation notice.
+- The seed comes first and is never cut; if its own text would exceed the budget, that text is clipped as above. After it, results are ordered by hop, then Provenance and confidence, then a penalty for high-degree nodes, then id.
+- At depth 2 and beyond, a node whose visible degree is above a threshold is not expanded. It is listed as a hub with its visible edge count and the call that would expand it, so a deep traversal never returns hundreds of nodes with no edges.
+- Truncation is always stated: how many nodes and edges were cut, exactly or as "at least N" when the traversal stopped early, and the budget that would include them all, but only when that budget is within the maximum; otherwise the notice points to the cursor.
+- Every successful continuation returns at least one item, so paging always advances.
+
+### Cursors
+
+- A cursor is a short opaque handle to state kept in Postgres, so any stateless query node can resume it. The state binds the issuing Member, the fingerprint of their effective view (ADR 0008), the Shard revisions the first page read, and the request's shape (Verb, seed, direction, kinds, depth, detail and filters). It expires after an hour.
+- Presented by another Member, after the view has changed, or with a different request shape, it is refused with the same expired-cursor error ADR 0008 defines. `budget` may change between pages, because the order is fixed by the pinned shape and revisions.
+- This replaces ADR 0008's signed, self-describing cursor with a handle that binds the same things and more.
 
 ### One call can describe a Symbol
 
-`node` takes `include: [callers, callees, tests, exports, owners, history, memories]` and returns a card: the Symbol's signature and doc summary, then each requested section, ranked and cut under one shared budget, each with its own "+N more" and the call that fetches the rest. Sections whose data arrives in a later milestone (owners and Memories in M2) are accepted and empty until then. Memories in a card obey the same Audience and visibility rules as `recall`.
+- `node` takes `include` and returns a card: the Symbol's signature and doc summary, then each requested section, ranked and cut under one shared budget. Every requested section is guaranteed a minimum share (for example a sixth of the budget), the remainder goes by rank, and each section ends with its own "+N more" and the call that fetches the rest.
+- The sections are defined by edges and Verbs that already exist: `callers` and `callees` (CALLS), `tests` (TESTS edges), `exports` (EXPORTS edges), `history` (the `history` Verb). `owners` (CODEOWNERS) and `memories` (`recall`, under its Audience and visibility rules) arrive in M2. A section is not advertised in the tool schema until its data exists; requesting it earlier is refused with a typed unsupported-section error, never answered with an empty section that would read as "none".
 
 ### MCP gets one compact rendering
 
 - MCP tools declare no `outputSchema` and return a single text rendering, line- and tree-oriented, with the repo stated once, signatures and call sites inline and the truncation notice last. There is no `structuredContent` copy.
 - REST and `yg … --json` keep the typed JSON for programs. The CLI's human output is the same rendering as MCP's, and the Skill's examples drop `--json`.
-- The rendering and the JSON are two views of one typed response, produced at the transport boundary.
+- The rendering and the JSON are two views of one typed, already budgeted response, produced at the transport boundary.
 
 ### Order of work
 
@@ -74,7 +90,7 @@ These wire changes land first in M1, before `callers`, `callees`, `impact` and `
 ## Consequences
 
 - Every Verb response changes shape, breaking every client; all of them are ours (the repository's breaking-changes default).
-- The server ranks and budgets each response and holds cursor state.
+- The server ranks and budgets each response, and holds cursor state in Postgres, where every query node can reach it.
 - The Shard grows by declaration lines and call-site line text, small next to the CALLS-edge bytes the profile measured; "Storage and indexing direction" owns the layout.
 - Two renderings (MCP text and JSON) must stay in step; both come from one typed response.
 - Ask (ADR 0010) and the PR impact report consume the same shapes and budgets.
