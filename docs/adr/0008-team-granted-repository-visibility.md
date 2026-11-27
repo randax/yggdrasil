@@ -71,7 +71,7 @@ The unit is the repository, never the path ([research note](https://github.com/r
   - intersected with their reader ceiling, which every Service Agent query has;
   - for Memory Verbs, together with the Audiences they may recall from.
 
-  A signed cursor carries the Member's id and a fingerprint of their effective view when it was issued. Presented by another Member, or after that effective view has changed, it is refused with the same error as an expired cursor. Only derived Verbs share result caches, keyed by the effective-view fingerprint, so two callers share an entry only when they see exactly the same repos under the same ceiling. Memory Verbs are never cached across Members. Revocation therefore needs no extra cursor or cache invalidation.
+  A cursor carries, or with ADR 0011 refers to server-held state carrying, the Member's id and a fingerprint of their effective view when it was issued. Presented by another Member, or after that effective view has changed, it is refused with the same error as an expired cursor. Only derived Verbs share result caches, keyed by the effective-view fingerprint, so two callers share an entry only when they see exactly the same repos under the same ceiling. Memory Verbs are never cached across Members. Revocation therefore needs no extra cursor or cache invalidation.
 
 ## Considered options
 
