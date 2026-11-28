@@ -34,7 +34,7 @@ This amends ADR 0012 for per-CR pointers:
 |---|---|---|---|---|
 | pending (queued, building, awaiting rebuild) | unchanged, or none yet | none yet | "being built" | `head_unavailable` (pending) |
 | live | current report | success | computed at read time | served |
-| not resident (evicted, idle) | edited once to fixed text ("no longer updated; it returns when the CR is next analysed"); withdrawn on narrowing at once | unchanged | "not resident"; opening it queues a rebuild | `head_unavailable` (not resident) |
+| not resident (evicted, idle) | edited once to fixed text ("no longer updated; it returns when the CR is next analysed"); withdrawn on narrowing at once | unchanged | "not resident"; offers a rebuild | `head_unavailable` (not resident) |
 | too large | "too large to analyse: N files changed" | success | the same notice | `head_unavailable` (too large) |
 | closed or merged | left as is; withdrawn on narrowing | unchanged | "closed"; no report | `head_unavailable` (closed) |
 | no longer eligible | deleted | unchanged | "not eligible" | `head_unavailable` (not eligible) |
