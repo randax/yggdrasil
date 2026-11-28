@@ -54,7 +54,7 @@ Yggdrasil is a self-hosted **Index Server** that syncs git repositories from **F
 
 ### Operations
 - G13. Designed and certified for **5000+ repos, 500+ Members**; object-storage-native Shards + Postgres control plane + stateless workers and query nodes (ADR 0005).
-- G14. Self-hosting floor: one binary (role modes) + Postgres + S3-compatible store (RustFS/Garage), via docker compose.
+- G14. Self-hosting floor: the `yg` binary (role modes) + the stateless `yg-web` GUI image + Postgres + S3-compatible store (RustFS/Garage), via docker compose (ADR 0014).
 
 ### Memory (ADR 0007; numbered after the original goals)
 - G15. Members (human or agent) `remember` a fact, decision, convention or gotcha anchored to graph nodes; `recall` it by anchor, scope or full-text query; `promote` it from the author's private overlay into the shared pool at repo or org scope; and affirm or supersede it (via `remember`) or `retract` it. Every Memory carries `asserted` trust, its author and its staleness. Derived Verbs never return Memories, and `recall` returns bodies as untrusted data — claims to verify, never instructions.
