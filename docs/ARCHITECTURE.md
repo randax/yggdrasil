@@ -55,6 +55,9 @@ Every edge records Provenance (`precise` | `syntactic` | `extracted` | `inferred
 ### Shard store (object storage)
 One immutable Shard per repo per revision: graph segment (SQLite file as artifact format), full-text segment (tantivy), vector segment (ANN index, M3), plus a source-contents segment, as loose files under a manifest that lists each file's sha256 (ADR 0012). Query-node caches are keyed by file sha256; re-index publishes a new Shard, lets holding nodes pre-warm, then swaps the pointer for every node at once in Postgres with a compare-and-swap under a per-repo lease; old Shards garbage-collected after a grace window. No locks, no partial states, trivially cacheable (ADR 0005).
 
+### Web GUI (`yg-web`, stateless)
+A Next.js server behind the Rust front door (ADR 0014): Rust reverse-proxies product pages and `/api/trpc` to it on one origin, serves every identity ceremony itself on a separate ceremony origin (the WebAuthn relying-party id, which the app origin cannot claim), and hands `yg-web` a request-bound assertion instead of the session cookie. `yg-web` calls back the proxying node's internal-only listener with that assertion and a GUI-surface credential. It renders pages and shapes view models only; every ceremony, session and authorisation decision stays in Rust, and Member data is never cached in Next.js or by intermediaries.
+
 ### Query Nodes (stateless, horizontal)
 Serve the Verb engine over REST + MCP (Streamable HTTP). Hot Shards are cached memory → NVMe → object storage (turbopuffer/Zoekt pattern). Single-repo Verbs touch one Shard. Cross-repo Verbs (`dependents`, `impact`, org-wide `callers`) consult the control-plane edge index first, then fan out only to the bounded set of implicated Shards. Org-wide `search` fans out across cached tantivy segments with early termination.
 

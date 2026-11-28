@@ -7,7 +7,7 @@ RFC 0001 deferred OIDC to after v1, and every Member today holds a token an Admi
 Three ideas run through the rules below:
 
 - **Authority comes from a stepped-up human act.** A Forge, an IdP or a config file may *inform* who someone is and what Teams they are in. None of them can create a Yggdrasil role, and every widening by a Member, whoever performs it, needs step-up, a reason, audit and a notice (ADR 0008).
-- **The factor never reaches the agent.** Every ceremony that hands out or uses a credential is a passkey touch on Yggdrasil's own web origin, on a page that says what is being approved.
+- **The factor never reaches the agent.** Every ceremony that hands out or uses a credential is a passkey touch on Yggdrasil's own web origin, on a page that says what is being approved. The Index Server renders those pages itself, on a ceremony origin of its own that is the WebAuthn relying-party id and that the web GUI's origin cannot claim, so no GUI code can obtain a passkey signature, and ceremonies work while the GUI is down ([ADR 0014](0014-web-gui-stack.md)).
 - **Freshness is stated and fails closed.** Anything derived from a Forge or an IdP has a maximum age. When it cannot be reconfirmed, it lapses and access narrows.
 
 ## The rules
