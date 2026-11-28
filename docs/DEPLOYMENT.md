@@ -3,7 +3,8 @@
 > **Planned (ADR 0014):** the reference deployment gains a second, stateless
 > `yg-web` container (the Next.js web GUI), which `yg` reverse-proxies on the
 > same origin and which calls `yg` on an internal-only listener with a
-> GUI-surface credential. It is not built yet.
+> GUI-surface credential. Login and the other ceremonies stay in `yg`. It is
+> not built yet.
 
 The reference deployment is one `yg serve --role=all` container with Postgres
 for control-plane state and RustFS for Shard objects. It is intended as a
